@@ -20,7 +20,7 @@ from server import (
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("checkout", "complete", "release", "status"))
-    parser.add_argument("task_id", help="PRD task id, for example M3.13")
+    parser.add_argument("task_id", help="PRD task or gate id, for example M3.13 or M3.G1")
     parser.add_argument("--agent-id", default=os.environ.get("FRACTAL_AGENT_ID"))
     parser.add_argument("--agent-label", default=os.environ.get("FRACTAL_AGENT_LABEL"))
     parser.add_argument("--prd", type=Path, default=DEFAULT_PRD)

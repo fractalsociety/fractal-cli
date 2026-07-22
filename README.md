@@ -30,6 +30,10 @@ python3 execution-graph/task-state.py checkout M3.13 \
   --agent-id codex/root --agent-label "Codex · root"
 ```
 
+Unchecked milestone gates are executable verification nodes too. They use the
+same lifecycle and attribution, for example `checkout M3.G1`; a gate may only
+be completed after its corresponding PRD checkbox is checked.
+
 After verification, check the task in the PRD and retain its attribution:
 
 ```bash

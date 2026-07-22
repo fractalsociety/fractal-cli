@@ -188,6 +188,51 @@ Gate M0 — `READY`:
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_gate_checkout_and_completion_are_attributed(self):
+        prd = """### M3 — Isolation
+- [x] M3.1 Build backend.
+
+Gate M3 — `ISOLATION_READY`:
+- [ ] Disposable execution passes.
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            prd_path = root / "PRD.md"
+            state_path = root / "state.json"
+            prd_path.write_text(prd, encoding="utf-8")
+            state_path.write_text('{"active": []}\n', encoding="utf-8")
+
+            assignment = mutate_task_state(
+                "checkout",
+                "M3.G1",
+                "codex/root",
+                "Codex · root",
+                prd_path=prd_path,
+                state_path=state_path,
+            )
+            self.assertEqual(assignment["state"], "checked_out")
+            gate = parse_prd(prd_path, state_path)["groups"][0]["tasks"][1]
+            self.assertEqual(gate["kind"], "gate")
+            self.assertEqual(gate["status"], "active")
+
+            with self.assertRaises(TaskStateError):
+                mutate_task_state(
+                    "complete",
+                    "M3.G1",
+                    "codex/root",
+                    prd_path=prd_path,
+                    state_path=state_path,
+                )
+            prd_path.write_text(prd.replace("[ ] Disposable", "[x] Disposable"), encoding="utf-8")
+            completed = mutate_task_state(
+                "complete",
+                "M3.G1",
+                "codex/root",
+                prd_path=prd_path,
+                state_path=state_path,
+            )
+            self.assertEqual(completed["state"], "completed")
+
 
 if __name__ == "__main__":
     unittest.main()

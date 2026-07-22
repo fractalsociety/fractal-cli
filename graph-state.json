@@ -3,9 +3,8 @@
   "work_id": "fractal-mac-runtime-prd",
   "title": "Build the Fractal Mac Runtime",
   "active": [
-    "M0.13",
-    "M3.13",
-    "M9.7"
+    "M10.7",
+    "M10.13"
   ],
   "note": "Cursor \u00b7 Auto completed M9.1 + M9.8 (skipped M9.2 transport as blocking). Next open non-blocking M9 candidates: M9.3 descriptors, M9.9 reversal, M9.11 fixtures. Other workers: M3.13/M3.16; M0.13 owner sign-off.",
   "assignments": {
@@ -278,8 +277,9 @@
     "M9.7": {
       "agent_id": "claude/fable-orchestrator",
       "agent_label": "Claude \u00b7 Fable Orchestrator",
-      "state": "checked_out",
-      "checked_out_at": "2026-07-22T20:10:13.204670+00:00"
+      "state": "completed",
+      "checked_out_at": "2026-07-22T20:10:13.204670+00:00",
+      "completed_at": "2026-07-22T20:27:18.381959+00:00"
     },
     "M9.6": {
       "agent_id": "cursor/auto",
@@ -294,6 +294,95 @@
       "state": "completed",
       "checked_out_at": "2026-07-22T20:17:20.932085+00:00",
       "completed_at": "2026-07-22T20:22:58.956577+00:00"
+    },
+    "M10.1": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T20:25:47.269184+00:00",
+      "completed_at": "2026-07-22T20:27:42.546117+00:00"
+    },
+    "M10.6": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T20:26:06.337836+00:00",
+      "completed_at": "2026-07-22T20:30:12.886741+00:00"
+    },
+    "M10.9": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T20:28:08.234156+00:00",
+      "completed_at": "2026-07-22T20:30:33.117731+00:00"
+    },
+    "M10.8": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T20:28:22.671506+00:00",
+      "completed_at": "2026-07-22T20:34:38.140353+00:00"
+    },
+    "M10.10": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T20:35:55.341477+00:00",
+      "completed_at": "2026-07-22T20:39:20.133289+00:00"
+    },
+    "M10.12": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T20:36:34.655542+00:00",
+      "completed_at": "2026-07-22T20:45:32.016844+00:00"
+    },
+    "M10.7": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "checked_out",
+      "checked_out_at": "2026-07-22T20:41:09.558797+00:00"
+    },
+    "M3.13": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T20:42:14.649419+00:00",
+      "completed_at": "2026-07-22T21:01:46.986403+00:00"
+    },
+    "M10.13": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "checked_out",
+      "checked_out_at": "2026-07-22T20:47:43.333053+00:00"
+    },
+    "M0.13": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "released",
+      "checked_out_at": "2026-07-22T21:02:19.942325+00:00",
+      "released_at": "2026-07-22T21:02:38.888105+00:00"
+    },
+    "M3.G1": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T21:02:51.115740+00:00",
+      "completed_at": "2026-07-22T21:03:33.248682+00:00"
+    },
+    "M3.G2": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T21:04:45.762231+00:00",
+      "completed_at": "2026-07-22T21:07:06.840979+00:00"
+    },
+    "M6.G4": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T21:08:00.287760+00:00",
+      "completed_at": "2026-07-22T21:10:23.092034+00:00"
     }
   }
 }

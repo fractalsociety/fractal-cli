@@ -27,8 +27,8 @@ MILESTONE_RE = re.compile(r"^###\s+(M\d+)\s+—\s+(.+?)\s*$")
 GATE_RE = re.compile(r"^Gate\s+(M\d+)\s+—\s+`?([^`]+)`?:\s*$")
 CHECK_RE = re.compile(r"^- \[([ xX])\]\s+(.+?)\s*$")
 TASK_ID_RE = re.compile(r"^(M\d+\.\d+)\s+(.+)$")
-TASK_NODE_ID_RE = re.compile(r"^M\d+\.\d+$")
-TASK_ACTION_RE = re.compile(r"^/api/tasks/(M\d+\.\d+)/(checkout|complete|release)$")
+TASK_NODE_ID_RE = re.compile(r"^M\d+\.(?:\d+|G\d+)$")
+TASK_ACTION_RE = re.compile(r"^/api/tasks/(M\d+\.(?:\d+|G\d+))/(checkout|complete|release)$")
 AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$")
 STATE_WRITE_LOCK = threading.Lock()
 
@@ -85,7 +85,7 @@ def _task_from_prd(task_id: str, prd_path: Path, state_path: Path) -> dict[str, 
     graph = parse_prd(prd_path, state_path)
     for group in graph["groups"]:
         for task in group["tasks"]:
-            if task["id"] == task_id and task["kind"] == "task":
+            if task["id"] == task_id and task["kind"] in {"task", "gate"}:
                 return task
     raise TaskStateError(HTTPStatus.NOT_FOUND, f"unknown PRD task: {task_id}")
 
