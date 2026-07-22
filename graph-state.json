@@ -2,6 +2,6 @@
   "schema": "fractal.execution_graph_view_state.v1",
   "work_id": "fractal-mac-runtime-prd",
   "title": "Build the Fractal Mac Runtime",
-  "active": ["M0.13", "M1.4", "M1.7"],
-  "note": "M2.6 immutable model/tokenizer/adapter registry is complete. M0.13/M1.4/M1.7 remain active elsewhere."
+  "active": ["M0.13", "M3.13"],
+  "note": "M3.12 complete: deny is the manifest default; Apple and Docker use network-none with loopback-only guests and denied raw-IP egress. Next: M3.13 retrieval-only controlled proxy profile. M0.13 still awaits owner sign-off."
 }
