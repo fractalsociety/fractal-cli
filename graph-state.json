@@ -2,6 +2,298 @@
   "schema": "fractal.execution_graph_view_state.v1",
   "work_id": "fractal-mac-runtime-prd",
   "title": "Build the Fractal Mac Runtime",
-  "active": ["M0.13", "M3.13"],
-  "note": "M3.12 complete: deny is the manifest default; Apple and Docker use network-none with loopback-only guests and denied raw-IP egress. Next: M3.13 retrieval-only controlled proxy profile. M0.13 still awaits owner sign-off."
+  "active": [
+    "M0.13",
+    "M3.13",
+    "M9.7"
+  ],
+  "note": "Cursor \u00b7 Auto completed M9.1 + M9.8 (skipped M9.2 transport as blocking). Next open non-blocking M9 candidates: M9.3 descriptors, M9.9 reversal, M9.11 fixtures. Other workers: M3.13/M3.16; M0.13 owner sign-off.",
+  "assignments": {
+    "M3.16": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T13:51:20.200922+00:00",
+      "completed_at": "2026-07-22T13:54:49.853281+00:00"
+    },
+    "M9.1": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T13:54:19.284628+00:00",
+      "completed_at": "2026-07-22T13:54:19.404131+00:00"
+    },
+    "M9.8": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T13:54:19.485269+00:00",
+      "completed_at": "2026-07-22T13:55:54.446744+00:00"
+    },
+    "M3.17": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T14:22:13.543090+00:00",
+      "completed_at": "2026-07-22T14:25:25.138040+00:00"
+    },
+    "M9.3": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T14:22:14.408364+00:00",
+      "completed_at": "2026-07-22T14:28:09.624045+00:00"
+    },
+    "M3.18": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T14:45:17.263347+00:00",
+      "completed_at": "2026-07-22T14:48:51.680279+00:00"
+    },
+    "M5.15": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T14:46:14.940263+00:00",
+      "completed_at": "2026-07-22T14:48:14.230133+00:00"
+    },
+    "M9.9": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T14:46:30.060078+00:00",
+      "completed_at": "2026-07-22T14:47:46.200733+00:00"
+    },
+    "M4.11": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T14:49:19.496366+00:00",
+      "completed_at": "2026-07-22T14:59:47.519366+00:00"
+    },
+    "M7.14": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T15:00:18.136676+00:00",
+      "completed_at": "2026-07-22T15:18:52.229574+00:00"
+    },
+    "M9.11": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T15:19:16.196004+00:00",
+      "completed_at": "2026-07-22T16:06:02.149087+00:00"
+    },
+    "M3.19": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T15:28:26.559194+00:00",
+      "completed_at": "2026-07-22T15:34:58.246867+00:00"
+    },
+    "M3.20": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T15:29:43.293975+00:00",
+      "completed_at": "2026-07-22T15:31:57.840886+00:00"
+    },
+    "M4.2": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T15:38:14.949480+00:00",
+      "completed_at": "2026-07-22T15:42:23.010641+00:00"
+    },
+    "M7.10": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T15:38:40.392202+00:00",
+      "completed_at": "2026-07-22T15:42:01.672302+00:00"
+    },
+    "M8.7": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T16:06:53.150167+00:00",
+      "completed_at": "2026-07-22T16:13:37.630338+00:00"
+    },
+    "M4.6": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T16:14:53.815499+00:00",
+      "completed_at": "2026-07-22T16:20:12.841767+00:00"
+    },
+    "M7.9": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T16:21:19.601468+00:00",
+      "completed_at": "2026-07-22T16:32:10.695427+00:00"
+    },
+    "M4.7": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T16:31:21.496252+00:00",
+      "completed_at": "2026-07-22T16:37:33.247772+00:00"
+    },
+    "M7.8": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T16:32:25.627110+00:00",
+      "completed_at": "2026-07-22T16:38:44.052302+00:00"
+    },
+    "M7.2": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T16:32:32.001480+00:00",
+      "completed_at": "2026-07-22T16:41:43.852481+00:00"
+    },
+    "M4.3": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T16:41:32.086732+00:00",
+      "completed_at": "2026-07-22T16:51:32.615314+00:00"
+    },
+    "M7.4": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T16:41:52.881738+00:00",
+      "completed_at": "2026-07-22T16:44:30.748413+00:00"
+    },
+    "M8.13": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T16:49:49.813247+00:00",
+      "completed_at": "2026-07-22T18:03:10.082444+00:00"
+    },
+    "M4.4": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T16:52:14.696081+00:00",
+      "completed_at": "2026-07-22T18:09:33.652694+00:00"
+    },
+    "M8.14": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T18:01:23.559687+00:00",
+      "completed_at": "2026-07-22T18:23:10.063028+00:00"
+    },
+    "M8.15": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T18:22:41.701682+00:00",
+      "completed_at": "2026-07-22T18:24:44.869602+00:00"
+    },
+    "M5.12": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T18:22:43.962337+00:00",
+      "completed_at": "2026-07-22T18:28:32.015660+00:00"
+    },
+    "M10.4": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T18:23:58.735211+00:00",
+      "completed_at": "2026-07-22T18:29:04.024880+00:00"
+    },
+    "M5.13": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T19:29:26.801441+00:00",
+      "completed_at": "2026-07-22T19:34:02.449653+00:00"
+    },
+    "M10.2": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T19:29:40.553876+00:00",
+      "completed_at": "2026-07-22T19:31:35.744647+00:00"
+    },
+    "M10.11": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T19:29:54.992211+00:00",
+      "completed_at": "2026-07-22T19:56:53.125978+00:00"
+    },
+    "M6.13": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T19:55:38.822748+00:00",
+      "completed_at": "2026-07-22T20:02:00.303740+00:00"
+    },
+    "M10.5": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T19:56:46.599426+00:00",
+      "completed_at": "2026-07-22T20:00:20.421909+00:00"
+    },
+    "M10.3": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T19:57:27.052000+00:00",
+      "completed_at": "2026-07-22T20:03:14.736715+00:00"
+    },
+    "M9.2": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T20:03:27.108403+00:00",
+      "completed_at": "2026-07-22T20:14:54.315261+00:00"
+    },
+    "M3.14": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T20:03:34.224546+00:00",
+      "completed_at": "2026-07-22T20:06:09.382729+00:00"
+    },
+    "M3.15": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T20:07:07.285578+00:00",
+      "completed_at": "2026-07-22T20:12:10.300745+00:00"
+    },
+    "M9.7": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "checked_out",
+      "checked_out_at": "2026-07-22T20:10:13.204670+00:00"
+    },
+    "M9.6": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T20:13:16.413369+00:00",
+      "completed_at": "2026-07-22T20:16:26.871781+00:00"
+    },
+    "M9.10": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-22T20:17:20.932085+00:00",
+      "completed_at": "2026-07-22T20:22:58.956577+00:00"
+    }
+  }
 }

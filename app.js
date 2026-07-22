@@ -29,6 +29,10 @@ function splitTitle(text, max = 25) {
   return lines.slice(0, 2);
 }
 
+function truncateLabel(text, max = 18) {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
 function edgePath(from, to, width, taskView) {
   const x1 = from[0] + width / 2;
   const x2 = to[0] - width / 2;
@@ -81,10 +85,12 @@ function renderGraph() {
 
   nodes.forEach(node => {
     const [x, y] = positions[node.id];
+    const assignment = taskView ? node.assignment : null;
+    const agentLabel = assignment?.agent_label || assignment?.agent_id || "";
     const item = svgElement("g", {
       class: `node ${node.status}${state.selected?.id === node.id ? " selected" : ""}`,
       transform: `translate(${x},${y})`, tabindex: "0", role: "button",
-      "aria-label": `${node.id}, ${node.title}, ${statusNames[node.status]}`
+      "aria-label": `${node.id}, ${node.title}, ${statusNames[node.status]}${agentLabel ? `, agent ${agentLabel}` : ""}`
     });
     item.append(svgElement("rect", { class: "node-aura", x: -width / 2 - 7, y: -height / 2 - 7, width: width + 14, height: height + 14, rx: 8 }));
     item.append(svgElement("rect", { class: "node-body", x: -width / 2, y: -height / 2, width, height, rx: 4 }));
@@ -95,6 +101,23 @@ function renderGraph() {
     const idText = svgElement("text", { class: "id-label", x: -width / 2 + 17, y: -height / 2 + 22 });
     idText.textContent = node.id;
     item.append(idText);
+    if (assignment) {
+      const badgeLabel = truncateLabel(agentLabel);
+      const badgeWidth = Math.max(48, badgeLabel.length * 6.3 + 19);
+      const badge = svgElement("g", {
+        class: `agent-badge ${assignment.state || "checked_out"}`,
+        transform: `translate(${width / 2 - 10},${-height / 2 + 16})`
+      });
+      const title = svgElement("title");
+      title.textContent = `${agentLabel} · ${(assignment.state || "checked_out").replace("_", " ")}`;
+      badge.append(title);
+      badge.append(svgElement("rect", { x: -badgeWidth, y: -11, width: badgeWidth, height: 20, rx: 10 }));
+      badge.append(svgElement("circle", { cx: -badgeWidth + 10, cy: -1, r: 3 }));
+      const badgeText = svgElement("text", { x: -8, y: 2.5, "text-anchor": "end" });
+      badgeText.textContent = badgeLabel;
+      badge.append(badgeText);
+      item.append(badge);
+    }
     splitTitle(node.title, taskView ? 30 : 23).forEach((line, index) => {
       const label = svgElement("text", { class: "title-label", x: -width / 2 + 17, y: -3 + index * 17 });
       label.textContent = line;
@@ -122,6 +145,17 @@ function selectNode(node, kind) {
   document.getElementById("node-id").textContent = node.id;
   document.getElementById("node-source").textContent = `${state.data.source} · line ${node.line}`;
   document.getElementById("node-gate").textContent = node.gate || (kind === "milestone" ? "Open milestone to inspect gate criteria" : "Inherited from milestone");
+  const assignmentWrap = document.getElementById("node-assignment-wrap");
+  if (kind === "task" && node.assignment) {
+    const assignment = node.assignment;
+    assignmentWrap.classList.remove("hidden");
+    document.getElementById("node-agent").textContent = assignment.agent_label || assignment.agent_id;
+    const activity = (assignment.state || "checked_out").replace("_", " ");
+    const at = assignment.completed_at || assignment.released_at || assignment.checked_out_at;
+    document.getElementById("node-assignment").textContent = at ? `${activity} · ${new Date(at).toLocaleString()}` : activity;
+  } else {
+    assignmentWrap.classList.add("hidden");
+  }
   const progressWrap = document.getElementById("node-progress-wrap");
   const open = document.getElementById("open-milestone");
   if (kind === "milestone") {

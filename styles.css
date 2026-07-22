@@ -109,6 +109,13 @@ h1 em { color: #a8beb4; font-weight: 400; }
 .node .id-label { fill: #aebdb7; font: 600 10px "SFMono-Regular", Consolas, monospace; letter-spacing: .12em; }
 .node .title-label { fill: #e7f0ec; font: 500 13px "Avenir Next", sans-serif; }
 .node .meta-label { fill: #697b73; font: 500 8px "SFMono-Regular", Consolas, monospace; letter-spacing: .08em; }
+.agent-badge rect { fill: rgba(7,16,14,.96); stroke: rgba(var(--amber-rgb), .72); stroke-width: 1; }
+.agent-badge circle { fill: var(--amber); filter: drop-shadow(0 0 4px var(--amber)); }
+.agent-badge text { fill: #f2d59d; font: 600 8px "SFMono-Regular", Consolas, monospace; letter-spacing: .035em; }
+.agent-badge.completed rect { stroke: rgba(var(--green-rgb), .65); }
+.agent-badge.completed circle { fill: var(--green); filter: drop-shadow(0 0 4px var(--green)); }
+.agent-badge.completed text { fill: #b7f7d1; }
+.agent-badge.released { opacity: .62; }
 .node .port { stroke-width: 1; fill: #07100e; }
 .node.complete .port { stroke: var(--green); }.node.active .port { stroke: var(--amber); }.node.incomplete .port { stroke: var(--red); }
 
@@ -133,6 +140,7 @@ h1 em { color: #a8beb4; font-weight: 400; }
 .inspector dl { margin: 31px 0 0; }
 .inspector dl div { padding: 16px 0; border-top: 1px solid var(--line); }
 .inspector dt { color: #5d6e66; font: 600 8px/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .12em; }
+.inspector .assignment-state-label { margin-top: 15px; }
 .inspector dd { margin: 8px 0 0; color: #a0afa9; font-size: 11px; line-height: 1.5; }
 .inspect-button { width: 100%; margin-top: 25px; padding: 14px 16px; display: flex; justify-content: space-between; color: #07100d; border: 0; background: var(--green); font: 700 9px/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .06em; cursor: pointer; }
 .inspect-button:hover { filter: brightness(1.08); box-shadow: 0 0 25px rgba(var(--green-rgb), .2); }

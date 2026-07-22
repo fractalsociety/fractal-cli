@@ -11,3 +11,6 @@ MODULE = module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 parse_prd = MODULE.parse_prd
+mutate_task_state = MODULE.mutate_task_state
+TaskStateError = MODULE.TaskStateError
+GraphHandler = MODULE.GraphHandler
