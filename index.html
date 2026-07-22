@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#07100f">
+    <title>Fractal Execution Graph</title>
+    <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="ambient" aria-hidden="true"></div>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Fractal execution graph home">
+        <span class="brand-mark"><i></i><i></i><i></i></span>
+        <span><strong>FRACTAL</strong><small>EXECUTION GRAPH</small></span>
+      </a>
+      <div class="live-state"><span></span> PRD SOURCE LIVE</div>
+      <button class="icon-button" id="refresh" type="button" aria-label="Refresh graph">↻</button>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="eyebrow"><span>WORK /</span> FRACTAL-MAC-RUNTIME-PRD</div>
+        <h1>Build intelligence<br><em>you can inspect.</em></h1>
+        <p>One verifiable path from architecture to a protected, self-evolving runtime.</p>
+        <div class="metrics" aria-label="Execution progress">
+          <article><span class="metric-value" id="percent">—</span><small>COMPLETE</small></article>
+          <article><span class="metric-value" id="completed">—</span><small>VERIFIED NODES</small></article>
+          <article><span class="metric-value amber" id="active">—</span><small>IN FLIGHT</small></article>
+          <article><span class="metric-value red" id="remaining">—</span><small>REMAINING</small></article>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <div class="graph-shell">
+          <div class="graph-toolbar">
+            <div>
+              <button class="back-button hidden" id="back" type="button">← Full architecture</button>
+              <p class="graph-kicker" id="graph-kicker">COMPILED EXECUTION PLAN</p>
+              <h2 id="graph-title">Runtime implementation</h2>
+            </div>
+            <div class="legend" aria-label="Status legend">
+              <span><i class="complete"></i>Complete</span>
+              <span><i class="active"></i>In progress</span>
+              <span><i class="incomplete"></i>Incomplete</span>
+            </div>
+          </div>
+          <div class="graph-stage" id="graph-stage">
+            <svg id="graph" role="img" aria-label="Fractal Runtime PRD execution graph"></svg>
+            <div class="graph-hint">Select a milestone to inspect its executable checklist</div>
+          </div>
+        </div>
+
+        <aside class="inspector" id="inspector">
+          <div class="inspector-empty" id="inspector-empty">
+            <span class="orbit-icon"><i></i></span>
+            <p>SELECT A NODE</p>
+            <small>Inspect its status, dependencies, source line, and completion evidence.</small>
+          </div>
+          <div class="inspector-content hidden" id="inspector-content">
+            <div class="status-pill" id="node-status"></div>
+            <p class="node-kind" id="node-kind"></p>
+            <h3 id="node-title"></h3>
+            <p class="node-id" id="node-id"></p>
+            <div class="node-progress" id="node-progress-wrap">
+              <span><b id="node-progress-label"></b><small id="node-progress-count"></small></span>
+              <div><i id="node-progress"></i></div>
+            </div>
+            <dl>
+              <div><dt>SOURCE</dt><dd id="node-source"></dd></div>
+              <div><dt>GATE</dt><dd id="node-gate"></dd></div>
+            </dl>
+            <button id="open-milestone" class="inspect-button hidden" type="button">Open milestone graph <span>→</span></button>
+          </div>
+        </aside>
+      </section>
+    </main>
+
+    <footer>
+      <span id="source-label">SOURCE · LOADING</span>
+      <span>Native MLX thinks · Containers act · Policy controls · Verifiers decide</span>
+    </footer>
+    <script src="app.js"></script>
+  </body>
+</html>
