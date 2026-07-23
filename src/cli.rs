@@ -21,6 +21,12 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub(crate) fractalwork: Option<PathBuf>,
 
+    /// Use the Coordinate backend: reconcile each graph into the real durable
+    /// Coordinate pull-queue (needs `squad`) instead of the in-process executor.
+    /// Also settable per session with `$FRACTAL_BACKEND=coordinate` or `/backend`.
+    #[arg(long, global = true)]
+    pub(crate) coordinate: bool,
+
     /// A natural-language request to submit with default options.
     #[arg(value_name = "REQUEST")]
     pub(crate) request: Option<String>,

@@ -24,6 +24,35 @@ use crate::{execute, graph_store};
 /// Bounded so evolution always terminates.
 const MAX_REPAIRS: u32 = 2;
 
+/// Which executor drives the graph. The default is turnkey and in-process; the
+/// Coordinate backend reconciles into the real durable Coordinate queue first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Backend {
+    InProcess,
+    Coordinate,
+}
+
+impl Backend {
+    /// Backend from `$FRACTAL_BACKEND` (`coordinate`) or an explicit flag.
+    pub(crate) fn resolve(coordinate_flag: bool) -> Self {
+        let env_coordinate = std::env::var("FRACTAL_BACKEND")
+            .map(|value| value.eq_ignore_ascii_case("coordinate"))
+            .unwrap_or(false);
+        if coordinate_flag || env_coordinate {
+            Self::Coordinate
+        } else {
+            Self::InProcess
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::InProcess => "in-process",
+            Self::Coordinate => "coordinate",
+        }
+    }
+}
+
 fn hex(hash: &Hash256) -> String {
     let mut s = String::from("sha256:");
     for byte in hash {
@@ -46,13 +75,17 @@ fn hex_to_hash(hexstr: &str) -> Hash256 {
 
 /// Run a committed graph end-to-end with signed receipts, governed evolution on
 /// failure, and a DataEvol export on success. Returns the final outcome.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_end_to_end(
     graph_hash: &str,
     workspace: &Path,
     agents: &[String],
     board: Option<&str>,
+    backend: Backend,
+    facts: &crate::router::RunFacts,
 ) -> Result<execute::RunOutcome> {
     let mut graph = graph_store::load_graph(graph_hash)?;
+    let mut current_hash = graph_hash.to_owned();
     let graph_id = graph
         .get("graph_id")
         .and_then(Value::as_str)
@@ -61,8 +94,20 @@ pub(crate) fn run_end_to_end(
     let ledger = RunLedger::new(&graph_id);
 
     let mut attempt = 0u32;
+    // The pending harness evolution awaiting its verifiable reward (RL feedback):
+    // (arm, bandit context, cause). Rewarded by the *next* run's verdict.
+    let mut pending: Option<(String, Vec<i32>, String)> = None;
     let outcome = loop {
-        let outcome = execute::run_multi_agent(&graph, workspace, agents, board)?;
+        let outcome = match backend {
+            Backend::InProcess => execute::run_multi_agent(&graph, workspace, agents, board)?,
+            Backend::Coordinate => crate::coordinate::run_via_coordinate(
+                &current_hash,
+                &graph,
+                workspace,
+                agents,
+                board,
+            )?,
+        };
 
         // (1)+(2) Signed receipts for every lifecycle event: lease, execution,
         // and (for verify nodes) the verdict.
@@ -74,55 +119,79 @@ pub(crate) fn run_end_to_end(
             }
         }
 
-        // (3) Governed evolution after a verified failure.
-        let failed = outcome.verified == Some(false) || outcome.failed_node.is_some();
-        if failed && attempt < MAX_REPAIRS {
+        let succeeded = outcome.verified != Some(false) && outcome.failed_node.is_none();
+
+        // RLVR feedback: reward the *previous* harness evolution with this run's
+        // verifiable outcome, so the bandit learns which mutation fixes the failure.
+        if let Some((arm, context_bp, cause)) = pending.take() {
+            crate::harness_evolution::record_reward(&arm, &context_bp, &cause, succeeded);
+            ledger.promotion(
+                &format!("{graph_id}:evolution:{arm}"),
+                &format!("reward:{}", if succeeded { "10000" } else { "0" }),
+            );
+        }
+
+        // (3) Self-evolving harness after a verified failure: attribute → bandit-
+        // select a governed morphogen (grow/repair) → apply → re-run.
+        if !succeeded && attempt < MAX_REPAIRS {
             let failed_node = outcome
                 .failed_node
                 .clone()
                 .unwrap_or_else(|| "acceptance".to_owned());
+            let evolution =
+                crate::harness_evolution::evolve(&graph, &current_hash, &failed_node, attempt)?;
             println!(
-                "  ⟳ verified failure at `{failed_node}` — governed repair (attempt {})…",
-                attempt + 1
+                "  ⟳ verified failure at `{failed_node}` (cause: {}) — harness evolution: {} [{}]",
+                evolution.cause, evolution.note, evolution.arm
             );
+
+            // (4) Anchor the developmental step + child lineage on the signed chain.
             let motivating = outcome
                 .log
                 .iter()
                 .find(|run| run.node == failed_node)
                 .map(|run| hex_to_hash(&run.evidence_hex))
                 .unwrap_or([0u8; 32]);
-            let produced = payload_hash_str(&format!("repair:{graph_id}:{failed_node}:{attempt}"));
+            let produced = payload_hash_str(&format!(
+                "evolve:{graph_id}:{failed_node}:{}:{attempt}",
+                evolution.arm
+            ));
             let step = DevelopmentalStep {
                 scale: ScaleLevel::Graph,
                 subject: format!("{graph_id}#{failed_node}"),
-                operation: DevelopmentalOp::Repair,
-                step_id: format!("repair-{failed_node}-{attempt}"),
+                operation: if evolution.arm == "grow.verification" {
+                    DevelopmentalOp::Grow
+                } else {
+                    DevelopmentalOp::Repair
+                },
+                step_id: format!("{}-{failed_node}-{attempt}", evolution.arm),
                 motivating_outcome: motivating,
                 produced_outcome: produced,
             };
             ledger.developmental(&step);
-
-            // (4) Persist a new child graph carrying the repair guidance + parent
-            // lineage; (5) re-running it re-enqueues the nodes.
-            let (child_hash, child_graph) = evolve_graph(&graph, attempt, &failed_node)?;
             ledger.promotion(
-                &format!("{graph_id}->{child_hash}"),
-                &format!("lineage:repair:{}", step.step_id),
+                &format!("{graph_id}->{}", evolution.child_hash),
+                &format!("lineage:{}:{}", evolution.arm, step.step_id),
             );
             println!(
-                "  ⟳ persisted child graph {} (repair lineage on-chain)",
-                &child_hash[..23.min(child_hash.len())]
+                "  ⟳ persisted evolved harness {} (lineage on-chain)",
+                &evolution.child_hash[..23.min(evolution.child_hash.len())]
             );
-            graph = child_graph;
+
+            // (5) Re-run the evolved harness; reward is applied next iteration.
+            pending = Some((evolution.arm, evolution.context_bp, evolution.cause));
+            graph = evolution.child_graph;
+            current_hash = evolution.child_hash;
             attempt += 1;
             continue;
         }
         break outcome;
     };
 
-    // (6) Auto-export the sanitized outcome to DataEvol on success.
+    // (6) Auto-export the sanitized outcome to DataEvol on success — and persist
+    // it to durable outcome memory so the router can learn from it (7).
     if outcome.verified != Some(false) && outcome.failed_node.is_none() {
-        if let Err(error) = export_to_dataevol(&graph_id, &outcome, workspace, &ledger) {
+        if let Err(error) = export_to_dataevol(&graph_id, &outcome, workspace, &ledger, facts) {
             eprintln!("  export note: {error:#}");
         }
     }
@@ -136,48 +205,6 @@ pub(crate) fn run_end_to_end(
     Ok(outcome)
 }
 
-/// Build a child graph from a failed parent: append repair guidance to the build
-/// nodes, record the parent hash for lineage, and commit it (new hash).
-fn evolve_graph(parent: &Value, attempt: u32, failed_node: &str) -> Result<(String, Value)> {
-    let mut child = parent.clone();
-    child["evolution"] = json!(attempt + 1);
-    child["parent_graph"] = parent.get("graph_hash").cloned().unwrap_or(Value::Null);
-    if let Some(nodes) = child.get_mut("nodes").and_then(Value::as_array_mut) {
-        for node in nodes {
-            let capability = node
-                .get("capability")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
-            if capability.contains("code.generate")
-                || capability.ends_with(".edit")
-                || capability.contains("code.write")
-            {
-                let instruction = node
-                    .get("instruction")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                node["instruction"] = json!(format!(
-                    "{instruction}\n\nREPAIR: a previous attempt FAILED verification at `{failed_node}`. \
-                     Read any error output, fix the implementation and tests so the whole suite passes."
-                ));
-            }
-        }
-    }
-    // Recompute the content hash (canonical over the graph minus graph_hash).
-    let mut hash_input = child
-        .as_object()
-        .cloned()
-        .context("child graph must be an object")?;
-    hash_input.remove("graph_hash");
-    let graph_hash = fractal_contracts::canonical_sha256(&Value::Object(hash_input))
-        .map_err(|error| anyhow!("child graph hashing failed: {error}"))?;
-    child["graph_hash"] = json!(graph_hash);
-    let record = graph_store::commit_graph(&child)?;
-    Ok((record.graph_hash, child))
-}
-
 /// Build the replayable evidence root + consent-gated sanitized export and write
 /// it as the DataEvol handoff.
 fn export_to_dataevol(
@@ -185,6 +212,7 @@ fn export_to_dataevol(
     outcome: &execute::RunOutcome,
     workspace: &Path,
     ledger: &RunLedger,
+    facts: &crate::router::RunFacts,
 ) -> Result<()> {
     let entries: Vec<EvidenceEntry> = outcome
         .log
@@ -237,5 +265,37 @@ fn export_to_dataevol(
         export.redacted_count,
         path.display()
     );
+
+    // Genuine ingest: hand the sanitized outcome to DataEvol's *real* normalizer
+    // and confirm it is accepted (fail-closed if DataEvol is present and rejects).
+    let verified = outcome.verified != Some(false) && outcome.failed_node.is_none();
+    match crate::dataevol::ingest(
+        graph_id,
+        &hex(&export.evidence_root),
+        &hex(&export.export_commitment),
+        verified,
+        facts,
+    )? {
+        Some(result) => {
+            ledger.promotion(
+                graph_id,
+                &format!(
+                    "dataevol:accepted:{}:{}",
+                    result.accepted, result.outcome_id
+                ),
+            );
+            println!(
+                "  ⇢ DataEvol normalizer {} outcome {} · recorded to outcome memory ({})",
+                if result.accepted {
+                    "accepted"
+                } else {
+                    "recorded (not acceptable)"
+                },
+                result.outcome_id,
+                facts.option_id,
+            );
+        }
+        None => println!("  (DataEvol not installed here — kept the sanitized export file)"),
+    }
     Ok(())
 }

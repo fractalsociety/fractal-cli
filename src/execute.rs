@@ -230,73 +230,51 @@ pub(crate) fn detect_agents() -> Vec<String> {
         .collect()
 }
 
-/// Detect and run the workspace's tests. Returns `None` when there is nothing to
-/// run (cannot verify, but not a failure).
-fn verify_workspace(workspace: &Path) -> Result<Option<bool>> {
-    let has = |name: &str| workspace.join(name).exists();
-    let python_tests = std::fs::read_dir(workspace)
-        .map(|entries| {
-            entries.flatten().any(|entry| {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                name.starts_with("test_") && name.ends_with(".py") || name.ends_with("_test.py")
-            })
-        })
-        .unwrap_or(false);
-
-    let mut command = if has("Cargo.toml") {
-        let mut c = Command::new("cargo");
-        c.arg("test");
-        c
-    } else if python_tests {
-        // Prefer pytest when it is importable; otherwise fall back to unittest
-        // discovery so a missing pytest is not mistaken for a test failure.
-        let pytest_available = Command::new("python3")
-            .args(["-c", "import pytest"])
-            .current_dir(workspace)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        let mut c = Command::new("python3");
-        if pytest_available {
-            c.args(["-m", "pytest", "-q"]);
-        } else {
-            c.args(["-m", "unittest", "discover", "-q"]);
-        }
-        c
-    } else if has("package.json") {
-        let mut c = Command::new("npm");
-        c.args(["test", "--silent"]);
-        c
-    } else {
-        return Ok(None);
-    };
-    match command.current_dir(workspace).status() {
-        Ok(status) => Ok(Some(status.success())),
-        // The runner itself could not launch — unverifiable, not a failure.
-        Err(_) => Ok(None),
-    }
+/// Result of executing one node.
+struct NodeOutcome {
+    ok: bool,
+    verified: Option<bool>,
+    /// A human-readable note (e.g. the evidence-floor verdict) to surface.
+    note: Option<String>,
 }
 
 /// Execute one node with a given agent: build nodes run the worker; verify nodes
-/// run the tests; passive nodes (analyze/control) are no-ops. Returns
-/// `(node_ok, verified)`.
-fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<(bool, Option<bool>)> {
+/// run the tests and are judged by the genuine `fractal-verify` evidence floor;
+/// passive nodes (analyze/control) are no-ops.
+fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> {
     let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
+    let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
     let instruction = node
         .get("instruction")
         .and_then(Value::as_str)
         .unwrap_or("");
     if is_build(capability) {
-        Ok((run_worker_as(agent, instruction, workspace)?, None))
+        Ok(NodeOutcome {
+            ok: run_worker_as(agent, instruction, workspace)?,
+            verified: None,
+            note: None,
+        })
     } else if is_verify(capability) {
-        let verified = verify_workspace(workspace)?;
-        // A verify node only fails on an actual test failure.
-        Ok((!matches!(verified, Some(false)), verified))
+        // Genuine governance: judge the suite with the real deny-by-default floor.
+        match crate::verify::evaluate_workspace(workspace, id, agent)? {
+            Some(verdict) => Ok(NodeOutcome {
+                ok: verdict.complete,
+                verified: Some(verdict.complete),
+                note: Some(verdict.detail),
+            }),
+            // Nothing to run: unverifiable, but not a failure.
+            None => Ok(NodeOutcome {
+                ok: true,
+                verified: None,
+                note: None,
+            }),
+        }
     } else {
-        Ok((true, None))
+        Ok(NodeOutcome {
+            ok: true,
+            verified: None,
+            note: None,
+        })
     }
 }
 
@@ -493,13 +471,17 @@ pub(crate) fn run_multi_agent(
                 let mut state = schedule.lock().expect("schedule lock");
                 state.in_progress.remove(&id);
                 let node_ok = match result {
-                    Ok((ok, verified)) => {
+                    Ok(NodeOutcome { ok, verified, note }) => {
                         if is_build(capability) && ok {
                             state.built = true;
                         }
                         if let Some(value) = verified {
                             state.verified = Some(value);
                         }
+                        let suffix = note
+                            .as_deref()
+                            .map(|note| format!(" — {note}"))
+                            .unwrap_or_default();
                         if ok {
                             state.completed.insert(id.clone());
                             mine += 1;
@@ -507,11 +489,11 @@ pub(crate) fn run_multi_agent(
                             if is_planning {
                                 println!("{clr}  [{agent}] ✓ plan ready — dispatching tasks to the workers.");
                             } else {
-                                println!("{clr}  [{agent}] ✓ {id}");
+                                println!("{clr}  [{agent}] ✓ {id}{suffix}");
                             }
                         } else {
                             state.failed = Some(id.clone());
-                            println!("{clr}  [{agent}] ✗ {id}");
+                            println!("{clr}  [{agent}] ✗ {id}{suffix}");
                         }
                         ok
                     }

@@ -2,17 +2,22 @@ mod board;
 mod chain;
 mod cli;
 mod compile;
+mod coordinate;
+mod dataevol;
 mod evolve;
 mod execute;
 mod graph_store;
 mod harness;
+mod harness_evolution;
 mod intent;
 mod interactive;
 mod orchestrate;
 mod pipeline;
+mod router;
 mod run;
 mod safety;
 mod ui;
+mod verify;
 mod work_builder;
 
 use std::process::ExitCode;
@@ -36,11 +41,12 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<()> {
     let Cli {
         fractalwork,
+        coordinate,
         request,
         command,
     } = cli;
     match (request, command) {
-        (None, None) => interactive::run(fractalwork.as_deref()),
+        (None, None) => interactive::run(fractalwork.as_deref(), coordinate),
         (Some(request), None) => print_submit_plan(
             &request,
             None,

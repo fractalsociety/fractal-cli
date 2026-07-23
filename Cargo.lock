@@ -357,6 +357,7 @@ dependencies = [
  "fractal-contracts",
  "fractal-evolution",
  "fractal-harnessc",
+ "fractal-verify",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -392,6 +393,15 @@ dependencies = [
 
 [[package]]
 name = "fractal-route"
+version = "0.1.0"
+dependencies = [
+ "fractal-contracts",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fractal-verify"
 version = "0.1.0"
 dependencies = [
  "fractal-contracts",

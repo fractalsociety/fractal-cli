@@ -8,13 +8,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::cli::{Mode, DEFAULT_GRAPH_PORT};
+use crate::orchestrate::Backend;
 use crate::work_builder::IntentClassification;
-use crate::{board, execute, intent, pipeline};
+use crate::{board, execute, graph_store, intent, pipeline};
 
 /// Launch the interactive session in the current working directory.
-pub(crate) fn run(fractalwork_override: Option<&Path>) -> Result<()> {
+pub(crate) fn run(fractalwork_override: Option<&Path>, coordinate_flag: bool) -> Result<()> {
     let workspace = std::env::current_dir().context("cannot resolve the current directory")?;
     banner(&workspace);
+
+    let mut backend = Backend::resolve(coordinate_flag);
 
     if !ensure_trusted(&workspace)? {
         println!("Not trusted — exiting. Nothing was read or run.");
@@ -40,7 +43,8 @@ pub(crate) fn run(fractalwork_override: Option<&Path>) -> Result<()> {
         } else {
             setup_agents()?
         };
-    println!("Type what you want built. Commands: /help, /trust, /exit.\n");
+    println!("Backend: {} (toggle with /backend).", backend.label());
+    println!("Type what you want built. Commands: /help, /trust, /backend, /exit.\n");
 
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
@@ -60,15 +64,27 @@ pub(crate) fn run(fractalwork_override: Option<&Path>) -> Result<()> {
             "/exit" | "/quit" => break,
             "/help" => print_help(),
             "/trust" => println!("Workspace {} is trusted.", workspace.display()),
+            "/backend" => {
+                backend = match backend {
+                    Backend::InProcess => Backend::Coordinate,
+                    Backend::Coordinate => Backend::InProcess,
+                };
+                println!("Backend is now {}.", backend.label());
+            }
             other if other.starts_with('/') => {
                 println!("Unknown command: {other}. Try /help.");
             }
             other => {
                 let port = DEFAULT_GRAPH_PORT.saturating_add(request_index);
                 request_index = request_index.wrapping_add(1);
-                if let Err(error) =
-                    execute_request(other, &workspace, fractalwork_override, port, &agents)
-                {
+                if let Err(error) = execute_request(
+                    other,
+                    &workspace,
+                    fractalwork_override,
+                    port,
+                    &agents,
+                    backend,
+                ) {
                     eprintln!("error: {error:#}");
                 }
             }
@@ -89,7 +105,8 @@ fn print_help() {
     println!("    build a CLI that reverses a string, with a passing test");
     println!("  Fractal classifies it, compiles a task-faithful execution graph,");
     println!("  commits it, and opens its live board.");
-    println!("  Commands: /help  /trust  /exit");
+    println!("  /backend switches between the in-process and Coordinate executors.");
+    println!("  Commands: /help  /trust  /backend  /exit");
 }
 
 /// Resolve, prompt for, and persist trust for `workspace`.
@@ -130,6 +147,32 @@ fn model_env_key(agent: &str) -> String {
         "FRACTAL_{}_MODEL",
         agent.to_ascii_uppercase().replace('-', "_")
     )
+}
+
+/// The model currently pinned for `agent`, or `"default"`.
+fn current_model(agent: &str) -> String {
+    std::env::var(model_env_key(agent))
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "default".to_owned())
+}
+
+/// A stable task-kind label so repeat requests of the same kind share a
+/// counterfactual group (and thus compare models). Prefers the classified
+/// intent; falls back to a slug of the request.
+fn task_group_for(classification: &Result<intent::TaskClassification>, request: &str) -> String {
+    if let Ok(classification) = classification {
+        if !classification.intent.trim().is_empty() {
+            return format!("fractal-cli:{}", classification.intent.trim());
+        }
+    }
+    let slug = request
+        .split_whitespace()
+        .take(6)
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_lowercase();
+    format!("fractal-cli:{slug}")
 }
 
 /// Guided team setup: primary agent → its model → other worker agents. Returns
@@ -271,6 +314,7 @@ fn execute_request(
     fractalwork_override: Option<&Path>,
     port: u16,
     agents: &[String],
+    backend: Backend,
 ) -> Result<()> {
     println!("\n→ Understanding: {request}");
     let classification = intent::fractalwork_dir(fractalwork_override)
@@ -315,9 +359,73 @@ fn execute_request(
                     println!("  → executing in {}…", workspace.display());
                 }
                 let board_url = format!("http://127.0.0.1:{port}");
+
+                // Router evolution (closing the loop): before running, ask the
+                // accumulated outcome memory which model is the cheapest
+                // *acceptable* one for this task-kind, and pin it. Then record this
+                // run's outcome under the same key so selection keeps improving.
+                let primary = agents[0].clone();
+                let graph_value = graph_store::load_graph(&hash).ok();
+                let graph_id = graph_value
+                    .as_ref()
+                    .and_then(|graph| graph.get("graph_id").and_then(|value| value.as_str()))
+                    .unwrap_or("graph")
+                    .to_owned();
+                let capabilities = graph_value
+                    .as_ref()
+                    .and_then(|graph| graph.get("nodes").and_then(|value| value.as_array()))
+                    .map(|nodes| {
+                        nodes
+                            .iter()
+                            .filter_map(|node| {
+                                node.get("capability")
+                                    .and_then(|value| value.as_str())
+                                    .map(str::to_owned)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let task_group = task_group_for(&classification, request);
+                let model0 = current_model(&primary);
+                let group_id = crate::router::facts_for(
+                    &task_group,
+                    &capabilities,
+                    &primary,
+                    &model0,
+                    &graph_id,
+                )
+                .group_id;
+                if let Some(rec) = crate::router::recommend(&group_id) {
+                    if let Some((agent, model)) = rec.chosen_option_id.split_once(':') {
+                        if agent == primary && model != model0 {
+                            std::env::set_var(model_env_key(&primary), model);
+                            println!(
+                                "  ↻ router: pinned {primary} model '{model}' — cheapest acceptable \
+                                 for this task-kind ({} sample(s), {} option(s) seen)",
+                                rec.samples,
+                                rec.observed.len()
+                            );
+                        }
+                    }
+                }
+                let effective_model = current_model(&primary);
+                let facts = crate::router::facts_for(
+                    &task_group,
+                    &capabilities,
+                    &primary,
+                    &effective_model,
+                    &graph_id,
+                );
+
                 let spinner = crate::ui::Spinner::start("working");
-                let outcome =
-                    crate::orchestrate::run_end_to_end(&hash, workspace, agents, Some(&board_url));
+                let outcome = crate::orchestrate::run_end_to_end(
+                    &hash,
+                    workspace,
+                    agents,
+                    Some(&board_url),
+                    backend,
+                    &facts,
+                );
                 let elapsed = crate::ui::format_elapsed(spinner.stop());
                 match outcome {
                     Ok(outcome) => {
