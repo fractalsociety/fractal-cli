@@ -69,7 +69,7 @@ pub(crate) fn select_harness(intent: &str) -> HarnessSelection {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{FALLBACK_HARNESS_ID, normalize_family, select_harness};
+    use super::{normalize_family, select_harness, FALLBACK_HARNESS_ID};
 
     #[test]
     fn strips_nl_prefix_and_lowercases() {

@@ -54,45 +54,71 @@ fn build_harness(selection: &HarnessSelection, goal: &str, success_criteria: &[S
     } else {
         success_criteria.join("; ")
     };
-    let analyze = format!(
-        "Analyze this goal and plan the build in the workspace: {goal}. Decide the file(s) to create and the interface."
+    // A parallel decomposition: the lead plans a shared interface, then the
+    // implementation and the tests are written *simultaneously* by two different
+    // agents, a third cross-checks them, and finally the suite is verified.
+    let plan = format!(
+        "Plan the build for: {goal}. Write INTERFACE.md stating the single module filename (e.g. solution.py), the public function name(s) and signatures, and 3-5 behaviors/edge cases it must satisfy: {criteria}. Keep it short and concrete so two agents can build the code and the tests in parallel from it."
     );
     let implement = format!(
-        "Build the artifact in the workspace to satisfy the goal: {goal}. It must meet: {criteria}. Write clean, self-contained code and a passing test; use no network or external services."
+        "Read INTERFACE.md and implement the module file exactly as specified for: {goal}. Self-contained, no network. Do not write tests — another agent is doing that in parallel."
     );
-    let acceptance = format!(
-        "Verify the built artifact passes its acceptance test. Success criteria: {criteria}. Run the workspace test suite / acceptance harness and report pass/fail with evidence; do not claim success unless the tests actually pass."
+    let author_tests = format!(
+        "Read INTERFACE.md and write a Python `unittest` test file (test_<module>.py) that imports the module and tests every behavior/edge case listed for: {goal}. Do not write the implementation — another agent is doing that in parallel."
     );
-    let complete = "Confirm the acceptance evidence and mark the outcome verified.".to_owned();
+    let review = format!(
+        "The implementation and the tests were written in parallel by two agents. Run `python3 -m unittest`, then reconcile them: fix any import/name/signature mismatch so the tests exercise the implementation and all tests pass. Criteria: {criteria}."
+    );
+    let acceptance =
+        "Run the whole unittest suite; every test must pass before completion.".to_owned();
+    let complete = "Implementation and tests were built in parallel, cross-checked, and verified — mark the outcome complete.".to_owned();
     json!({
         "schema": "fractal.compiled_harness.v1",
         "version": 1,
         "harness_id": selection.harness_id,
-        "goal": "Build the requested artifact from the work goal and prove it passes its acceptance test.",
+        "goal": "Decompose the build into parallel implementation + tests, cross-check them, and prove the suite passes.",
         "nodes": [
             {
-                "id": "analyze",
-                "capability": "content.analyze",
+                "id": "plan",
+                "capability": "code.generate",
                 "memory_scopes": ["work:goal", "workspace:root"],
                 "preconditions": [],
-                "produced_state": ["analysis_complete"],
-                "instruction": analyze,
-                "budget": {"timeout_ms": 30_000}
+                "produced_state": ["plan_ready"],
+                "instruction": plan,
+                "budget": {"timeout_ms": 60_000}
             },
             {
                 "id": "implement",
                 "capability": "code.generate",
                 "memory_scopes": ["work:goal", "workspace:root"],
-                "preconditions": ["analysis_complete"],
-                "produced_state": ["implementation_complete"],
+                "preconditions": ["plan_ready"],
+                "produced_state": ["implementation_ready"],
                 "instruction": implement,
+                "budget": {"timeout_ms": 180_000}
+            },
+            {
+                "id": "author_tests",
+                "capability": "code.generate",
+                "memory_scopes": ["work:goal", "workspace:root"],
+                "preconditions": ["plan_ready"],
+                "produced_state": ["tests_ready"],
+                "instruction": author_tests,
+                "budget": {"timeout_ms": 180_000}
+            },
+            {
+                "id": "review",
+                "capability": "code.edit",
+                "memory_scopes": ["work:goal", "workspace:root"],
+                "preconditions": ["implementation_ready", "tests_ready"],
+                "produced_state": ["reviewed"],
+                "instruction": review,
                 "budget": {"timeout_ms": 180_000}
             },
             {
                 "id": "acceptance",
                 "capability": "python.tests.execute",
                 "memory_scopes": ["work:goal", "workspace:root", "acceptance:spec"],
-                "preconditions": ["implementation_complete"],
+                "preconditions": ["reviewed"],
                 "produced_state": ["acceptance_passed"],
                 "instruction": acceptance,
                 "budget": {"timeout_ms": 120_000}
@@ -108,8 +134,11 @@ fn build_harness(selection: &HarnessSelection, goal: &str, success_criteria: &[S
             }
         ],
         "edges": [
-            {"from": "analyze", "to": "implement", "condition": "success"},
-            {"from": "implement", "to": "acceptance", "condition": "success"},
+            {"from": "plan", "to": "implement", "condition": "success"},
+            {"from": "plan", "to": "author_tests", "condition": "success"},
+            {"from": "implement", "to": "review", "condition": "success"},
+            {"from": "author_tests", "to": "review", "condition": "success"},
+            {"from": "review", "to": "acceptance", "condition": "success"},
             {"from": "acceptance", "to": "complete", "condition": "success"}
         ]
     })
@@ -387,26 +416,44 @@ mod tests {
             .iter()
             .filter_map(|node| node["id"].as_str())
             .collect();
-        assert!(ids.contains(&"acceptance"), "{ids:?}");
-        assert!(ids.contains(&"implement"), "{ids:?}");
+        // Decomposed into parallel implementation + tests, a review, and verify.
+        for expected in [
+            "plan",
+            "implement",
+            "author_tests",
+            "review",
+            "acceptance",
+            "complete",
+        ] {
+            assert!(ids.contains(&expected), "missing {expected} in {ids:?}");
+        }
         assert!(!serde_json::to_string(&graph)
             .unwrap()
             .contains("python_repair"));
-        let routes = graph["nodes"]
-            .as_array()
-            .expect("nodes")
-            .iter()
-            .map(|node| {
-                (
-                    node["id"].as_str().expect("node id"),
-                    node["route_candidates"][0].as_str().expect("route"),
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        assert!(routes["analyze"].starts_with("cursor://"));
-        assert!(routes["acceptance"].starts_with("cursor://"));
-        assert!(routes["implement"].starts_with("codex://"));
-        assert!(routes["complete"].starts_with("codex://"));
+        let requires = |id: &str| -> Vec<String> {
+            graph["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["id"] == json!(id))
+                .and_then(|node| node["requires"].as_array())
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // implement and author_tests both depend only on `plan` → parallel.
+        assert_eq!(requires("implement"), vec!["plan_ready".to_owned()]);
+        assert_eq!(requires("author_tests"), vec!["plan_ready".to_owned()]);
+        // review waits for both parallel builds.
+        let mut review_deps = requires("review");
+        review_deps.sort();
+        assert_eq!(
+            review_deps,
+            vec!["implementation_ready".to_owned(), "tests_ready".to_owned()]
+        );
     }
 
     #[test]

@@ -30,7 +30,11 @@ impl RunPlan {
     /// A shell-ish rendering for display (not for re-parsing).
     pub fn rendered(&self) -> String {
         let mut parts = vec![self.program.to_string_lossy().into_owned()];
-        parts.extend(self.args.iter().map(|arg| arg.to_string_lossy().into_owned()));
+        parts.extend(
+            self.args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned()),
+        );
         parts.join(" ")
     }
 }
@@ -202,7 +206,13 @@ mod tests {
         let hash = commit_sample_graph();
         // squad_bin points at a nonexistent program; dry-run must still succeed
         // because it never spawns it.
-        run_graph(&hash, None, Some(Path::new("/nonexistent/squad")), false, true)
-            .expect("dry run succeeds without executing");
+        run_graph(
+            &hash,
+            None,
+            Some(Path::new("/nonexistent/squad")),
+            false,
+            true,
+        )
+        .expect("dry run succeeds without executing");
     }
 }

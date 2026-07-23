@@ -24,31 +24,29 @@ pub(crate) fn run(fractalwork_override: Option<&Path>) -> Result<()> {
 
     // With no agent env set, guide the user through picking a team. When
     // $FRACTAL_WORKER / $FRACTAL_AGENTS are set, honor them without prompting.
-    let agents: Vec<String> = if std::env::var("FRACTAL_WORKER").is_ok()
-        || std::env::var("FRACTAL_AGENTS").is_ok()
-    {
-        let roster = if std::env::var("FRACTAL_WORKER").is_ok() {
-            vec![execute::worker_label()]
+    let agents: Vec<String> =
+        if std::env::var("FRACTAL_WORKER").is_ok() || std::env::var("FRACTAL_AGENTS").is_ok() {
+            let roster = if std::env::var("FRACTAL_WORKER").is_ok() {
+                vec![execute::worker_label()]
+            } else {
+                execute::detect_agents()
+            };
+            match roster.len() {
+                0 => println!("No worker (claude/codex/cursor) on PATH — preview only.\n"),
+                1 => println!("Building with: {} (from environment).\n", roster[0]),
+                _ => println!("Agent team (from environment): {}.\n", roster.join(", ")),
+            }
+            roster
         } else {
-            execute::detect_agents()
+            setup_agents()?
         };
-        match roster.len() {
-            0 => println!("No worker (claude/codex/cursor) on PATH — preview only.\n"),
-            1 => println!("Building with: {} (from environment).\n", roster[0]),
-            _ => println!("Agent team (from environment): {}.\n", roster.join(", ")),
-        }
-        roster
-    } else {
-        setup_agents()?
-    };
     println!("Type what you want built. Commands: /help, /trust, /exit.\n");
 
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
     let mut request_index: u16 = 0;
     loop {
-        print!("fractal> ");
-        io::stdout().flush().ok();
+        crate::ui::print_prompt();
         let Some(line) = lines.next() else {
             println!();
             break; // Ctrl-D / EOF
@@ -120,13 +118,18 @@ fn ask(prompt: &str) -> Result<String> {
     print!("{prompt}");
     io::stdout().flush().ok();
     let mut answer = String::new();
-    io::stdin().read_line(&mut answer).context("failed to read input")?;
+    io::stdin()
+        .read_line(&mut answer)
+        .context("failed to read input")?;
     Ok(answer.trim().to_owned())
 }
 
 /// `$FRACTAL_<AGENT>_MODEL` key for pinning a model.
 fn model_env_key(agent: &str) -> String {
-    format!("FRACTAL_{}_MODEL", agent.to_ascii_uppercase().replace('-', "_"))
+    format!(
+        "FRACTAL_{}_MODEL",
+        agent.to_ascii_uppercase().replace('-', "_")
+    )
 }
 
 /// Guided team setup: primary agent → its model → other worker agents. Returns
@@ -183,7 +186,10 @@ fn setup_agents() -> Result<Vec<String>> {
     } else {
         println!(
             "\nTeam: {primary} (lead){}. Each checks out nodes from the graph until it is done.\n",
-            roster[1..].iter().map(|agent| format!(", {agent}")).collect::<String>()
+            roster[1..]
+                .iter()
+                .map(|agent| format!(", {agent}"))
+                .collect::<String>()
         );
     }
     Ok(roster)
@@ -206,7 +212,11 @@ fn pick_model(agent: &str) -> Result<Option<String>> {
             }
             return Ok(None); // default / out of range
         }
-        return Ok(if choice.is_empty() { None } else { Some(choice) });
+        return Ok(if choice.is_empty() {
+            None
+        } else {
+            Some(choice)
+        });
     }
     let typed = ask(&format!("Model for {agent} (Enter for default): "))?;
     Ok(if typed.is_empty() { None } else { Some(typed) })
@@ -250,7 +260,8 @@ fn persist_trust(store: &Path, workspace: &Path) -> Result<()> {
     }
     existing.push_str(&canonical(workspace));
     existing.push('\n');
-    std::fs::write(store, existing).with_context(|| format!("failed to persist trust to {}", store.display()))
+    std::fs::write(store, existing)
+        .with_context(|| format!("failed to persist trust to {}", store.display()))
 }
 
 /// Compile + commit a graph for one request and open its board.
@@ -266,10 +277,14 @@ fn execute_request(
         .and_then(|directory| intent::classify(request, &directory));
     let mapped = classification.as_ref().ok().map(map_classification);
     if let Ok(classification) = &classification {
-        println!("  intent: {}  privacy: {}", classification.intent, classification.privacy);
+        println!(
+            "  intent: {}  privacy: {}",
+            classification.intent, classification.privacy
+        );
     }
 
-    let plan = pipeline::render_submit_plan(request, Some(Mode::Build), None, Some(workspace), mapped)?;
+    let plan =
+        pipeline::render_submit_plan(request, Some(Mode::Build), None, Some(workspace), mapped)?;
     for line in plan.text.lines() {
         if line.starts_with("Harness:")
             || line.starts_with("Graph id:")
@@ -291,14 +306,20 @@ fn execute_request(
                 println!("  Graph is on the board. Building is off — enable it at launch to run workers.\n");
             } else {
                 if agents.len() > 1 {
-                    println!("  → executing with {} agents in {} (board turns green live)…", agents.len(), workspace.display());
+                    println!(
+                        "  → executing with {} agents in {} (board turns green live)…",
+                        agents.len(),
+                        workspace.display()
+                    );
                 } else {
                     println!("  → executing in {}…", workspace.display());
                 }
                 let board_url = format!("http://127.0.0.1:{port}");
+                let spinner = crate::ui::Spinner::start("working");
                 let outcome = graph_store::load_graph(&hash).and_then(|graph| {
                     execute::run_multi_agent(&graph, workspace, agents, Some(&board_url))
                 });
+                let elapsed = crate::ui::format_elapsed(spinner.stop());
                 match outcome {
                     Ok(outcome) => {
                         let mark = match outcome.verified {
@@ -307,9 +328,11 @@ fn execute_request(
                             None if outcome.built => "✓",
                             None => "·",
                         };
-                        println!("  {mark} {}\n", outcome.detail);
+                        println!("  {mark} {} · worked for {elapsed}\n", outcome.detail);
                     }
-                    Err(error) => eprintln!("  execution error: {error:#}\n"),
+                    Err(error) => {
+                        eprintln!("  execution error: {error:#} · worked for {elapsed}\n")
+                    }
                 }
             }
         }

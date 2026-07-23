@@ -2,9 +2,9 @@
 
 use anyhow::{bail, Result};
 use fractal_evolution::{
-    build_morphogen, DemoEvolveSource, EvolveTickOutcome, EvolveWatchConfig, EvolveWatchSink,
-    MorphogenDiffBounds, MorphogenOperation, MorphogenRegistry, MorphogenScale, MorphogenTrigger,
-    SystemEvolveClock, run_evolve_once, run_evolve_watch,
+    build_morphogen, run_evolve_once, run_evolve_watch, DemoEvolveSource, EvolveTickOutcome,
+    EvolveWatchConfig, EvolveWatchSink, MorphogenDiffBounds, MorphogenOperation, MorphogenRegistry,
+    MorphogenScale, MorphogenTrigger, SystemEvolveClock,
 };
 
 use crate::cli::EvolveArgs;

@@ -1,11 +1,30 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
 use crate::graph_store;
+
+/// Block until the board's `/api/health` responds, so execution progress posted
+/// immediately after does not race a not-yet-listening server (which would drop
+/// the first node's checkout/complete and leave it stuck).
+pub(crate) fn wait_until_listening(port: u16) {
+    let url = format!("http://127.0.0.1:{port}/api/health");
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        if ureq::get(&url)
+            .timeout(Duration::from_millis(300))
+            .call()
+            .is_ok()
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
 
 const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:8091/";
 const START_COMMAND: &str = "python3 execution-graph/server.py --prd FRACTAL_PIPELINE_TASKS.md --state execution-graph/graph-state-pipeline.json --port 8091";
@@ -96,7 +115,10 @@ pub(crate) fn serve_graph_file(
     let viewer_dir = resolve_exec_graph_dir(exec_graph_dir)?;
     let server_path = viewer_dir.join("server.py");
     if !server_path.is_file() {
-        bail!("execution-graph viewer server.py is missing: {}", server_path.display());
+        bail!(
+            "execution-graph viewer server.py is missing: {}",
+            server_path.display()
+        );
     }
     Command::new("python3")
         .arg(&server_path)
@@ -111,6 +133,7 @@ pub(crate) fn serve_graph_file(
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("failed to launch board server {}", server_path.display()))?;
+    wait_until_listening(port);
     let url = format!("http://127.0.0.1:{port}/");
     println!("Board: {url}");
     if !no_open {
@@ -139,6 +162,7 @@ pub(crate) fn serve_graph(
         .and_then(serde_json::Value::as_str)
         .context("stored execution graph is missing graph_id")?;
     let state_file = graph_file.with_extension("board-state.json");
+    let _ = std::fs::remove_file(&state_file); // start clean so progress shows
 
     let viewer_dir = resolve_exec_graph_dir(exec_graph_dir)?;
     let server_path = viewer_dir.join("server.py");
@@ -167,6 +191,7 @@ pub(crate) fn serve_graph(
                 server_path.display()
             )
         })?;
+    wait_until_listening(port);
 
     let url = format!("http://127.0.0.1:{port}/");
     println!("Serving {url}");

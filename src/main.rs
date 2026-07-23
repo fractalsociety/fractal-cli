@@ -5,10 +5,12 @@ mod evolve;
 mod execute;
 mod graph_store;
 mod harness;
-mod interactive;
 mod intent;
+mod interactive;
 mod pipeline;
 mod run;
+mod safety;
+mod ui;
 mod work_builder;
 
 use std::process::ExitCode;
@@ -85,6 +87,11 @@ fn run(cli: Cli) -> Result<()> {
             pipeline::print_node_stub(&args.id, args.show, args.retry, args.cancel);
             Ok(())
         }
+        (None, Some(Command::Clean(args))) => {
+            let removed = safety::guarded_clear(&args.dir, args.yes)?;
+            println!("Cleared {removed} item(s) from {}", args.dir.display());
+            Ok(())
+        }
         (None, Some(Command::Version)) => {
             println!("fractal {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -105,10 +112,7 @@ fn print_submit_plan(
 ) -> Result<()> {
     let classification = intent::fractalwork_dir(fractalwork_override)
         .and_then(|directory| intent::classify(request, &directory));
-    let mapped = classification
-        .as_ref()
-        .ok()
-        .map(map_classification);
+    let mapped = classification.as_ref().ok().map(map_classification);
     let plan = pipeline::render_submit_plan(request, mode, provider, repo, mapped)?;
     match &classification {
         Ok(classification) => {
@@ -143,7 +147,10 @@ fn run_local(args: &crate::cli::RunArgs) -> Result<()> {
         if let Some(file) = &args.graph_file {
             (serde_json::from_slice(&std::fs::read(file)?)?, file.clone())
         } else if let Some(hash) = &args.graph {
-            (graph_store::load_graph(hash)?, graph_store::graph_path(hash))
+            (
+                graph_store::load_graph(hash)?,
+                graph_store::graph_path(hash),
+            )
         } else {
             anyhow::bail!("--local requires --graph <hash> or --graph-file <path>");
         };

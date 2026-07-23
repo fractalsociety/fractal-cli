@@ -32,7 +32,9 @@ pub(crate) fn worker_label() -> String {
 }
 
 fn is_build(capability: &str) -> bool {
-    capability.contains("code.generate") || capability.ends_with(".edit") || capability.contains("code.write")
+    capability.contains("code.generate")
+        || capability.ends_with(".edit")
+        || capability.contains("code.write")
 }
 
 fn is_verify(capability: &str) -> bool {
@@ -48,19 +50,30 @@ fn topo_order(graph: &Value) -> Result<Vec<Value>> {
     let mut by_id: BTreeMap<String, Value> = BTreeMap::new();
     let mut indegree: BTreeMap<String, usize> = BTreeMap::new();
     for node in nodes {
-        let id = node.get("id").and_then(Value::as_str).context("node missing id")?;
+        let id = node
+            .get("id")
+            .and_then(Value::as_str)
+            .context("node missing id")?;
         by_id.insert(id.to_owned(), node.clone());
         indegree.entry(id.to_owned()).or_insert(0);
     }
     let mut adjacency: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for edge in graph.get("edges").and_then(Value::as_array).into_iter().flatten() {
+    for edge in graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         let (from, to) = (
             edge.get("from").and_then(Value::as_str),
             edge.get("to").and_then(Value::as_str),
         );
         if let (Some(from), Some(to)) = (from, to) {
             if by_id.contains_key(from) && by_id.contains_key(to) {
-                adjacency.entry(from.to_owned()).or_default().push(to.to_owned());
+                adjacency
+                    .entry(from.to_owned())
+                    .or_default()
+                    .push(to.to_owned());
                 *indegree.get_mut(to).unwrap() += 1;
             }
         }
@@ -96,7 +109,9 @@ fn model_for(kind: &str) -> Option<String> {
         "FRACTAL_{}_MODEL",
         kind.to_ascii_uppercase().replace('-', "_")
     );
-    std::env::var(key).ok().filter(|value| !value.trim().is_empty())
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// Build the headless worker command for `kind`, honoring a pinned model.
@@ -117,7 +132,8 @@ fn worker_command(kind: &str, prompt: &str) -> Result<Command> {
             if let Some(model) = model_for("codex") {
                 c.arg("--model").arg(model);
             }
-            c.arg("--dangerously-bypass-approvals-and-sandbox").arg(prompt);
+            c.arg("--dangerously-bypass-approvals-and-sandbox")
+                .arg(prompt);
             c
         }
         "cursor" | "cursor-agent" => {
@@ -138,8 +154,10 @@ fn worker_command(kind: &str, prompt: &str) -> Result<Command> {
 /// Run a specific `kind` of worker on `instruction` in `workspace`, streaming.
 fn run_worker_as(kind: &str, instruction: &str, workspace: &Path) -> Result<bool> {
     let prompt = format!(
-        "{instruction}\n\nWork entirely in the current directory. Create or edit the files \
-         needed and make any tests pass. Do not ask questions; make reasonable choices."
+        "You are one agent on a coordinated team; a lead has planned the project (read INTERFACE.md \
+         if it exists). Do exactly this assigned task and nothing else:\n\n{instruction}\n\nWork \
+         entirely in the current directory. Create or edit only the files this task needs and make \
+         any tests pass. Do not ask questions; make reasonable choices."
     );
     let status = worker_command(kind, &prompt)?
         .current_dir(workspace)
@@ -162,8 +180,7 @@ fn binary_on_path(binary: &str) -> bool {
         .map(|paths| {
             std::env::split_paths(&paths).any(|dir| {
                 let candidate = dir.join(binary);
-                candidate.is_file()
-                    || candidate.with_extension("exe").is_file()
+                candidate.is_file() || candidate.with_extension("exe").is_file()
             })
         })
         .unwrap_or(false)
@@ -207,8 +224,7 @@ fn verify_workspace(workspace: &Path) -> Result<Option<bool>> {
             entries.flatten().any(|entry| {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                name.starts_with("test_") && name.ends_with(".py")
-                    || name.ends_with("_test.py")
+                name.starts_with("test_") && name.ends_with(".py") || name.ends_with("_test.py")
             })
         })
         .unwrap_or(false);
@@ -254,7 +270,10 @@ fn verify_workspace(workspace: &Path) -> Result<Option<bool>> {
 /// `(node_ok, verified)`.
 fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<(bool, Option<bool>)> {
     let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
-    let instruction = node.get("instruction").and_then(Value::as_str).unwrap_or("");
+    let instruction = node
+        .get("instruction")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if is_build(capability) {
         Ok((run_worker_as(agent, instruction, workspace)?, None))
     } else if is_verify(capability) {
@@ -270,7 +289,12 @@ fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<(bool, Option
 /// turns yellow (checkout) then green (complete) as agents work.
 fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str) {
     if let Some(base) = board {
-        let url = format!("{}/api/tasks/{}/{}", base.trim_end_matches('/'), node, action);
+        let url = format!(
+            "{}/api/tasks/{}/{}",
+            base.trim_end_matches('/'),
+            node,
+            action
+        );
         let body = serde_json::json!({ "agent_id": agent, "agent_label": agent }).to_string();
         let _ = ureq::post(&url)
             .set("Content-Type", "application/json")
@@ -313,7 +337,12 @@ pub(crate) fn run_multi_agent(
         .collect();
     let mut predecessors: BTreeMap<String, Vec<String>> =
         ids.iter().map(|id| (id.clone(), Vec::new())).collect();
-    for edge in graph.get("edges").and_then(Value::as_array).into_iter().flatten() {
+    for edge in graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         if let (Some(from), Some(to)) = (
             edge.get("from").and_then(Value::as_str),
             edge.get("to").and_then(Value::as_str),
@@ -326,13 +355,17 @@ pub(crate) fn run_multi_agent(
     let total = ids.len();
     let schedule = Mutex::new(Schedule::default());
 
-    // The primary agent (first in the roster) is the lead: only it takes the
-    // build/coding nodes; the others handle analyze / verify / control.
-    let primary: &str = agents.first().map(String::as_str).unwrap_or("");
+    // The lead (first agent) is the ORCHESTRATOR: it plans the project (the root
+    // node) and closes it out (control), then assigns + monitors — it does not do
+    // the coding tasks. Every other agent is a WORKER that pulls ready coding
+    // tasks in parallel and steals another when it finishes early. A solo agent
+    // does everything itself.
+    let lead: &str = agents.first().map(String::as_str).unwrap_or("");
+    let has_workers = agents.len() > 1;
     std::thread::scope(|scope| {
         for agent in agents {
             let agent = agent.clone();
-            let is_primary = agent.as_str() == primary;
+            let is_lead = agent.as_str() == lead;
             let (schedule, ids, node_by_id, predecessors) =
                 (&schedule, &ids, &node_by_id, &predecessors);
             scope.spawn(move || {
@@ -342,8 +375,11 @@ pub(crate) fn run_multi_agent(
                 // little longer before grabbing the next node, so work rotates
                 // across the team instead of one agent winning every race.
                 // Bounded so large graphs are not slowed materially.
+                // The yield for an agent that has already worked must exceed the
+                // idle poll below, so idle agents win the next (parallel) node
+                // instead of one fast agent grabbing them all.
                 if mine > 0 {
-                    std::thread::sleep(Duration::from_millis(mine.min(3) * 20));
+                    std::thread::sleep(Duration::from_millis(mine.min(3) * 120));
                 }
                 // Atomically check out a ready, unclaimed node.
                 let claimed = {
@@ -364,18 +400,22 @@ pub(crate) fn run_multi_agent(
                             && !state.in_progress.contains(id)
                             && predecessors[id].iter().all(|pred| state.completed.contains(pred))
                     };
-                    // How many build nodes are ready right now: with >1 the team
-                    // parallelizes; with exactly 1 the lead takes it.
-                    let ready_builds = ids
+                    let is_root = |id: &String| predecessors[id].is_empty();
+                    let is_control = |id: &String| capability_of(id).starts_with("control.");
+                    // Role split: the lead plans (root) + closes out (control);
+                    // workers do the middle coding/verify tasks in parallel.
+                    let for_this_agent = |id: &String| {
+                        if !has_workers {
+                            true
+                        } else if is_lead {
+                            is_root(id) || is_control(id)
+                        } else {
+                            !is_root(id) && !is_control(id)
+                        }
+                    };
+                    let next = ids
                         .iter()
-                        .filter(|id| is_ready(id, &state) && is_build(&capability_of(id)))
-                        .count();
-                    let next = ids.iter().find(|id| {
-                        is_ready(id, &state)
-                            && (is_primary
-                                || !is_build(&capability_of(id))
-                                || ready_builds >= 2)
-                    });
+                        .find(|id| is_ready(id, &state) && for_this_agent(id));
                     match next {
                         Some(id) => {
                             state.in_progress.insert(id.clone());
@@ -385,13 +425,22 @@ pub(crate) fn run_multi_agent(
                     }
                 };
                 let Some(id) = claimed else {
-                    std::thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(Duration::from_millis(30));
                     continue;
                 };
 
                 let node = node_by_id.get(&id).expect("claimed node exists");
                 let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
-                println!("  [{agent}] ▸ checked out {id} ({capability})");
+                let is_planning =
+                    has_workers && is_lead && predecessors[&id].is_empty() && is_build(capability);
+                let clr = crate::ui::CLEAR_LINE;
+                if is_planning {
+                    println!("{clr}  🧠 [{agent}] planning the project & interface, then assigning tasks to the team…");
+                } else if has_workers && is_lead {
+                    println!("{clr}  [{agent}] (orchestrator) ▸ {id}");
+                } else {
+                    println!("{clr}  [{agent}] ▸ checked out {id} ({capability})");
+                }
                 report_node(board, &id, "checkout", &agent);
                 let result = run_node(node, &agent, workspace);
 
@@ -409,10 +458,14 @@ pub(crate) fn run_multi_agent(
                             state.completed.insert(id.clone());
                             mine += 1;
                             report_node(board, &id, "complete", &agent);
-                            println!("  [{agent}] ✓ {id}");
+                            if is_planning {
+                                println!("{clr}  [{agent}] ✓ plan ready — dispatching tasks to the workers.");
+                            } else {
+                                println!("{clr}  [{agent}] ✓ {id}");
+                            }
                         } else {
                             state.failed = Some(id.clone());
-                            println!("  [{agent}] ✗ {id}");
+                            println!("{clr}  [{agent}] ✗ {id}");
                         }
                     }
                     Err(error) => {

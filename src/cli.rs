@@ -43,8 +43,24 @@ pub(crate) enum Command {
     Evolve(EvolveArgs),
     /// Inspect or control one graph node (stub).
     Node(NodeArgs),
+    /// Safely clear a fractal workspace/test folder (guarded + confirmed).
+    Clean(CleanArgs),
     /// Print the Fractal CLI version.
     Version,
+}
+
+/// Arguments accepted by `fractal clean`.
+#[derive(Debug, Args)]
+pub(crate) struct CleanArgs {
+    /// Directory to clear — must resolve inside a fractal disposable folder
+    /// (`$FRACTAL_HOME`/`~/.fractal`, `~/fractal-test`, `~/fractal-demo`,
+    /// `~/fractal-runs`). Any other path is refused.
+    #[arg(value_name = "DIR")]
+    pub(crate) dir: PathBuf,
+
+    /// Skip the confirmation prompt.
+    #[arg(long)]
+    pub(crate) yes: bool,
 }
 
 /// Arguments accepted by `fractal submit`.

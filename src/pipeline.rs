@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 
 use crate::cli::{Mode, Provider};
-use crate::work_builder::{IntentClassification, NlWorkRequest, build_work_from_nl};
+use crate::work_builder::{build_work_from_nl, IntentClassification, NlWorkRequest};
 
 const STAGES: [(&str, &str); 8] = [
     (
@@ -259,7 +259,9 @@ mod tests {
         )
         .expect("plan");
         assert!(plan.committed_graph_hash.is_none());
-        assert!(plan.text.contains("Preview mode: stopping before execution"));
+        assert!(plan
+            .text
+            .contains("Preview mode: stopping before execution"));
         assert!(!plan.text.contains("Graph hash:"));
         assert!(!plan.text.contains("Committed:"));
     }
@@ -269,8 +271,7 @@ mod tests {
         let _environment_lock = crate::graph_store::ENV_LOCK
             .lock()
             .expect("environment lock");
-        let _home = crate::graph_store::TestHome::new("pipeline")
-            .expect("temporary FRACTAL_HOME");
+        let _home = crate::graph_store::TestHome::new("pipeline").expect("temporary FRACTAL_HOME");
         let plan = render_submit_plan(
             "build a tiny CLI that reverses a string",
             Some(Mode::Build),
