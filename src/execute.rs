@@ -12,11 +12,26 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
+/// One node's execution record, for signed receipts + evidence roots.
+#[derive(Clone)]
+pub(crate) struct NodeRun {
+    pub node: String,
+    pub agent: String,
+    pub is_verify: bool,
+    pub ok: bool,
+    /// Content-addressed evidence digest (hex) of the workspace after the node.
+    pub evidence_hex: String,
+}
+
 /// Outcome of driving one graph.
 pub(crate) struct RunOutcome {
     pub built: bool,
     pub verified: Option<bool>,
     pub detail: String,
+    /// The node whose verification failed (drives governed evolution), if any.
+    pub failed_node: Option<String>,
+    /// Per-node execution log for chain receipts + the sanitized export.
+    pub log: Vec<NodeRun>,
 }
 /// The headless worker to use, from `$FRACTAL_WORKER` (default `claude`).
 fn worker_kind() -> String {
@@ -302,6 +317,34 @@ fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str) {
     }
 }
 
+/// A content-addressed digest of the workspace's top-level files (sorted names +
+/// contents), used as a node's evidence after it runs.
+fn workspace_digest(workspace: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut names: Vec<String> = std::fs::read_dir(workspace)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    let mut hasher = Sha256::new();
+    for name in &names {
+        hasher.update(name.as_bytes());
+        hasher.update([0u8]);
+        if let Ok(bytes) = std::fs::read(workspace.join(name)) {
+            hasher.update(&bytes);
+        }
+    }
+    let mut hex = String::from("sha256:");
+    for byte in hasher.finalize() {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
 /// Shared scheduler state for the multi-agent pull-queue.
 #[derive(Default)]
 struct Schedule {
@@ -310,6 +353,7 @@ struct Schedule {
     failed: Option<String>,
     built: bool,
     verified: Option<bool>,
+    log: Vec<NodeRun>,
 }
 
 /// Drive the whole graph with several agents: each agent repeatedly checks out a
@@ -444,9 +488,11 @@ pub(crate) fn run_multi_agent(
                 report_node(board, &id, "checkout", &agent);
                 let result = run_node(node, &agent, workspace);
 
+                let evidence_hex = workspace_digest(workspace);
+                let node_is_verify = is_verify(capability);
                 let mut state = schedule.lock().expect("schedule lock");
                 state.in_progress.remove(&id);
-                match result {
+                let node_ok = match result {
                     Ok((ok, verified)) => {
                         if is_build(capability) && ok {
                             state.built = true;
@@ -467,12 +513,21 @@ pub(crate) fn run_multi_agent(
                             state.failed = Some(id.clone());
                             println!("{clr}  [{agent}] ✗ {id}");
                         }
+                        ok
                     }
                     Err(error) => {
                         state.failed = Some(id.clone());
                         eprintln!("  [{agent}] ✗ {id}: {error:#}");
+                        false
                     }
-                }
+                };
+                state.log.push(NodeRun {
+                    node: id.clone(),
+                    agent: agent.clone(),
+                    is_verify: node_is_verify,
+                    ok: node_ok,
+                    evidence_hex,
+                });
               }
             });
         }
@@ -493,5 +548,7 @@ pub(crate) fn run_multi_agent(
         built: state.built,
         verified: state.verified,
         detail,
+        failed_node: state.failed.clone(),
+        log: state.log.clone(),
     })
 }

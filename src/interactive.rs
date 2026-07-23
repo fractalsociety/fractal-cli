@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::{Mode, DEFAULT_GRAPH_PORT};
 use crate::work_builder::IntentClassification;
-use crate::{board, execute, graph_store, intent, pipeline};
+use crate::{board, execute, intent, pipeline};
 
 /// Launch the interactive session in the current working directory.
 pub(crate) fn run(fractalwork_override: Option<&Path>) -> Result<()> {
@@ -316,9 +316,8 @@ fn execute_request(
                 }
                 let board_url = format!("http://127.0.0.1:{port}");
                 let spinner = crate::ui::Spinner::start("working");
-                let outcome = graph_store::load_graph(&hash).and_then(|graph| {
-                    execute::run_multi_agent(&graph, workspace, agents, Some(&board_url))
-                });
+                let outcome =
+                    crate::orchestrate::run_end_to_end(&hash, workspace, agents, Some(&board_url));
                 let elapsed = crate::ui::format_elapsed(spinner.stop());
                 match outcome {
                     Ok(outcome) => {

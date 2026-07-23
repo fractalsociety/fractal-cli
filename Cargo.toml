@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+fractal-chain = { path = "../fractal-chain" }
 fractal-contracts = { path = "../../FractalRuntime/crates/fractal-contracts" }
 fractal-evolution = { path = "../../FractalRuntime/crates/fractal-evolution" }
 fractal-harnessc = { path = "../../FractalRuntime/crates/fractal-harnessc" }

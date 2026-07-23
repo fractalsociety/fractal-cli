@@ -1,4 +1,5 @@
 mod board;
+mod chain;
 mod cli;
 mod compile;
 mod evolve;
@@ -7,6 +8,7 @@ mod graph_store;
 mod harness;
 mod intent;
 mod interactive;
+mod orchestrate;
 mod pipeline;
 mod run;
 mod safety;
