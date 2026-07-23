@@ -1,0 +1,22 @@
+[package]
+name = "fractal-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI front door for the Fractal pipeline"
+
+[[bin]]
+name = "fractal"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+fractal-contracts = { path = "../../FractalRuntime/crates/fractal-contracts" }
+fractal-evolution = { path = "../../FractalRuntime/crates/fractal-evolution" }
+fractal-harnessc = { path = "../../FractalRuntime/crates/fractal-harnessc" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+ureq = "2"
+
+[workspace]
