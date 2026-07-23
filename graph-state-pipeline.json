@@ -302,9 +302,10 @@
     "P5.5": {
       "agent_id": "claude/fable-orchestrator",
       "agent_label": "claude/fable-orchestrator",
-      "state": "released",
+      "state": "completed",
       "checked_out_at": "2026-07-23T16:09:33.478601+00:00",
-      "released_at": "2026-07-23T16:11:29.350523+00:00"
+      "released_at": "2026-07-23T16:11:29.350523+00:00",
+      "completed_at": "2026-07-23T17:06:53.287709+00:00"
     }
   }
 }
