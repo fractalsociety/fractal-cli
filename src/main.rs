@@ -2,8 +2,10 @@ mod board;
 mod cli;
 mod compile;
 mod evolve;
+mod execute;
 mod graph_store;
 mod harness;
+mod interactive;
 mod intent;
 mod pipeline;
 mod run;
@@ -34,6 +36,7 @@ fn run(cli: Cli) -> Result<()> {
         command,
     } = cli;
     match (request, command) {
+        (None, None) => interactive::run(fractalwork.as_deref()),
         (Some(request), None) => print_submit_plan(
             &request,
             None,
@@ -63,6 +66,7 @@ fn run(cli: Cli) -> Result<()> {
             GraphCommand::Status(args) => board::status(&args.url, args.json),
             GraphCommand::Show(args) => graph_store::show(&args.graph_hash, args.json),
         },
+        (None, Some(Command::Run(args))) if args.local => run_local(&args),
         (None, Some(Command::Run(args))) => match args.graph.as_deref() {
             Some(graph_hash) => run::run_graph(
                 graph_hash,
@@ -129,6 +133,26 @@ fn print_submit_plan(
             eprintln!("warning: could not auto-open the execution-graph viewer: {error:#}");
         }
     }
+    Ok(())
+}
+
+/// Execute a committed or file-based graph in-process with the local agent team.
+fn run_local(args: &crate::cli::RunArgs) -> Result<()> {
+    let graph: serde_json::Value = if let Some(file) = &args.graph_file {
+        serde_json::from_slice(&std::fs::read(file)?)?
+    } else if let Some(hash) = &args.graph {
+        graph_store::load_graph(hash)?
+    } else {
+        anyhow::bail!("--local requires --graph <hash> or --graph-file <path>");
+    };
+    let workspace = std::env::current_dir()?;
+    let agents = execute::detect_agents();
+    if agents.is_empty() {
+        anyhow::bail!("no agents (claude/codex/cursor) on PATH");
+    }
+    println!("Running graph with agent team: {} in {}", agents.join(", "), workspace.display());
+    let outcome = execute::run_multi_agent(&graph, &workspace, &agents)?;
+    println!("⇒ {}", outcome.detail);
     Ok(())
 }
 

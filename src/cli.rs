@@ -14,8 +14,7 @@ pub(crate) const DEFAULT_GRAPH_PORT: u16 = 8092;
     name = "fractal",
     version,
     disable_version_flag = true,
-    arg_required_else_help = true,
-    about = "Inspect the live Fractal graph and preview pipeline work"
+    about = "Run `fractal` with no arguments to start an interactive session, or use a subcommand"
 )]
 pub(crate) struct Cli {
     /// FractalWork checkout containing the TypeScript intent classifier.
@@ -186,6 +185,15 @@ pub(crate) struct RunArgs {
     /// Committed execution-graph hash to run through Coordinate.
     #[arg(long, value_name = "SHA256")]
     pub(crate) graph: Option<String>,
+
+    /// A raw `fractal.execution_graph.v1` JSON file to run (with `--local`).
+    #[arg(long, value_name = "PATH")]
+    pub(crate) graph_file: Option<PathBuf>,
+
+    /// Execute the graph in-process with the local multi-agent team (each agent
+    /// checks out ready nodes) instead of enqueuing through Coordinate.
+    #[arg(long)]
+    pub(crate) local: bool,
 
     /// Coordinate SQLite store (defaults to `$FRACTAL_HOME/coordinate.sqlite3`).
     #[arg(long, value_name = "PATH")]
