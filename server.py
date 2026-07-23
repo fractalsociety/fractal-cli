@@ -23,14 +23,19 @@ PROJECT_DIR = APP_DIR.parent
 DEFAULT_PRD = PROJECT_DIR / "FRACTAL_MAC_RUNTIME_PRD.md"
 DEFAULT_STATE = APP_DIR / "graph-state.json"
 
-MILESTONE_RE = re.compile(r"^###\s+(M\d+)\s+—\s+(.+?)\s*$")
-GATE_RE = re.compile(r"^Gate\s+(M\d+)\s+—\s+`?([^`]+)`?:\s*$")
+# Milestone/task ids use a single uppercase-letter prefix (M for the Mac Runtime
+# PRD, P for the pipeline PRD, …) + digits, so one board tool serves many PRDs.
+MILESTONE_RE = re.compile(r"^###\s+([A-Z]\d+)\s+—\s+(.+?)\s*$")
+GATE_RE = re.compile(r"^Gate\s+([A-Z]\d+)\s+—\s+`?([^`]+)`?:\s*$")
 CHECK_RE = re.compile(r"^- \[([ xX])\]\s+(.+?)\s*$")
-TASK_ID_RE = re.compile(r"^(M\d+\.\d+)\s+(.+)$")
-TASK_NODE_ID_RE = re.compile(r"^M\d+\.(?:\d+|G\d+)$")
-TASK_ACTION_RE = re.compile(r"^/api/tasks/(M\d+\.(?:\d+|G\d+))/(checkout|complete|release)$")
+TASK_ID_RE = re.compile(r"^([A-Z]\d+\.\d+)\s+(.+)$")
+TASK_NODE_ID_RE = re.compile(r"^[A-Z]\d+\.(?:\d+|G\d+)$")
+GRAPH_NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+TASK_ACTION_RE = re.compile(r"^/api/tasks/([^/]+)/(checkout|complete|release)$")
+DEVELOPMENT_RE = re.compile(r"^/api/development$")
 AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$")
 STATE_WRITE_LOCK = threading.Lock()
+RESHAPING_OPS = frozenset({"grow", "repair"})
 
 MILESTONE_DEPS: dict[str, list[str]] = {
     "M0": [],
@@ -88,6 +93,24 @@ def _task_from_prd(task_id: str, prd_path: Path, state_path: Path) -> dict[str, 
             if task["id"] == task_id and task["kind"] in {"task", "gate"}:
                 return task
     raise TaskStateError(HTTPStatus.NOT_FOUND, f"unknown PRD task: {task_id}")
+
+
+def _write_state_atomic(state_path: Path, state: dict[str, Any]) -> None:
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{state_path.name}.", suffix=".tmp", dir=state_path.parent
+    )
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as temporary_file:
+            json.dump(state, temporary_file, indent=2)
+            temporary_file.write("\n")
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        if state_path.exists():
+            os.chmod(temporary_name, state_path.stat().st_mode & 0o777)
+        os.replace(temporary_name, state_path)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
 
 
 def mutate_task_state(
@@ -170,22 +193,244 @@ def mutate_task_state(
             assignment = current
             active[:] = [item for item in active if item != task_id]
 
-        file_descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{state_path.name}.", suffix=".tmp", dir=state_path.parent
-        )
-        try:
-            with os.fdopen(file_descriptor, "w", encoding="utf-8") as temporary_file:
-                json.dump(state, temporary_file, indent=2)
-                temporary_file.write("\n")
-                temporary_file.flush()
-                os.fsync(temporary_file.fileno())
-            if state_path.exists():
-                os.chmod(temporary_name, state_path.stat().st_mode & 0o777)
-            os.replace(temporary_name, state_path)
-        finally:
-            if os.path.exists(temporary_name):
-                os.unlink(temporary_name)
+        _write_state_atomic(state_path, state)
         return dict(assignment)
+
+
+def _graph_identity(graph_path: Path) -> tuple[str, set[str]]:
+    graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    if not isinstance(graph, dict) or graph.get("schema") != "fractal.execution_graph.v1":
+        raise TaskStateError(
+            HTTPStatus.CONFLICT,
+            f"{graph_path} is not a fractal.execution_graph.v1 graph",
+        )
+    graph_id = graph.get("graph_id")
+    if not isinstance(graph_id, str) or not graph_id.strip():
+        raise TaskStateError(HTTPStatus.CONFLICT, "execution graph id is malformed")
+    nodes = graph.get("nodes")
+    if not isinstance(nodes, list):
+        raise TaskStateError(HTTPStatus.CONFLICT, "execution graph nodes are malformed")
+    node_ids: set[str] = set()
+    for node in nodes:
+        node_id = node.get("id") if isinstance(node, dict) else None
+        if not isinstance(node_id, str) or not GRAPH_NODE_ID_RE.fullmatch(node_id):
+            raise TaskStateError(HTTPStatus.CONFLICT, "execution graph has an invalid node id")
+        if node_id in node_ids:
+            raise TaskStateError(
+                HTTPStatus.CONFLICT,
+                f"execution graph has duplicate node id: {node_id}",
+            )
+        node_ids.add(node_id)
+    return graph_id, node_ids
+
+
+def mutate_graph_node_state(
+    action: str,
+    node_id: str,
+    agent_id: str,
+    agent_label: str | None = None,
+    *,
+    graph_path: Path,
+    state_path: Path,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Atomically check out, complete, or release one committed graph node."""
+    if action not in {"checkout", "complete", "release"}:
+        raise TaskStateError(HTTPStatus.BAD_REQUEST, f"unsupported task action: {action}")
+    if not GRAPH_NODE_ID_RE.fullmatch(node_id):
+        raise TaskStateError(HTTPStatus.BAD_REQUEST, f"invalid graph node id: {node_id}")
+    agent_id, label = _agent_payload(agent_id, agent_label)
+    timestamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_suffix(f"{state_path.suffix}.lock")
+
+    with STATE_WRITE_LOCK, lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        graph_id, node_ids = _graph_identity(graph_path)
+        if node_id not in node_ids:
+            raise TaskStateError(HTTPStatus.NOT_FOUND, f"unknown graph node: {node_id}")
+        state = _read_json(state_path)
+        state_graph_id = state.get("graph_id")
+        if state_graph_id is not None and state_graph_id != graph_id:
+            raise TaskStateError(
+                HTTPStatus.CONFLICT,
+                f"state belongs to execution graph {state_graph_id}, not {graph_id}",
+            )
+        assignments = state.setdefault("assignments", {})
+        if not isinstance(assignments, dict):
+            raise TaskStateError(HTTPStatus.CONFLICT, "graph assignments state is malformed")
+        current = assignments.get(node_id)
+        current = current if isinstance(current, dict) else None
+
+        if action == "checkout":
+            if current and current.get("state") == "completed":
+                raise TaskStateError(
+                    HTTPStatus.CONFLICT,
+                    f"graph node {node_id} is already complete",
+                )
+            if (
+                current
+                and current.get("state") == "checked_out"
+                and current.get("agent_id") != agent_id
+            ):
+                raise TaskStateError(
+                    HTTPStatus.CONFLICT,
+                    f"graph node {node_id} is checked out by "
+                    f"{current.get('agent_label', current.get('agent_id'))}",
+                )
+            checked_out_at = (
+                current.get("checked_out_at", timestamp)
+                if current and current.get("agent_id") == agent_id
+                else timestamp
+            )
+            assignment = {
+                "agent_id": agent_id,
+                "agent_label": label,
+                "state": "checked_out",
+                "checked_out_at": checked_out_at,
+            }
+            assignments[node_id] = assignment
+        else:
+            if (
+                not current
+                or current.get("state") != "checked_out"
+                or current.get("agent_id") != agent_id
+            ):
+                raise TaskStateError(
+                    HTTPStatus.CONFLICT,
+                    f"graph node {node_id} is not checked out by {agent_id}",
+                )
+            if action == "complete":
+                current["state"] = "completed"
+                current["completed_at"] = timestamp
+            else:
+                current["state"] = "released"
+                current["released_at"] = timestamp
+            assignment = current
+
+        state["graph_id"] = graph_id
+        _write_state_atomic(state_path, state)
+        return dict(assignment)
+
+
+def _normalize_development_step(raw: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalize one developmental step for board visibility."""
+    required = (
+        "step_id",
+        "operation",
+        "scale",
+        "subject",
+        "motivating_outcome",
+        "produced_outcome",
+    )
+    for field in required:
+        value = raw.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise TaskStateError(HTTPStatus.BAD_REQUEST, f"development.{field} is required")
+    operation = str(raw["operation"]).strip().lower()
+    if operation not in {"grow", "repair", "differentiate"}:
+        raise TaskStateError(
+            HTTPStatus.BAD_REQUEST,
+            "development.operation must be grow|repair|differentiate",
+        )
+    step_id = str(raw["step_id"]).strip()
+    if not GRAPH_NODE_ID_RE.fullmatch(step_id):
+        raise TaskStateError(HTTPStatus.BAD_REQUEST, f"invalid development.step_id: {step_id}")
+    visible = raw.get("visible_node_id")
+    if visible is not None:
+        if not isinstance(visible, str) or not GRAPH_NODE_ID_RE.fullmatch(visible):
+            raise TaskStateError(HTTPStatus.BAD_REQUEST, "invalid development.visible_node_id")
+    anchored = raw.get("anchored", True)
+    if not isinstance(anchored, bool):
+        raise TaskStateError(HTTPStatus.BAD_REQUEST, "development.anchored must be a boolean")
+    return {
+        "step_id": step_id,
+        "operation": operation,
+        "scale": str(raw["scale"]).strip(),
+        "subject": str(raw["subject"]).strip(),
+        "motivating_outcome": str(raw["motivating_outcome"]).strip(),
+        "produced_outcome": str(raw["produced_outcome"]).strip(),
+        "anchored": anchored,
+        "visible_node_id": visible.strip() if isinstance(visible, str) else None,
+    }
+
+
+def record_development_step(
+    step: dict[str, Any],
+    *,
+    graph_path: Path,
+    state_path: Path,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Append a developmental step to the graph board state (lineage-visible)."""
+    normalized = _normalize_development_step(step)
+    timestamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_suffix(f"{state_path.suffix}.lock")
+
+    with STATE_WRITE_LOCK, lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        graph_id, node_ids = _graph_identity(graph_path)
+        visible = normalized.get("visible_node_id")
+        if visible is not None and visible not in node_ids:
+            # Grown nodes may not be in the compiled harness yet — allow, but
+            # keep the step visible on the board with lineage metadata.
+            pass
+        state = _read_json(state_path)
+        state_graph_id = state.get("graph_id")
+        if state_graph_id is not None and state_graph_id != graph_id:
+            raise TaskStateError(
+                HTTPStatus.CONFLICT,
+                f"state belongs to execution graph {state_graph_id}, not {graph_id}",
+            )
+        development = state.setdefault("development", {"schema": "fractal.board_development.v1", "steps": []})
+        if not isinstance(development, dict):
+            raise TaskStateError(HTTPStatus.CONFLICT, "graph development state is malformed")
+        steps = development.setdefault("steps", [])
+        if not isinstance(steps, list):
+            raise TaskStateError(HTTPStatus.CONFLICT, "graph development.steps is malformed")
+        for existing in steps:
+            if isinstance(existing, dict) and existing.get("step_id") == normalized["step_id"]:
+                raise TaskStateError(
+                    HTTPStatus.CONFLICT,
+                    f"development step {normalized['step_id']} already recorded",
+                )
+        recorded = {
+            **normalized,
+            "recorded_at": timestamp,
+        }
+        steps.append(recorded)
+        state["graph_id"] = graph_id
+        state["development"] = development
+        _write_state_atomic(state_path, state)
+        return recorded
+
+
+def development_summary(state: dict[str, Any]) -> dict[str, Any]:
+    """Board-visible developmental lineage summary for P5.4."""
+    development = state.get("development")
+    if not isinstance(development, dict):
+        return {
+            "schema": "fractal.board_development.v1",
+            "steps": [],
+            "grew_or_repaired": False,
+            "visible": False,
+        }
+    steps = development.get("steps", [])
+    steps = steps if isinstance(steps, list) else []
+    normalized = [step for step in steps if isinstance(step, dict)]
+    reshaping = [
+        step
+        for step in normalized
+        if str(step.get("operation", "")).lower() in RESHAPING_OPS
+    ]
+    return {
+        "schema": "fractal.board_development.v1",
+        "steps": normalized,
+        "grew_or_repaired": bool(reshaping),
+        "visible": bool(normalized),
+        "reshaping_count": len(reshaping),
+    }
 
 
 def parse_prd(prd_path: Path = DEFAULT_PRD, state_path: Path = DEFAULT_STATE) -> dict[str, Any]:
@@ -377,9 +622,123 @@ def parse_prd(prd_path: Path = DEFAULT_PRD, state_path: Path = DEFAULT_STATE) ->
     return view
 
 
+def parse_graph(graph_path: Path, state_path: Path | None = None) -> dict[str, Any]:
+    """Adapt a committed execution graph to the browser-ready board shape."""
+    graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    if not isinstance(graph, dict) or graph.get("schema") != "fractal.execution_graph.v1":
+        raise ValueError(f"{graph_path} is not a fractal.execution_graph.v1 graph")
+
+    state = _read_json(state_path) if state_path is not None else {}
+    state_graph_id = state.get("graph_id")
+    if state_graph_id is not None and state_graph_id != graph.get("graph_id"):
+        raise ValueError(
+            f"{state_path} belongs to execution graph {state_graph_id}, "
+            f"not {graph.get('graph_id')}"
+        )
+    assignments = state.get("assignments", {})
+    assignments = assignments if isinstance(assignments, dict) else {}
+    graph_id = graph["graph_id"]
+    nodes = graph["nodes"]
+    edges = graph["edges"]
+    tasks = []
+    for node in nodes:
+        assignment = assignments.get(node["id"])
+        assignment = dict(assignment) if isinstance(assignment, dict) else None
+        assignment_state = assignment.get("state") if assignment else None
+        status = (
+            "complete"
+            if assignment_state == "completed"
+            else "active"
+            if assignment_state == "checked_out"
+            else "incomplete"
+        )
+        tasks.append(
+            {
+                "id": node["id"],
+                "title": f"{node['kind']}: {node['capability']}",
+                "kind": "task",
+                "status": status,
+                "checked": status == "complete",
+                "assignment": assignment,
+            }
+        )
+    group_edges = [
+        {
+            key: edge[key]
+            for key in ("from", "to", "condition")
+            if key in edge
+        }
+        for edge in edges
+    ]
+    group = {
+        "id": "G0",
+        "title": "Execution graph",
+        "gate": "",
+        "tasks": tasks,
+        "edges": group_edges,
+    }
+    total = len(tasks)
+    completed = sum(task["status"] == "complete" for task in tasks)
+    active = sum(task["status"] == "active" for task in tasks)
+    incomplete = total - completed - active
+    group_status = (
+        "active"
+        if active
+        else "complete"
+        if tasks and completed == total
+        else "incomplete"
+    )
+    source_mtime = datetime.fromtimestamp(
+        graph_path.stat().st_mtime, timezone.utc
+    ).isoformat()
+    view = {
+        "schema": "fractal.execution_graph_view.v1",
+        "graph": graph,
+        "title": f"Execution graph {graph_id}",
+        "work_id": graph_id,
+        "source": graph_path.name,
+        "source_mtime": source_mtime,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "note": "",
+        "development": development_summary(state),
+        "totals": {
+            "complete": completed,
+            "active": active,
+            "incomplete": incomplete,
+            "all": total,
+            "percent": round((completed / total) * 100) if total else 0,
+        },
+        "overview": {
+            "nodes": [
+                {
+                    "id": "G0",
+                    "title": "Execution graph",
+                    "status": group_status,
+                    "completed": completed,
+                    "total": total,
+                    "progress": round((completed / total) * 100) if total else 0,
+                    "gate": "",
+                }
+            ],
+            "edges": [],
+        },
+        "groups": [group],
+    }
+    view_hash_payload = {
+        key: view[key]
+        for key in ("schema", "graph", "work_id", "source", "overview", "groups")
+    }
+    serialized_view = json.dumps(
+        view_hash_payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    view["view_hash"] = f"sha256:{hashlib.sha256(serialized_view).hexdigest()}"
+    return view
+
+
 class GraphHandler(SimpleHTTPRequestHandler):
     prd_path = DEFAULT_PRD
     state_path = DEFAULT_STATE
+    graph_path: Path | None = None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, directory=str(APP_DIR), **kwargs)
@@ -387,7 +746,10 @@ class GraphHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         route = self.path.split("?", 1)[0]
         if route == "/api/graph":
-            self._send_json(parse_prd(self.prd_path, self.state_path))
+            if self.graph_path is not None:
+                self._send_json(parse_graph(self.graph_path, self.state_path))
+            else:
+                self._send_json(parse_prd(self.prd_path, self.state_path))
             return
         if route == "/api/health":
             self._send_json({"ok": True, "service": "fractal-execution-graph"})
@@ -396,6 +758,9 @@ class GraphHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         route = self.path.split("?", 1)[0]
+        if DEVELOPMENT_RE.fullmatch(route):
+            self._handle_development_post()
+            return
         match = TASK_ACTION_RE.fullmatch(route)
         if not match:
             self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -419,17 +784,58 @@ class GraphHandler(SimpleHTTPRequestHandler):
             agent_label = payload.get("agent_label")
             if agent_label is not None and not isinstance(agent_label, str):
                 raise TaskStateError(HTTPStatus.BAD_REQUEST, "agent_label must be a string")
-            assignment = mutate_task_state(
-                match.group(2),
-                match.group(1),
-                agent_id,
-                agent_label,
-                prd_path=self.prd_path,
-                state_path=self.state_path,
-            )
+            if self.graph_path is not None:
+                assignment = mutate_graph_node_state(
+                    match.group(2),
+                    match.group(1),
+                    agent_id,
+                    agent_label,
+                    graph_path=self.graph_path,
+                    state_path=self.state_path,
+                )
+            else:
+                assignment = mutate_task_state(
+                    match.group(2),
+                    match.group(1),
+                    agent_id,
+                    agent_label,
+                    prd_path=self.prd_path,
+                    state_path=self.state_path,
+                )
             self._send_json(
                 {"ok": True, "task_id": match.group(1), "assignment": assignment}
             )
+        except TaskStateError as error:
+            self._send_json({"error": str(error)}, error.status)
+        except (json.JSONDecodeError, ValueError):
+            self._send_json({"error": "request body must be valid JSON"}, HTTPStatus.BAD_REQUEST)
+
+    def _handle_development_post(self) -> None:
+        if self.graph_path is None:
+            self._send_json(
+                {"error": "development recording requires --graph board mode"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 8192:
+                raise TaskStateError(
+                    HTTPStatus.BAD_REQUEST,
+                    "request body must be 1-8192 bytes",
+                )
+            payload = json.loads(self.rfile.read(length))
+            if not isinstance(payload, dict):
+                raise TaskStateError(
+                    HTTPStatus.BAD_REQUEST,
+                    "request body must be a JSON object",
+                )
+            recorded = record_development_step(
+                payload,
+                graph_path=self.graph_path,
+                state_path=self.state_path,
+            )
+            self._send_json({"ok": True, "step": recorded})
         except TaskStateError as error:
             self._send_json({"error": str(error)}, error.status)
         except (json.JSONDecodeError, ValueError):
@@ -455,8 +861,12 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8090)
     parser.add_argument("--prd", type=Path, default=DEFAULT_PRD)
+    parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
+    parser.add_argument("--graph", type=Path)
     args = parser.parse_args()
     GraphHandler.prd_path = args.prd.resolve()
+    GraphHandler.state_path = args.state.resolve()
+    GraphHandler.graph_path = args.graph.resolve() if args.graph is not None else None
     server = ThreadingHTTPServer((args.host, args.port), GraphHandler)
     print(f"Fractal execution graph: http://{args.host}:{args.port}/", flush=True)
     try:

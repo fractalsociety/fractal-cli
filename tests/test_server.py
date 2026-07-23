@@ -9,10 +9,208 @@ from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from execution_graph_server import GraphHandler, TaskStateError, mutate_task_state, parse_prd
+from execution_graph_server import (
+    GraphHandler,
+    TaskStateError,
+    mutate_graph_node_state,
+    mutate_task_state,
+    parse_graph,
+    parse_prd,
+)
 
 
 class ParsePrdTests(unittest.TestCase):
+    def test_committed_graph_maps_to_one_board_group(self):
+        committed = {
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_sample",
+            "work_hash": "sha256:" + "1" * 64,
+            "harness_hash": "sha256:" + "2" * 64,
+            "compiler_version": "test/1",
+            "target": "darwin-arm64",
+            "nodes": [
+                {
+                    "id": "analyze",
+                    "kind": "model",
+                    "capability": "reason",
+                    "memory_scopes": ["work"],
+                    "budget": {"timeout_ms": 1000},
+                },
+                {
+                    "id": "verify",
+                    "kind": "tool",
+                    "capability": "test",
+                    "memory_scopes": ["work"],
+                    "budget": {"timeout_ms": 1000},
+                },
+            ],
+            "edges": [
+                {
+                    "from": "analyze",
+                    "to": "verify",
+                    "condition": "predecessor_complete",
+                }
+            ],
+            "graph_hash": "sha256:" + "3" * 64,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            graph_path = Path(temp_dir) / "sample.json"
+            graph_path.write_text(json.dumps(committed), encoding="utf-8")
+            view = parse_graph(graph_path)
+
+        expected_keys = {
+            "schema",
+            "graph",
+            "title",
+            "work_id",
+            "groups",
+            "overview",
+            "totals",
+            "view_hash",
+        }
+        self.assertTrue(expected_keys.issubset(view))
+        self.assertEqual(view["graph"], committed)
+        self.assertEqual(len(view["groups"]), 1)
+        self.assertEqual(
+            view["groups"][0]["tasks"],
+            [
+                {
+                    "id": "analyze",
+                    "title": "model: reason",
+                    "kind": "task",
+                    "status": "incomplete",
+                    "checked": False,
+                    "assignment": None,
+                },
+                {
+                    "id": "verify",
+                    "title": "tool: test",
+                    "kind": "task",
+                    "status": "incomplete",
+                    "checked": False,
+                    "assignment": None,
+                },
+            ],
+        )
+        self.assertEqual(view["groups"][0]["edges"], committed["edges"])
+
+    def test_graph_node_lifecycle_is_persistent_attributed_and_conflict_safe(self):
+        committed = {
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_lifecycle",
+            "nodes": [
+                {"id": "analyze", "kind": "model", "capability": "reason"},
+                {"id": "implement", "kind": "tool", "capability": "code.edit"},
+            ],
+            "edges": [],
+        }
+        first_time = datetime(2026, 7, 23, 12, 0, tzinfo=timezone.utc)
+        second_time = datetime(2026, 7, 23, 12, 5, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            graph_path = root / "graph.json"
+            state_path = root / "graph-state.json"
+            graph_path.write_text(json.dumps(committed), encoding="utf-8")
+
+            checked_out = mutate_graph_node_state(
+                "checkout",
+                "analyze",
+                "codex-1",
+                "Coordinate · codex-1",
+                graph_path=graph_path,
+                state_path=state_path,
+                now=first_time,
+            )
+            self.assertEqual(checked_out["state"], "checked_out")
+            active = parse_graph(graph_path, state_path)
+            self.assertEqual(active["totals"], {
+                "complete": 0,
+                "active": 1,
+                "incomplete": 1,
+                "all": 2,
+                "percent": 0,
+            })
+            self.assertEqual(
+                active["groups"][0]["tasks"][0]["assignment"]["agent_id"],
+                "codex-1",
+            )
+
+            with self.assertRaises(TaskStateError) as conflict:
+                mutate_graph_node_state(
+                    "checkout",
+                    "analyze",
+                    "cursor-1",
+                    graph_path=graph_path,
+                    state_path=state_path,
+                )
+            self.assertEqual(conflict.exception.status, HTTPStatus.CONFLICT)
+
+            completed = mutate_graph_node_state(
+                "complete",
+                "analyze",
+                "codex-1",
+                graph_path=graph_path,
+                state_path=state_path,
+                now=second_time,
+            )
+            self.assertEqual(completed["state"], "completed")
+            view = parse_graph(graph_path, state_path)
+            self.assertEqual(view["groups"][0]["tasks"][0]["status"], "complete")
+            self.assertTrue(view["groups"][0]["tasks"][0]["checked"])
+            self.assertEqual(view["totals"]["complete"], 1)
+            self.assertEqual(view["totals"]["percent"], 50)
+
+            with self.assertRaises(TaskStateError) as completed_conflict:
+                mutate_graph_node_state(
+                    "checkout",
+                    "analyze",
+                    "codex-1",
+                    graph_path=graph_path,
+                    state_path=state_path,
+                )
+            self.assertEqual(completed_conflict.exception.status, HTTPStatus.CONFLICT)
+
+    def test_graph_node_release_allows_a_new_agent_to_claim(self):
+        committed = {
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_release",
+            "nodes": [{"id": "verify-related", "kind": "tool", "capability": "test"}],
+            "edges": [],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            graph_path = root / "graph.json"
+            state_path = root / "graph-state.json"
+            graph_path.write_text(json.dumps(committed), encoding="utf-8")
+
+            mutate_graph_node_state(
+                "checkout",
+                "verify-related",
+                "codex-1",
+                graph_path=graph_path,
+                state_path=state_path,
+            )
+            released = mutate_graph_node_state(
+                "release",
+                "verify-related",
+                "codex-1",
+                graph_path=graph_path,
+                state_path=state_path,
+            )
+            self.assertEqual(released["state"], "released")
+            reclaimed = mutate_graph_node_state(
+                "checkout",
+                "verify-related",
+                "cursor-1",
+                graph_path=graph_path,
+                state_path=state_path,
+            )
+            self.assertEqual(reclaimed["agent_id"], "cursor-1")
+            self.assertEqual(
+                parse_graph(graph_path, state_path)["groups"][0]["tasks"][0]["status"],
+                "active",
+            )
+
     def test_statuses_edges_and_totals(self):
         prd = """### M0 — Foundations
 - [x] M0.1 Audit system.
@@ -183,6 +381,99 @@ Gate M0 — `READY`:
                 with self.assertRaises(HTTPError) as error:
                     urlopen(conflict)
                 self.assertEqual(error.exception.code, HTTPStatus.CONFLICT)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_http_graph_mode_accepts_slug_checkout_and_completion(self):
+        committed = {
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_http",
+            "nodes": [{"id": "implement", "kind": "model", "capability": "code.edit"}],
+            "edges": [],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            graph_path = root / "graph.json"
+            state_path = root / "graph-state.json"
+            graph_path.write_text(json.dumps(committed), encoding="utf-8")
+
+            class TemporaryGraphHandler(GraphHandler):
+                def log_message(self, format, *args):  # noqa: A002
+                    pass
+
+            TemporaryGraphHandler.graph_path = graph_path
+            TemporaryGraphHandler.state_path = state_path
+            server = ThreadingHTTPServer(("127.0.0.1", 0), TemporaryGraphHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+
+            def post(action, agent_id="codex-reverse-1"):
+                return Request(
+                    f"{base}/api/tasks/implement/{action}",
+                    data=json.dumps({
+                        "agent_id": agent_id,
+                        "agent_label": f"Coordinate · {agent_id}",
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+
+            try:
+                with urlopen(post("checkout")) as response:
+                    checkout = json.load(response)
+                self.assertEqual(checkout["task_id"], "implement")
+                self.assertEqual(checkout["assignment"]["state"], "checked_out")
+
+                with urlopen(f"{base}/api/graph") as response:
+                    active = json.load(response)
+                self.assertEqual(active["groups"][0]["tasks"][0]["status"], "active")
+                self.assertEqual(active["totals"]["active"], 1)
+
+                with urlopen(post("complete")) as response:
+                    completed = json.load(response)
+                self.assertEqual(completed["assignment"]["state"], "completed")
+                with urlopen(f"{base}/api/graph") as response:
+                    view = json.load(response)
+                self.assertEqual(view["groups"][0]["tasks"][0]["status"], "complete")
+                self.assertEqual(view["totals"]["percent"], 100)
+
+                unknown = Request(
+                    f"{base}/api/tasks/not-in-graph/checkout",
+                    data=b'{"agent_id":"codex-reverse-1"}',
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(unknown)
+                self.assertEqual(error.exception.code, HTTPStatus.NOT_FOUND)
+
+                develop = Request(
+                    f"{base}/api/development",
+                    data=json.dumps({
+                        "step_id": "grow-verify-edge",
+                        "operation": "grow",
+                        "scale": "graph",
+                        "subject": "graph:fixture",
+                        "motivating_outcome": "sha256:" + ("a" * 64),
+                        "produced_outcome": "sha256:" + ("b" * 64),
+                        "anchored": True,
+                        "visible_node_id": "verify.edgecase",
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(develop) as response:
+                    recorded = json.load(response)
+                self.assertTrue(recorded["ok"])
+                self.assertEqual(recorded["step"]["operation"], "grow")
+                with urlopen(f"{base}/api/graph") as response:
+                    developed = json.load(response)
+                self.assertTrue(developed["development"]["visible"])
+                self.assertTrue(developed["development"]["grew_or_repaired"])
+                self.assertEqual(developed["development"]["reshaping_count"], 1)
             finally:
                 server.shutdown()
                 server.server_close()

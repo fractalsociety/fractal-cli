@@ -1,7 +1,7 @@
 "use strict";
 
 const NS = "http://www.w3.org/2000/svg";
-const state = { data: null, view: "overview", selected: null };
+const state = { data: null, view: "overview", selected: null, initialized: false };
 const statusNames = { complete: "Complete", active: "In progress", incomplete: "Incomplete" };
 
 const overviewPositions = {
@@ -64,7 +64,19 @@ function renderGraph() {
       positions[node.id] = [155 + column * 290, 105 + row * 130];
     });
   } else {
-    nodes.forEach(node => { positions[node.id] = overviewPositions[node.id] || [100, 100]; });
+    // Use the curated layout when present (the Mac Runtime M-board); otherwise lay
+    // milestones out in a spaced grid so ANY PRD (e.g. the P-pipeline board)
+    // renders every milestone instead of stacking them at one fallback point.
+    const overviewColumns = 4;
+    nodes.forEach((node, index) => {
+      if (overviewPositions[node.id]) {
+        positions[node.id] = overviewPositions[node.id];
+      } else {
+        const row = Math.floor(index / overviewColumns);
+        const column = index % overviewColumns;
+        positions[node.id] = [200 + column * 400, 170 + row * 260];
+      }
+    });
   }
 
   const contentWidth = taskView ? 1180 : 1745;
@@ -212,6 +224,20 @@ async function loadGraph() {
     document.getElementById("active").textContent = totals.active;
     document.getElementById("remaining").textContent = totals.incomplete;
     document.getElementById("source-label").textContent = `SOURCE · ${state.data.source} · ${new Date(state.data.source_mtime).toLocaleString()}`;
+    const development = state.data.development;
+    const note = document.getElementById("source-label");
+    if (development && development.visible) {
+      const reshaping = development.reshaping_count || 0;
+      note.textContent += ` · DEVELOPMENT · ${development.steps.length} step(s), ${reshaping} grow/repair`;
+    }
+    // A per-graph board has a single group whose "overview" is just one node;
+    // open straight to its graph nodes on first load (still navigable after).
+    if (!state.initialized) {
+      state.initialized = true;
+      if (Array.isArray(state.data.groups) && state.data.groups.length === 1) {
+        state.view = state.data.groups[0].id;
+      }
+    }
     if (state.view !== "overview" && !state.data.groups.some(group => group.id === state.view)) state.view = "overview";
     renderGraph();
   } catch (error) {
