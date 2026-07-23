@@ -251,4 +251,4 @@ async function loadGraph() {
 document.getElementById("refresh").addEventListener("click", loadGraph);
 document.getElementById("back").addEventListener("click", showOverview);
 loadGraph();
-setInterval(loadGraph, 30000);
+setInterval(loadGraph, 2000);
