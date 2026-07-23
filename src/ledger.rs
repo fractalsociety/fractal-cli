@@ -101,6 +101,13 @@ impl ScaleLedger {
         }
     }
 
+    /// Open an empty ledger from a 32-byte signing seed (so callers need not
+    /// depend on ed25519 directly).
+    #[must_use]
+    pub fn from_seed(scale: impl Into<String>, seed: [u8; 32]) -> Self {
+        Self::new(scale, SigningKey::from_bytes(&seed))
+    }
+
     /// The scale this ledger anchors.
     pub fn scale(&self) -> &str {
         &self.scale
@@ -126,9 +133,7 @@ impl ScaleLedger {
     /// when empty. This is the value a parent scale anchors when folding this
     /// ledger upward.
     pub fn head(&self) -> Hash256 {
-        self.blocks
-            .last()
-            .map_or(GENESIS_PREV, Block::header_hash)
+        self.blocks.last().map_or(GENESIS_PREV, Block::header_hash)
     }
 
     /// Seal `receipts` into a new signed block linked to the current head and
@@ -154,9 +159,7 @@ impl ScaleLedger {
         let signature: Signature = self.signing_key.sign(&block.header_hash());
         block.signature = signature.to_bytes();
         self.blocks.push(block);
-        self.blocks
-            .last()
-            .expect("a block was just appended")
+        self.blocks.last().expect("a block was just appended")
     }
 
     /// Verify the whole chain: monotone indices, intact hash links, recomputable
@@ -251,7 +254,10 @@ mod tests {
         assert_eq!(ledger.blocks().len(), 2);
         assert_eq!(ledger.blocks()[0].index, 0);
         assert_eq!(ledger.blocks()[0].prev_hash, GENESIS_PREV);
-        assert_eq!(ledger.blocks()[1].prev_hash, ledger.blocks()[0].header_hash());
+        assert_eq!(
+            ledger.blocks()[1].prev_hash,
+            ledger.blocks()[0].header_hash()
+        );
         assert_eq!(ledger.head(), ledger.blocks()[1].header_hash());
         assert_eq!(ledger.blocks()[1].receipt_count, 2);
         ledger.verify().expect("honest chain verifies");
@@ -262,10 +268,7 @@ mod tests {
         let mut ledger = seeded_ledger();
         // Flip a byte in a committed receipt payload without re-sealing.
         ledger.blocks[0].receipts[0].payload_hash[0] ^= 1;
-        assert_eq!(
-            ledger.verify(),
-            Err(ChainError::RootMismatch { index: 0 })
-        );
+        assert_eq!(ledger.verify(), Err(ChainError::RootMismatch { index: 0 }));
     }
 
     #[test]
@@ -275,10 +278,7 @@ mod tests {
         // signature no longer verifies.
         ledger.blocks[1].receipts_root[0] ^= 0xFF;
         // The root now also mismatches its receipts, caught first.
-        assert_eq!(
-            ledger.verify(),
-            Err(ChainError::RootMismatch { index: 1 })
-        );
+        assert_eq!(ledger.verify(), Err(ChainError::RootMismatch { index: 1 }));
     }
 
     #[test]
@@ -292,10 +292,7 @@ mod tests {
         forged.signature = sig.to_bytes();
         ledger.blocks[1] = forged;
         // Signature is valid for the forger, but the signer changed from block 0.
-        assert_eq!(
-            ledger.verify(),
-            Err(ChainError::BadSignature { index: 1 })
-        );
+        assert_eq!(ledger.verify(), Err(ChainError::BadSignature { index: 1 }));
     }
 
     #[test]
@@ -303,10 +300,7 @@ mod tests {
         let mut ledger = seeded_ledger();
         // Drop the middle of the link by replacing block 1's prev_hash.
         ledger.blocks[1].prev_hash[0] ^= 1;
-        assert_eq!(
-            ledger.verify(),
-            Err(ChainError::BrokenLink { index: 1 })
-        );
+        assert_eq!(ledger.verify(), Err(ChainError::BrokenLink { index: 1 }));
     }
 
     #[test]
