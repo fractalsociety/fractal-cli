@@ -18,7 +18,6 @@ pub(crate) struct RunOutcome {
     pub verified: Option<bool>,
     pub detail: String,
 }
-
 /// The headless worker to use, from `$FRACTAL_WORKER` (default `claude`).
 fn worker_kind() -> String {
     std::env::var("FRACTAL_WORKER")
@@ -134,11 +133,6 @@ fn worker_command(kind: &str, prompt: &str) -> Result<Command> {
     };
     command.env("FRACTAL_WORKER", kind);
     Ok(command)
-}
-
-/// Run the configured single worker on `instruction` in `workspace`.
-fn run_worker(instruction: &str, workspace: &Path) -> Result<bool> {
-    run_worker_as(&worker_kind(), instruction, workspace)
 }
 
 /// Run a specific `kind` of worker on `instruction` in `workspace`, streaming.
@@ -272,6 +266,18 @@ fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<(bool, Option
     }
 }
 
+/// Best-effort report of a node transition to the live board so the dashboard
+/// turns yellow (checkout) then green (complete) as agents work.
+fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str) {
+    if let Some(base) = board {
+        let url = format!("{}/api/tasks/{}/{}", base.trim_end_matches('/'), node, action);
+        let body = serde_json::json!({ "agent_id": agent, "agent_label": agent }).to_string();
+        let _ = ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_string(&body);
+    }
+}
+
 /// Shared scheduler state for the multi-agent pull-queue.
 #[derive(Default)]
 struct Schedule {
@@ -290,6 +296,7 @@ pub(crate) fn run_multi_agent(
     graph: &Value,
     workspace: &Path,
     agents: &[String],
+    board: Option<&str>,
 ) -> Result<RunOutcome> {
     let ordered = topo_order(graph)?; // validates acyclic
     let ids: Vec<String> = ordered
@@ -385,6 +392,7 @@ pub(crate) fn run_multi_agent(
                 let node = node_by_id.get(&id).expect("claimed node exists");
                 let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
                 println!("  [{agent}] ▸ checked out {id} ({capability})");
+                report_node(board, &id, "checkout", &agent);
                 let result = run_node(node, &agent, workspace);
 
                 let mut state = schedule.lock().expect("schedule lock");
@@ -400,6 +408,7 @@ pub(crate) fn run_multi_agent(
                         if ok {
                             state.completed.insert(id.clone());
                             mine += 1;
+                            report_node(board, &id, "complete", &agent);
                             println!("  [{agent}] ✓ {id}");
                         } else {
                             state.failed = Some(id.clone());
@@ -432,58 +441,4 @@ pub(crate) fn run_multi_agent(
         verified: state.verified,
         detail,
     })
-}
-
-/// Drive the whole graph: run each node, streaming progress.
-pub(crate) fn run_with_workers(graph: &Value, workspace: &Path) -> Result<RunOutcome> {
-    let ordered = topo_order(graph)?;
-    let mut built = false;
-    let mut verified = None;
-    for node in &ordered {
-        let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
-        let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
-        let instruction = node
-            .get("instruction")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-
-        if is_build(capability) {
-            println!("  ▸ {id} ({capability}) — building with {}…", worker_kind());
-            let ok = run_worker(instruction, workspace)?;
-            println!("    {} {id}", if ok { "✓" } else { "✗" });
-            built = ok;
-            if !ok {
-                return Ok(RunOutcome {
-                    built: false,
-                    verified: None,
-                    detail: format!("build node `{id}` failed"),
-                });
-            }
-        } else if is_verify(capability) {
-            println!("  ▸ {id} ({capability}) — verifying…");
-            verified = verify_workspace(workspace)?;
-            match verified {
-                Some(true) => println!("    ✓ {id} — tests pass"),
-                Some(false) => {
-                    println!("    ✗ {id} — tests failed");
-                    return Ok(RunOutcome {
-                        built,
-                        verified,
-                        detail: "verification failed".to_owned(),
-                    });
-                }
-                None => println!("    · {id} — no tests detected to run"),
-            }
-        } else {
-            // analyze / control: a plan or marker step, no worker spend.
-            println!("  · {id} ({capability})");
-        }
-    }
-    let detail = match verified {
-        Some(true) => "built and verified".to_owned(),
-        Some(false) => "built but verification failed".to_owned(),
-        None if built => "built (no tests to verify)".to_owned(),
-        None => "nothing to build".to_owned(),
-    };
-    Ok(RunOutcome { built, verified, detail })
 }

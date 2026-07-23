@@ -291,16 +291,13 @@ fn execute_request(
                 println!("  Graph is on the board. Building is off — enable it at launch to run workers.\n");
             } else {
                 if agents.len() > 1 {
-                    println!("  → executing with {} agents in {}…", agents.len(), workspace.display());
+                    println!("  → executing with {} agents in {} (board turns green live)…", agents.len(), workspace.display());
                 } else {
                     println!("  → executing in {}…", workspace.display());
                 }
+                let board_url = format!("http://127.0.0.1:{port}");
                 let outcome = graph_store::load_graph(&hash).and_then(|graph| {
-                    if agents.len() > 1 {
-                        execute::run_multi_agent(&graph, workspace, agents)
-                    } else {
-                        execute::run_with_workers(&graph, workspace)
-                    }
+                    execute::run_multi_agent(&graph, workspace, agents, Some(&board_url))
                 });
                 match outcome {
                     Ok(outcome) => {

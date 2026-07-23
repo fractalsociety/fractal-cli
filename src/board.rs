@@ -81,6 +81,44 @@ pub(crate) fn open() -> Result<()> {
     }
 }
 
+/// Launch a board backed by a raw execution-graph JSON file (fresh state).
+pub(crate) fn serve_graph_file(
+    graph_file: &Path,
+    port: u16,
+    exec_graph_dir: Option<&Path>,
+    no_open: bool,
+) -> Result<()> {
+    if !graph_file.is_file() {
+        bail!("execution graph file is missing: {}", graph_file.display());
+    }
+    let state_file = graph_file.with_extension("board-state.json");
+    let _ = std::fs::remove_file(&state_file); // start clean so progress shows
+    let viewer_dir = resolve_exec_graph_dir(exec_graph_dir)?;
+    let server_path = viewer_dir.join("server.py");
+    if !server_path.is_file() {
+        bail!("execution-graph viewer server.py is missing: {}", server_path.display());
+    }
+    Command::new("python3")
+        .arg(&server_path)
+        .arg("--graph")
+        .arg(graph_file)
+        .arg("--state")
+        .arg(&state_file)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to launch board server {}", server_path.display()))?;
+    let url = format!("http://127.0.0.1:{port}/");
+    println!("Board: {url}");
+    if !no_open {
+        let _ = Command::new("open").arg(&url).status();
+    }
+    Ok(())
+}
+
 /// Launch a board backed by one committed execution graph.
 pub(crate) fn serve_graph(
     graph_hash: &str,

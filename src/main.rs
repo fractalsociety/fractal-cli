@@ -136,22 +136,36 @@ fn print_submit_plan(
     Ok(())
 }
 
-/// Execute a committed or file-based graph in-process with the local agent team.
+/// Execute a committed or file-based graph in-process with the local agent team,
+/// serving a live board that turns green as nodes complete.
 fn run_local(args: &crate::cli::RunArgs) -> Result<()> {
-    let graph: serde_json::Value = if let Some(file) = &args.graph_file {
-        serde_json::from_slice(&std::fs::read(file)?)?
-    } else if let Some(hash) = &args.graph {
-        graph_store::load_graph(hash)?
-    } else {
-        anyhow::bail!("--local requires --graph <hash> or --graph-file <path>");
-    };
+    let (graph, graph_file): (serde_json::Value, std::path::PathBuf) =
+        if let Some(file) = &args.graph_file {
+            (serde_json::from_slice(&std::fs::read(file)?)?, file.clone())
+        } else if let Some(hash) = &args.graph {
+            (graph_store::load_graph(hash)?, graph_store::graph_path(hash))
+        } else {
+            anyhow::bail!("--local requires --graph <hash> or --graph-file <path>");
+        };
     let workspace = std::env::current_dir()?;
     let agents = execute::detect_agents();
     if agents.is_empty() {
         anyhow::bail!("no agents (claude/codex/cursor) on PATH");
     }
-    println!("Running graph with agent team: {} in {}", agents.join(", "), workspace.display());
-    let outcome = execute::run_multi_agent(&graph, &workspace, &agents)?;
+
+    let port = crate::cli::DEFAULT_GRAPH_PORT;
+    let board_url = format!("http://127.0.0.1:{port}");
+    if let Err(error) = board::serve_graph_file(&graph_file, port, None, args.dry_run) {
+        eprintln!("(board unavailable: {error:#})");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    println!(
+        "Running graph with agent team: {} in {}",
+        agents.join(", "),
+        workspace.display()
+    );
+    let outcome = execute::run_multi_agent(&graph, &workspace, &agents, Some(&board_url))?;
     println!("⇒ {}", outcome.detail);
     Ok(())
 }
