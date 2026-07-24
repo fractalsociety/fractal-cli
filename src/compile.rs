@@ -31,16 +31,21 @@ fn harness_for(selection: &HarnessSelection, goal: &str, success_criteria: &[Str
     }
 }
 
-/// Heuristic: does the goal ask to create something new (vs. repair existing
-/// code)? Greenfield verbs with no repair signal route to the build harness.
+/// Heuristic: should this compile to the task-faithful build harness (which has a
+/// real planning node and grades on the work's own acceptance) rather than the
+/// repository-repair fixture (which assumes an existing repo to edit)?
+///
+/// Only a clear repair signal keeps the repair fixture. Everything else — an
+/// explicit build verb, or an open-ended directive like "work on the PRD" / "ship
+/// the roadmap" / "execute the spec" — routes to the build harness, because those
+/// are greenfield planning tasks, not edits to a failing repo. (Previously an
+/// open-ended goal with no build verb fell through to the repair fixture, whose
+/// passive `analyze` node does no planning at all — which is why "work on the prd"
+/// never produced a task breakdown.)
 fn goal_is_greenfield_build(goal: &str) -> bool {
     let goal = goal.to_ascii_lowercase();
     const REPAIR: [&str; 6] = ["fix", "repair", "bug", "regression", "debug", "failing"];
-    if REPAIR.iter().any(|word| goal.contains(word)) {
-        return false;
-    }
-    const BUILD: [&str; 6] = ["build", "create", "write", "implement", "make", "generate"];
-    BUILD.iter().any(|word| goal.contains(word))
+    !REPAIR.iter().any(|word| goal.contains(word))
 }
 
 /// A task-faithful greenfield build harness. The `implement` node produces the
@@ -58,13 +63,16 @@ fn build_harness(selection: &HarnessSelection, goal: &str, success_criteria: &[S
     // implementation and the tests are written *simultaneously* by two different
     // agents, a third cross-checks them, and finally the suite is verified.
     let plan = format!(
-        "Plan the build for: {goal}. Write INTERFACE.md stating the single module filename (e.g. solution.py), the public function name(s) and signatures, and 3-5 behaviors/edge cases it must satisfy: {criteria}. Keep it short and concrete so two agents can build the code and the tests in parallel from it."
+        "Plan the build for: {goal}. Optimize for the BEST performance and quality of the product itself — correctness, robustness, and the behaviors that matter — NOT for the lowest cost or the least effort. \
+         First reason briefly through 2-3 alternative implementation approaches and choose the one that maximizes product performance, noting why the others are weaker. \
+         Then write INTERFACE.md stating: the single module filename (e.g. solution.py); the public function name(s) and signatures; the chosen approach (1-2 lines) and the alternatives you rejected; and — as your own acceptance BENCHMARKS — 5-8 concrete, measurable behaviors and edge cases the product must satisfy to count as high-performing: {criteria}. \
+         Make the benchmarks demanding and specific so they genuinely test performance, not just happy-path. Keep it concrete so two agents can build the code and the tests in parallel from it."
     );
     let implement = format!(
         "Read INTERFACE.md and implement the module file exactly as specified for: {goal}. Self-contained, no network. Do not write tests — another agent is doing that in parallel."
     );
     let author_tests = format!(
-        "Read INTERFACE.md and write a Python `unittest` test file (test_<module>.py) that imports the module and tests every behavior/edge case listed for: {goal}. Do not write the implementation — another agent is doing that in parallel."
+        "Read INTERFACE.md and write a Python `unittest` test file (test_<module>.py) that imports the module and rigorously tests EVERY benchmark behavior and edge case the plan listed for: {goal}. The plan's benchmarks are the bar for high performance, so make the tests demanding — cover the edge cases and failure modes, not just the happy path. Do not write the implementation — another agent is doing that in parallel."
     );
     let review = format!(
         "The implementation and the tests were written in parallel by two agents. Run `python3 -m unittest`, then reconcile them: fix any import/name/signature mismatch so the tests exercise the implementation and all tests pass. Criteria: {criteria}."

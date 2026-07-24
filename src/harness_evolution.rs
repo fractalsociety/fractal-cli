@@ -267,18 +267,55 @@ fn apply_grow(
     attribution: &AttributionReport,
 ) -> Result<ArmResult> {
     let source = source_code_node(graph).unwrap_or_else(|| failed_node.to_owned());
+    grow_arm(
+        graph,
+        current_hash,
+        &source,
+        failed_node,
+        attribution,
+        GrowTrigger {
+            morphogen_name: "grow.verify_after_failure",
+            trigger_kind: "node_failed",
+            predicate: "verify.state == failed",
+            event_kind: GraphEventKind::NodeFailed,
+            causal: "add a verification floor for the failed acceptance",
+        },
+    )
+}
+
+/// A grow morphogen's trigger flavour — a failure grow and a proactive mid-run
+/// grow differ only in what fired them, so they share `grow_arm`.
+struct GrowTrigger {
+    morphogen_name: &'static str,
+    trigger_kind: &'static str,
+    predicate: &'static str,
+    event_kind: GraphEventKind,
+    causal: &'static str,
+}
+
+/// Shared grow implementation: build the grow morphogen, propose the bounded
+/// verification growth off `source`, guard the immutable boundary, then realise
+/// the child either by recompiling the mutated genome or splicing the diff.
+fn grow_arm(
+    graph: &Value,
+    current_hash: &str,
+    source: &str,
+    event_node: &str,
+    attribution: &AttributionReport,
+    trigger: GrowTrigger,
+) -> Result<ArmResult> {
     let morphogen = build_morphogen(
-        "grow.verify_after_failure",
+        trigger.morphogen_name,
         MorphogenTrigger {
-            kind: "node_failed".to_owned(),
-            predicate: "verify.state == failed".to_owned(),
+            kind: trigger.trigger_kind.to_owned(),
+            predicate: trigger.predicate.to_owned(),
         },
         MorphogenOperation::Grow,
         MorphogenDiffBounds {
             max_changed_nodes: 2,
             max_changed_edges: 2,
         },
-        "add a verification floor for the failed acceptance",
+        trigger.causal,
         MorphogenScale::Subgraph,
         vec!["harness-topology".to_owned()],
     )
@@ -295,15 +332,15 @@ fn apply_grow(
         scale: MorphogenScale::Subgraph,
         causal_hypothesis: morphogen.causal_hypothesis.clone(),
         event: GraphEvent {
-            kind: GraphEventKind::NodeFailed,
-            node_id: Some(failed_node.to_owned()),
+            kind: trigger.event_kind,
+            node_id: Some(event_node.to_owned()),
             observed_at_ms: now_ms(),
         },
         parent_graph_hash: current_hash.to_owned(),
     };
 
     let growth =
-        propose_verification_growth(&morphogen, &fired, &harness, &grammar, &source, attribution)
+        propose_verification_growth(&morphogen, &fired, &harness, &grammar, source, attribution)
             .map_err(|error| anyhow!("growth proposal rejected: {error}"))?;
 
     // Immutable-boundary guard on the mutation target (harness topology is mutable).
@@ -322,7 +359,7 @@ fn apply_grow(
     // and recompile it through `fractal-harnessc`; fall back to a graph splice
     // when the source genome is unavailable or the recompile is rejected.
     let (mut child, recompiled_source, how) = match recompiled_child(current_hash, |harness| {
-        harness_add_verification(harness, &source, &verify_id);
+        harness_add_verification(harness, source, &verify_id);
     }) {
         Some((graph, harness, work, target_id)) => {
             (graph, Some((harness, work, target_id)), "recompiled genome")
@@ -337,6 +374,63 @@ fn apply_grow(
         morphogen_id: morphogen.morphogen_id,
         operation: MorphogenOperation::Grow,
         recompiled_source,
+    })
+}
+
+/// Mid-run, PROACTIVE grow: fire a `grow.verification` morphogen *while the run is
+/// still in flight* — not on a failure — because progress signals (a slow / costly
+/// node) say the remaining work needs a verification checkpoint. Grafts the
+/// verification node off `source_node`, governs it (panels / anomaly / promotion +
+/// an open canary), and returns the committed child so the supervisor can re-point
+/// the board and keep executing the adapted graph. Reuses the same governed path
+/// as failure-driven evolution, so mid-run mutations are held to the same floor.
+pub(crate) fn grow_proactive(
+    graph: &Value,
+    current_hash: &str,
+    source_node: &str,
+) -> Result<Evolution> {
+    let attribution = attribution_for(source_node, 0);
+    let result = grow_arm(
+        graph,
+        current_hash,
+        source_node,
+        source_node,
+        &attribution,
+        GrowTrigger {
+            morphogen_name: "grow.verify_on_slow_progress",
+            trigger_kind: "node_slow",
+            predicate: "progress.latency_ms > budget",
+            event_kind: GraphEventKind::NodeComplete,
+            causal: "graft a proactive verification checkpoint on a slow/costly node",
+        },
+    )?;
+
+    let child_hash = commit_child(result.child_graph.clone())?;
+    if let Some((harness, work, target_id)) = &result.recompiled_source {
+        graph_store::persist_source(&child_hash, harness, work, target_id).ok();
+    }
+
+    let motivating_hash = format!("sha256:midrun-grow:{source_node}");
+    let verified_count = past_successes(ARM_GROW);
+    let (governance, verdict) = govern(
+        ARM_GROW,
+        &result,
+        graph,
+        current_hash,
+        &graph_id_of(graph),
+        verified_count,
+        &motivating_hash,
+    );
+
+    Ok(Evolution {
+        child_hash,
+        child_graph: result.child_graph,
+        arm: ARM_GROW.to_owned(),
+        context_bp: context_features(cause_index("harness"), 0),
+        cause: "progress".to_owned(),
+        note: result.note,
+        verdict,
+        governance,
     })
 }
 

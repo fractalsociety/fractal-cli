@@ -61,7 +61,15 @@ fn hex(hash: &Hash256) -> String {
     s
 }
 
-fn hex_to_hash(hexstr: &str) -> Hash256 {
+/// Extract the port from a board URL like `http://127.0.0.1:8092`.
+pub(crate) fn board_port(url: &str) -> Option<u16> {
+    url.trim_end_matches('/')
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse::<u16>().ok())
+}
+
+pub(crate) fn hex_to_hash(hexstr: &str) -> Hash256 {
     let hexstr = hexstr.strip_prefix("sha256:").unwrap_or(hexstr);
     let mut out = [0u8; 32];
     for (index, chunk) in hexstr.as_bytes().chunks(2).take(32).enumerate() {
@@ -105,6 +113,23 @@ pub(crate) fn run_end_to_end(
     )> = None;
     let outcome = loop {
         let outcome = match backend {
+            // Mid-run morphogenesis supervisor: drives the graph wave-by-wave and
+            // fires proactive governed morphogens between waves (adapting the graph
+            // continuously), returning the possibly-evolved graph to continue from.
+            Backend::InProcess if crate::supervise::enabled() => {
+                let supervised = crate::supervise::run_supervised(
+                    graph.clone(),
+                    &current_hash,
+                    &graph_id,
+                    workspace,
+                    agents,
+                    board,
+                    &ledger,
+                )?;
+                graph = supervised.graph;
+                current_hash = supervised.hash;
+                supervised.outcome
+            }
             Backend::InProcess => execute::run_multi_agent(&graph, workspace, agents, board)?,
             Backend::Coordinate => crate::coordinate::run_via_coordinate(
                 &current_hash,
@@ -189,6 +214,21 @@ pub(crate) fn run_end_to_end(
                 "  ⟳ persisted evolved harness {} (lineage on-chain)",
                 &evolution.child_hash[..23.min(evolution.child_hash.len())]
             );
+
+            // Board follows the evolution: re-point the live board to the child
+            // graph so the grown / differentiated / repaired tasks appear on the
+            // board (with the child's `parent_graph` / `evolution_arm` lineage),
+            // instead of the board staying on the original planned tasks.
+            if let Some(url) = board {
+                if let Some(port) = board_port(url) {
+                    println!("  ⟳ board now following the evolved graph…");
+                    if let Err(error) =
+                        crate::board::serve_graph(&evolution.child_hash, port, None, true)
+                    {
+                        eprintln!("  (board follow unavailable: {error:#})");
+                    }
+                }
+            }
 
             // (5) Re-run the evolved harness; reward + canary settle next iteration.
             pending = Some((

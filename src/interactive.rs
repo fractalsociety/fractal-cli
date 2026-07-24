@@ -358,6 +358,20 @@ fn persist_trust(store: &Path, workspace: &Path) -> Result<()> {
 }
 
 /// Compile + commit a graph for one request and open its board.
+/// Echo the key committed-graph lines from a submit plan to the console.
+fn print_committed_plan_lines(text: &str) {
+    for line in text.lines() {
+        if line.starts_with("Harness:")
+            || line.starts_with("Graph id:")
+            || line.starts_with("Graph hash:")
+            || line.starts_with("Nodes:")
+            || line.starts_with("Committed:")
+        {
+            println!("  {line}");
+        }
+    }
+}
+
 fn execute_request(
     request: &str,
     workspace: &Path,
@@ -377,20 +391,51 @@ fn execute_request(
         );
     }
 
-    let plan =
-        pipeline::render_submit_plan(request, Some(Mode::Build), None, Some(workspace), mapped)?;
-    for line in plan.text.lines() {
-        if line.starts_with("Harness:")
-            || line.starts_with("Graph id:")
-            || line.starts_with("Graph hash:")
-            || line.starts_with("Nodes:")
-            || line.starts_with("Committed:")
-        {
-            println!("  {line}");
+    // PRD-decomposition path: if the request names a PRD/spec file, the lead
+    // planner reads it and decomposes it into a task DAG that becomes the graph —
+    // instead of collapsing the whole PRD into one fixed template harness. Falls
+    // back to the standard harness when no PRD is referenced (or planning fails).
+    let committed_hash = match crate::decompose::maybe_decompose(request, workspace, agents) {
+        Some(Ok(hash)) => {
+            println!("  Harness: harness.prd_decomposition.v1 (PRD → task DAG)");
+            if let Ok(graph) = graph_store::load_graph(&hash) {
+                let count = |key| {
+                    graph
+                        .get(key)
+                        .and_then(|v| v.as_array())
+                        .map_or(0, Vec::len)
+                };
+                println!("  Graph hash: {hash}");
+                println!("  Nodes: {}  Edges: {}", count("nodes"), count("edges"));
+            }
+            Some(hash)
         }
-    }
+        Some(Err(error)) => {
+            eprintln!("  (PRD decomposition failed: {error:#}; using the standard harness)");
+            let plan = pipeline::render_submit_plan(
+                request,
+                Some(Mode::Build),
+                None,
+                Some(workspace),
+                mapped,
+            )?;
+            print_committed_plan_lines(&plan.text);
+            plan.committed_graph_hash
+        }
+        None => {
+            let plan = pipeline::render_submit_plan(
+                request,
+                Some(Mode::Build),
+                None,
+                Some(workspace),
+                mapped,
+            )?;
+            print_committed_plan_lines(&plan.text);
+            plan.committed_graph_hash
+        }
+    };
 
-    match plan.committed_graph_hash {
+    match committed_hash {
         Some(hash) => {
             println!("  → opening the live board for this graph…");
             if let Err(error) = board::serve_graph(&hash, port, None, false) {

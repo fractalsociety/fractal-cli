@@ -19,8 +19,15 @@ pub(crate) struct NodeRun {
     pub agent: String,
     pub is_verify: bool,
     pub ok: bool,
+    /// The evidence-floor verdict when this was a verify node that actually ran a
+    /// suite (`None` when the node was not a verifier or had nothing to verify).
+    pub verified: Option<bool>,
     /// Content-addressed evidence digest (hex) of the workspace after the node.
     pub evidence_hex: String,
+    /// Wall-clock time the node's agent took, in milliseconds — a progress
+    /// signal the mid-run morphogenesis supervisor reads (a slow node triggers a
+    /// proactive verification graft). Zero when unmeasured.
+    pub latency_ms: u64,
 }
 
 /// Outcome of driving one graph.
@@ -46,13 +53,13 @@ pub(crate) fn worker_label() -> String {
     worker_kind()
 }
 
-fn is_build(capability: &str) -> bool {
+pub(crate) fn is_build(capability: &str) -> bool {
     capability.contains("code.generate")
         || capability.ends_with(".edit")
         || capability.contains("code.write")
 }
 
-fn is_verify(capability: &str) -> bool {
+pub(crate) fn is_verify(capability: &str) -> bool {
     capability.contains("tests") || capability.contains("verify")
 }
 
@@ -190,9 +197,16 @@ fn run_worker_as(kind: &str, instruction: &str, workspace: &Path) -> Result<bool
          entirely in the current directory. Create or edit only the files this task needs and make \
          any tests pass. Do not ask questions; make reasonable choices."
     );
+    run_agent_prompt(kind, &prompt, workspace)
+}
+
+/// Run an agent with a verbatim prompt (no team-task wrapper), streaming its output
+/// in `workspace`. Used by the PRD-decomposition planner, which needs full control
+/// of the planning prompt rather than the per-node task wrapper.
+pub(crate) fn run_agent_prompt(kind: &str, prompt: &str, workspace: &Path) -> Result<bool> {
     // Detach the worker's stdin: headless agents (e.g. `claude -p`) otherwise
     // inherit the CLI's piped stdin and block reading it instead of exiting.
-    let status = worker_command(kind, &prompt)?
+    let status = worker_command(kind, prompt)?
         .current_dir(workspace)
         .stdin(std::process::Stdio::null())
         .status()
@@ -483,10 +497,13 @@ pub(crate) fn run_multi_agent(
                     println!("{clr}  [{agent}] ▸ checked out {id} ({capability})");
                 }
                 report_node(board, &id, "checkout", &agent);
+                let started = std::time::Instant::now();
                 let result = run_node(node, &agent, workspace);
+                let latency_ms = started.elapsed().as_millis() as u64;
 
                 let evidence_hex = workspace_digest(workspace);
                 let node_is_verify = is_verify(capability);
+                let mut node_verified: Option<bool> = None;
                 let mut state = schedule.lock().expect("schedule lock");
                 state.in_progress.remove(&id);
                 let node_ok = match result {
@@ -494,6 +511,7 @@ pub(crate) fn run_multi_agent(
                         if is_build(capability) && ok {
                             state.built = true;
                         }
+                        node_verified = verified;
                         if let Some(value) = verified {
                             state.verified = Some(value);
                         }
@@ -527,7 +545,9 @@ pub(crate) fn run_multi_agent(
                     agent: agent.clone(),
                     is_verify: node_is_verify,
                     ok: node_ok,
+                    verified: node_verified,
                     evidence_hex,
+                    latency_ms,
                 });
               }
             });
@@ -552,4 +572,156 @@ pub(crate) fn run_multi_agent(
         failed_node: state.failed.clone(),
         log: state.log.clone(),
     })
+}
+
+/// Predecessor map: for each node id, the ids that must complete before it runs.
+pub(crate) fn predecessor_map(graph: &Value) -> BTreeMap<String, Vec<String>> {
+    let ids: Vec<String> = graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| node.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let mut preds: BTreeMap<String, Vec<String>> =
+        ids.iter().map(|id| (id.clone(), Vec::new())).collect();
+    for edge in graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let (Some(from), Some(to)) = (
+            edge.get("from").and_then(Value::as_str),
+            edge.get("to").and_then(Value::as_str),
+        ) {
+            if let Some(list) = preds.get_mut(to) {
+                list.push(from.to_owned());
+            }
+        }
+    }
+    preds
+}
+
+/// The dependency-ready frontier: nodes not yet in `completed` whose predecessors
+/// are all complete, in the graph's node order. This is the mid-run supervisor's
+/// unit of work — one wave — after which morphogen triggers are evaluated.
+pub(crate) fn ready_frontier(graph: &Value, completed: &BTreeSet<String>) -> Vec<Value> {
+    let preds = predecessor_map(graph);
+    graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|node| {
+            let id = node.get("id").and_then(Value::as_str).unwrap_or("");
+            !id.is_empty()
+                && !completed.contains(id)
+                && preds
+                    .get(id)
+                    .map(|list| list.iter().all(|pred| completed.contains(pred)))
+                    .unwrap_or(true)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Execute one node with one agent, timing it and reporting board transitions.
+/// Mirrors the per-node body of `run_multi_agent` and is the shared unit both the
+/// whole-graph executor and the wave executor build on.
+fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&str>) -> NodeRun {
+    let id = node
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
+    let clr = crate::ui::CLEAR_LINE;
+    println!("{clr}  [{agent}] ▸ {id} ({capability})");
+    report_node(board, &id, "checkout", agent);
+    let started = std::time::Instant::now();
+    let result = run_node(node, agent, workspace);
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let evidence_hex = workspace_digest(workspace);
+    let is_verify_node = is_verify(capability);
+    let mut verified = None;
+    let ok = match result {
+        Ok(NodeOutcome {
+            ok,
+            verified: node_verified,
+            note,
+        }) => {
+            verified = node_verified;
+            let suffix = note
+                .as_deref()
+                .map(|note| format!(" — {note}"))
+                .unwrap_or_default();
+            if ok {
+                report_node(board, &id, "complete", agent);
+                println!("{clr}  [{agent}] ✓ {id}{suffix}");
+            } else {
+                println!("{clr}  [{agent}] ✗ {id}{suffix}");
+            }
+            ok
+        }
+        Err(error) => {
+            eprintln!("  [{agent}] ✗ {id}: {error:#}");
+            false
+        }
+    };
+    NodeRun {
+        node: id,
+        agent: agent.to_owned(),
+        is_verify: is_verify_node,
+        ok,
+        verified,
+        evidence_hex,
+        latency_ms,
+    }
+}
+
+/// Run one wave — a set of already-ready, mutually independent nodes — in parallel
+/// across the agent team, role-aware (the lead runs root/control nodes; workers
+/// run the coding/verify tasks; a solo agent runs everything). Returns one
+/// `NodeRun` per node. The mid-run supervisor calls this once per frontier.
+pub(crate) fn run_wave(
+    nodes: &[Value],
+    graph: &Value,
+    agents: &[String],
+    workspace: &Path,
+    board: Option<&str>,
+) -> Vec<NodeRun> {
+    let preds = predecessor_map(graph);
+    let lead: &str = agents.first().map(String::as_str).unwrap_or("");
+    let has_workers = agents.len() > 1;
+    let workers: Vec<&str> = if has_workers {
+        agents[1..].iter().map(String::as_str).collect()
+    } else {
+        vec![lead]
+    };
+    let runs = Mutex::new(Vec::new());
+    let next_worker = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for node in nodes {
+            let id = node.get("id").and_then(Value::as_str).unwrap_or("");
+            let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
+            let is_root = preds.get(id).map(|p| p.is_empty()).unwrap_or(true);
+            let is_control = capability.starts_with("control.");
+            // Role assignment mirrors the pull-queue: lead owns root + control,
+            // workers own the middle. Workers are handed out round-robin so a
+            // multi-node wave (e.g. implement ∥ author_tests) runs in parallel.
+            let agent: String = if !has_workers || is_root || is_control {
+                lead.to_owned()
+            } else {
+                let idx = next_worker.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                workers[idx % workers.len()].to_owned()
+            };
+            let (node, runs) = (node, &runs);
+            scope.spawn(move || {
+                let run = run_and_record(node, &agent, workspace, board);
+                runs.lock().expect("wave runs lock").push(run);
+            });
+        }
+    });
+    runs.into_inner().expect("wave runs")
 }
