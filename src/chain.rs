@@ -4,12 +4,15 @@
 //! receipt on a graph-scale [`fractal_chain::ScaleLedger`]. The whole run is then
 //! auditable and tamper-evident, and folds into the wider chain.
 
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fractal_chain::{
     anchor_node_execution, anchor_promotion, anchor_step, anchor_verifier_verdict, commit_anchors,
-    payload_hash_str, AnchorEvent, DevelopmentalStep, Hash256, ScaleLedger,
+    fold_child_into_parent, payload_hash_str, verify_child_anchored, AnchorEvent,
+    DevelopmentalStep, Hash256, Receipt, ReceiptKind, ScaleLedger,
 };
 
 /// A thread-safe signed ledger for one interactive run.
@@ -31,6 +34,87 @@ fn hex(hash: &Hash256) -> String {
         s.push_str(&format!("{byte:02x}"));
     }
     s
+}
+
+fn hex_to_hash(hexstr: &str) -> Hash256 {
+    let hexstr = hexstr.strip_prefix("sha256:").unwrap_or(hexstr);
+    let mut out = [0u8; 32];
+    for (index, chunk) in hexstr.as_bytes().chunks(2).take(32).enumerate() {
+        out[index] = std::str::from_utf8(chunk)
+            .ok()
+            .and_then(|s| u8::from_str_radix(s, 16).ok())
+            .unwrap_or(0);
+    }
+    out
+}
+
+fn chain_dir() -> PathBuf {
+    let root = match std::env::var_os("FRACTAL_HOME") {
+        Some(home) => PathBuf::from(home),
+        None => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(".fractal"),
+            None => PathBuf::from(".fractal"),
+        },
+    };
+    root.join("chain")
+}
+
+/// The durable, append-only fold log for the per-home machine-scale chain.
+fn fold_log_path() -> PathBuf {
+    chain_dir().join("machine-fold-log.jsonl")
+}
+
+/// Stable per-home signing seed for the machine-scale chain.
+fn machine_seed() -> [u8; 32] {
+    payload_hash_str(&format!("fractal.machine.v1:{}", chain_dir().display()))
+}
+
+/// Reconstruct the durable machine-scale ledger by replaying the fold log. Each
+/// log entry replays the exact `Lineage` receipt `fold_child_into_parent` would
+/// append (`child.scale`, `child.head`, timestamp), so the ledger is rebuilt
+/// deterministically and signs identically across runs.
+fn machine_ledger() -> ScaleLedger {
+    let mut machine = ScaleLedger::from_seed("machine", machine_seed());
+    if let Ok(text) = std::fs::read_to_string(fold_log_path()) {
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let scale = record
+                .get("child_scale")
+                .and_then(|value| value.as_str())
+                .unwrap_or("graph");
+            let root = record
+                .get("child_root")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let timestamp = record
+                .get("timestamp_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let receipt = Receipt::new(ReceiptKind::Lineage, scale, hex_to_hash(root), timestamp);
+            machine.append(vec![receipt], timestamp);
+        }
+    }
+    machine
+}
+
+/// Summary of the durable machine-scale chain after a fold.
+pub(crate) struct FoldSummary {
+    /// Runs anchored into the machine chain (one block per run).
+    pub runs: usize,
+    /// Global machine-chain root hash (hex).
+    pub machine_root: String,
+    /// Whether the machine chain currently verifies.
+    pub verified: bool,
+}
+
+/// Reconstruct and verify the durable machine-scale chain without folding.
+/// `(runs_anchored, machine_root_hex, verified)`.
+pub(crate) fn machine_summary() -> (usize, String, bool) {
+    let machine = machine_ledger();
+    let verified = machine.verify().is_ok();
+    (machine.blocks().len(), hex(&machine.head()), verified)
 }
 
 impl RunLedger {
@@ -115,5 +199,45 @@ impl RunLedger {
             ),
             Err(_) => (0, hex(&[0u8; 32]), false),
         }
+    }
+
+    /// Fold this run's signed graph-scale head into the durable, per-home
+    /// machine-scale chain and persist the fold so the chain accumulates across
+    /// runs. The machine ledger is reconstructed by replay, this run's head is
+    /// folded in as a signed lineage receipt, both chains are re-verified, and
+    /// the fold is appended to the log. Returns `None` on any error.
+    pub(crate) fn fold_into_machine(&self, verified: bool) -> Option<FoldSummary> {
+        let run = self.ledger.lock().ok()?;
+        let mut machine = machine_ledger();
+        let timestamp = now_ms();
+
+        // Fold graph→machine (verifies both chains + scale-tower adjacency).
+        fold_child_into_parent(&mut machine, &run, timestamp).ok()?;
+        machine.verify().ok()?;
+        verify_child_anchored(&machine, &run).ok()?;
+
+        // Persist the fold for deterministic replay on the next run.
+        let record = serde_json::json!({
+            "child_scale": run.scale(),
+            "child_root": hex(&run.head()),
+            "timestamp_ms": timestamp,
+            "graph_id": self.graph_id,
+            "verified": verified,
+            "receipts": run.blocks().len(),
+        });
+        std::fs::create_dir_all(chain_dir()).ok();
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(fold_log_path())
+        {
+            let _ = writeln!(file, "{record}");
+        }
+
+        Some(FoldSummary {
+            runs: machine.blocks().len(),
+            machine_root: hex(&machine.head()),
+            verified: machine.verify().is_ok(),
+        })
     }
 }

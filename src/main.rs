@@ -13,6 +13,7 @@ mod intent;
 mod interactive;
 mod orchestrate;
 mod pipeline;
+mod rlvr;
 mod router;
 mod run;
 mod safety;
@@ -98,6 +99,35 @@ fn run(cli: Cli) -> Result<()> {
         (None, Some(Command::Clean(args))) => {
             let removed = safety::guarded_clear(&args.dir, args.yes)?;
             println!("Cleared {removed} item(s) from {}", args.dir.display());
+            Ok(())
+        }
+        (None, Some(Command::Train)) => {
+            let count = rlvr::available_rollouts();
+            match rlvr::train()? {
+                Some(report) => {
+                    println!("GRPO training over {count} verifiable rollout(s):");
+                    println!("  {report}");
+                }
+                None if count < 2 => println!(
+                    "Not enough accumulated verifiable rewards yet ({count}); run a few builds first."
+                ),
+                None => println!(
+                    "fractal-rlvr not found. Build it (cargo build -p fractal-rlvr) or set $FRACTAL_RLVR_BIN."
+                ),
+            }
+            Ok(())
+        }
+        (None, Some(Command::Chain)) => {
+            let (runs, root, verified) = chain::machine_summary();
+            if runs == 0 {
+                println!("Machine chain is empty — no runs have been folded in yet.");
+            } else {
+                println!(
+                    "Machine chain: {runs} run(s) anchored · root {} · {}",
+                    &root[..23.min(root.len())],
+                    if verified { "verified" } else { "INVALID" }
+                );
+            }
             Ok(())
         }
         (None, Some(Command::Version)) => {

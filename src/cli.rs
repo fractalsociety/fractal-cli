@@ -51,6 +51,10 @@ pub(crate) enum Command {
     Node(NodeArgs),
     /// Safely clear a fractal workspace/test folder (guarded + confirmed).
     Clean(CleanArgs),
+    /// GRPO-train an adapter from accumulated verifiable rewards (fractal-rlvr).
+    Train,
+    /// Show + verify the durable machine-scale chain of folded run receipts.
+    Chain,
     /// Print the Fractal CLI version.
     Version,
 }

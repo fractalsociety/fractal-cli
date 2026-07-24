@@ -279,16 +279,51 @@ pub(crate) fn compile_graph(
         })
         .unwrap_or_default();
     let harness = harness_for(selection, goal, &success_criteria);
-    let registry = build_registry(&harness);
+    let target_id = target_id(target);
+    let graph = recompile(work, &harness, target_id)?;
+
+    // Persist the compile inputs (harness genome + work + target) alongside the
+    // graph so harness evolution can mutate the genome and recompile it.
+    if let Some(hash) = graph.get("graph_hash").and_then(Value::as_str) {
+        crate::graph_store::persist_source(hash, &harness, work, target_id).ok();
+    }
+    Ok(graph)
+}
+
+/// Stable identifier for a compile target (round-trips through the source sidecar).
+fn target_id(target: fractal_harnessc::Target) -> &'static str {
+    match target {
+        fractal_harnessc::Target::CudaVllmOci => "cuda-linux",
+        fractal_harnessc::Target::DarwinMlxApple => "darwin-arm64",
+    }
+}
+
+fn target_from_id(target_id: &str) -> fractal_harnessc::Target {
+    match target_id {
+        "cuda-linux" => fractal_harnessc::Target::CudaVllmOci,
+        _ => fractal_harnessc::Target::DarwinMlxApple,
+    }
+}
+
+/// Compile a harness genome + work into an execution graph. This is the single
+/// genome→graph hop, shared by the initial compile and by harness evolution's
+/// recompile-after-mutation path.
+pub(crate) fn recompile(work: &Value, harness: &Value, target_id: &str) -> Result<Value> {
+    let registry = build_registry(harness);
     let mut authorized_work = work.clone();
 
     // NL work describes intent-level requirements. Compilation additionally
     // authorizes the concrete selected harness's capabilities and memory scopes
     // on this copy, leaving the submitted FractalWork object unchanged.
-    augment_work_authorizations(&mut authorized_work, &harness)?;
+    augment_work_authorizations(&mut authorized_work, harness)?;
 
-    fractal_harnessc::compile(&authorized_work, &harness, &registry, target)
-        .map_err(|error| anyhow!("fractal-harnessc compile failed: {error}"))
+    fractal_harnessc::compile(
+        &authorized_work,
+        harness,
+        &registry,
+        target_from_id(target_id),
+    )
+    .map_err(|error| anyhow!("fractal-harnessc compile failed: {error}"))
 }
 
 fn augment_work_authorizations(work: &mut Value, harness: &Value) -> Result<()> {
@@ -359,6 +394,19 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::compile_graph;
+
+    /// Isolate `FRACTAL_HOME` (compile now persists a genome sidecar) and
+    /// serialize with the other tests that mutate the environment.
+    fn isolate() -> (
+        std::sync::MutexGuard<'static, ()>,
+        crate::graph_store::TestHome,
+    ) {
+        let lock = crate::graph_store::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = crate::graph_store::TestHome::new("compile").expect("test home");
+        (lock, home)
+    }
     use crate::harness::{select_harness, HarnessSelection};
 
     fn representative_work() -> Value {
@@ -388,6 +436,7 @@ mod tests {
 
     #[test]
     fn code_family_compiles_to_execution_graph() {
+        let _guard = isolate();
         let graph = compile_graph(
             &representative_work(),
             &select_harness("nl.code"),
@@ -406,6 +455,7 @@ mod tests {
 
     #[test]
     fn greenfield_build_uses_task_faithful_acceptance_harness() {
+        let _guard = isolate();
         let mut work = representative_work();
         work["goal"] = json!("Build a tiny CLI that reverses a string, with a passing test.");
         let graph = compile_graph(&work, &select_harness("nl.code"), Target::DarwinMlxApple)
@@ -458,6 +508,7 @@ mod tests {
 
     #[test]
     fn repair_goal_keeps_python_repair_fixture() {
+        let _guard = isolate();
         let mut work = representative_work();
         work["goal"] = json!("Fix the failing reverse test in the parser module.");
         let graph = compile_graph(&work, &select_harness("nl.code"), Target::DarwinMlxApple)
@@ -469,6 +520,7 @@ mod tests {
 
     #[test]
     fn repeated_compilation_is_deterministic() {
+        let _guard = isolate();
         let work = representative_work();
         let selection = select_harness("nl.code");
         let first = compile_graph(&work, &selection, Target::DarwinMlxApple)
@@ -481,6 +533,7 @@ mod tests {
 
     #[test]
     fn unknown_family_uses_valid_minimal_harness() {
+        let _guard = isolate();
         let selection = HarnessSelection {
             harness_id: "harness.generic_task.v1".to_owned(),
             family: "unknown-family".to_owned(),

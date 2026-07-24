@@ -39,6 +39,49 @@ pub(crate) fn graph_path(graph_hash: &str) -> PathBuf {
         .join(format!("{}.json", graph_hash.trim_start_matches("sha256:")))
 }
 
+/// Sidecar path holding the compile inputs (harness genome + work + target) for
+/// a committed graph, so harness evolution can mutate the genome and recompile.
+pub(crate) fn source_path(graph_hash: &str) -> PathBuf {
+    let hash = graph_hash.trim_start_matches("sha256:");
+    graph_path(graph_hash).with_file_name(format!("{hash}.source.json"))
+}
+
+/// Persist the compile inputs alongside a committed graph (best-effort).
+pub(crate) fn persist_source(
+    graph_hash: &str,
+    harness: &Value,
+    work: &Value,
+    target_id: &str,
+) -> Result<()> {
+    let path = source_path(graph_hash);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    let document = serde_json::json!({
+        "schema": "fractal.graph_source.v1",
+        "harness": harness,
+        "work": work,
+        "target": target_id,
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&document)?)
+        .with_context(|| format!("write graph source {}", path.display()))?;
+    Ok(())
+}
+
+/// Load the compile inputs `(harness, work, target_id)` for a committed graph.
+pub(crate) fn load_source(graph_hash: &str) -> Option<(Value, Value, String)> {
+    let text = fs::read_to_string(source_path(graph_hash)).ok()?;
+    let document: Value = serde_json::from_str(&text).ok()?;
+    let harness = document.get("harness")?.clone();
+    let work = document.get("work")?.clone();
+    let target = document
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or("darwin-arm64")
+        .to_owned();
+    Some((harness, work, target))
+}
+
 /// Atomically persist a compiled graph after verifying its claimed hash.
 pub(crate) fn commit_graph(graph: &Value) -> Result<CommitRecord> {
     let graph_hash = claimed_hash(graph)?;

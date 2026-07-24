@@ -90,6 +90,16 @@ pub(crate) fn run(fractalwork_override: Option<&Path>, coordinate_flag: bool) ->
             }
         }
     }
+    // On exit, GRPO-train an adapter from the session's accumulated verifiable
+    // rewards (skipped when fractal-rlvr is absent or there is too little data).
+    match crate::rlvr::train() {
+        Ok(Some(report)) => {
+            println!("\n⛭ GRPO-trained an adapter from accumulated verifiable rewards:");
+            println!("  {report}");
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("  (rlvr training skipped: {error:#})"),
+    }
     println!("Goodbye.");
     Ok(())
 }

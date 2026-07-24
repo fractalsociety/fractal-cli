@@ -174,8 +174,11 @@ fn run_worker_as(kind: &str, instruction: &str, workspace: &Path) -> Result<bool
          entirely in the current directory. Create or edit only the files this task needs and make \
          any tests pass. Do not ask questions; make reasonable choices."
     );
+    // Detach the worker's stdin: headless agents (e.g. `claude -p`) otherwise
+    // inherit the CLI's piped stdin and block reading it instead of exiting.
     let status = worker_command(kind, &prompt)?
         .current_dir(workspace)
+        .stdin(std::process::Stdio::null())
         .status()
         .with_context(|| format!("failed to launch worker `{kind}` (is it on PATH?)"))?;
     Ok(status.success())

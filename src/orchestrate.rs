@@ -95,8 +95,14 @@ pub(crate) fn run_end_to_end(
 
     let mut attempt = 0u32;
     // The pending harness evolution awaiting its verifiable reward (RL feedback):
-    // (arm, bandit context, cause). Rewarded by the *next* run's verdict.
-    let mut pending: Option<(String, Vec<i32>, String)> = None;
+    // (arm, bandit context, cause, governance session). Settled by the next run's
+    // verdict: the bandit is rewarded and the canary is activated or rolled back.
+    let mut pending: Option<(
+        String,
+        Vec<i32>,
+        String,
+        crate::harness_evolution::Governance,
+    )> = None;
     let outcome = loop {
         let outcome = match backend {
             Backend::InProcess => execute::run_multi_agent(&graph, workspace, agents, board)?,
@@ -123,11 +129,16 @@ pub(crate) fn run_end_to_end(
 
         // RLVR feedback: reward the *previous* harness evolution with this run's
         // verifiable outcome, so the bandit learns which mutation fixes the failure.
-        if let Some((arm, context_bp, cause)) = pending.take() {
+        if let Some((arm, context_bp, cause, governance)) = pending.take() {
             crate::harness_evolution::record_reward(&arm, &context_bp, &cause, succeeded);
+            // Settle the governed canary with this run's verifiable verdict.
+            let settle = crate::harness_evolution::settle(governance, succeeded);
+            if !settle.is_empty() {
+                println!("  ⟳ {settle}");
+            }
             ledger.promotion(
                 &format!("{graph_id}:evolution:{arm}"),
-                &format!("reward:{}", if succeeded { "10000" } else { "0" }),
+                &format!("reward:{}:{settle}", if succeeded { "10000" } else { "0" }),
             );
         }
 
@@ -144,6 +155,7 @@ pub(crate) fn run_end_to_end(
                 "  ⟳ verified failure at `{failed_node}` (cause: {}) — harness evolution: {} [{}]",
                 evolution.cause, evolution.note, evolution.arm
             );
+            println!("  ⟳ {}", evolution.verdict);
 
             // (4) Anchor the developmental step + child lineage on the signed chain.
             let motivating = outcome
@@ -159,10 +171,10 @@ pub(crate) fn run_end_to_end(
             let step = DevelopmentalStep {
                 scale: ScaleLevel::Graph,
                 subject: format!("{graph_id}#{failed_node}"),
-                operation: if evolution.arm == "grow.verification" {
-                    DevelopmentalOp::Grow
-                } else {
-                    DevelopmentalOp::Repair
+                operation: match evolution.arm.as_str() {
+                    "grow.verification" => DevelopmentalOp::Grow,
+                    "differentiate.specialize" => DevelopmentalOp::Differentiate,
+                    _ => DevelopmentalOp::Repair,
                 },
                 step_id: format!("{}-{failed_node}-{attempt}", evolution.arm),
                 motivating_outcome: motivating,
@@ -178,8 +190,13 @@ pub(crate) fn run_end_to_end(
                 &evolution.child_hash[..23.min(evolution.child_hash.len())]
             );
 
-            // (5) Re-run the evolved harness; reward is applied next iteration.
-            pending = Some((evolution.arm, evolution.context_bp, evolution.cause));
+            // (5) Re-run the evolved harness; reward + canary settle next iteration.
+            pending = Some((
+                evolution.arm,
+                evolution.context_bp,
+                evolution.cause,
+                evolution.governance,
+            ));
             graph = evolution.child_graph;
             current_hash = evolution.child_hash;
             attempt += 1;
@@ -202,6 +219,18 @@ pub(crate) fn run_end_to_end(
         &root[..23.min(root.len())],
         if ok { "verified" } else { "INVALID" }
     );
+
+    // Fold this run's signed head into the durable machine-scale chain so the
+    // receipts accumulate, verifiably, across runs.
+    let run_ok = outcome.verified != Some(false) && outcome.failed_node.is_none();
+    if let Some(fold) = ledger.fold_into_machine(run_ok) {
+        println!(
+            "  ⛓  folded into machine chain · {} run(s) anchored · machine root {} · {}",
+            fold.runs,
+            &fold.machine_root[..23.min(fold.machine_root.len())],
+            if fold.verified { "verified" } else { "INVALID" }
+        );
+    }
     Ok(outcome)
 }
 
