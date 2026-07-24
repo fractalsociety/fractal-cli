@@ -640,9 +640,9 @@ def parse_graph(graph_path: Path, state_path: Path | None = None) -> dict[str, A
     graph_id = graph["graph_id"]
     nodes = graph["nodes"]
     edges = graph["edges"]
-    tasks = []
-    for node in nodes:
-        assignment = assignments.get(node["id"])
+
+    def node_status(node_id):
+        assignment = assignments.get(node_id)
         assignment = dict(assignment) if isinstance(assignment, dict) else None
         assignment_state = assignment.get("state") if assignment else None
         status = (
@@ -652,10 +652,37 @@ def parse_graph(graph_path: Path, state_path: Path | None = None) -> dict[str, A
             if assignment_state == "checked_out"
             else "incomplete"
         )
+        return status, assignment
+
+    # Planning phase: the lead planner is the root node(s) (no incoming edges).
+    # Until it completes, reveal ONLY the planner ("planning the task breakdown…"),
+    # so the board doesn't display the tasks before they're planned. Once the
+    # plan node is complete, reveal the full set of tasks it planned. The frontend
+    # re-polls, so the board expands automatically.
+    incoming = {node["id"]: 0 for node in nodes}
+    for edge in edges:
+        target = edge.get("to")
+        if target in incoming:
+            incoming[target] += 1
+    roots = [node["id"] for node in nodes if incoming.get(node["id"], 0) == 0]
+    # Only a *single* root is the lead planner. A graph with several independent
+    # roots has no single planning step, so it reveals everything immediately.
+    planner = roots[0] if len(roots) == 1 else None
+    planning = planner is not None and node_status(planner)[0] != "complete"
+    visible_ids = {planner} if planning else {node["id"] for node in nodes}
+
+    tasks = []
+    for node in nodes:
+        if node["id"] not in visible_ids:
+            continue
+        status, assignment = node_status(node["id"])
+        title = f"{node['kind']}: {node['capability']}"
+        if planning and node["id"] == planner:
+            title = "🧠 planning the task breakdown…"
         tasks.append(
             {
                 "id": node["id"],
-                "title": f"{node['kind']}: {node['capability']}",
+                "title": title,
                 "kind": "task",
                 "status": status,
                 "checked": status == "complete",
@@ -669,6 +696,7 @@ def parse_graph(graph_path: Path, state_path: Path | None = None) -> dict[str, A
             if key in edge
         }
         for edge in edges
+        if edge.get("from") in visible_ids and edge.get("to") in visible_ids
     ]
     group = {
         "id": "G0",
@@ -699,7 +727,24 @@ def parse_graph(graph_path: Path, state_path: Path | None = None) -> dict[str, A
         "source": graph_path.name,
         "source_mtime": source_mtime,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "note": "",
+        "phase": "planning" if planning else "executing",
+        "note": (
+            "Lead agent is planning — tasks appear once the plan is ready."
+            if planning
+            else ""
+        ),
+        # Evolution lineage: present when this graph is a self-evolved child, so
+        # the board can show an "evolved from …" marker for the grown / repaired /
+        # differentiated task set.
+        "lineage": (
+            {
+                "evolved_from": graph.get("parent_graph"),
+                "arm": graph.get("evolution_arm"),
+                "generation": graph.get("evolution"),
+            }
+            if graph.get("parent_graph")
+            else None
+        ),
         "development": development_summary(state),
         "totals": {
             "complete": completed,

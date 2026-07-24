@@ -56,7 +56,45 @@ class ParsePrdTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             graph_path = Path(temp_dir) / "sample.json"
             graph_path.write_text(json.dumps(committed), encoding="utf-8")
-            view = parse_graph(graph_path)
+            state_path = Path(temp_dir) / "sample-state.json"
+
+            # Planning phase: with the planner (root) not yet complete, the board
+            # reveals only the planner — tasks are not displayed before they are
+            # planned.
+            planning = parse_graph(graph_path)
+            self.assertEqual(planning["phase"], "planning")
+            self.assertEqual(
+                planning["groups"][0]["tasks"],
+                [
+                    {
+                        "id": "analyze",
+                        "title": "🧠 planning the task breakdown…",
+                        "kind": "task",
+                        "status": "incomplete",
+                        "checked": False,
+                        "assignment": None,
+                    }
+                ],
+            )
+            self.assertEqual(planning["groups"][0]["edges"], [])
+
+            # Once the planner completes, the board reveals the full planned graph.
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "graph_id": "fg_sample",
+                        "assignments": {
+                            "analyze": {
+                                "state": "completed",
+                                "agent_id": "a",
+                                "completed_at": 1,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            view = parse_graph(graph_path, state_path)
 
         expected_keys = {
             "schema",
@@ -70,6 +108,7 @@ class ParsePrdTests(unittest.TestCase):
         }
         self.assertTrue(expected_keys.issubset(view))
         self.assertEqual(view["graph"], committed)
+        self.assertEqual(view["phase"], "executing")
         self.assertEqual(len(view["groups"]), 1)
         self.assertEqual(
             view["groups"][0]["tasks"],
@@ -78,9 +117,13 @@ class ParsePrdTests(unittest.TestCase):
                     "id": "analyze",
                     "title": "model: reason",
                     "kind": "task",
-                    "status": "incomplete",
-                    "checked": False,
-                    "assignment": None,
+                    "status": "complete",
+                    "checked": True,
+                    "assignment": {
+                        "state": "completed",
+                        "agent_id": "a",
+                        "completed_at": 1,
+                    },
                 },
                 {
                     "id": "verify",
