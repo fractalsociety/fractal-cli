@@ -191,54 +191,85 @@ fn task_group_for(classification: &Result<intent::TaskClassification>, request: 
 fn setup_agents() -> Result<Vec<String>> {
     let available = execute::available_agents();
     if available.is_empty() {
-        println!("No build agents (claude/codex/cursor) found on PATH — preview only.\n");
+        println!("No build agents (claude/codex/cursor/hermes) found on PATH — preview only.\n");
         return Ok(Vec::new());
     }
 
-    println!("Pick your primary agent (does the lead work). It spends that agent's credits.");
-    for (index, agent) in available.iter().enumerate() {
-        println!("  {}) {agent}", index + 1);
-    }
-    println!("  0) none — preview only (compile graphs, run no workers)");
-    let primary_index = ask("> ")?.parse::<usize>().unwrap_or(0);
-    if primary_index == 0 || primary_index > available.len() {
-        println!("\nPreview only — requests compile a graph + open its board, no workers.\n");
-        return Ok(Vec::new());
-    }
-    let primary = available[primary_index - 1].clone();
+    println!("Build your agent team — add as many agents as you want.");
+    println!("The FIRST one you add is the lead (plans + closes out); the rest are workers.");
+    println!("Type a number to add an agent; press Enter on an empty line (or type `done`) when finished.");
+    println!("Type `0` (or `none`) for preview only — compile graphs, run no workers.\n");
 
-    if let Some(model) = pick_model(&primary)? {
-        std::env::set_var(model_env_key(&primary), &model);
-        println!("  → {primary} will run on model '{model}'.");
-    }
-
-    let others: Vec<String> = available
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != primary_index - 1)
-        .map(|(_, agent)| agent.clone())
-        .collect();
-    let mut roster = vec![primary.clone()];
-    if !others.is_empty() {
-        println!("\nAdd other worker agents (comma-separated numbers, or Enter for none):");
-        for (index, agent) in others.iter().enumerate() {
-            println!("  {}) {agent}", index + 1);
+    let mut roster: Vec<String> = Vec::new();
+    loop {
+        for (index, agent) in available.iter().enumerate() {
+            let role = if roster.first().map(String::as_str) == Some(agent.as_str()) {
+                "  ✓ lead"
+            } else if roster.contains(agent) {
+                "  ✓ worker"
+            } else {
+                ""
+            };
+            println!("  {}) {agent}{role}", index + 1);
         }
-        let line = ask("> ")?;
-        for token in line.split(',') {
-            if let Ok(number) = token.trim().parse::<usize>() {
-                if number >= 1 && number <= others.len() && !roster.contains(&others[number - 1]) {
-                    roster.push(others[number - 1].clone());
-                }
-            }
+        let prompt = if roster.is_empty() {
+            "add agent > ".to_owned()
+        } else {
+            format!(
+                "add another ({} selected) — or Enter to start > ",
+                roster.len()
+            )
+        };
+        let choice = ask(&prompt)?;
+        let choice = choice.trim();
+
+        if choice.is_empty() || choice.eq_ignore_ascii_case("done") {
+            break;
         }
+        if choice == "0" || choice.eq_ignore_ascii_case("none") {
+            println!("\nPreview only — requests compile a graph + open its board, no workers.\n");
+            return Ok(Vec::new());
+        }
+        let Ok(number) = choice.parse::<usize>() else {
+            println!(
+                "  (enter a number 1..{}, `done` to finish, or `0` for none)",
+                available.len()
+            );
+            continue;
+        };
+        if number < 1 || number > available.len() {
+            println!("  (enter a number 1..{})", available.len());
+            continue;
+        }
+        let agent = available[number - 1].clone();
+        if roster.contains(&agent) {
+            println!("  ({agent} is already on the team)");
+            continue;
+        }
+        let is_lead = roster.is_empty();
+        if let Some(model) = pick_model(&agent)? {
+            std::env::set_var(model_env_key(&agent), &model);
+            println!(
+                "  → added {agent} on model '{model}'{}",
+                if is_lead { " (lead)" } else { " (worker)" }
+            );
+        } else {
+            println!(
+                "  → added {agent}{}",
+                if is_lead { " (lead)" } else { " (worker)" }
+            );
+        }
+        roster.push(agent);
     }
 
-    if roster.len() == 1 {
-        println!("\nAgent: {primary} (lead). Type a request to build.\n");
+    if roster.is_empty() {
+        println!("\nPreview only — no agents selected.\n");
+    } else if roster.len() == 1 {
+        println!("\nAgent: {} (lead). Type a request to build.\n", roster[0]);
     } else {
         println!(
-            "\nTeam: {primary} (lead){}. Each checks out nodes from the graph until it is done.\n",
+            "\nTeam: {} (lead){}. Each checks out nodes from the graph until it is done.\n",
+            roster[0],
             roster[1..]
                 .iter()
                 .map(|agent| format!(", {agent}"))
@@ -251,17 +282,26 @@ fn setup_agents() -> Result<Vec<String>> {
 /// Pick a model for the primary agent. Known Claude aliases are offered as a
 /// menu; other agents accept a free-form model id (Enter = the agent's default).
 fn pick_model(agent: &str) -> Result<Option<String>> {
-    if agent == "claude" {
-        println!("Model for claude:");
-        let options = ["fable", "opus", "sonnet"];
-        for (index, model) in options.iter().enumerate() {
+    let menu: &[&str] = match agent {
+        "claude" => &["fable", "opus", "sonnet"],
+        // hermes is powered by an OpenRouter model; offer free nemotron variants.
+        "hermes" => &[
+            "nvidia/nemotron-nano-9b-v2:free",
+            "nvidia/nemotron-3-super-120b-a12b:free",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+        ],
+        _ => &[],
+    };
+    if !menu.is_empty() {
+        println!("Model for {agent}:");
+        for (index, model) in menu.iter().enumerate() {
             println!("  {}) {model}", index + 1);
         }
-        println!("  {}) default", options.len() + 1);
+        println!("  {}) default / other (type a model id)", menu.len() + 1);
         let choice = ask("> ")?;
         if let Ok(number) = choice.parse::<usize>() {
-            if number >= 1 && number <= options.len() {
-                return Ok(Some(options[number - 1].to_owned()));
+            if number >= 1 && number <= menu.len() {
+                return Ok(Some(menu[number - 1].to_owned()));
             }
             return Ok(None); // default / out of range
         }

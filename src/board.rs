@@ -8,6 +8,51 @@ use serde::Deserialize;
 
 use crate::graph_store;
 
+/// Terminate any *leftover fractal board server* still listening on `port` from
+/// a previous run. Without this, the new server cannot bind the port and the
+/// browser connects to the stale (already-completed, all-green) server instead
+/// of the fresh graph. Only processes whose command is the execution-graph
+/// `server.py` are killed, never unrelated processes on the port.
+fn free_port(port: u16) {
+    use std::collections::BTreeSet;
+    // PIDs currently listening on the port.
+    let Ok(listing) = Command::new("lsof")
+        .args(["-ti", &format!("tcp:{port}")])
+        .output()
+    else {
+        return;
+    };
+    let on_port: BTreeSet<String> = String::from_utf8_lossy(&listing.stdout)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    if on_port.is_empty() {
+        return;
+    }
+    // PIDs that are execution-graph board servers (matched on the full command
+    // line via pgrep, which — unlike `ps -o command=` — does not truncate the
+    // long macOS `python3` path before the server.py argument).
+    let board_servers: BTreeSet<String> = Command::new("pgrep")
+        .args(["-f", "execution-graph/server.py"])
+        .output()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut killed = false;
+    for pid in on_port.intersection(&board_servers) {
+        let _ = Command::new("kill").arg("-9").arg(pid).status();
+        killed = true;
+    }
+    if killed {
+        // Give the OS a moment to release the socket before the new bind.
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// Block until the board's `/api/health` responds, so execution progress posted
 /// immediately after does not race a not-yet-listening server (which would drop
 /// the first node's checkout/complete and leave it stuck).
@@ -112,6 +157,7 @@ pub(crate) fn serve_graph_file(
     }
     let state_file = graph_file.with_extension("board-state.json");
     let _ = std::fs::remove_file(&state_file); // start clean so progress shows
+    free_port(port); // replace any leftover board server holding this port
     let viewer_dir = resolve_exec_graph_dir(exec_graph_dir)?;
     let server_path = viewer_dir.join("server.py");
     if !server_path.is_file() {
@@ -163,6 +209,7 @@ pub(crate) fn serve_graph(
         .context("stored execution graph is missing graph_id")?;
     let state_file = graph_file.with_extension("board-state.json");
     let _ = std::fs::remove_file(&state_file); // start clean so progress shows
+    free_port(port); // replace any leftover board server holding this port
 
     let viewer_dir = resolve_exec_graph_dir(exec_graph_dir)?;
     let server_path = viewer_dir.join("server.py");

@@ -160,7 +160,23 @@ fn worker_command(kind: &str, prompt: &str) -> Result<Command> {
             c.arg("--force").arg(prompt);
             c
         }
-        other => bail!("unknown worker: {other} (use claude|codex|cursor)"),
+        "hermes" => {
+            // Hermes one-shot (`-z`) with tools auto-approved (`--yolo`). A pinned
+            // model routes through OpenRouter (where the free nemotron models live)
+            // unless $FRACTAL_HERMES_PROVIDER overrides the provider.
+            let mut c = Command::new("hermes");
+            c.arg("--yolo");
+            if let Some(model) = model_for("hermes") {
+                let provider = std::env::var("FRACTAL_HERMES_PROVIDER")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "openrouter".to_owned());
+                c.arg("-m").arg(model).arg("--provider").arg(provider);
+            }
+            c.arg("-z").arg(prompt);
+            c
+        }
+        other => bail!("unknown worker: {other} (use claude|codex|cursor|hermes)"),
     };
     command.env("FRACTAL_WORKER", kind);
     Ok(command)
@@ -206,7 +222,7 @@ fn binary_on_path(binary: &str) -> bool {
 
 /// Every supported agent whose binary is on `PATH` (ignores env config).
 pub(crate) fn available_agents() -> Vec<String> {
-    ["claude", "codex", "cursor"]
+    ["claude", "codex", "cursor", "hermes"]
         .into_iter()
         .filter(|kind| binary_on_path(agent_binary(kind)))
         .map(str::to_owned)
@@ -226,7 +242,7 @@ pub(crate) fn detect_agents() -> Vec<String> {
             return chosen;
         }
     }
-    ["codex", "cursor", "claude"]
+    ["codex", "cursor", "claude", "hermes"]
         .into_iter()
         .filter(|kind| binary_on_path(agent_binary(kind)))
         .map(str::to_owned)
