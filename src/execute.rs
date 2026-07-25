@@ -474,8 +474,13 @@ fn validate_closeout(prd: &Value, closeout: &Value) -> Result<usize> {
 
 /// Best-effort report of a node transition to the live board so the dashboard
 /// turns yellow (checkout) then green (complete) as agents work.
-fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str) {
+fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str, workspace: &Path) {
     crate::run_control::node_transition(board, node, action, agent);
+    if let Err(error) = crate::project_file::transition(workspace, node, action, agent, agent) {
+        eprintln!("  live graph state note: {error:#}");
+    } else {
+        crate::project_sync::maybe_sync_runtime(workspace);
+    }
     if let Some(base) = board {
         let url = format!(
             "{}/api/tasks/{}/{}",
@@ -668,7 +673,7 @@ pub(crate) fn run_multi_agent(
                 } else {
                     println!("{clr}  [{agent}] ▸ checked out {id} ({capability})");
                 }
-                report_node(board, &id, "checkout", &agent);
+                report_node(board, &id, "checkout", &agent, workspace);
                 let started = std::time::Instant::now();
                 let result = run_node(node, &agent, workspace);
                 let latency_ms = started.elapsed().as_millis() as u64;
@@ -694,7 +699,7 @@ pub(crate) fn run_multi_agent(
                         if ok {
                             state.completed.insert(id.clone());
                             mine += 1;
-                            report_node(board, &id, "complete", &agent);
+                            report_node(board, &id, "complete", &agent, workspace);
                             if is_planning {
                                 println!("{clr}  [{agent}] ✓ plan ready — dispatching tasks to the workers.");
                             } else {
@@ -702,12 +707,14 @@ pub(crate) fn run_multi_agent(
                             }
                         } else {
                             state.failed = Some(id.clone());
+                            report_node(board, &id, "release", &agent, workspace);
                             println!("{clr}  [{agent}] ✗ {id}{suffix}");
                         }
                         ok
                     }
                     Err(error) => {
                         state.failed = Some(id.clone());
+                        report_node(board, &id, "release", &agent, workspace);
                         eprintln!("  [{agent}] ✗ {id}: {error:#}");
                         false
                     }
@@ -810,7 +817,7 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
     let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
     let clr = crate::ui::CLEAR_LINE;
     println!("{clr}  [{agent}] ▸ {id} ({capability})");
-    report_node(board, &id, "checkout", agent);
+    report_node(board, &id, "checkout", agent, workspace);
     let started = std::time::Instant::now();
     let result = run_node(node, agent, workspace);
     let latency_ms = started.elapsed().as_millis() as u64;
@@ -829,14 +836,16 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
                 .map(|note| format!(" — {note}"))
                 .unwrap_or_default();
             if ok {
-                report_node(board, &id, "complete", agent);
+                report_node(board, &id, "complete", agent, workspace);
                 println!("{clr}  [{agent}] ✓ {id}{suffix}");
             } else {
+                report_node(board, &id, "release", agent, workspace);
                 println!("{clr}  [{agent}] ✗ {id}{suffix}");
             }
             ok
         }
         Err(error) => {
+            report_node(board, &id, "release", agent, workspace);
             eprintln!("  [{agent}] ✗ {id}: {error:#}");
             false
         }

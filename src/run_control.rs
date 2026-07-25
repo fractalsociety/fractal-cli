@@ -201,6 +201,16 @@ pub(crate) fn status(args: &StatusArgs) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn workspace_is_running(workspace: &Path) -> bool {
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    live_runs().is_ok_and(|runs| {
+        runs.iter()
+            .any(|run| Path::new(&run.workspace) == workspace)
+    })
+}
+
 fn halt(original: &ActiveRun) -> Result<()> {
     let mut run = original.clone();
     run.status = "halted".to_owned();
@@ -222,6 +232,11 @@ fn halt(original: &ActiveRun) -> Result<()> {
                 .send_string(&body);
         }
     }
+    let workspace = Path::new(&run.workspace);
+    for (node, agent) in &run.active_nodes {
+        crate::project_file::transition(workspace, node, "release", agent, agent).ok();
+    }
+    crate::project_file::set_execution_phase(workspace, "halted").ok();
 
     // Stop the coordinator first so a terminated planner cannot be mistaken for
     // an ordinary failure and trigger fallback planning while cancellation is
@@ -229,6 +244,9 @@ fn halt(original: &ActiveRun) -> Result<()> {
     signal_process(run.pid, libc::SIGTERM);
     for group in &run.worker_groups {
         signal_group(*group, libc::SIGTERM);
+    }
+    if let Err(error) = crate::project_sync::sync_runtime_now(workspace) {
+        eprintln!("  halted graph sync note: {error:#}");
     }
     thread::sleep(Duration::from_millis(250));
     for group in &run.worker_groups {

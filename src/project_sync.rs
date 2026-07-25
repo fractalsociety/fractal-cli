@@ -9,6 +9,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -56,6 +57,8 @@ enum PutFailure {
     Status(u16, Box<ureq::Response>),
     Transport(anyhow::Error),
 }
+
+static UPLOAD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn preference_path(workspace: &Path) -> PathBuf {
     workspace.join(".fractal").join("sync.json")
@@ -122,6 +125,35 @@ pub(crate) fn maybe_sync_planning(workspace: &Path) -> Option<String> {
     maybe_sync_with_options(workspace, false)
 }
 
+/// Coalesce a node checkout/completion into the authenticated cloud graph
+/// without blocking the worker or creating a GitHub commit for every state
+/// transition. Every upload reads the latest project document after acquiring
+/// the shared upload lock, so delayed transitions cannot overwrite newer ones.
+pub(crate) fn maybe_sync_runtime(workspace: &Path) {
+    if std::env::var_os("FRACTAL_OFFLINE").is_some() {
+        return;
+    }
+    let workspace = workspace.to_path_buf();
+    std::thread::spawn(move || {
+        if let Err(error) = sync_runtime_now(&workspace) {
+            eprintln!("  live graph sync note: {error:#}");
+        }
+    });
+}
+
+pub(crate) fn sync_runtime_now(workspace: &Path) -> Result<()> {
+    if std::env::var_os("FRACTAL_OFFLINE").is_some() {
+        return Ok(());
+    }
+    match load_preference(workspace) {
+        Some(preference) if !preference.enabled => return Ok(()),
+        Some(_) => {}
+        None if crate::auth::load_session().is_err() => return Ok(()),
+        None => {}
+    }
+    upload(workspace, None).map(|_| ())
+}
+
 fn maybe_sync_with_options(workspace: &Path, publish_github: bool) -> Option<String> {
     if std::env::var_os("FRACTAL_OFFLINE").is_some() {
         return None;
@@ -168,6 +200,14 @@ fn maybe_sync_with_options(workspace: &Path, publish_github: bool) -> Option<Str
 }
 
 fn upload(workspace: &Path, repository: Option<&RepositoryLink>) -> Result<SyncResponse> {
+    let _guard = UPLOAD_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("project upload lock");
+    crate::project_file::backfill_execution(workspace).ok();
+    if !crate::run_control::workspace_is_running(workspace) {
+        crate::project_file::release_stale_assignments(workspace).ok();
+    }
     let session = crate::auth::load_session()?;
     let document = crate::project_file::load(workspace)?;
     let endpoint = format!(

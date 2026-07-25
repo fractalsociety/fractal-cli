@@ -1,8 +1,10 @@
 //! Standardized, portable per-project execution graph.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -15,6 +17,8 @@ pub(crate) struct FractalProject {
     pub(crate) project: ProjectIdentity,
     pub(crate) graph_hash: String,
     pub(crate) graph: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) execution: Option<ExecutionState>,
     pub(crate) updated_at: String,
 }
 
@@ -25,11 +29,34 @@ pub(crate) struct ProjectIdentity {
     pub(crate) visibility: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ExecutionState {
+    pub(crate) schema: String,
+    pub(crate) phase: String,
+    pub(crate) assignments: BTreeMap<String, ExecutionAssignment>,
+    pub(crate) updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ExecutionAssignment {
+    pub(crate) agent_id: String,
+    pub(crate) agent_label: String,
+    pub(crate) state: String,
+    pub(crate) checked_out_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) released_at: Option<String>,
+}
+
+static PROJECT_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
 pub(crate) fn path(workspace: &Path) -> PathBuf {
     workspace.join(".fractal").join("project.fractal")
 }
 
 pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<PathBuf> {
+    let _guard = project_file_lock();
     let graph_hash = graph
         .get("graph_hash")
         .and_then(Value::as_str)
@@ -41,6 +68,25 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
         .context("refuse to persist an execution graph with an invalid hash")?;
     reject_secret_fields(graph)?;
     let slug = slug_for(workspace);
+    let now = timestamp();
+    let execution = load(workspace)
+        .ok()
+        .filter(|current| current.graph_hash == graph_hash)
+        .and_then(|current| current.execution)
+        .or_else(|| execution_from_local_board(graph_hash, graph, &now))
+        .or_else(|| {
+            Some(ExecutionState {
+                schema: "fractal.execution_state.v1".to_owned(),
+                phase: if is_planning_preview(graph) {
+                    "planning"
+                } else {
+                    "executing"
+                }
+                .to_owned(),
+                assignments: BTreeMap::new(),
+                updated_at: now.clone(),
+            })
+        });
     let document = FractalProject {
         schema: "fractal.project.v1".to_owned(),
         project: ProjectIdentity {
@@ -50,7 +96,8 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
         },
         graph_hash: graph_hash.to_owned(),
         graph: graph.clone(),
-        updated_at: timestamp(),
+        execution,
+        updated_at: now,
     };
     let destination = path(workspace);
     let directory = destination.parent().expect("project file has parent");
@@ -58,6 +105,210 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
     let bytes = serde_json::to_vec_pretty(&document)?;
     atomic_write(&destination, &bytes)?;
     Ok(destination)
+}
+
+fn execution_from_local_board(
+    graph_hash: &str,
+    graph: &Value,
+    updated_at: &str,
+) -> Option<ExecutionState> {
+    let hash = graph_hash.strip_prefix("sha256:")?;
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let home = std::env::var_os("FRACTAL_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".fractal")))
+        .unwrap_or_else(|| PathBuf::from(".fractal"));
+    let board_path = home.join("graphs").join(format!("{hash}.board-state.json"));
+    let value: Value = serde_json::from_slice(&fs::read(board_path).ok()?).ok()?;
+    let assignments: BTreeMap<String, ExecutionAssignment> =
+        serde_json::from_value(value.get("assignments")?.clone()).ok()?;
+    if assignments.is_empty() {
+        return None;
+    }
+    let node_count = graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let completed = assignments
+        .values()
+        .filter(|assignment| assignment.state == "completed")
+        .count();
+    Some(ExecutionState {
+        schema: "fractal.execution_state.v1".to_owned(),
+        phase: if node_count > 0 && completed == node_count {
+            "completed"
+        } else {
+            "executing"
+        }
+        .to_owned(),
+        assignments,
+        updated_at: updated_at.to_owned(),
+    })
+}
+
+pub(crate) fn transition(
+    workspace: &Path,
+    node: &str,
+    action: &str,
+    agent_id: &str,
+    agent_label: &str,
+) -> Result<()> {
+    let _guard = project_file_lock();
+    let mut document = load(workspace)?;
+    let known_node = document
+        .graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|value| value.get("id").and_then(Value::as_str) == Some(node));
+    if !known_node {
+        bail!("execution transition references unknown graph node `{node}`");
+    }
+    let now = timestamp();
+    let execution = document.execution.get_or_insert_with(|| ExecutionState {
+        schema: "fractal.execution_state.v1".to_owned(),
+        phase: "executing".to_owned(),
+        assignments: BTreeMap::new(),
+        updated_at: now.clone(),
+    });
+    execution.phase = "executing".to_owned();
+    match action {
+        "checkout" => {
+            let checked_out_at = execution
+                .assignments
+                .get(node)
+                .map(|assignment| assignment.checked_out_at.clone())
+                .unwrap_or_else(|| now.clone());
+            execution.assignments.insert(
+                node.to_owned(),
+                ExecutionAssignment {
+                    agent_id: agent_id.to_owned(),
+                    agent_label: agent_label.to_owned(),
+                    state: "checked_out".to_owned(),
+                    checked_out_at,
+                    completed_at: None,
+                    released_at: None,
+                },
+            );
+        }
+        "complete" => {
+            let checked_out_at = execution
+                .assignments
+                .get(node)
+                .map(|assignment| assignment.checked_out_at.clone())
+                .unwrap_or_else(|| now.clone());
+            execution.assignments.insert(
+                node.to_owned(),
+                ExecutionAssignment {
+                    agent_id: agent_id.to_owned(),
+                    agent_label: agent_label.to_owned(),
+                    state: "completed".to_owned(),
+                    checked_out_at,
+                    completed_at: Some(now.clone()),
+                    released_at: None,
+                },
+            );
+        }
+        "release" => {
+            let checked_out_at = execution
+                .assignments
+                .get(node)
+                .map(|assignment| assignment.checked_out_at.clone())
+                .unwrap_or_else(|| now.clone());
+            execution.assignments.insert(
+                node.to_owned(),
+                ExecutionAssignment {
+                    agent_id: agent_id.to_owned(),
+                    agent_label: agent_label.to_owned(),
+                    state: "released".to_owned(),
+                    checked_out_at,
+                    completed_at: None,
+                    released_at: Some(now.clone()),
+                },
+            );
+        }
+        other => bail!("unsupported execution transition `{other}`"),
+    }
+    let node_count = document
+        .graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let completed = execution
+        .assignments
+        .values()
+        .filter(|assignment| assignment.state == "completed")
+        .count();
+    if node_count > 0 && completed == node_count {
+        execution.phase = "completed".to_owned();
+    }
+    execution.updated_at = now.clone();
+    document.updated_at = now;
+    write_document(workspace, &document)
+}
+
+pub(crate) fn backfill_execution(workspace: &Path) -> Result<bool> {
+    let _guard = project_file_lock();
+    let mut document = load(workspace)?;
+    if document.execution.is_some() {
+        return Ok(false);
+    }
+    let now = timestamp();
+    let Some(execution) = execution_from_local_board(&document.graph_hash, &document.graph, &now)
+    else {
+        return Ok(false);
+    };
+    document.execution = Some(execution);
+    document.updated_at = now;
+    write_document(workspace, &document)?;
+    Ok(true)
+}
+
+pub(crate) fn release_stale_assignments(workspace: &Path) -> Result<bool> {
+    let _guard = project_file_lock();
+    let mut document = load(workspace)?;
+    let Some(execution) = document.execution.as_mut() else {
+        return Ok(false);
+    };
+    let now = timestamp();
+    let mut changed = false;
+    for assignment in execution.assignments.values_mut() {
+        if assignment.state == "checked_out" {
+            assignment.state = "released".to_owned();
+            assignment.released_at = Some(now.clone());
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+    execution.phase = "halted".to_owned();
+    execution.updated_at = now.clone();
+    document.updated_at = now;
+    write_document(workspace, &document)?;
+    Ok(true)
+}
+
+pub(crate) fn set_execution_phase(workspace: &Path, phase: &str) -> Result<()> {
+    if !matches!(phase, "planning" | "executing" | "halted" | "completed") {
+        bail!("unsupported execution phase `{phase}`");
+    }
+    let _guard = project_file_lock();
+    let mut document = load(workspace)?;
+    let now = timestamp();
+    let execution = document.execution.get_or_insert_with(|| ExecutionState {
+        schema: "fractal.execution_state.v1".to_owned(),
+        phase: phase.to_owned(),
+        assignments: BTreeMap::new(),
+        updated_at: now.clone(),
+    });
+    execution.phase = phase.to_owned();
+    execution.updated_at = now.clone();
+    document.updated_at = now;
+    write_document(workspace, &document)
 }
 
 pub(crate) fn load(workspace: &Path) -> Result<FractalProject> {
@@ -82,7 +333,60 @@ fn validate(document: &FractalProject) -> Result<()> {
     crate::graph_store::verify_graph_document(&document.graph)
         .context("embedded execution graph hash is invalid")?;
     reject_secret_fields(&document.graph)?;
+    if let Some(execution) = &document.execution {
+        if execution.schema != "fractal.execution_state.v1"
+            || !matches!(
+                execution.phase.as_str(),
+                "planning" | "executing" | "halted" | "completed"
+            )
+        {
+            bail!("invalid fractal.execution_state.v1 document");
+        }
+        let node_ids = document
+            .graph
+            .get("nodes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|node| node.get("id").and_then(Value::as_str))
+            .collect::<std::collections::BTreeSet<_>>();
+        for (node, assignment) in &execution.assignments {
+            if !node_ids.contains(node.as_str())
+                || !matches!(
+                    assignment.state.as_str(),
+                    "checked_out" | "completed" | "released"
+                )
+                || assignment.agent_id.trim().is_empty()
+                || assignment.agent_label.trim().is_empty()
+            {
+                bail!("invalid execution assignment for node `{node}`");
+            }
+        }
+    }
     Ok(())
+}
+
+fn is_planning_preview(graph: &Value) -> bool {
+    let nodes = graph.get("nodes").and_then(Value::as_array);
+    nodes.is_some_and(|nodes| {
+        nodes.len() == 1
+            && nodes[0].get("capability").and_then(Value::as_str) == Some("control.plan")
+    })
+}
+
+fn write_document(workspace: &Path, document: &FractalProject) -> Result<()> {
+    validate(document)?;
+    let destination = path(workspace);
+    let directory = destination.parent().expect("project file has parent");
+    fs::create_dir_all(directory).with_context(|| format!("create {}", directory.display()))?;
+    atomic_write(&destination, &serde_json::to_vec_pretty(document)?)
+}
+
+fn project_file_lock() -> std::sync::MutexGuard<'static, ()> {
+    PROJECT_FILE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("project file lock")
 }
 
 fn reject_secret_fields(value: &Value) -> Result<()> {
@@ -234,8 +538,50 @@ mod tests {
         assert_eq!(document.schema, "fractal.project.v1");
         assert!(document.project.slug.starts_with("my-expense-app-"));
         assert_eq!(document.graph, graph);
+        assert_eq!(
+            document
+                .execution
+                .as_ref()
+                .map(|state| state.phase.as_str()),
+            Some("executing")
+        );
         let encoded = fs::read_to_string(stored)?;
         assert!(!encoded.contains(workspace.to_string_lossy().as_ref()));
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn records_portable_agent_assignments_without_changing_graph_hash() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [
+                {"id": "build", "capability": "code.generate", "instruction": "Build it."},
+                {"id": "test", "capability": "project.tests.execute", "instruction": "Test it."}
+            ],
+            "edges": [{"from": "build", "to": "test"}]
+        });
+        graph["graph_hash"] = Value::String(
+            fractal_contracts::canonical_sha256(&graph)
+                .map_err(|error| anyhow::anyhow!("hash fixture: {error}"))?,
+        );
+        persist(&workspace, &graph, "Build app")?;
+        let original_hash = load(&workspace)?.graph_hash;
+        transition(&workspace, "build", "checkout", "cursor", "Cursor")?;
+        transition(&workspace, "test", "checkout", "codex", "Codex")?;
+        transition(&workspace, "build", "complete", "cursor", "Cursor")?;
+        let document = load(&workspace)?;
+        assert_eq!(document.graph_hash, original_hash);
+        let execution = document.execution.expect("execution state");
+        assert_eq!(execution.phase, "executing");
+        assert_eq!(execution.assignments["build"].state, "completed");
+        assert_eq!(execution.assignments["test"].state, "checked_out");
+        assert!(release_stale_assignments(&workspace)?);
+        let execution = load(&workspace)?.execution.expect("execution state");
+        assert_eq!(execution.phase, "halted");
+        assert_eq!(execution.assignments["test"].state, "released");
         fs::remove_dir_all(workspace)?;
         Ok(())
     }
