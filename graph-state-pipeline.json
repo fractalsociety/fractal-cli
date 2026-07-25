@@ -327,6 +327,13 @@
       "state": "completed",
       "checked_out_at": "2026-07-25T17:47:03.872981+00:00",
       "completed_at": "2026-07-25T17:56:12.947253+00:00"
+    },
+    "P8.4": {
+      "agent_id": "codex/lead-planning",
+      "agent_label": "Codex \u00b7 Lead Planning",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T20:40:36.933945+00:00",
+      "completed_at": "2026-07-25T20:55:35.493191+00:00"
     }
   }
 }
