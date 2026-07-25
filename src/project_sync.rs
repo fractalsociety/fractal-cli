@@ -34,6 +34,8 @@ struct SyncState {
 #[derive(Debug, Deserialize)]
 struct SyncResponse {
     project_url: String,
+    #[serde(default)]
+    browser_url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -111,6 +113,16 @@ pub(crate) fn run(args: &SyncArgs) -> Result<()> {
 /// Publish the current project when cloud sync is enabled and return the
 /// authenticated Fractal Society page that should be shown to the user.
 pub(crate) fn maybe_sync(workspace: &Path) -> Option<String> {
+    maybe_sync_with_options(workspace, true)
+}
+
+/// Publish an early planning graph without waiting for GitHub initialization.
+/// The full graph performs the normal GitHub sync after planning completes.
+pub(crate) fn maybe_sync_planning(workspace: &Path) -> Option<String> {
+    maybe_sync_with_options(workspace, false)
+}
+
+fn maybe_sync_with_options(workspace: &Path, publish_github: bool) -> Option<String> {
     if std::env::var_os("FRACTAL_OFFLINE").is_some() {
         return None;
     }
@@ -125,12 +137,16 @@ pub(crate) fn maybe_sync(workspace: &Path) -> Option<String> {
             }
         }
     }
-    let repository = match publish_local_github(workspace) {
-        Ok(repository) => repository,
-        Err(error) => {
-            eprintln!("  GitHub sync note: {error:#}");
-            None
+    let repository = if publish_github {
+        match publish_local_github(workspace) {
+            Ok(repository) => repository,
+            Err(error) => {
+                eprintln!("  GitHub sync note: {error:#}");
+                None
+            }
         }
+    } else {
+        None
     };
     match upload(workspace, repository.as_ref()) {
         Ok(response) => {
@@ -138,7 +154,11 @@ pub(crate) fn maybe_sync(workspace: &Path) -> Option<String> {
             if let Some(repository) = repository {
                 println!("  ↗ GitHub graph: {}", repository.github_graph_url);
             }
-            Some(response.project_url)
+            Some(if response.browser_url.is_empty() {
+                response.project_url
+            } else {
+                response.browser_url
+            })
         }
         Err(error) => {
             eprintln!("  sync note: {error:#}");
@@ -238,10 +258,23 @@ fn upload(workspace: &Path, repository: Option<&RepositoryLink>) -> Result<SyncR
             result.project_url
         );
     }
+    if result.browser_url.starts_with('/') {
+        result.browser_url = format!(
+            "{}{}",
+            session.server.trim_end_matches('/'),
+            result.browser_url
+        );
+    }
     if !is_safe_project_url(&result.project_url) {
         bail!(
             "Fractal Society returned an invalid project URL: {}",
             result.project_url
+        );
+    }
+    if !result.browser_url.is_empty() && !is_safe_project_url(&result.browser_url) {
+        bail!(
+            "Fractal Society returned an invalid browser handoff URL: {}",
+            result.browser_url
         );
     }
     let account = session.account_identity();

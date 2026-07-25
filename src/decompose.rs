@@ -113,6 +113,57 @@ pub(crate) fn plan_and_commit(
     decompose_and_commit(&source_text, &source_name, request, workspace, &agents[0])
 }
 
+/// Commit a minimal graph before the lead starts its potentially multi-minute
+/// planning call. This lets authenticated users open the permanent project URL
+/// immediately; the same project document is replaced with the full DAG later.
+pub(crate) fn commit_planning_preview(
+    request: &str,
+    workspace: &Path,
+    lead_agent: &str,
+) -> Result<String> {
+    let source_name = detect_prd_file(request, workspace)
+        .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "user request".to_owned());
+    let harness = planning_preview_harness(&source_name, lead_agent);
+    let work = build_work_value(&format!(
+        "Lead agent `{lead_agent}` is planning {source_name}: {request}"
+    ))?;
+    let target_id = "darwin-arm64";
+    let graph = crate::compile::recompile(&work, &harness, target_id)
+        .context("compile the planning preview graph")?;
+    let record =
+        graph_store::commit_graph(&graph).context("commit the planning preview graph")?;
+    if let Some(hash) = graph.get("graph_hash").and_then(Value::as_str) {
+        graph_store::persist_source(hash, &harness, &work, target_id).ok();
+    }
+    Ok(record.graph_hash)
+}
+
+fn planning_preview_harness(source_name: &str, lead_agent: &str) -> Value {
+    json!({
+        "schema": "fractal.compiled_harness.v1",
+        "version": 1,
+        "harness_id": "harness.lead_planning_preview.v1",
+        "goal": format!("Expand {source_name} into a structured project plan."),
+        "nodes": [{
+            "id": "lead_planning",
+            "title": "Lead agent is planning the project",
+            "capability": "control.plan",
+            "status": "active",
+            "agent": lead_agent,
+            "agent_label": lead_agent,
+            "memory_scopes": ["work:goal", "workspace:root"],
+            "preconditions": [],
+            "produced_state": ["lead_plan.ready"],
+            "instruction": format!(
+                "The lead is reading {source_name}, selecting architecture, defining acceptance criteria, and decomposing the execution graph."
+            ),
+            "budget": {"timeout_ms": 900_000},
+        }],
+        "edges": [],
+    })
+}
+
 /// Find a PRD/spec file the request explicitly names (a token that resolves to an
 /// existing file). Requires an explicit filename so we never guess among many PRDs.
 fn detect_prd_file(request: &str, workspace: &Path) -> Option<PathBuf> {
@@ -732,5 +783,28 @@ mod tests {
         );
         assert_eq!(detect_prd_file("work on the prd", &dir), None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn planning_preview_exposes_one_active_lead_node() {
+        let harness = planning_preview_harness("APP_PRD.md", "claude");
+        let node = &harness["nodes"][0];
+        assert_eq!(harness["harness_id"], "harness.lead_planning_preview.v1");
+        assert_eq!(node["id"], "lead_planning");
+        assert_eq!(node["capability"], "control.plan");
+        assert_eq!(node["status"], "active");
+        assert_eq!(node["agent"], "claude");
+    }
+
+    #[test]
+    fn planning_preview_compiles_to_a_publishable_execution_graph() {
+        let harness = planning_preview_harness("APP_PRD.md", "claude");
+        let work = build_work_value("Plan the application").expect("work");
+        let graph =
+            crate::compile::recompile(&work, &harness, "darwin-arm64").expect("planning graph");
+        crate::graph_store::verify_graph_document(&graph).expect("valid graph hash");
+        let nodes = graph["nodes"].as_array().expect("nodes");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["capability"], "control.plan");
     }
 }

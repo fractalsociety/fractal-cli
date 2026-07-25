@@ -76,6 +76,7 @@ pub(crate) fn run(fractalwork_override: Option<&Path>, coordinate_flag: bool) ->
                     &task_group,
                     &completed,
                     Some(&completed),
+                    false,
                 );
             } else {
                 crate::checkpoint::discard(&cp.key);
@@ -473,6 +474,7 @@ pub(crate) fn execute_ingested(
             &task_group,
             &completed,
             Some(&completed),
+            false,
         ));
     }
 
@@ -535,6 +537,7 @@ pub(crate) fn resume_project(
         &task_group,
         &completed,
         Some(&completed),
+        false,
     ))
 }
 
@@ -560,6 +563,11 @@ fn execute_request(
     // Lead-planning path: every ordinary request becomes a structured PRD,
     // architecture, acceptance contract, and validated task DAG before workers
     // execute. Deterministic compilation remains the fail-soft fallback.
+    let planning_browser_opened = if agents.is_empty() {
+        false
+    } else {
+        publish_and_open_planning_preview(request, workspace, &agents[0])
+    };
     let committed_hash = if agents.is_empty() {
         let plan = pipeline::render_submit_plan(
             request,
@@ -616,6 +624,7 @@ fn execute_request(
                 &task_group,
                 &BTreeSet::new(),
                 None,
+                planning_browser_opened,
             )
         }
         None => {
@@ -640,6 +649,7 @@ fn drive_committed_graph(
     task_group: &str,
     resume_completed: &BTreeSet<String>,
     board_preseed: Option<&BTreeSet<String>>,
+    browser_already_open: bool,
 ) -> Option<crate::execute::RunOutcome> {
     let project_url = match graph_store::load_graph(hash)
         .and_then(|graph| crate::project_file::persist(workspace, &graph, request))
@@ -673,7 +683,7 @@ fn drive_committed_graph(
     if let Err(error) = board::serve_graph(hash, port, None, is_cloud_target, board_preseed) {
         eprintln!("  (board unavailable: {error:#})");
     }
-    if is_cloud_target {
+    if is_cloud_target && !browser_already_open {
         if let Err(error) = board::open_url(&browser_target) {
             eprintln!("  (Fractal Society page unavailable: {error:#}; opening local board)");
             let (local_board_url, _) = board::browser_target(None, port);
@@ -777,6 +787,31 @@ fn drive_committed_graph(
         Err(error) => {
             eprintln!("  execution error: {error:#} · worked for {elapsed}\n");
             None
+        }
+    }
+}
+
+fn publish_and_open_planning_preview(request: &str, workspace: &Path, lead: &str) -> bool {
+    let result = crate::decompose::commit_planning_preview(request, workspace, lead)
+        .and_then(|hash| graph_store::load_graph(&hash))
+        .and_then(|graph| crate::project_file::persist(workspace, &graph, request));
+    let path = match result {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("  planning graph note: {error:#}");
+            return false;
+        }
+    };
+    println!("  ◇ Planning graph: {}", path.display());
+    let Some(browser_url) = crate::project_sync::maybe_sync_planning(workspace) else {
+        return false;
+    };
+    println!("  → opening the project now; it will refresh when planning completes…");
+    match board::open_url(&browser_url) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("  (could not open the planning graph: {error:#})");
+            false
         }
     }
 }
