@@ -48,8 +48,10 @@ struct DeviceAuthorization {
 struct Account {
     #[serde(default)]
     id: String,
-    #[serde(default, alias = "label")]
+    #[serde(default)]
     username: String,
+    #[serde(default)]
+    label: String,
 }
 
 #[derive(Deserialize)]
@@ -139,7 +141,7 @@ pub(crate) fn run_login(args: &LoginArgs) -> Result<()> {
                     serde_json::from_value(body).context("decode browser authorization result")?;
                 let (username, account_id) = match token.account {
                     Some(account) => (
-                        (!account.username.is_empty()).then_some(account.username),
+                        account.username(),
                         (!account.id.is_empty()).then_some(account.id),
                     ),
                     None => (None, None),
@@ -280,6 +282,16 @@ pub(crate) fn load_session() -> Result<StoredSession> {
 impl StoredSession {
     pub(crate) fn account_identity(&self) -> Option<String> {
         self.account_id.clone().or_else(|| self.username.clone())
+    }
+}
+
+impl Account {
+    fn username(&self) -> Option<String> {
+        if !self.username.is_empty() {
+            Some(self.username.clone())
+        } else {
+            (!self.label.is_empty()).then_some(self.label.clone())
+        }
     }
 }
 
@@ -436,5 +448,20 @@ mod tests {
         });
         assert_eq!(response_state(&body), Some("authorization_pending"));
         assert_eq!(body["interval"], 3);
+    }
+
+    #[test]
+    fn decodes_account_with_distinct_username_and_label_fields() {
+        let token: TokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": "test-token",
+            "account": {
+                "id": "acct_builder",
+                "username": "builder",
+                "label": "Builder"
+            }
+        }))
+        .unwrap();
+        let account = token.account.unwrap();
+        assert_eq!(account.username(), Some("builder".to_owned()));
     }
 }
