@@ -52,11 +52,19 @@ fn run(cli: Cli) -> Result<()> {
     let Cli {
         fractalwork,
         coordinate,
+        offline,
         request,
         command,
     } = cli;
     match (request, command) {
-        (None, None) => interactive::run(fractalwork.as_deref(), coordinate),
+        (None, None) => {
+            if offline {
+                println!("Offline mode: Fractal Society login and cloud sync are disabled.\n");
+            } else {
+                auth::ensure_login()?;
+            }
+            interactive::run(fractalwork.as_deref(), coordinate)
+        }
         (Some(request), None) => print_submit_plan(
             &request,
             None,

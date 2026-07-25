@@ -27,6 +27,10 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) coordinate: bool,
 
+    /// Start a local-only interactive session without Fractal Society login.
+    #[arg(long, global = true)]
+    pub(crate) offline: bool,
+
     /// A natural-language request to submit with default options.
     #[arg(value_name = "REQUEST")]
     pub(crate) request: Option<String>,
@@ -497,6 +501,14 @@ mod tests {
     fn parses_bare_request() {
         let cli = Cli::try_parse_from(["fractal", "build a tiny CLI"]).unwrap();
         assert_eq!(cli.request.as_deref(), Some("build a tiny CLI"));
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_explicit_offline_interactive_mode() {
+        let cli = Cli::try_parse_from(["fractal", "--offline"]).unwrap();
+        assert!(cli.offline);
+        assert!(cli.request.is_none());
         assert!(cli.command.is_none());
     }
 

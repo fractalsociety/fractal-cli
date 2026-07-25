@@ -185,6 +185,76 @@ pub(crate) fn run_login(args: &LoginArgs) -> Result<()> {
     bail!("browser authorization timed out; run `fractal login` again")
 }
 
+/// Ensure the interactive CLI has a live Fractal Society session.
+///
+/// A valid owner-only local credential is reused. Missing, malformed, or
+/// server-revoked credentials enter the same browser device flow as
+/// `fractal login`. `fractal --offline` is the explicit local-only bypass.
+pub(crate) fn ensure_login() -> Result<()> {
+    let path = session_path()?;
+    if path.exists() {
+        match load_session_from(&path) {
+            Ok(session) => match validate_remote_session(&session) {
+                Ok(true) => {
+                    println!(
+                        "✓ Signed in to Fractal Society{}.",
+                        session
+                            .username
+                            .as_deref()
+                            .map(|name| format!(" as @{name}"))
+                            .unwrap_or_default()
+                    );
+                    return Ok(());
+                }
+                Ok(false) => {
+                    println!("Your Fractal Society session expired. Sign in again.");
+                }
+                Err(error) => {
+                    return Err(error).context(
+                        "cannot verify Fractal Society login; use `fractal --offline` for local-only work",
+                    );
+                }
+            },
+            Err(error) => {
+                eprintln!("Credential note: {error:#}");
+                println!("Sign in again to repair the local session.");
+            }
+        }
+    } else {
+        println!("Welcome to Fractal. Sign in to connect your projects and execution graphs.");
+    }
+
+    run_login(&LoginArgs {
+        server: None,
+        no_open: false,
+        timeout: 300,
+    })
+}
+
+fn validate_remote_session(session: &StoredSession) -> Result<bool> {
+    let endpoint = format!(
+        "{}/api/fractal/account",
+        session.server.trim_end_matches('/')
+    );
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(8))
+        .timeout_read(Duration::from_secs(12))
+        .timeout_write(Duration::from_secs(12))
+        .build();
+    match agent
+        .get(&endpoint)
+        .set("Authorization", &format!("Bearer {}", session.access_token))
+        .call()
+    {
+        Ok(response) => Ok(response.status() == 200),
+        Err(ureq::Error::Status(401, _)) => Ok(false),
+        Err(ureq::Error::Status(status, _)) => {
+            bail!("Fractal Society session check failed with HTTP {status}")
+        }
+        Err(error) => Err(error).context("contact Fractal Society"),
+    }
+}
+
 fn response_state(body: &serde_json::Value) -> Option<&str> {
     body.get("error")
         .or_else(|| body.get("status"))
