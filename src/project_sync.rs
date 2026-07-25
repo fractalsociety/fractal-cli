@@ -2,11 +2,13 @@
 //!
 //! Local `.fractal/project.fractal` persistence never depends on a network.
 //! Logging in opts the CLI into private Fractal Society project publication.
-//! GitHub mirroring remains explicitly opt-in. `fractal sync --disable` creates
-//! a project-local opt-out marker.
+//! GitHub access remains entirely local: Fractal uses the repository's Git
+//! remote and the user's existing `git`/`gh` authentication, then sends only
+//! sanitized public repository links to Fractal Society.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -32,10 +34,12 @@ struct SyncState {
 #[derive(Debug, Deserialize)]
 struct SyncResponse {
     project_url: String,
-    #[serde(default)]
-    github_url: Option<String>,
-    #[serde(default)]
-    github_notice: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RepositoryLink {
+    repository_url: String,
+    github_graph_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,13 +83,23 @@ pub(crate) fn run(args: &SyncArgs) -> Result<()> {
             &SyncPreference {
                 schema: "fractal.project_sync.v1".to_owned(),
                 enabled: true,
-                sync_github: args.github,
+                sync_github: true,
             },
         )?;
     }
-    let response = upload(&workspace, args.github)?;
+    let repository = match publish_local_github(&workspace) {
+        Ok(repository) => repository,
+        Err(error) if args.github => return Err(error),
+        Err(error) => {
+            eprintln!("GitHub sync note: {error:#}");
+            None
+        }
+    };
+    let response = upload(&workspace, repository.as_ref())?;
     println!("Project URL: {}", response.project_url);
-    report_github_result(&response, args.github)?;
+    if let Some(repository) = repository {
+        println!("GitHub graph: {}", repository.github_graph_url);
+    }
     if !args.enable {
         println!(
             "One-shot sync complete. Pass --enable to sync future graph updates automatically."
@@ -95,46 +109,36 @@ pub(crate) fn run(args: &SyncArgs) -> Result<()> {
 }
 
 pub(crate) fn maybe_sync(workspace: &Path) {
-    let sync_github = match load_preference(workspace) {
+    match load_preference(workspace) {
         Some(preference) if !preference.enabled => return,
-        Some(preference) => preference.sync_github,
+        Some(_) => {}
         None => {
             // No login means purely local/offline operation, without a warning
             // on every graph build. A valid login enables private web sync.
             if crate::auth::load_session().is_err() {
                 return;
             }
-            false
+        }
+    }
+    let repository = match publish_local_github(workspace) {
+        Ok(repository) => repository,
+        Err(error) => {
+            eprintln!("  GitHub sync note: {error:#}");
+            None
         }
     };
-    match upload(workspace, sync_github) {
+    match upload(workspace, repository.as_ref()) {
         Ok(response) => {
             println!("  ↗ Project URL: {}", response.project_url);
-            if let Err(error) = report_github_result(&response, sync_github) {
-                eprintln!("  sync note: {error:#}");
+            if let Some(repository) = repository {
+                println!("  ↗ GitHub graph: {}", repository.github_graph_url);
             }
         }
         Err(error) => eprintln!("  sync note: {error:#}"),
     }
 }
 
-fn report_github_result(response: &SyncResponse, requested: bool) -> Result<()> {
-    if !requested {
-        return Ok(());
-    }
-    if let Some(url) = &response.github_url {
-        println!("GitHub graph: {url}");
-        return Ok(());
-    }
-    bail!(
-        "{}",
-        response.github_notice.as_deref().unwrap_or(
-            "GitHub was not mirrored. Open the project URL, connect GitHub, choose a repository, and sync again."
-        )
-    )
-}
-
-fn upload(workspace: &Path, sync_github: bool) -> Result<SyncResponse> {
+fn upload(workspace: &Path, repository: Option<&RepositoryLink>) -> Result<SyncResponse> {
     let session = crate::auth::load_session()?;
     let document = crate::project_file::load(workspace)?;
     let endpoint = format!(
@@ -143,9 +147,19 @@ fn upload(workspace: &Path, sync_github: bool) -> Result<SyncResponse> {
         document.project.slug
     );
     let mut body = serde_json::to_value(&document)?;
-    body.as_object_mut()
-        .context("fractal project must encode as an object")?
-        .insert("sync_github".to_owned(), sync_github.into());
+    if let Some(repository) = repository {
+        let object = body
+            .as_object_mut()
+            .context("fractal project must encode as an object")?;
+        object.insert(
+            "repository_url".to_owned(),
+            repository.repository_url.clone().into(),
+        );
+        object.insert(
+            "github_graph_url".to_owned(),
+            repository.github_graph_url.clone().into(),
+        );
+    }
     let encoded = serde_json::to_string(&body)?;
     let prior_hash = load_state(workspace)
         .filter(|state| {
@@ -222,6 +236,155 @@ fn upload(workspace: &Path, sync_github: bool) -> Result<SyncResponse> {
         },
     )?;
     Ok(result)
+}
+
+fn publish_local_github(workspace: &Path) -> Result<Option<RepositoryLink>> {
+    let root = match git_output(workspace, &["rev-parse", "--show-toplevel"]) {
+        Ok(root) => PathBuf::from(root),
+        Err(_) => {
+            run_command(
+                Command::new("git").arg("init").arg(workspace),
+                "initialize local Git repository",
+            )?;
+            workspace.to_path_buf()
+        }
+    };
+    let graph = crate::project_file::path(workspace);
+    let relative_graph = graph.strip_prefix(&root).with_context(|| {
+        format!(
+            "project graph {} is outside Git repository {}",
+            graph.display(),
+            root.display()
+        )
+    })?;
+
+    let remote = match git_output(&root, &["remote", "get-url", "origin"]) {
+        Ok(remote) => remote,
+        Err(_) => {
+            let slug = crate::project_file::load(workspace)?.project.slug;
+            run_command(
+                Command::new("gh")
+                    .current_dir(&root)
+                    .args(["repo", "create", &slug, "--private", "--source", "."])
+                    .args(["--remote", "origin"]),
+                "create a private GitHub repository with local `gh` authentication",
+            )
+            .context("run `gh auth login` first, or add a GitHub `origin` remote")?;
+            git_output(&root, &["remote", "get-url", "origin"])?
+        }
+    };
+    let repository_url = canonical_github_repository(&remote)
+        .context("origin must point to github.com before Fractal can publish it")?;
+
+    let relative = relative_graph
+        .to_str()
+        .context("project graph path must be valid UTF-8")?;
+    run_command(
+        Command::new("git")
+            .current_dir(&root)
+            .args(["add", "-f", "--", relative]),
+        "stage .fractal/project.fractal",
+    )?;
+    let changed = !command_success(
+        Command::new("git")
+            .current_dir(&root)
+            .args(["diff", "--cached", "--quiet", "--", relative]),
+    )?;
+    if changed {
+        run_command(
+            Command::new("git").current_dir(&root).args([
+                "commit",
+                "--only",
+                "-m",
+                "Update Fractal execution graph",
+                "--",
+                relative,
+            ]),
+            "commit .fractal/project.fractal",
+        )?;
+    }
+    let commit = git_output(&root, &["rev-parse", "HEAD"])
+        .context("Git repository needs a commit before it can be published")?;
+    run_command(
+        Command::new("git")
+            .current_dir(&root)
+            .args(["push", "--set-upstream", "origin", "HEAD"]),
+        "push the Fractal graph with local GitHub credentials",
+    )?;
+    let path = relative
+        .split('/')
+        .map(url_path_segment)
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok(Some(RepositoryLink {
+        github_graph_url: format!("{repository_url}/blob/{commit}/{path}"),
+        repository_url,
+    }))
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .with_context(|| format!("run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+fn run_command(command: &mut Command, action: &str) -> Result<()> {
+    let status = command.status().with_context(|| action.to_owned())?;
+    if !status.success() {
+        bail!("{action} failed with {status}");
+    }
+    Ok(())
+}
+
+fn command_success(command: &mut Command) -> Result<bool> {
+    Ok(command.status()?.success())
+}
+
+fn canonical_github_repository(remote: &str) -> Option<String> {
+    let path = if let Some(path) = remote.strip_prefix("git@github.com:") {
+        path
+    } else if let Some(path) = remote.strip_prefix("ssh://git@github.com/") {
+        path
+    } else {
+        remote
+            .strip_prefix("https://github.com/")
+            .or_else(|| remote.strip_prefix("http://github.com/"))?
+    };
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repository = parts.next()?;
+    if parts.next().is_some() || !safe_github_segment(owner) || !safe_github_segment(repository) {
+        return None;
+    }
+    Some(format!("https://github.com/{owner}/{repository}"))
+}
+
+fn safe_github_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn url_path_segment(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+                vec![char::from(byte)]
+            } else {
+                format!("%{byte:02X}").chars().collect()
+            }
+        })
+        .collect()
 }
 
 fn put_project(
@@ -350,26 +513,17 @@ mod tests {
     }
 
     #[test]
-    fn requested_github_requires_proof_of_a_real_mirror() {
-        let pending = SyncResponse {
-            project_url: "https://fractalsociety.com/@builder/app".to_owned(),
-            github_url: None,
-            github_notice: Some(
-                "Connect GitHub and choose a repository on the project page.".to_owned(),
-            ),
-        };
-        let error = report_github_result(&pending, true)
-            .expect_err("a notice is not proof that GitHub was mirrored");
-        assert!(error.to_string().contains("Connect GitHub"));
-
-        let mirrored = SyncResponse {
-            project_url: pending.project_url,
-            github_url: Some(
-                "https://github.com/builder/app/blob/main/.fractal/project.fractal".to_owned(),
-            ),
-            github_notice: None,
-        };
-        assert!(report_github_result(&mirrored, true).is_ok());
+    fn normalizes_only_safe_github_repository_remotes() {
+        assert_eq!(
+            canonical_github_repository("git@github.com:builder/app.git").as_deref(),
+            Some("https://github.com/builder/app")
+        );
+        assert_eq!(
+            canonical_github_repository("https://github.com/builder/app/").as_deref(),
+            Some("https://github.com/builder/app")
+        );
+        assert!(canonical_github_repository("https://token@github.com/builder/app.git").is_none());
+        assert!(canonical_github_repository("https://gitlab.com/builder/app.git").is_none());
     }
 
     #[test]

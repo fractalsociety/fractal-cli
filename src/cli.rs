@@ -104,7 +104,7 @@ pub(crate) struct SyncArgs {
     #[arg(long, value_name = "PATH")]
     pub(crate) repo: Option<PathBuf>,
 
-    /// Enable future sync, optionally including GitHub with --github.
+    /// Enable future profile and local-GitHub sync.
     #[arg(long, conflicts_with = "disable")]
     pub(crate) enable: bool,
 
@@ -112,7 +112,7 @@ pub(crate) struct SyncArgs {
     #[arg(long, conflicts_with_all = ["enable", "github"])]
     pub(crate) disable: bool,
 
-    /// Ask Fractal Society to mirror project.fractal to the connected GitHub repository.
+    /// Require the local GitHub push to succeed instead of treating it as fail-soft.
     #[arg(long)]
     pub(crate) github: bool,
 }
