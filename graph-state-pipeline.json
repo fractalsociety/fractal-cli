@@ -341,6 +341,13 @@
       "state": "completed",
       "checked_out_at": "2026-07-25T21:22:15.143796+00:00",
       "completed_at": "2026-07-25T21:29:01.673829+00:00"
+    },
+    "P8.6": {
+      "agent_id": "codex/early-cloud-graph",
+      "agent_label": "Codex \u00b7 Early Cloud Graph",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T21:46:54.211924+00:00",
+      "completed_at": "2026-07-25T21:57:38.465374+00:00"
     }
   }
 }
