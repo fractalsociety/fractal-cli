@@ -334,6 +334,13 @@
       "state": "completed",
       "checked_out_at": "2026-07-25T20:40:36.933945+00:00",
       "completed_at": "2026-07-25T20:55:35.493191+00:00"
+    },
+    "P8.5": {
+      "agent_id": "codex/planning-cloud-ux",
+      "agent_label": "Codex \u00b7 Planning/Cloud UX",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T21:22:15.143796+00:00",
+      "completed_at": "2026-07-25T21:29:01.673829+00:00"
     }
   }
 }
