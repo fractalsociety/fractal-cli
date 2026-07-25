@@ -153,8 +153,8 @@ fn banner(workspace: &Path) {
 fn print_help() {
     println!("  Type a request in plain language, e.g.:");
     println!("    build a CLI that reverses a string, with a passing test");
-    println!("  Fractal classifies it, compiles a task-faithful execution graph,");
-    println!("  commits it, and opens its live board.");
+    println!("  The lead writes the PRD, architecture, acceptance criteria, and task DAG.");
+    println!("  Fractal validates and compiles it, workers build it, and the lead closes it.");
     println!("  /backend switches between the in-process and Coordinate executors.");
     println!("  Commands: /help  /trust  /backend  /exit");
 }
@@ -476,7 +476,14 @@ pub(crate) fn execute_ingested(
         ));
     }
 
-    execute_request(request, &workspace, fractalwork_override, port, &agents, backend)
+    execute_request(
+        request,
+        &workspace,
+        fractalwork_override,
+        port,
+        &agents,
+        backend,
+    )
 }
 
 /// Resume a project by its stable number — used by `fractal resume <N>` and by the
@@ -550,47 +557,49 @@ fn execute_request(
         );
     }
 
-    // PRD-decomposition path: if the request names a PRD/spec file, the lead
-    // planner reads it and decomposes it into a task DAG that becomes the graph —
-    // instead of collapsing the whole PRD into one fixed template harness. Falls
-    // back to the standard harness when no PRD is referenced (or planning fails).
-    let committed_hash = match crate::decompose::maybe_decompose(request, workspace, agents) {
-        Some(Ok(hash)) => {
-            println!("  Harness: harness.prd_decomposition.v1 (PRD → task DAG)");
-            if let Ok(graph) = graph_store::load_graph(&hash) {
-                let count = |key| {
-                    graph
-                        .get(key)
-                        .and_then(|v| v.as_array())
-                        .map_or(0, Vec::len)
-                };
-                println!("  Graph hash: {hash}");
-                println!("  Nodes: {}  Edges: {}", count("nodes"), count("edges"));
+    // Lead-planning path: every ordinary request becomes a structured PRD,
+    // architecture, acceptance contract, and validated task DAG before workers
+    // execute. Deterministic compilation remains the fail-soft fallback.
+    let committed_hash = if agents.is_empty() {
+        let plan = pipeline::render_submit_plan(
+            request,
+            Some(Mode::Build),
+            None,
+            Some(workspace),
+            mapped,
+        )?;
+        print_committed_plan_lines(&plan.text);
+        plan.committed_graph_hash
+    } else {
+        match crate::decompose::plan_and_commit(request, workspace, agents) {
+            Ok(hash) => {
+                println!("  Harness: harness.lead_planned_project.v1 (request → PRD → validated task DAG)");
+                if let Ok(graph) = graph_store::load_graph(&hash) {
+                    let count = |key| {
+                        graph
+                            .get(key)
+                            .and_then(|v| v.as_array())
+                            .map_or(0, Vec::len)
+                    };
+                    println!("  Graph hash: {hash}");
+                    println!("  Nodes: {}  Edges: {}", count("nodes"), count("edges"));
+                }
+                Some(hash)
             }
-            Some(hash)
-        }
-        Some(Err(error)) => {
-            eprintln!("  (PRD decomposition failed: {error:#}; using the standard harness)");
-            let plan = pipeline::render_submit_plan(
-                request,
-                Some(Mode::Build),
-                None,
-                Some(workspace),
-                mapped,
-            )?;
-            print_committed_plan_lines(&plan.text);
-            plan.committed_graph_hash
-        }
-        None => {
-            let plan = pipeline::render_submit_plan(
-                request,
-                Some(Mode::Build),
-                None,
-                Some(workspace),
-                mapped,
-            )?;
-            print_committed_plan_lines(&plan.text);
-            plan.committed_graph_hash
+            Err(error) => {
+                eprintln!(
+                    "  (lead planning failed: {error:#}; using the deterministic fallback harness)"
+                );
+                let plan = pipeline::render_submit_plan(
+                    request,
+                    Some(Mode::Build),
+                    None,
+                    Some(workspace),
+                    mapped,
+                )?;
+                print_committed_plan_lines(&plan.text);
+                plan.committed_graph_hash
+            }
         }
     };
 
@@ -740,6 +749,9 @@ fn drive_committed_graph(
                 None => "·",
             };
             println!("  {mark} {} · worked for {elapsed}\n", outcome.detail);
+            if outcome.failed_node.is_none() {
+                crate::project_sync::maybe_sync(workspace);
+            }
             Some(outcome)
         }
         Err(error) => {

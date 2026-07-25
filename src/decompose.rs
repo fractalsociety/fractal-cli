@@ -1,9 +1,8 @@
-//! PRD-decomposition planner.
+//! Lead-planned project decomposition.
 //!
-//! When a request points at a PRD / spec file, the lead planner *reads it* and
-//! decomposes it into a concrete task DAG (N tasks + dependencies), which compiles
-//! into a real execution graph the agent team + mid-run morphogenesis execute —
-//! instead of collapsing the whole PRD into one fixed template harness.
+//! Every ordinary interactive build asks the selected lead to expand the request
+//! (or a referenced PRD/spec) into a structured product contract plus a concrete
+//! task DAG. Fractal validates both artifacts before compiling the DAG.
 //!
 //! Pipeline: detect the PRD file → lead agent writes `fractal-plan.json` (a task
 //! DAG optimized for the product's performance) → validate (acyclic, capabilities,
@@ -16,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::graph_store;
@@ -36,8 +36,46 @@ const ALLOWED_CAPS: [&str; 6] = [
 const MAX_TASKS: usize = 40;
 const MIN_TASKS: usize = 2;
 
-/// One task from the planner's decomposition of the PRD.
-#[derive(Clone)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct StructuredPrd {
+    schema: String,
+    title: String,
+    summary: String,
+    architecture: Architecture,
+    acceptance_criteria: Vec<AcceptanceCriterion>,
+    #[serde(default)]
+    non_goals: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct Architecture {
+    approach: String,
+    rationale: String,
+    components: Vec<ArchitectureComponent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ArchitectureComponent {
+    name: String,
+    responsibility: String,
+    technology: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct AcceptanceCriterion {
+    id: String,
+    criterion: String,
+    verification: String,
+}
+
+#[derive(Debug)]
+struct PlannedProject {
+    prd: StructuredPrd,
+    tasks: Vec<Task>,
+}
+
+/// One task from the lead's decomposition.
+#[derive(Clone, Debug)]
 struct Task {
     id: String,
     title: String,
@@ -46,22 +84,33 @@ struct Task {
     depends_on: Vec<String>,
 }
 
-/// If the request references a PRD/spec file, decompose it into a committed graph
-/// and return its hash. Returns `None` when no PRD file is referenced (the caller
-/// then uses the standard harness). The inner `Result` is `Err` only when a PRD
-/// *was* found but planning failed — the caller falls back with a note.
-pub(crate) fn maybe_decompose(
+/// Expand any ordinary request into a structured PRD and committed task graph.
+/// A referenced PRD/spec becomes the source; otherwise the user's request is the
+/// source. The caller owns deterministic fallback when planning is unavailable.
+pub(crate) fn plan_and_commit(
     request: &str,
     workspace: &Path,
     agents: &[String],
-) -> Option<Result<String>> {
-    let prd = detect_prd_file(request, workspace)?;
+) -> Result<String> {
     if agents.is_empty() {
-        return Some(Err(anyhow!(
+        return Err(anyhow!(
             "no agent is enabled to plan the PRD (enable a builder at launch)"
-        )));
+        ));
     }
-    Some(decompose_and_commit(&prd, request, workspace, &agents[0]))
+    let referenced = detect_prd_file(request, workspace);
+    let (source_text, source_name) = match referenced {
+        Some(path) => {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("read PRD file {}", path.display()))?;
+            let name = path
+                .file_name()
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            (text, name)
+        }
+        None => (request.to_owned(), "user request".to_owned()),
+    };
+    decompose_and_commit(&source_text, &source_name, request, workspace, &agents[0])
 }
 
 /// Find a PRD/spec file the request explicitly names (a token that resolves to an
@@ -104,33 +153,32 @@ fn candidate_paths(token: &str, workspace: &Path) -> Vec<PathBuf> {
 }
 
 fn decompose_and_commit(
-    prd_path: &Path,
+    source_text: &str,
+    source_name: &str,
     request: &str,
     workspace: &Path,
     lead_agent: &str,
 ) -> Result<String> {
-    let prd_text = std::fs::read_to_string(prd_path)
-        .with_context(|| format!("read PRD file {}", prd_path.display()))?;
-    let prd_name = prd_path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| prd_path.display().to_string());
-
     println!(
-        "  🧠 [{lead_agent}] decomposing {prd_name} into a task graph (optimizing for performance)…"
+        "  🧠 [{lead_agent}] expanding {source_name} into a PRD, architecture, acceptance contract, and task graph…"
     );
 
-    let tasks = plan_tasks(&prd_text, &prd_name, lead_agent, workspace)?;
+    let planned = plan_project(source_text, source_name, lead_agent, workspace)?;
+    persist_structured_prd(workspace, &planned.prd)?;
     println!(
-        "  ✓ planner produced {} tasks; compiling the execution graph…",
-        tasks.len()
+        "  ✓ lead proposed {} validated tasks and {} acceptance criteria; compiling the execution graph…",
+        planned.tasks.len(),
+        planned.prd.acceptance_criteria.len(),
     );
 
-    let harness = build_harness_genome(&tasks, &prd_name);
+    let harness = build_harness_genome(&planned.tasks, source_name);
 
     // Reuse the exact compile + commit path the built-in harnesses use, so the
     // decomposed graph is evolution- and supervisor-ready.
-    let goal = format!("Execute the plan decomposed from the PRD {prd_name}: {request}");
+    let goal = format!(
+        "Execute the lead-planned project `{}` from {source_name}: {request}",
+        planned.prd.title
+    );
     let work = build_work_value(&goal)?;
     let target_id = "darwin-arm64";
     let graph = crate::compile::recompile(&work, &harness, target_id)
@@ -163,19 +211,19 @@ fn build_work_value(goal: &str) -> Result<Value> {
     serde_json::to_value(&work).context("encode decomposed FractalWork")
 }
 
-/// Invoke the lead agent to write `fractal-plan.json`, then parse + validate it
-/// into a task DAG.
-fn plan_tasks(
-    prd_text: &str,
-    prd_name: &str,
+/// Invoke the lead agent to write `fractal-plan.json`, then validate its
+/// structured product contract and task DAG.
+fn plan_project(
+    source_text: &str,
+    source_name: &str,
     lead_agent: &str,
     workspace: &Path,
-) -> Result<Vec<Task>> {
+) -> Result<PlannedProject> {
     let plan_path = workspace.join("fractal-plan.json");
     // Start clean so we never read a stale plan from a previous attempt.
     std::fs::remove_file(&plan_path).ok();
 
-    let prompt = planning_prompt(prd_text, prd_name);
+    let prompt = planning_prompt(source_text, source_name);
     // Planning gets a generous budget; a hung planner is killed rather than
     // stalling forever.
     let planner_timeout_ms = std::env::var("FRACTAL_AGENT_TIMEOUT_MS")
@@ -197,29 +245,49 @@ fn plan_tasks(
     let raw = std::fs::read_to_string(&plan_path).map_err(|_| {
         anyhow!("planner did not write fractal-plan.json (the PRD may be too large or unclear)")
     })?;
-    let tasks = parse_and_validate(&raw)?;
-    Ok(tasks)
+    parse_and_validate(&raw)
 }
 
-fn planning_prompt(prd_text: &str, prd_name: &str) -> String {
+fn planning_prompt(source_text: &str, source_name: &str) -> String {
     format!(
-        "You are the LEAD PLANNER for an autonomous multi-agent build team. Read the PRD below \
-         ({prd_name}) and decompose it into a concrete, executable task DAG that a team of coding \
-         agents will run in this workspace.\n\n\
+        "You are the LEAD PLANNER for an autonomous multi-agent build team. Expand the source below \
+         ({source_name}) into a product-ready structured PRD, select a concrete architecture, define \
+         verifiable acceptance criteria, and decompose it into an executable task DAG.\n\n\
          Optimize the plan for the PERFORMANCE and QUALITY of the product being built — correctness, \
          robustness, and the behaviors that matter — NOT for the lowest cost or least effort. Prefer \
          a decomposition that maximizes safe parallelism (independent tasks share no dependency).\n\n\
          WRITE A FILE named exactly `fractal-plan.json` in the current directory, and nothing else. \
          It MUST be valid JSON of this exact shape:\n\
-         {{\n  \"tasks\": [\n    {{\n      \"id\": \"short_snake_case_id\",\n      \"title\": \"one line\",\n      \"capability\": \"code.generate|code.edit|project.tests.execute|content.analyze\",\n      \"instruction\": \"a self-contained directive an agent can execute in this workspace with no other context\",\n      \"depends_on\": [\"ids of tasks that must finish first\"]\n    }}\n  ]\n}}\n\n\
+         {{\n\
+           \"prd\": {{\n\
+             \"schema\": \"fractal.prd.v1\",\n\
+             \"title\": \"specific product title\",\n\
+             \"summary\": \"what is being built and for whom\",\n\
+             \"architecture\": {{\n\
+               \"approach\": \"chosen architecture\",\n\
+               \"rationale\": \"why it fits\",\n\
+               \"components\": [{{\"name\":\"component\", \"responsibility\":\"what it owns\", \"technology\":\"concrete technology\"}}]\n\
+             }},\n\
+             \"acceptance_criteria\": [{{\"id\":\"AC-1\", \"criterion\":\"observable behavior\", \"verification\":\"exact test or check\"}}],\n\
+             \"non_goals\": [\"explicitly excluded scope\"]\n\
+           }},\n\
+           \"tasks\": [{{\n\
+             \"id\": \"short_snake_case_id\",\n\
+             \"title\": \"one line\",\n\
+             \"capability\": \"code.generate|code.edit|project.tests.execute|content.analyze\",\n\
+             \"instruction\": \"a self-contained directive an agent can execute in this workspace with no other context\",\n\
+             \"depends_on\": [\"ids of tasks that must finish first\"]\n\
+           }}]\n\
+         }}\n\n\
          Rules: {min}-{max} tasks; ids unique; `depends_on` must reference earlier task ids only and form a DAG (no cycles); \
          every `instruction` must be concrete and standalone (name the files to create/edit and what they must contain/do); \
-         include at least one `project.tests.execute` task that depends on the implementation and gates it (it should run the repository's real native/package test suite and fail if anything fails); \
+         architecture must name at least one component; include at least one observable acceptance criterion; \
+         include at least one `project.tests.execute` task that depends on implementation and verifies the stated acceptance criteria using the repository's real native/package test suite; \
          put the tasks in a sensible build order. Do NOT implement anything now — only write the plan file.\n\n\
-         --- PRD ({prd_name}) ---\n{prd}\n--- END PRD ---",
+         --- SOURCE ({source_name}) ---\n{source}\n--- END SOURCE ---",
         min = MIN_TASKS,
         max = MAX_TASKS,
-        prd = truncate_prd(prd_text),
+        source = truncate_prd(source_text),
     )
 }
 
@@ -236,12 +304,19 @@ fn truncate_prd(text: &str) -> String {
     format!("{}\n\n[PRD truncated for planning]", &text[..cut])
 }
 
-/// Parse the planner's JSON (tolerating markdown fences) and validate it into a
-/// clean, acyclic task list with a synthesized `complete` node.
-fn parse_and_validate(raw: &str) -> Result<Vec<Task>> {
+/// Parse the planner's JSON and fail closed unless the product contract and DAG
+/// are complete, bounded, and acyclic.
+fn parse_and_validate(raw: &str) -> Result<PlannedProject> {
     let json = extract_json(raw)?;
     let doc: Value = serde_json::from_str(&json)
         .context("planner produced invalid JSON in fractal-plan.json")?;
+    let prd: StructuredPrd = serde_json::from_value(
+        doc.get("prd")
+            .cloned()
+            .context("fractal-plan.json has no `prd` object")?,
+    )
+    .context("decode structured PRD")?;
+    validate_structured_prd(&prd)?;
     let array = doc
         .get("tasks")
         .and_then(Value::as_array)
@@ -251,8 +326,11 @@ fn parse_and_validate(raw: &str) -> Result<Vec<Task>> {
     let mut seen = std::collections::BTreeSet::new();
     for item in array {
         let id = sanitize_id(item.get("id").and_then(Value::as_str).unwrap_or(""));
-        if id.is_empty() || !seen.insert(id.clone()) {
-            continue; // skip empty or duplicate ids
+        if id.is_empty() {
+            bail!("planner produced a task with an empty id");
+        }
+        if !seen.insert(id.clone()) {
+            bail!("planner produced duplicate task id `{id}`");
         }
         let instruction = item
             .get("instruction")
@@ -261,7 +339,7 @@ fn parse_and_validate(raw: &str) -> Result<Vec<Task>> {
             .trim()
             .to_owned();
         if instruction.is_empty() {
-            continue;
+            bail!("task `{id}` has no instruction");
         }
         let capability = normalize_capability(item.get("capability").and_then(Value::as_str));
         let title = item
@@ -295,47 +373,124 @@ fn parse_and_validate(raw: &str) -> Result<Vec<Task>> {
             tasks.len()
         );
     }
-    tasks.truncate(MAX_TASKS);
-
-    // Drop dependency references to unknown/dropped ids, then break any cycles so
-    // the graph is a DAG the executor can topo-order.
-    let ids: std::collections::BTreeSet<String> = tasks.iter().map(|t| t.id.clone()).collect();
-    for task in &mut tasks {
-        task.depends_on
-            .retain(|dep| ids.contains(dep) && dep != &task.id);
+    if tasks.len() > MAX_TASKS {
+        bail!(
+            "planner produced {} tasks — maximum is {MAX_TASKS}",
+            tasks.len()
+        );
     }
-    break_cycles(&mut tasks);
-    Ok(tasks)
+    let ids: std::collections::BTreeSet<String> = tasks.iter().map(|t| t.id.clone()).collect();
+    for task in &tasks {
+        for dependency in &task.depends_on {
+            if dependency == &task.id {
+                bail!("task `{}` depends on itself", task.id);
+            }
+            if !ids.contains(dependency) {
+                bail!("task `{}` depends on unknown task `{dependency}`", task.id);
+            }
+        }
+    }
+    tasks = topological_sort(tasks)?;
+    if !tasks
+        .iter()
+        .any(|task| task.capability.ends_with("tests.execute"))
+    {
+        bail!("lead plan must contain a gating tests task");
+    }
+    Ok(PlannedProject { prd, tasks })
 }
 
-/// Remove edges that would form a cycle, keeping the first-seen order as the DAG
-/// spine (a dependency is only honored if it points to an already-ordered task).
-fn break_cycles(tasks: &mut [Task]) {
-    let order: std::collections::BTreeMap<String, usize> = tasks
-        .iter()
-        .enumerate()
-        .map(|(index, task)| (task.id.clone(), index))
-        .collect();
-    for task in tasks.iter_mut() {
-        let self_index = order[&task.id];
-        task.depends_on.retain(|dep| {
-            order
-                .get(dep)
-                .is_some_and(|dep_index| *dep_index < self_index)
-        });
+fn validate_structured_prd(prd: &StructuredPrd) -> Result<()> {
+    if prd.schema != "fractal.prd.v1" {
+        bail!("structured PRD schema must be `fractal.prd.v1`");
     }
+    if prd.title.trim().is_empty()
+        || prd.summary.trim().is_empty()
+        || prd.architecture.approach.trim().is_empty()
+        || prd.architecture.rationale.trim().is_empty()
+        || prd.architecture.components.is_empty()
+        || prd.acceptance_criteria.is_empty()
+    {
+        bail!("structured PRD is missing required product or architecture detail");
+    }
+    if prd.architecture.components.iter().any(|component| {
+        component.name.trim().is_empty()
+            || component.responsibility.trim().is_empty()
+            || component.technology.trim().is_empty()
+    }) {
+        bail!("every architecture component needs name, responsibility, and technology");
+    }
+    let mut criteria = std::collections::BTreeSet::new();
+    for criterion in &prd.acceptance_criteria {
+        if criterion.id.trim().is_empty()
+            || criterion.criterion.trim().is_empty()
+            || criterion.verification.trim().is_empty()
+            || !criteria.insert(criterion.id.clone())
+        {
+            bail!("acceptance criteria require unique ids, behavior, and verification");
+        }
+    }
+    Ok(())
+}
+
+fn topological_sort(tasks: Vec<Task>) -> Result<Vec<Task>> {
+    let mut remaining = tasks;
+    let mut ordered = Vec::with_capacity(remaining.len());
+    let mut completed = std::collections::BTreeSet::new();
+    while !remaining.is_empty() {
+        let Some(index) = remaining
+            .iter()
+            .position(|task| task.depends_on.iter().all(|dep| completed.contains(dep)))
+        else {
+            bail!("lead plan contains a dependency cycle");
+        };
+        let task = remaining.remove(index);
+        completed.insert(task.id.clone());
+        ordered.push(task);
+    }
+    Ok(ordered)
+}
+
+fn structured_prd_path(workspace: &Path) -> PathBuf {
+    workspace.join(".fractal").join("lead-prd.json")
+}
+
+fn persist_structured_prd(workspace: &Path, prd: &StructuredPrd) -> Result<()> {
+    let path = structured_prd_path(workspace);
+    let directory = path.parent().expect("structured PRD has parent");
+    std::fs::create_dir_all(directory)?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temporary, serde_json::to_vec_pretty(prd)?)
+        .with_context(|| format!("write {}", temporary.display()))?;
+    std::fs::rename(&temporary, &path).with_context(|| format!("replace {}", path.display()))?;
+    println!("  ◇ Structured PRD: {}", path.display());
+    Ok(())
 }
 
 /// Assemble a `fractal.compiled_harness.v1` genome from the task DAG. Each task is
-/// a node carrying its instruction; edges come from `depends_on`; a synthesized
-/// `complete` control node depends on every sink task so the run has one closer.
+/// a node carrying its instruction; a durable lead-plan root makes all workers
+/// non-root; and a lead-only closeout node reviews every completed sink.
 fn build_harness_genome(tasks: &[Task], prd_name: &str) -> Value {
     let ready = |id: &str| format!("{id}.ready");
-    let mut nodes = Vec::new();
+    let mut nodes = vec![json!({
+        "id": "lead_plan",
+        "title": "Lead PRD and architecture approved",
+        "capability": "control.plan",
+        "memory_scopes": ["work:goal", "workspace:root"],
+        "preconditions": [],
+        "produced_state": [ready("lead_plan")],
+        "instruction": "The lead-authored .fractal/lead-prd.json and validated task DAG are ready.",
+        "budget": {"timeout_ms": 5_000},
+    })];
     let mut edges = Vec::new();
 
     for task in tasks {
-        let preconditions: Vec<String> = task.depends_on.iter().map(|dep| ready(dep)).collect();
+        let dependencies = if task.depends_on.is_empty() {
+            vec!["lead_plan".to_owned()]
+        } else {
+            task.depends_on.clone()
+        };
+        let preconditions: Vec<String> = dependencies.iter().map(|dep| ready(dep)).collect();
         let budget = if task.capability.ends_with("tests.execute") {
             120_000
         } else {
@@ -351,7 +506,7 @@ fn build_harness_genome(tasks: &[Task], prd_name: &str) -> Value {
             "instruction": task.instruction,
             "budget": {"timeout_ms": budget},
         }));
-        for dep in &task.depends_on {
+        for dep in &dependencies {
             edges.push(json!({"from": dep, "to": task.id, "condition": "success"}));
         }
     }
@@ -367,23 +522,24 @@ fn build_harness_genome(tasks: &[Task], prd_name: &str) -> Value {
         .collect();
     let closer_preconditions: Vec<String> = sinks.iter().map(|task| ready(&task.id)).collect();
     for task in &sinks {
-        edges.push(json!({"from": task.id, "to": "complete", "condition": "success"}));
+        edges.push(json!({"from": task.id, "to": "lead_closeout", "condition": "success"}));
     }
     nodes.push(json!({
-        "id": "complete",
-        "capability": "control.complete",
-        "memory_scopes": ["work:goal"],
+        "id": "lead_closeout",
+        "title": "Lead acceptance review and closeout",
+        "capability": "control.closeout",
+        "memory_scopes": ["work:goal", "workspace:root"],
         "preconditions": closer_preconditions,
         "produced_state": ["outcome_verified"],
-        "instruction": "Every planned task and its gating tests have passed — mark the outcome complete.",
-        "budget": {"timeout_ms": 5_000},
+        "instruction": "Review the finished implementation against .fractal/lead-prd.json. Inspect the changes and verification evidence, run any final checks needed, then write .fractal/closeout.json with schema fractal.closeout.v1, status approved, a non-empty summary, an acceptance array containing every PRD acceptance id with passed=true and concrete evidence, and a risks array. Do not approve if any criterion is unsupported.",
+        "budget": {"timeout_ms": 180_000},
     }));
 
     json!({
         "schema": "fractal.compiled_harness.v1",
         "version": 1,
-        "harness_id": "harness.prd_decomposition.v1",
-        "goal": format!("Execute the task DAG decomposed from {prd_name}."),
+        "harness_id": "harness.lead_planned_project.v1",
+        "goal": format!("Execute and close out the lead-planned project derived from {prd_name}."),
         "nodes": nodes,
         "edges": edges,
     })
@@ -444,64 +600,122 @@ fn extract_json(raw: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    fn valid_plan(tasks: &str) -> String {
+        format!(
+            r#"{{
+              "prd": {{
+                "schema": "fractal.prd.v1",
+                "title": "Expense tracker",
+                "summary": "Track personal expenses.",
+                "architecture": {{
+                  "approach": "local-first application",
+                  "rationale": "simple and testable",
+                  "components": [
+                    {{"name":"app","responsibility":"user workflows","technology":"Rust"}}
+                  ]
+                }},
+                "acceptance_criteria": [
+                  {{"id":"AC-1","criterion":"expenses can be recorded","verification":"automated test"}}
+                ],
+                "non_goals": []
+              }},
+              "tasks": {tasks}
+            }}"#
+        )
+    }
+
     #[test]
     fn parses_a_task_dag_and_synthesizes_a_closer() {
-        let raw = r#"```json
-        {"tasks": [
+        let raw = valid_plan(
+            r#"[
           {"id": "core", "title": "core", "capability": "code.generate", "instruction": "write core.py", "depends_on": []},
           {"id": "tests", "title": "tests", "capability": "python.tests.execute", "instruction": "run pytest", "depends_on": ["core"]}
-        ]}
-        ```"#;
-        let tasks = parse_and_validate(raw).expect("valid plan");
-        assert_eq!(tasks.len(), 2);
-        let genome = build_harness_genome(&tasks, "X.md");
+        ]"#,
+        );
+        let planned = parse_and_validate(&raw).expect("valid plan");
+        assert_eq!(planned.tasks.len(), 2);
+        let genome = build_harness_genome(&planned.tasks, "X.md");
         let ids: Vec<&str> = genome["nodes"]
             .as_array()
             .unwrap()
             .iter()
             .map(|n| n["id"].as_str().unwrap())
             .collect();
-        assert!(ids.contains(&"core") && ids.contains(&"tests") && ids.contains(&"complete"));
-        // tests is the sink → the closer depends on it.
+        assert!(
+            ids.contains(&"lead_plan")
+                && ids.contains(&"core")
+                && ids.contains(&"tests")
+                && ids.contains(&"lead_closeout")
+        );
+        assert!(genome["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge["from"] == "lead_plan" && edge["to"] == "core"));
         let closer_edge = genome["edges"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|e| e["from"] == "tests" && e["to"] == "complete");
+            .any(|e| e["from"] == "tests" && e["to"] == "lead_closeout");
         assert!(closer_edge);
     }
 
     #[test]
-    fn breaks_cycles_and_drops_unknown_deps() {
-        let raw = r#"{"tasks": [
+    fn rejects_cycles_and_unknown_dependencies() {
+        let cycle = valid_plan(
+            r#"[
           {"id": "a", "capability": "code.generate", "instruction": "a", "depends_on": ["b"]},
           {"id": "b", "capability": "code.generate", "instruction": "b", "depends_on": ["a"]},
-          {"id": "c", "capability": "python.tests.execute", "instruction": "c", "depends_on": ["ghost"]}
-        ]}"#;
-        let tasks = parse_and_validate(raw).expect("valid");
-        // a↔b cycle broken (a keeps nothing since b is later; b keeps a); ghost dropped.
-        for task in &tasks {
-            for dep in &task.depends_on {
-                assert!(tasks.iter().any(|t| &t.id == dep), "dep {dep} must exist");
-            }
-        }
-        // Must be a DAG: no task depends on a later-or-equal task.
-        let index: std::collections::BTreeMap<_, _> = tasks
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.id.clone(), i))
-            .collect();
-        for (i, task) in tasks.iter().enumerate() {
-            for dep in &task.depends_on {
-                assert!(index[dep] < i, "cycle remained");
-            }
-        }
+          {"id": "tests", "capability": "project.tests.execute", "instruction": "test", "depends_on": ["a"]}
+        ]"#,
+        );
+        assert!(parse_and_validate(&cycle)
+            .unwrap_err()
+            .to_string()
+            .contains("cycle"));
+
+        let unknown = valid_plan(
+            r#"[
+          {"id": "core", "capability": "code.generate", "instruction": "core", "depends_on": ["ghost"]},
+          {"id": "tests", "capability": "project.tests.execute", "instruction": "test", "depends_on": ["core"]}
+        ]"#,
+        );
+        assert!(parse_and_validate(&unknown)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown task"));
     }
 
     #[test]
     fn rejects_too_few_tasks() {
-        let raw = r#"{"tasks": [{"id": "only", "capability": "code.generate", "instruction": "x", "depends_on": []}]}"#;
-        assert!(parse_and_validate(raw).is_err());
+        let raw = valid_plan(
+            r#"[{"id": "only", "capability": "code.generate", "instruction": "x", "depends_on": []}]"#,
+        );
+        assert!(parse_and_validate(&raw).is_err());
+    }
+
+    #[test]
+    fn topologically_orders_forward_dependencies_and_requires_tests() {
+        let raw = valid_plan(
+            r#"[
+          {"id": "tests", "capability": "project.tests.execute", "instruction": "test", "depends_on": ["core"]},
+          {"id": "core", "capability": "code.generate", "instruction": "core", "depends_on": []}
+        ]"#,
+        );
+        let planned = parse_and_validate(&raw).expect("valid");
+        assert_eq!(planned.tasks[0].id, "core");
+        assert_eq!(planned.tasks[1].id, "tests");
+
+        let no_tests = valid_plan(
+            r#"[
+          {"id": "core", "capability": "code.generate", "instruction": "core", "depends_on": []},
+          {"id": "docs", "capability": "content.analyze", "instruction": "docs", "depends_on": ["core"]}
+        ]"#,
+        );
+        assert!(parse_and_validate(&no_tests)
+            .unwrap_err()
+            .to_string()
+            .contains("gating tests"));
     }
 
     #[test]

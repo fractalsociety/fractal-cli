@@ -340,7 +340,9 @@ fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> 
         .get("instruction")
         .and_then(Value::as_str)
         .unwrap_or("");
-    if is_build(capability) {
+    if capability == "control.closeout" {
+        run_lead_closeout(node, agent, workspace)
+    } else if is_build(capability) {
         let timeout_ms = agent_timeout_ms(node);
         let run = run_worker_as(agent, instruction, workspace, timeout_ms)?;
         let note = run.timed_out.then(|| {
@@ -376,6 +378,89 @@ fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> 
             note: None,
         })
     }
+}
+
+fn run_lead_closeout(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> {
+    let closeout_path = workspace.join(".fractal").join("closeout.json");
+    std::fs::remove_file(&closeout_path).ok();
+    let instruction = node
+        .get("instruction")
+        .and_then(Value::as_str)
+        .unwrap_or("Review and close out the project.");
+    let timeout_ms = agent_timeout_ms(node);
+    let run = run_worker_as(agent, instruction, workspace, timeout_ms)?;
+    if !run.ok {
+        return Ok(NodeOutcome {
+            ok: false,
+            verified: Some(false),
+            note: Some(if run.timed_out {
+                "lead closeout timed out".to_owned()
+            } else {
+                "lead closeout agent failed".to_owned()
+            }),
+        });
+    }
+
+    let prd: Value = serde_json::from_slice(
+        &std::fs::read(workspace.join(".fractal").join("lead-prd.json"))
+            .context("lead closeout requires .fractal/lead-prd.json")?,
+    )
+    .context("decode lead PRD for closeout")?;
+    let closeout: Value = serde_json::from_slice(
+        &std::fs::read(&closeout_path).context("lead did not write .fractal/closeout.json")?,
+    )
+    .context("decode lead closeout")?;
+    let approved = validate_closeout(&prd, &closeout)?;
+    Ok(NodeOutcome {
+        ok: true,
+        verified: Some(true),
+        note: Some(format!("lead approved {approved} acceptance criteria")),
+    })
+}
+
+fn validate_closeout(prd: &Value, closeout: &Value) -> Result<usize> {
+    let required: BTreeSet<String> = prd
+        .get("acceptance_criteria")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|criterion| criterion.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    if required.is_empty() {
+        bail!("lead PRD has no acceptance criteria to close out");
+    }
+
+    if closeout.get("schema").and_then(Value::as_str) != Some("fractal.closeout.v1")
+        || closeout.get("status").and_then(Value::as_str) != Some("approved")
+        || closeout
+            .get("summary")
+            .and_then(Value::as_str)
+            .is_none_or(|summary| summary.trim().is_empty())
+    {
+        bail!("lead closeout must be an approved fractal.closeout.v1 with a summary");
+    }
+    let acceptance = closeout
+        .get("acceptance")
+        .and_then(Value::as_array)
+        .context("lead closeout has no acceptance evidence")?;
+    let passed: BTreeSet<String> = acceptance
+        .iter()
+        .filter(|entry| entry.get("passed").and_then(Value::as_bool) == Some(true))
+        .filter(|entry| {
+            entry
+                .get("evidence")
+                .and_then(Value::as_str)
+                .is_some_and(|evidence| !evidence.trim().is_empty())
+        })
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    let missing: Vec<&String> = required.difference(&passed).collect();
+    if !missing.is_empty() {
+        bail!("lead closeout did not approve acceptance criteria: {missing:?}");
+    }
+    Ok(required.len())
 }
 
 /// Best-effort report of a node transition to the live board so the dashboard
@@ -801,4 +886,41 @@ pub(crate) fn run_wave(
         }
     });
     runs.into_inner().expect("wave runs")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn closeout_requires_evidence_for_every_acceptance_criterion() {
+        let prd = json!({
+            "acceptance_criteria": [
+                {"id": "AC-1"},
+                {"id": "AC-2"}
+            ]
+        });
+        let complete = json!({
+            "schema": "fractal.closeout.v1",
+            "status": "approved",
+            "summary": "All acceptance checks passed.",
+            "acceptance": [
+                {"id": "AC-1", "passed": true, "evidence": "test expense creation"},
+                {"id": "AC-2", "passed": true, "evidence": "test persistence"}
+            ],
+            "risks": []
+        });
+        assert_eq!(validate_closeout(&prd, &complete).unwrap(), 2);
+
+        let incomplete = json!({
+            "schema": "fractal.closeout.v1",
+            "status": "approved",
+            "summary": "One check is missing.",
+            "acceptance": [
+                {"id": "AC-1", "passed": true, "evidence": "test expense creation"}
+            ]
+        });
+        assert!(validate_closeout(&prd, &incomplete).is_err());
+    }
 }

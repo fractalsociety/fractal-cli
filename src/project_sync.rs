@@ -279,29 +279,41 @@ fn publish_local_github(workspace: &Path) -> Result<Option<RepositoryLink>> {
     let relative = relative_graph
         .to_str()
         .context("project graph path must be valid UTF-8")?;
-    run_command(
-        Command::new("git")
-            .current_dir(&root)
-            .args(["add", "-f", "--", relative]),
-        "stage .fractal/project.fractal",
-    )?;
-    let changed = !command_success(
-        Command::new("git")
-            .current_dir(&root)
-            .args(["diff", "--cached", "--quiet", "--", relative]),
-    )?;
+    let mut artifacts = vec![relative.to_owned()];
+    for name in ["lead-prd.json", "closeout.json"] {
+        let path = workspace.join(".fractal").join(name);
+        if path.is_file() {
+            validate_publishable_artifact(&path)?;
+            artifacts.push(
+                path.strip_prefix(&root)?
+                    .to_str()
+                    .context("Fractal artifact path must be valid UTF-8")?
+                    .to_owned(),
+            );
+        }
+    }
+    let mut add = Command::new("git");
+    add.current_dir(&root).args(["add", "-f", "--"]);
+    add.args(&artifacts);
+    run_command(&mut add, "stage Fractal project artifacts")?;
+    let mut diff = Command::new("git");
+    diff.current_dir(&root)
+        .args(["diff", "--cached", "--quiet", "--"])
+        .args(&artifacts);
+    let changed = !command_success(&mut diff)?;
     if changed {
-        run_command(
-            Command::new("git").current_dir(&root).args([
+        let mut commit = Command::new("git");
+        commit
+            .current_dir(&root)
+            .args([
                 "commit",
                 "--only",
                 "-m",
-                "Update Fractal execution graph",
+                "Update Fractal project artifacts",
                 "--",
-                relative,
-            ]),
-            "commit .fractal/project.fractal",
-        )?;
+            ])
+            .args(&artifacts);
+        run_command(&mut commit, "commit Fractal project artifacts")?;
     }
     let commit = git_output(&root, &["rev-parse", "HEAD"])
         .context("Git repository needs a commit before it can be published")?;
@@ -320,6 +332,44 @@ fn publish_local_github(workspace: &Path) -> Result<Option<RepositoryLink>> {
         github_graph_url: format!("{repository_url}/blob/{commit}/{path}"),
         repository_url,
     }))
+}
+
+fn validate_publishable_artifact(path: &Path) -> Result<()> {
+    fn walk(value: &serde_json::Value) -> Result<()> {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, child) in object {
+                    let normalized = key.to_ascii_lowercase().replace('-', "_");
+                    if matches!(
+                        normalized.as_str(),
+                        "access_token"
+                            | "api_key"
+                            | "authorization"
+                            | "cookie"
+                            | "credentials"
+                            | "password"
+                            | "private_key"
+                            | "refresh_token"
+                            | "secret"
+                            | "token"
+                    ) {
+                        bail!("refuse to publish credential-shaped field `{key}`");
+                    }
+                    walk(child)?;
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    walk(value)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)
+        .with_context(|| format!("decode publishable artifact {}", path.display()))?;
+    walk(&value).with_context(|| format!("inspect {}", path.display()))
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String> {
@@ -524,6 +574,26 @@ mod tests {
         );
         assert!(canonical_github_repository("https://token@github.com/builder/app.git").is_none());
         assert!(canonical_github_repository("https://gitlab.com/builder/app.git").is_none());
+    }
+
+    #[test]
+    fn refuses_credential_fields_in_lead_artifacts() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "fractal-lead-artifact-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir_all(&directory)?;
+        let safe = directory.join("safe.json");
+        fs::write(&safe, r#"{"schema":"fractal.prd.v1","summary":"safe"}"#)?;
+        assert!(validate_publishable_artifact(&safe).is_ok());
+        let unsafe_path = directory.join("unsafe.json");
+        fs::write(
+            &unsafe_path,
+            r#"{"architecture":{"api_key":"do-not-publish"}}"#,
+        )?;
+        assert!(validate_publishable_artifact(&unsafe_path).is_err());
+        fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[test]
