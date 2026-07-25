@@ -23,9 +23,10 @@ use crate::work_builder::{build_work_from_nl, NlWorkRequest};
 
 /// Capabilities a planned task may declare; anything else is coerced to
 /// `code.generate` so a wayward plan still compiles.
-const ALLOWED_CAPS: [&str; 5] = [
+const ALLOWED_CAPS: [&str; 6] = [
     "code.generate",
     "code.edit",
+    "project.tests.execute",
     "python.tests.execute",
     "content.analyze",
     "control.complete",
@@ -175,10 +176,23 @@ fn plan_tasks(
     std::fs::remove_file(&plan_path).ok();
 
     let prompt = planning_prompt(prd_text, prd_name);
-    let ok = crate::execute::run_agent_prompt(lead_agent, &prompt, workspace)
+    // Planning gets a generous budget; a hung planner is killed rather than
+    // stalling forever.
+    let planner_timeout_ms = std::env::var("FRACTAL_AGENT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(900_000);
+    let run = crate::execute::run_agent_prompt(lead_agent, &prompt, workspace, planner_timeout_ms)
         .with_context(|| format!("lead planner `{lead_agent}` failed to run"))?;
-    if !ok {
-        bail!("lead planner `{lead_agent}` exited with an error");
+    if !run.ok {
+        bail!(
+            "lead planner `{lead_agent}` {}",
+            if run.timed_out {
+                "timed out"
+            } else {
+                "exited with an error"
+            }
+        );
     }
     let raw = std::fs::read_to_string(&plan_path).map_err(|_| {
         anyhow!("planner did not write fractal-plan.json (the PRD may be too large or unclear)")
@@ -197,10 +211,10 @@ fn planning_prompt(prd_text: &str, prd_name: &str) -> String {
          a decomposition that maximizes safe parallelism (independent tasks share no dependency).\n\n\
          WRITE A FILE named exactly `fractal-plan.json` in the current directory, and nothing else. \
          It MUST be valid JSON of this exact shape:\n\
-         {{\n  \"tasks\": [\n    {{\n      \"id\": \"short_snake_case_id\",\n      \"title\": \"one line\",\n      \"capability\": \"code.generate|code.edit|python.tests.execute|content.analyze\",\n      \"instruction\": \"a self-contained directive an agent can execute in this workspace with no other context\",\n      \"depends_on\": [\"ids of tasks that must finish first\"]\n    }}\n  ]\n}}\n\n\
+         {{\n  \"tasks\": [\n    {{\n      \"id\": \"short_snake_case_id\",\n      \"title\": \"one line\",\n      \"capability\": \"code.generate|code.edit|project.tests.execute|content.analyze\",\n      \"instruction\": \"a self-contained directive an agent can execute in this workspace with no other context\",\n      \"depends_on\": [\"ids of tasks that must finish first\"]\n    }}\n  ]\n}}\n\n\
          Rules: {min}-{max} tasks; ids unique; `depends_on` must reference earlier task ids only and form a DAG (no cycles); \
          every `instruction` must be concrete and standalone (name the files to create/edit and what they must contain/do); \
-         include at least one `python.tests.execute` task that depends on the implementation and gates it (it should run the test suite and fail if anything fails); \
+         include at least one `project.tests.execute` task that depends on the implementation and gates it (it should run the repository's real native/package test suite and fail if anything fails); \
          put the tasks in a sensible build order. Do NOT implement anything now — only write the plan file.\n\n\
          --- PRD ({prd_name}) ---\n{prd}\n--- END PRD ---",
         min = MIN_TASKS,
@@ -322,7 +336,7 @@ fn build_harness_genome(tasks: &[Task], prd_name: &str) -> Value {
 
     for task in tasks {
         let preconditions: Vec<String> = task.depends_on.iter().map(|dep| ready(dep)).collect();
-        let budget = if task.capability == "python.tests.execute" {
+        let budget = if task.capability.ends_with("tests.execute") {
             120_000
         } else {
             180_000
@@ -380,7 +394,7 @@ fn normalize_capability(capability: Option<&str>) -> String {
         Some(value) if ALLOWED_CAPS.contains(&value) => value.to_owned(),
         // Common synonyms the planner might emit.
         Some(value) if value.contains("test") || value.contains("verif") => {
-            "python.tests.execute".to_owned()
+            "project.tests.execute".to_owned()
         }
         Some(value) if value.contains("edit") || value.contains("review") => "code.edit".to_owned(),
         Some(value) if value.contains("analy") || value.contains("plan") => {

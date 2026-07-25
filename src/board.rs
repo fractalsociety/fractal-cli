@@ -8,6 +8,76 @@ use serde::Deserialize;
 
 use crate::graph_store;
 
+/// Prepare the board-state file for a graph about to be served. A graph with no
+/// lineage starts clean (so progress shows from zero). An **evolved child** —
+/// grown / repaired / differentiated mid-run, identified by its `parent_graph`
+/// field — inherits its parent's board state (the completed / in-progress
+/// assignments for the tasks it still contains), so re-serving it mid-run keeps
+/// the progress already made instead of resetting every task to pending.
+fn seed_board_state(
+    graph: &serde_json::Value,
+    state_file: &Path,
+    preseed_completed: Option<&std::collections::BTreeSet<String>>,
+) {
+    let node_ids: std::collections::BTreeSet<&str> = graph
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| node.get("id").and_then(serde_json::Value::as_str))
+        .collect();
+
+    // Resume: mark the already-completed tasks so the board shows prior progress
+    // (green) instead of restarting them from pending.
+    if let Some(completed) = preseed_completed {
+        let assignments: serde_json::Map<String, serde_json::Value> = completed
+            .iter()
+            .filter(|id| node_ids.contains(id.as_str()))
+            .map(|id| {
+                (
+                    id.clone(),
+                    serde_json::json!({
+                        "agent_id": "resumed",
+                        "agent_label": "resumed",
+                        "state": "completed",
+                    }),
+                )
+            })
+            .collect();
+        let graph_id = graph.get("graph_id").cloned().unwrap_or_default();
+        let state = serde_json::json!({ "graph_id": graph_id, "assignments": assignments });
+        if let Ok(serialized) = serde_json::to_string_pretty(&state) {
+            let _ = std::fs::write(state_file, serialized);
+        }
+        return;
+    }
+
+    if let Some(parent) = graph
+        .get("parent_graph")
+        .and_then(serde_json::Value::as_str)
+    {
+        let parent_state = graph_store::graph_path(parent).with_extension("board-state.json");
+        if let Ok(text) = std::fs::read_to_string(&parent_state) {
+            if let Ok(mut state) = serde_json::from_str::<serde_json::Value>(&text) {
+                // Keep only the assignments for tasks the child still has.
+                if let Some(map) = state
+                    .get_mut("assignments")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    map.retain(|node_id, _| node_ids.contains(node_id.as_str()));
+                }
+                if let Ok(serialized) = serde_json::to_string_pretty(&state) {
+                    if std::fs::write(state_file, serialized).is_ok() {
+                        return; // inherited the parent's progress
+                    }
+                }
+            }
+        }
+    }
+    // No lineage (or the parent state was unreadable): start clean.
+    let _ = std::fs::remove_file(state_file);
+}
+
 /// Terminate any *leftover fractal board server* still listening on `port` from
 /// a previous run. Without this, the new server cannot bind the port and the
 /// browser connects to the stale (already-completed, all-green) server instead
@@ -194,6 +264,7 @@ pub(crate) fn serve_graph(
     port: u16,
     exec_graph_dir: Option<&Path>,
     no_open: bool,
+    preseed_completed: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<()> {
     let graph = graph_store::load_graph(graph_hash)?;
     let graph_file = graph_store::graph_path(graph_hash);
@@ -208,7 +279,12 @@ pub(crate) fn serve_graph(
         .and_then(serde_json::Value::as_str)
         .context("stored execution graph is missing graph_id")?;
     let state_file = graph_file.with_extension("board-state.json");
-    let _ = std::fs::remove_file(&state_file); // start clean so progress shows
+    // Seed the board state. A brand-new graph starts clean so progress shows from
+    // zero; an evolved child (grown/repaired/differentiated mid-run) INHERITS its
+    // parent's progress so re-serving it does not reset every completed task to
+    // pending — which, combined with the planning reveal, made the whole graph
+    // vanish behind "planning…" each time evolution fired.
+    seed_board_state(&graph, &state_file, preseed_completed);
     free_port(port); // replace any leftover board server holding this port
 
     let viewer_dir = resolve_exec_graph_dir(exec_graph_dir)?;

@@ -2,6 +2,7 @@
 //! `codex`. It asks to trust the current folder, then reads natural-language
 //! requests and turns each one into a committed execution graph on a live board.
 
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -44,6 +45,45 @@ pub(crate) fn run(fractalwork_override: Option<&Path>, coordinate_flag: bool) ->
             setup_agents()?
         };
     println!("Backend: {} (toggle with /backend).", backend.label());
+
+    // Stop/restart support: if a build in this folder was interrupted, offer to
+    // resume it — reloading its graph and skipping the tasks already completed.
+    if !agents.is_empty() {
+        if let Some(cp) = crate::checkpoint::find_resumable(&workspace) {
+            let short: String = cp.request.chars().take(88).collect();
+            let answer = ask(&format!(
+                "↻ An earlier build here was interrupted:\n    \"{short}\"\n    {}/{} tasks done. Resume it? [Y/n]: ",
+                cp.completed.len(),
+                cp.total
+            ))?;
+            if matches!(answer.to_ascii_lowercase().as_str(), "" | "y" | "yes") {
+                println!(
+                    "↻ Resuming — {} of {} tasks already done, continuing the rest…\n",
+                    cp.completed.len(),
+                    cp.total
+                );
+                let completed: BTreeSet<String> = cp.completed.iter().cloned().collect();
+                let classification = intent::fractalwork_dir(fractalwork_override)
+                    .and_then(|dir| intent::classify(&cp.request, &dir));
+                let task_group = task_group_for(&classification, &cp.request);
+                drive_committed_graph(
+                    &cp.current_graph_hash,
+                    &cp.request,
+                    &workspace,
+                    &agents,
+                    backend,
+                    DEFAULT_GRAPH_PORT,
+                    &task_group,
+                    &completed,
+                    Some(&completed),
+                );
+            } else {
+                crate::checkpoint::discard(&cp.key);
+                println!("  Discarded the interrupted run — starting fresh.\n");
+            }
+        }
+    }
+
     println!("Type what you want built. Commands: /help, /trust, /backend, /exit.\n");
 
     let stdin = io::stdin();
@@ -372,6 +412,125 @@ fn print_committed_plan_lines(text: &str) {
     }
 }
 
+/// Drive one already-gated normalized input without opening the interactive
+/// wizard. Voice automation may only operate in a workspace the user previously
+/// trusted from the interactive CLI; a background service can never grant trust.
+pub(crate) fn execute_ingested(
+    request: &str,
+    workspace_override: Option<&Path>,
+    fractalwork_override: Option<&Path>,
+    coordinate_flag: bool,
+    port: u16,
+) -> Result<Option<crate::execute::RunOutcome>> {
+    // Voice/typed control command: "resume project 3" continues that numbered
+    // project regardless of the current folder, instead of starting a build.
+    if let Some(number) = crate::projects::parse_resume_command(request) {
+        return resume_project(number, fractalwork_override, port, coordinate_flag);
+    }
+
+    let workspace = match workspace_override {
+        Some(path) => path
+            .canonicalize()
+            .with_context(|| format!("cannot resolve ingest workspace {}", path.display()))?,
+        None => std::env::current_dir().context("cannot resolve ingest workspace")?,
+    };
+    let trust_store = trust_store_path();
+    if !trust_contains(&trust_store, &workspace) {
+        anyhow::bail!(
+            "voice ingest cannot execute in untrusted workspace {}; run `fractal` there once and approve trust",
+            workspace.display()
+        );
+    }
+    let agents = execute::detect_agents();
+    if agents.is_empty() {
+        anyhow::bail!("no build agents (claude/codex/cursor/hermes) found on PATH");
+    }
+    let backend = Backend::resolve(coordinate_flag);
+
+    // Auto-resume an interrupted build in this project instead of re-planning from
+    // scratch. Non-interactive callers (voice ingest, `fractal ios`) run headless,
+    // so continuing the existing graph — rather than decomposing a fresh, different
+    // one and throwing away completed work — is the right default. A build that
+    // finished cleanly has no checkpoint, so this only fires on genuine leftovers.
+    if let Some(cp) = crate::checkpoint::find_resumable(&workspace) {
+        println!(
+            "↻ Resuming the interrupted build in {} — {}/{} tasks already done, continuing the rest…\n",
+            workspace.display(),
+            cp.completed.len(),
+            cp.total
+        );
+        let completed: BTreeSet<String> = cp.completed.iter().cloned().collect();
+        let classification = intent::fractalwork_dir(fractalwork_override)
+            .and_then(|dir| intent::classify(&cp.request, &dir));
+        let task_group = task_group_for(&classification, &cp.request);
+        return Ok(drive_committed_graph(
+            &cp.current_graph_hash,
+            &cp.request,
+            &workspace,
+            &agents,
+            backend,
+            port,
+            &task_group,
+            &completed,
+            Some(&completed),
+        ));
+    }
+
+    execute_request(request, &workspace, fractalwork_override, port, &agents, backend)
+}
+
+/// Resume a project by its stable number — used by `fractal resume <N>` and by the
+/// voice/typed "resume project N" command. Continues from the saved checkpoint.
+pub(crate) fn resume_project(
+    number: u32,
+    fractalwork_override: Option<&Path>,
+    port: u16,
+    coordinate_flag: bool,
+) -> Result<Option<crate::execute::RunOutcome>> {
+    let Some(project) = crate::projects::by_number(number) else {
+        anyhow::bail!("no project #{number} — run `fractal projects` to see the list");
+    };
+    let workspace = PathBuf::from(&project.workspace);
+    let Some(cp) = crate::checkpoint::find_resumable(&workspace) else {
+        println!(
+            "Project #{number} ({}) has nothing to resume — it is complete or hasn't started.",
+            project.label
+        );
+        return Ok(None);
+    };
+    if !trust_contains(&trust_store_path(), &workspace) {
+        anyhow::bail!(
+            "project #{number} workspace {} is no longer trusted; run `fractal` there and approve trust",
+            workspace.display()
+        );
+    }
+    let agents = execute::detect_agents();
+    if agents.is_empty() {
+        anyhow::bail!("no build agents (claude/codex/cursor/hermes) found on PATH");
+    }
+    println!(
+        "↻ Resuming project #{number} ({}) — {}/{} tasks already done, continuing the rest…\n",
+        project.label,
+        cp.completed.len(),
+        cp.total
+    );
+    let completed: BTreeSet<String> = cp.completed.iter().cloned().collect();
+    let classification = intent::fractalwork_dir(fractalwork_override)
+        .and_then(|dir| intent::classify(&cp.request, &dir));
+    let task_group = task_group_for(&classification, &cp.request);
+    Ok(drive_committed_graph(
+        &cp.current_graph_hash,
+        &cp.request,
+        &workspace,
+        &agents,
+        Backend::resolve(coordinate_flag),
+        port,
+        &task_group,
+        &completed,
+        Some(&completed),
+    ))
+}
+
 fn execute_request(
     request: &str,
     workspace: &Path,
@@ -379,7 +538,7 @@ fn execute_request(
     port: u16,
     agents: &[String],
     backend: Backend,
-) -> Result<()> {
+) -> Result<Option<crate::execute::RunOutcome>> {
     println!("\n→ Understanding: {request}");
     let classification = intent::fractalwork_dir(fractalwork_override)
         .and_then(|directory| intent::classify(request, &directory));
@@ -435,112 +594,159 @@ fn execute_request(
         }
     };
 
-    match committed_hash {
+    let outcome = match committed_hash {
         Some(hash) => {
-            println!("  → opening the live board for this graph…");
-            if let Err(error) = board::serve_graph(&hash, port, None, false) {
-                eprintln!("  (board unavailable: {error:#})");
-            }
-            if agents.is_empty() {
-                println!("  Graph is on the board. Building is off — enable it at launch to run workers.\n");
-            } else {
-                if agents.len() > 1 {
-                    println!(
-                        "  → executing with {} agents in {} (board turns green live)…",
-                        agents.len(),
-                        workspace.display()
-                    );
-                } else {
-                    println!("  → executing in {}…", workspace.display());
-                }
-                let board_url = format!("http://127.0.0.1:{port}");
+            let task_group = task_group_for(&classification, request);
+            drive_committed_graph(
+                &hash,
+                request,
+                workspace,
+                agents,
+                backend,
+                port,
+                &task_group,
+                &BTreeSet::new(),
+                None,
+            )
+        }
+        None => {
+            println!("  (no graph committed)\n");
+            None
+        }
+    };
+    Ok(outcome)
+}
 
-                // Router evolution (closing the loop): before running, ask the
-                // accumulated outcome memory which model is the cheapest
-                // *acceptable* one for this task-kind, and pin it. Then record this
-                // run's outcome under the same key so selection keeps improving.
-                let primary = agents[0].clone();
-                let graph_value = graph_store::load_graph(&hash).ok();
-                let graph_id = graph_value
-                    .as_ref()
-                    .and_then(|graph| graph.get("graph_id").and_then(|value| value.as_str()))
-                    .unwrap_or("graph")
-                    .to_owned();
-                let capabilities = graph_value
-                    .as_ref()
-                    .and_then(|graph| graph.get("nodes").and_then(|value| value.as_array()))
-                    .map(|nodes| {
-                        nodes
-                            .iter()
-                            .filter_map(|node| {
-                                node.get("capability")
-                                    .and_then(|value| value.as_str())
-                                    .map(str::to_owned)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let task_group = task_group_for(&classification, request);
-                let model0 = current_model(&primary);
-                let group_id = crate::router::facts_for(
-                    &task_group,
-                    &capabilities,
-                    &primary,
-                    &model0,
-                    &graph_id,
-                )
-                .group_id;
-                if let Some(rec) = crate::router::recommend(&group_id) {
-                    if let Some((agent, model)) = rec.chosen_option_id.split_once(':') {
-                        if agent == primary && model != model0 {
-                            std::env::set_var(model_env_key(&primary), model);
-                            println!(
-                                "  ↻ router: pinned {primary} model '{model}' — cheapest acceptable \
-                                 for this task-kind ({} sample(s), {} option(s) seen)",
-                                rec.samples,
-                                rec.observed.len()
-                            );
-                        }
-                    }
-                }
-                let effective_model = current_model(&primary);
-                let facts = crate::router::facts_for(
-                    &task_group,
-                    &capabilities,
-                    &primary,
-                    &effective_model,
-                    &graph_id,
-                );
+/// Serve a committed graph's board and drive it to completion with the agent team,
+/// applying router evolution. Shared by fresh runs and resume (which pre-seeds the
+/// completed tasks so they are not re-run and shows them already green on the board).
+#[allow(clippy::too_many_arguments)]
+fn drive_committed_graph(
+    hash: &str,
+    request: &str,
+    workspace: &Path,
+    agents: &[String],
+    backend: Backend,
+    port: u16,
+    task_group: &str,
+    resume_completed: &BTreeSet<String>,
+    board_preseed: Option<&BTreeSet<String>>,
+) -> Option<crate::execute::RunOutcome> {
+    match graph_store::load_graph(hash)
+        .and_then(|graph| crate::project_file::persist(workspace, &graph, request))
+    {
+        Ok(path) => {
+            println!("  ◇ Project graph: {}", path.display());
+            crate::project_sync::maybe_sync(workspace);
+        }
+        Err(error) => eprintln!("  project graph note: {error:#}"),
+    }
+    let number = crate::projects::register(workspace);
+    println!(
+        "  📁 Project #{number} · {} (say \"resume project {number}\" to continue later)",
+        workspace
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    );
+    println!("  → opening the live board for this graph…");
+    if let Err(error) = board::serve_graph(hash, port, None, false, board_preseed) {
+        eprintln!("  (board unavailable: {error:#})");
+    }
+    if agents.is_empty() {
+        println!(
+            "  Graph is on the board. Building is off — enable it at launch to run workers.\n"
+        );
+        return None;
+    }
+    if agents.len() > 1 {
+        println!(
+            "  → executing with {} agents in {} (board turns green live)…",
+            agents.len(),
+            workspace.display()
+        );
+    } else {
+        println!("  → executing in {}…", workspace.display());
+    }
+    let board_url = format!("http://127.0.0.1:{port}");
 
-                let spinner = crate::ui::Spinner::start("working");
-                let outcome = crate::orchestrate::run_end_to_end(
-                    &hash,
-                    workspace,
-                    agents,
-                    Some(&board_url),
-                    backend,
-                    &facts,
+    // Router evolution (closing the loop): before running, ask the accumulated
+    // outcome memory which model is the cheapest *acceptable* one for this
+    // task-kind, and pin it. Then record this run's outcome under the same key.
+    let primary = agents[0].clone();
+    let graph_value = graph_store::load_graph(hash).ok();
+    let graph_id = graph_value
+        .as_ref()
+        .and_then(|graph| graph.get("graph_id").and_then(|value| value.as_str()))
+        .unwrap_or("graph")
+        .to_owned();
+    let capabilities = graph_value
+        .as_ref()
+        .and_then(|graph| graph.get("nodes").and_then(|value| value.as_array()))
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|node| {
+                    node.get("capability")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let model0 = current_model(&primary);
+    let group_id =
+        crate::router::facts_for(task_group, &capabilities, &primary, &model0, &graph_id).group_id;
+    if let Some(rec) = crate::router::recommend(&group_id) {
+        if let Some((agent, model)) = rec.chosen_option_id.split_once(':') {
+            if agent == primary && model != model0 {
+                std::env::set_var(model_env_key(&primary), model);
+                println!(
+                    "  ↻ router: pinned {primary} model '{model}' — cheapest acceptable \
+                     for this task-kind ({} sample(s), {} option(s) seen)",
+                    rec.samples,
+                    rec.observed.len()
                 );
-                let elapsed = crate::ui::format_elapsed(spinner.stop());
-                match outcome {
-                    Ok(outcome) => {
-                        let mark = match outcome.verified {
-                            Some(true) => "✓",
-                            Some(false) => "✗",
-                            None if outcome.built => "✓",
-                            None => "·",
-                        };
-                        println!("  {mark} {} · worked for {elapsed}\n", outcome.detail);
-                    }
-                    Err(error) => {
-                        eprintln!("  execution error: {error:#} · worked for {elapsed}\n")
-                    }
-                }
             }
         }
-        None => println!("  (no graph committed)\n"),
     }
-    Ok(())
+    let effective_model = current_model(&primary);
+    let facts = crate::router::facts_for(
+        task_group,
+        &capabilities,
+        &primary,
+        &effective_model,
+        &graph_id,
+    );
+
+    let spinner = crate::ui::Spinner::start("working");
+    let outcome = crate::orchestrate::run_end_to_end(
+        hash,
+        workspace,
+        agents,
+        Some(&board_url),
+        backend,
+        &facts,
+        request,
+        resume_completed,
+    );
+    let elapsed = crate::ui::format_elapsed(spinner.stop());
+    match outcome {
+        Ok(outcome) => {
+            let mark = match outcome.verified {
+                Some(true) => "✓",
+                Some(false) => "✗",
+                None if outcome.built => "✓",
+                None => "·",
+            };
+            println!("  {mark} {} · worked for {elapsed}\n", outcome.detail);
+            Some(outcome)
+        }
+        Err(error) => {
+            eprintln!("  execution error: {error:#} · worked for {elapsed}\n");
+            None
+        }
+    }
 }
 
 fn map_classification(classification: &intent::TaskClassification) -> IntentClassification {

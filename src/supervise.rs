@@ -14,7 +14,7 @@
 //! so proactive adaptations are held to the same floor. The open canaries are
 //! settled once the run's final verifiable verdict is known, feeding the RL bandit.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::Result;
@@ -47,13 +47,120 @@ pub(crate) fn enabled() -> bool {
     )
 }
 
-/// Latency (ms) above which a completed code node is considered "slow" and grafts
-/// a proactive verification checkpoint. Tunable via `FRACTAL_SLOW_MS`.
-fn slow_threshold_ms() -> u64 {
-    std::env::var("FRACTAL_SLOW_MS")
+/// A proactive graft is only worthwhile when the node's output would otherwise go
+/// unverified for at least this many steps — so an early check prevents that
+/// intervening work from being wasted on a defect (faster to the objective) or
+/// fills a real coverage gap (higher quality), without adding redundant work when
+/// a gate is already near. Tunable via `FRACTAL_GRAFT_MIN_HOPS`.
+fn min_verify_hops() -> usize {
+    std::env::var("FRACTAL_GRAFT_MIN_HOPS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(60_000)
+        .unwrap_or(3)
+}
+
+/// Sentinel for "no downstream verifier at all" — a coverage gap. Large so such
+/// nodes rank highest (a graft there adds a missing check).
+const NO_DOWNSTREAM_VERIFIER: usize = usize::MAX;
+
+/// Downstream successor adjacency (`from` → `[to]`).
+fn successors(graph: &Value) -> BTreeMap<String, Vec<String>> {
+    let mut succ: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for edge in graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let (Some(from), Some(to)) = (
+            edge.get("from").and_then(Value::as_str),
+            edge.get("to").and_then(Value::as_str),
+        ) {
+            succ.entry(from.to_owned()).or_default().push(to.to_owned());
+        }
+    }
+    succ
+}
+
+/// Count of not-yet-completed nodes that transitively depend on `node` — the
+/// rework a defect in `node` would put at risk.
+fn downstream_unrun(graph: &Value, node: &str, completed: &BTreeSet<String>) -> usize {
+    let succ = successors(graph);
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![node.to_owned()];
+    let mut count = 0;
+    while let Some(current) = stack.pop() {
+        for next in succ.get(&current).into_iter().flatten() {
+            if seen.insert(next.clone()) {
+                if !completed.contains(next) {
+                    count += 1;
+                }
+                stack.push(next.clone());
+            }
+        }
+    }
+    count
+}
+
+/// Hops to the nearest still-pending verify/test node downstream of `node` — how
+/// much work runs before `node`'s output is checked by an EXISTING gate. Returns
+/// [`NO_DOWNSTREAM_VERIFIER`] when nothing downstream verifies it.
+fn hops_to_nearest_pending_verifier(
+    graph: &Value,
+    node: &str,
+    completed: &BTreeSet<String>,
+) -> usize {
+    let succ = successors(graph);
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut frontier: Vec<String> = succ.get(node).cloned().unwrap_or_default();
+    for id in &frontier {
+        seen.insert(id.clone());
+    }
+    let mut depth = 1usize;
+    while !frontier.is_empty() {
+        for id in &frontier {
+            if !completed.contains(id) && execute::is_verify(&capability_of(graph, id)) {
+                return depth;
+            }
+        }
+        let mut next = Vec::new();
+        for id in &frontier {
+            for child in succ.get(id).into_iter().flatten() {
+                if seen.insert(child.clone()) {
+                    next.push(child.clone());
+                }
+            }
+        }
+        frontier = next;
+        depth += 1;
+    }
+    NO_DOWNSTREAM_VERIFIER
+}
+
+fn gap_display(hops: usize) -> String {
+    if hops == NO_DOWNSTREAM_VERIFIER {
+        "no downstream gate".to_owned()
+    } else {
+        format!("{hops} steps to next gate")
+    }
+}
+
+/// A native/compiled project (iOS/Swift, SwiftPM) whose tests require the WHOLE
+/// project to compile — so it cannot be verified mid-build. Detected by an Xcode
+/// project, an xcodegen `project.yml`, a SwiftPM manifest, or any `.swift` source.
+fn native_project(workspace: &Path) -> bool {
+    if workspace.join("project.yml").exists() || workspace.join("Package.swift").exists() {
+        return true;
+    }
+    std::fs::read_dir(workspace)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.ends_with(".xcodeproj") || name.ends_with(".swift")
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Every node id declared in the graph.
@@ -95,6 +202,7 @@ fn detail_for(built: bool, verified: Option<bool>, failed: &Option<String>) -> S
 }
 
 /// Drive the graph wave by wave, firing proactive morphogens between waves.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_supervised(
     graph: Value,
     graph_hash: &str,
@@ -103,11 +211,20 @@ pub(crate) fn run_supervised(
     agents: &[String],
     board: Option<&str>,
     ledger: &RunLedger,
+    resume_completed: &BTreeSet<String>,
+    recorder: Option<&crate::checkpoint::Recorder>,
 ) -> Result<Supervised> {
     let mut graph = graph;
     let mut hash = graph_hash.to_owned();
 
-    let mut completed: BTreeSet<String> = BTreeSet::new();
+    // Resume: seed the completed set (only nodes still present in the graph) so the
+    // ready frontier skips them and execution continues from where it stopped.
+    let present = all_node_ids(&graph);
+    let mut completed: BTreeSet<String> = resume_completed
+        .iter()
+        .filter(|id| present.contains(id.as_str()))
+        .cloned()
+        .collect();
     let mut log: Vec<NodeRun> = Vec::new();
     let mut built = false;
     let mut verified: Option<bool> = None;
@@ -119,7 +236,13 @@ pub(crate) fn run_supervised(
     // Sources we have already grafted a checkpoint off, so we don't re-graft.
     let mut grown: BTreeSet<String> = BTreeSet::new();
     let mut midrun = 0u32;
-    let threshold = slow_threshold_ms();
+    let min_hops = min_verify_hops();
+    // Native/compiled projects (iOS/Swift, SwiftPM) cannot be verified mid-build —
+    // the whole project must compile before any test runs, so a proactive graft
+    // that runs `xcodebuild test` on a half-written project always fails and turns
+    // the board red. Skip proactive grafts for them; the final acceptance gate
+    // verifies once everything is in place.
+    let native = native_project(workspace);
 
     loop {
         let frontier = execute::ready_frontier(&graph, &completed);
@@ -144,6 +267,11 @@ pub(crate) fn run_supervised(
             log.push(run.clone());
         }
 
+        // Checkpoint after every wave so an interruption can resume from here.
+        if let Some(recorder) = recorder {
+            recorder.record(&hash, &completed, all_node_ids(&graph).len());
+        }
+
         if failed.is_some() {
             break; // the caller's failure-evolution loop takes over from here.
         }
@@ -152,22 +280,45 @@ pub(crate) fn run_supervised(
         }
 
         // ── Mid-run morphogenesis: read this wave's progress signals ──
-        if midrun >= MAX_MIDRUN {
+        if midrun >= MAX_MIDRUN || native {
             continue;
         }
-        let slow = runs.iter().find(|run| {
-            run.ok
-                && !grown.contains(&run.node)
-                && execute::is_build(&capability_of(&graph, &run.node))
-                && run.latency_ms >= threshold
-        });
-        let Some(run) = slow else { continue };
+        let nodes_now = all_node_ids(&graph);
+        let has_verify_child =
+            |id: &str| nodes_now.iter().any(|other| other.starts_with(&format!("verify.{id}.")));
+        // Value-of-grafting: only graft a verification if it is genuinely worth it
+        // — the node has dependent work at risk AND its output is not already
+        // checked for at least `min_hops` steps (so an early check catches a defect
+        // before that work is wasted, or fills a missing gate). Among candidates,
+        // pick the highest-value one (largest verification gap, then most at-risk
+        // work). Slowness is NOT a trigger; a well-gated plan grafts nothing.
+        let scored = runs
+            .iter()
+            .filter(|run| {
+                run.ok
+                    && !grown.contains(&run.node)
+                    && !has_verify_child(&run.node)
+                    && execute::is_build(&capability_of(&graph, &run.node))
+            })
+            .filter_map(|run| {
+                let at_risk = downstream_unrun(&graph, &run.node, &completed);
+                let gap = hops_to_nearest_pending_verifier(&graph, &run.node, &completed);
+                (at_risk >= 1 && gap >= min_hops).then_some((run, at_risk, gap))
+            })
+            .max_by_key(|&(_, at_risk, gap)| (gap, at_risk));
+        let Some((run, at_risk, gap)) = scored else {
+            continue;
+        };
 
         match harness_evolution::grow_proactive(&graph, &hash, &run.node) {
             Ok(evolution) => {
                 println!(
-                    "  ⟳ mid-run morphogen fired on slow `{}` ({} ms) — {} [{}]",
-                    run.node, run.latency_ms, evolution.note, evolution.arm
+                    "  ⟳ mid-run morphogen: verifying `{}` early ({} ms) — {at_risk} dependent task(s) at risk, {} — {} [{}]",
+                    run.node,
+                    run.latency_ms,
+                    gap_display(gap),
+                    evolution.note,
+                    evolution.arm
                 );
                 println!("  ⟳ {}", evolution.verdict);
                 anchor_midrun(
@@ -184,7 +335,7 @@ pub(crate) fn run_supervised(
                     if let Some(port) = crate::orchestrate::board_port(url) {
                         println!("  ⟳ board now following the mid-run graph…");
                         if let Err(error) =
-                            crate::board::serve_graph(&evolution.child_hash, port, None, true)
+                            crate::board::serve_graph(&evolution.child_hash, port, None, true, None)
                         {
                             eprintln!("  (board follow unavailable: {error:#})");
                         }
@@ -201,6 +352,10 @@ pub(crate) fn run_supervised(
                 graph = evolution.child_graph;
                 hash = evolution.child_hash;
                 midrun += 1;
+                // Point the checkpoint at the newly-grown child graph.
+                if let Some(recorder) = recorder {
+                    recorder.record(&hash, &completed, all_node_ids(&graph).len());
+                }
             }
             Err(error) => {
                 eprintln!("  (mid-run morphogen skipped: {error:#})");
@@ -349,6 +504,65 @@ mod tests {
         // review needs impl+tests (ready); the grafted verify.impl needs impl (ready).
         assert!(frontier.contains(&"verify.impl".to_owned()));
         assert!(frontier.contains(&"review".to_owned()));
+    }
+
+    fn linear_with_gate() -> Value {
+        // foundation → a → b → c → gate(verify) → done
+        json!({
+            "graph_id": "g",
+            "nodes": [
+                {"id":"foundation","capability":"code.generate"},
+                {"id":"a","capability":"code.generate"},
+                {"id":"b","capability":"code.generate"},
+                {"id":"c","capability":"code.generate"},
+                {"id":"gate","capability":"python.tests.execute"},
+                {"id":"done","capability":"control.complete"}
+            ],
+            "edges": [
+                {"from":"foundation","to":"a"},{"from":"a","to":"b"},
+                {"from":"b","to":"c"},{"from":"c","to":"gate"},{"from":"gate","to":"done"}
+            ]
+        })
+    }
+
+    #[test]
+    fn graft_value_favors_far_from_gate_high_leverage_nodes() {
+        let g = linear_with_gate();
+        let none: BTreeSet<String> = BTreeSet::new();
+        // A foundational node: many dependents, gate is far → worth an early check.
+        assert!(downstream_unrun(&g, "foundation", &none) >= 4);
+        assert_eq!(hops_to_nearest_pending_verifier(&g, "foundation", &none), 4);
+        // A node right before the gate: the gate is 1 hop away → NOT worth grafting.
+        assert_eq!(hops_to_nearest_pending_verifier(&g, "c", &none), 1);
+        // With min_hops = 3: foundation qualifies, c does not.
+        assert!(hops_to_nearest_pending_verifier(&g, "foundation", &none) >= 3);
+        assert!(hops_to_nearest_pending_verifier(&g, "c", &none) < 3);
+    }
+
+    #[test]
+    fn coverage_gap_ranks_highest() {
+        // No verifier anywhere downstream → a graft fills a real gap.
+        let g = json!({
+            "graph_id":"g",
+            "nodes":[{"id":"x","capability":"code.generate"},{"id":"y","capability":"code.generate"}],
+            "edges":[{"from":"x","to":"y"}]
+        });
+        let none: BTreeSet<String> = BTreeSet::new();
+        assert_eq!(hops_to_nearest_pending_verifier(&g, "x", &none), NO_DOWNSTREAM_VERIFIER);
+    }
+
+    #[test]
+    fn native_projects_are_detected_so_grafts_are_skipped() {
+        let dir = std::env::temp_dir().join(format!("frac-native-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Empty / python workspace → not native.
+        assert!(!native_project(&dir));
+        std::fs::write(dir.join("test_x.py"), "x").unwrap();
+        assert!(!native_project(&dir));
+        // An xcodegen project.yml → native.
+        std::fs::write(dir.join("project.yml"), "name: X").unwrap();
+        assert!(native_project(&dir));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
@@ -57,6 +57,7 @@ pub(crate) fn is_build(capability: &str) -> bool {
     capability.contains("code.generate")
         || capability.ends_with(".edit")
         || capability.contains("code.write")
+        || capability == "content.analyze"
 }
 
 pub(crate) fn is_verify(capability: &str) -> bool {
@@ -190,28 +191,86 @@ fn worker_command(kind: &str, prompt: &str) -> Result<Command> {
 }
 
 /// Run a specific `kind` of worker on `instruction` in `workspace`, streaming.
-fn run_worker_as(kind: &str, instruction: &str, workspace: &Path) -> Result<bool> {
+/// The result of running an agent: whether it succeeded, and whether it was
+/// killed for exceeding its time budget (a hang).
+pub(crate) struct AgentRun {
+    pub ok: bool,
+    pub timed_out: bool,
+}
+
+fn run_worker_as(
+    kind: &str,
+    instruction: &str,
+    workspace: &Path,
+    timeout_ms: u64,
+) -> Result<AgentRun> {
     let prompt = format!(
         "You are one agent on a coordinated team; a lead has planned the project (read INTERFACE.md \
          if it exists). Do exactly this assigned task and nothing else:\n\n{instruction}\n\nWork \
          entirely in the current directory. Create or edit only the files this task needs and make \
          any tests pass. Do not ask questions; make reasonable choices."
     );
-    run_agent_prompt(kind, &prompt, workspace)
+    run_agent_prompt(kind, &prompt, workspace, timeout_ms)
 }
 
-/// Run an agent with a verbatim prompt (no team-task wrapper), streaming its output
-/// in `workspace`. Used by the PRD-decomposition planner, which needs full control
-/// of the planning prompt rather than the per-node task wrapper.
-pub(crate) fn run_agent_prompt(kind: &str, prompt: &str, workspace: &Path) -> Result<bool> {
+/// Run an agent with a verbatim prompt (no team-task wrapper) under a hard time
+/// budget: if it does not finish within `timeout_ms`, the process is killed and
+/// reported as a (timed-out) failure — so a hung agent never stalls the whole
+/// build; the node fails and the governed repair loop re-instructs it.
+pub(crate) fn run_agent_prompt(
+    kind: &str,
+    prompt: &str,
+    workspace: &Path,
+    timeout_ms: u64,
+) -> Result<AgentRun> {
     // Detach the worker's stdin: headless agents (e.g. `claude -p`) otherwise
     // inherit the CLI's piped stdin and block reading it instead of exiting.
-    let status = worker_command(kind, prompt)?
+    let mut child = worker_command(kind, prompt)?
         .current_dir(workspace)
         .stdin(std::process::Stdio::null())
-        .status()
+        .spawn()
         .with_context(|| format!("failed to launch worker `{kind}` (is it on PATH?)"))?;
-    Ok(status.success())
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                return Ok(AgentRun {
+                    ok: status.success(),
+                    timed_out: false,
+                });
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(AgentRun {
+                        ok: false,
+                        timed_out: true,
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
+/// The kill-timeout for an agent working `node`. `$FRACTAL_AGENT_TIMEOUT_MS`, when
+/// set, is an explicit absolute override; otherwise it is the node's declared
+/// budget but never less than a generous 15-minute floor — so a legitimately long
+/// task is not killed, only a genuinely hung agent.
+fn agent_timeout_ms(node: &Value) -> u64 {
+    if let Some(override_ms) = std::env::var("FRACTAL_AGENT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return override_ms;
+    }
+    let budget = node
+        .get("budget")
+        .and_then(|budget| budget.get("timeout_ms"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    budget.max(900_000) // 15-minute floor
 }
 
 /// The binary that provides a given logical agent.
@@ -282,10 +341,18 @@ fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> 
         .and_then(Value::as_str)
         .unwrap_or("");
     if is_build(capability) {
+        let timeout_ms = agent_timeout_ms(node);
+        let run = run_worker_as(agent, instruction, workspace, timeout_ms)?;
+        let note = run.timed_out.then(|| {
+            format!(
+                "agent hung — killed after {}s; failing the task so it is repaired",
+                timeout_ms / 1000
+            )
+        });
         Ok(NodeOutcome {
-            ok: run_worker_as(agent, instruction, workspace)?,
+            ok: run.ok,
             verified: None,
-            note: None,
+            note,
         })
     } else if is_verify(capability) {
         // Genuine governance: judge the suite with the real deny-by-default floor.
@@ -376,6 +443,7 @@ pub(crate) fn run_multi_agent(
     workspace: &Path,
     agents: &[String],
     board: Option<&str>,
+    completed_seed: &BTreeSet<String>,
 ) -> Result<RunOutcome> {
     let ordered = topo_order(graph)?; // validates acyclic
     let ids: Vec<String> = ordered
@@ -408,7 +476,16 @@ pub(crate) fn run_multi_agent(
         }
     }
     let total = ids.len();
-    let schedule = Mutex::new(Schedule::default());
+    // Resume: pre-mark already-completed tasks so they are skipped (the ready
+    // check treats them as done) but still counted toward `total`.
+    let schedule = Mutex::new(Schedule {
+        completed: completed_seed
+            .iter()
+            .filter(|id| ids.contains(id))
+            .cloned()
+            .collect(),
+        ..Schedule::default()
+    });
 
     // The lead (first agent) is the ORCHESTRATOR: it plans the project (the root
     // node) and closes it out (control), then assigns + monitors — it does not do

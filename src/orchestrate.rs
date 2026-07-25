@@ -21,8 +21,9 @@ use fractal_chain::{
 use crate::chain::RunLedger;
 use crate::{execute, graph_store};
 
-/// Bounded so evolution always terminates.
-const MAX_REPAIRS: u32 = 2;
+/// Bounded so evolution always terminates. Three governed repair/grow attempts
+/// before giving up (was two) — more resilience on multi-task builds.
+const MAX_REPAIRS: u32 = 3;
 
 /// Which executor drives the graph. The default is turnkey and in-process; the
 /// Coordinate backend reconciles into the real durable Coordinate queue first.
@@ -91,6 +92,8 @@ pub(crate) fn run_end_to_end(
     board: Option<&str>,
     backend: Backend,
     facts: &crate::router::RunFacts,
+    request: &str,
+    resume_completed: &std::collections::BTreeSet<String>,
 ) -> Result<execute::RunOutcome> {
     let mut graph = graph_store::load_graph(graph_hash)?;
     let mut current_hash = graph_hash.to_owned();
@@ -100,6 +103,11 @@ pub(crate) fn run_end_to_end(
         .unwrap_or("graph")
         .to_owned();
     let ledger = RunLedger::new(&graph_id);
+    // Durable checkpoint so this run can be stopped and resumed. The supervisor
+    // records progress per wave; here we clear it on success and keep it on
+    // failure so an interrupted or failed run can be picked back up.
+    let recorder = crate::checkpoint::Recorder::new(workspace, &graph_id, request);
+    let mut run_completed: std::collections::BTreeSet<String> = resume_completed.clone();
 
     let mut attempt = 0u32;
     // The pending harness evolution awaiting its verifiable reward (RL feedback):
@@ -125,12 +133,16 @@ pub(crate) fn run_end_to_end(
                     agents,
                     board,
                     &ledger,
+                    &run_completed,
+                    Some(&recorder),
                 )?;
                 graph = supervised.graph;
                 current_hash = supervised.hash;
                 supervised.outcome
             }
-            Backend::InProcess => execute::run_multi_agent(&graph, workspace, agents, board)?,
+            Backend::InProcess => {
+                execute::run_multi_agent(&graph, workspace, agents, board, &run_completed)?
+            }
             Backend::Coordinate => crate::coordinate::run_via_coordinate(
                 &current_hash,
                 &graph,
@@ -148,7 +160,20 @@ pub(crate) fn run_end_to_end(
             if run.is_verify {
                 ledger.verdict(&run.node, run.ok);
             }
+            if run.ok {
+                run_completed.insert(run.node.clone());
+            }
         }
+        // Checkpoint the accumulated progress (covers the non-supervised executors;
+        // the supervisor also records per wave).
+        recorder.record(
+            &current_hash,
+            &run_completed,
+            graph
+                .get("nodes")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+        );
 
         let succeeded = outcome.verified != Some(false) && outcome.failed_node.is_none();
 
@@ -175,7 +200,18 @@ pub(crate) fn run_end_to_end(
                 .clone()
                 .unwrap_or_else(|| "acceptance".to_owned());
             let evolution =
-                crate::harness_evolution::evolve(&graph, &current_hash, &failed_node, attempt)?;
+                match crate::harness_evolution::evolve(&graph, &current_hash, &failed_node, attempt) {
+                    Ok(evolution) => evolution,
+                    Err(error) => {
+                        // A failed evolution must NEVER destroy the whole build. Log
+                        // it, stop evolving, and return the partial outcome — the
+                        // checkpoint is kept so the run can be resumed.
+                        eprintln!(
+                            "  ⟳ harness evolution unavailable ({error:#}); keeping progress and stopping evolution"
+                        );
+                        break outcome;
+                    }
+                };
             println!(
                 "  ⟳ verified failure at `{failed_node}` (cause: {}) — harness evolution: {} [{}]",
                 evolution.cause, evolution.note, evolution.arm
@@ -214,6 +250,13 @@ pub(crate) fn run_end_to_end(
                 "  ⟳ persisted evolved harness {} (lineage on-chain)",
                 &evolution.child_hash[..23.min(evolution.child_hash.len())]
             );
+            if let Err(error) =
+                crate::project_file::persist(workspace, &evolution.child_graph, request)
+            {
+                eprintln!("  project graph note: {error:#}");
+            } else {
+                crate::project_sync::maybe_sync(workspace);
+            }
 
             // Board follows the evolution: re-point the live board to the child
             // graph so the grown / differentiated / repaired tasks appear on the
@@ -223,7 +266,7 @@ pub(crate) fn run_end_to_end(
                 if let Some(port) = board_port(url) {
                     println!("  ⟳ board now following the evolved graph…");
                     if let Err(error) =
-                        crate::board::serve_graph(&evolution.child_hash, port, None, true)
+                        crate::board::serve_graph(&evolution.child_hash, port, None, true, None)
                     {
                         eprintln!("  (board follow unavailable: {error:#})");
                     }
@@ -248,6 +291,9 @@ pub(crate) fn run_end_to_end(
     // (6) Auto-export the sanitized outcome to DataEvol on success — and persist
     // it to durable outcome memory so the router can learn from it (7).
     if outcome.verified != Some(false) && outcome.failed_node.is_none() {
+        // Run finished cleanly — clear the checkpoint so it is not offered for
+        // resume. A failed run keeps its checkpoint so it can be picked back up.
+        recorder.finish();
         if let Err(error) = export_to_dataevol(&graph_id, &outcome, workspace, &ledger, facts) {
             eprintln!("  export note: {error:#}");
         }

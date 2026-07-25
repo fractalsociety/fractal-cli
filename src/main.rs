@@ -1,5 +1,7 @@
+mod auth;
 mod board;
 mod chain;
+mod checkpoint;
 mod cli;
 mod compile;
 mod coordinate;
@@ -10,10 +12,15 @@ mod execute;
 mod graph_store;
 mod harness;
 mod harness_evolution;
+mod ingest;
 mod intent;
 mod interactive;
+mod mobile;
 mod orchestrate;
 mod pipeline;
+mod projects;
+mod project_file;
+mod project_sync;
 mod rlvr;
 mod router;
 mod run;
@@ -68,6 +75,17 @@ fn run(cli: Cli) -> Result<()> {
             args.port,
             args.no_open,
         ),
+        (None, Some(Command::Ios(args))) => {
+            mobile::run_ios(&args, fractalwork.as_deref(), coordinate)
+        }
+        (None, Some(Command::Mobile(args))) => {
+            mobile::run_mobile(&args, fractalwork.as_deref(), coordinate)
+        }
+        (None, Some(Command::Ingest(args))) => {
+            ingest::run(&args, fractalwork.as_deref(), coordinate)
+        }
+        (None, Some(Command::Voice(args))) => ingest::launch_voice(&args, false),
+        (None, Some(Command::Dictate(args))) => ingest::launch_voice(&args, true),
         (None, Some(Command::Graph(args))) => match args.command {
             GraphCommand::Open => board::open(),
             GraphCommand::Board(args) => board::serve_graph(
@@ -75,6 +93,7 @@ fn run(cli: Cli) -> Result<()> {
                 args.port,
                 args.exec_graph_dir.as_deref(),
                 args.no_open,
+                None,
             ),
             GraphCommand::Status(args) => board::status(&args.url, args.json),
             GraphCommand::Show(args) => graph_store::show(&args.graph_hash, args.json),
@@ -132,6 +151,31 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        (None, Some(Command::Projects)) => {
+            let projects = projects::list();
+            if projects.is_empty() {
+                println!("No projects yet — start a build and it will be numbered.");
+            } else {
+                println!("Projects (resume by number, or say \"resume project N\"):");
+                for project in projects {
+                    let status = match checkpoint::find_resumable(std::path::Path::new(
+                        &project.workspace,
+                    )) {
+                        Some(cp) => format!("{}/{} done — resumable", cp.completed.len(), cp.total),
+                        None => "complete / idle".to_owned(),
+                    };
+                    println!("  #{:<3} {:<40} {}", project.number, project.label, status);
+                }
+            }
+            Ok(())
+        }
+        (None, Some(Command::Resume(args))) => {
+            interactive::resume_project(args.number, fractalwork.as_deref(), args.port, coordinate)
+                .map(|_| ())
+        }
+        (None, Some(Command::Login(args))) => auth::run_login(&args),
+        (None, Some(Command::Logout)) => auth::logout(),
+        (None, Some(Command::Sync(args))) => project_sync::run(&args),
         (None, Some(Command::Version)) => {
             println!("fractal {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -169,11 +213,22 @@ fn print_submit_plan(
     // P1.4 — auto-open the viewer on submit: when build mode durably committed a
     // graph, launch its own board and open it (unless suppressed with --no-open).
     if let Some(graph_hash) = plan.committed_graph_hash {
+        if let Some(workspace) = repo {
+            match graph_store::load_graph(&graph_hash)
+                .and_then(|graph| project_file::persist(workspace, &graph, request))
+            {
+                Ok(path) => {
+                    println!("Project graph: {}", path.display());
+                    project_sync::maybe_sync(workspace);
+                }
+                Err(error) => eprintln!("project graph note: {error:#}"),
+            }
+        }
         if no_open {
             println!(
                 "Skipping viewer (--no-open). Open it with:\n  fractal graph board {graph_hash} --port {port}"
             );
-        } else if let Err(error) = board::serve_graph(&graph_hash, port, None, false) {
+        } else if let Err(error) = board::serve_graph(&graph_hash, port, None, false, None) {
             eprintln!("warning: could not auto-open the execution-graph viewer: {error:#}");
         }
     }
@@ -212,7 +267,13 @@ fn run_local(args: &crate::cli::RunArgs) -> Result<()> {
         agents.join(", "),
         workspace.display()
     );
-    let outcome = execute::run_multi_agent(&graph, &workspace, &agents, Some(&board_url))?;
+    let outcome = execute::run_multi_agent(
+        &graph,
+        &workspace,
+        &agents,
+        Some(&board_url),
+        &std::collections::BTreeSet::new(),
+    )?;
     println!("⇒ {}", outcome.detail);
     Ok(())
 }

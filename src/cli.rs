@@ -41,6 +41,16 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Parse a request and preview its intended pipeline stages.
     Submit(SubmitArgs),
+    /// Build, verify, and optionally launch a native SwiftUI iOS app.
+    Ios(IosArgs),
+    /// Build a cross-platform mobile app (Expo by default).
+    Mobile(MobileArgs),
+    /// Normalize stdin into fractal.input.v1 and route it through the safety gate.
+    Ingest(IngestArgs),
+    /// Switch to a Superwhisper command mode and start recording.
+    Voice(VoiceArgs),
+    /// Switch to a Superwhisper dictation mode and start recording.
+    Dictate(VoiceArgs),
     /// Open or inspect the live execution-graph board.
     Graph(GraphArgs),
     /// Run a compiled graph through Coordinate (stub).
@@ -55,8 +65,62 @@ pub(crate) enum Command {
     Train,
     /// Show + verify the durable machine-scale chain of folded run receipts.
     Chain,
+    /// List numbered projects and their resume status.
+    Projects,
+    /// Resume a project by its number (also: say "resume project N" by voice).
+    Resume(ResumeArgs),
+    /// Log in through Fractal Society in the browser.
+    Login(LoginArgs),
+    /// Remove the locally stored Fractal Society session.
+    Logout,
+    /// Publish this project's standardized graph (explicitly or opt-in).
+    Sync(SyncArgs),
     /// Print the Fractal CLI version.
     Version,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct LoginArgs {
+    /// Fractal Society origin (defaults to https://fractalsociety.com).
+    #[arg(long, value_name = "URL")]
+    pub(crate) server: Option<String>,
+
+    /// Print the authorization URL instead of opening a browser.
+    #[arg(long)]
+    pub(crate) no_open: bool,
+
+    /// Maximum seconds to wait for browser authorization.
+    #[arg(long, default_value_t = 300)]
+    pub(crate) timeout: u64,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct SyncArgs {
+    /// Project workspace (defaults to the current directory).
+    #[arg(long, value_name = "PATH")]
+    pub(crate) repo: Option<PathBuf>,
+
+    /// Enable future sync, optionally including GitHub with --github.
+    #[arg(long, conflicts_with = "disable")]
+    pub(crate) enable: bool,
+
+    /// Opt this project out of automatic web uploads.
+    #[arg(long, conflicts_with_all = ["enable", "github"])]
+    pub(crate) disable: bool,
+
+    /// Ask Fractal Society to mirror project.fractal to the connected GitHub repository.
+    #[arg(long)]
+    pub(crate) github: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ResumeArgs {
+    /// Project number, as shown by `fractal projects`.
+    pub(crate) number: u32,
+
+    /// Board port to serve the resumed graph on.
+    #[arg(long, default_value_t = DEFAULT_GRAPH_PORT)]
+    pub(crate) port: u16,
 }
 
 /// Arguments accepted by `fractal clean`.
@@ -98,6 +162,150 @@ pub(crate) struct SubmitArgs {
     /// Do not auto-open the execution-graph viewer after a build.
     #[arg(long)]
     pub(crate) no_open: bool,
+}
+
+/// Arguments accepted by `fractal ios`.
+#[derive(Debug, Args)]
+pub(crate) struct IosArgs {
+    /// Natural-language description of the app to build.
+    pub(crate) request: String,
+
+    /// Build, install, and open the app in iOS Simulator after verification.
+    #[arg(long)]
+    pub(crate) launch: bool,
+
+    /// Project folder. By default Fractal creates one under `~/fractal-projects`.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) repo: Option<PathBuf>,
+
+    /// Simulator device to use.
+    #[arg(long, default_value = "iPhone 17 Pro")]
+    pub(crate) simulator: String,
+
+    /// Print the specialized plan without writing or running anything.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+}
+
+/// Arguments accepted by `fractal mobile`.
+#[derive(Debug, Args)]
+pub(crate) struct MobileArgs {
+    /// Natural-language description of the app to build.
+    pub(crate) request: String,
+
+    /// Cross-platform framework.
+    #[arg(long, value_enum, default_value_t = MobileFramework::Expo)]
+    pub(crate) framework: MobileFramework,
+
+    /// Target platforms.
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "ios,android")]
+    pub(crate) platforms: Vec<MobilePlatform>,
+
+    /// Platform to launch after verification.
+    #[arg(long, value_enum)]
+    pub(crate) launch: Option<MobilePlatform>,
+
+    /// Project folder. By default Fractal creates one under `~/fractal-projects`.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) repo: Option<PathBuf>,
+
+    /// iOS Simulator device to use when launching iOS.
+    #[arg(long, default_value = "iPhone 17 Pro")]
+    pub(crate) simulator: String,
+
+    /// Print the specialized plan without writing or running anything.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum MobileFramework {
+    Expo,
+}
+
+impl std::fmt::Display for MobileFramework {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Expo => "expo",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum MobilePlatform {
+    Ios,
+    Android,
+}
+
+impl std::fmt::Display for MobilePlatform {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Ios => "ios",
+            Self::Android => "android",
+        })
+    }
+}
+
+/// Arguments accepted by `fractal ingest`.
+#[derive(Debug, Args)]
+pub(crate) struct IngestArgs {
+    /// Source adapter that produced the input event.
+    #[arg(long, default_value = "terminal")]
+    pub(crate) source: String,
+
+    /// Encoding read from stdin.
+    #[arg(long, value_enum, default_value_t = InputFormat::Text)]
+    pub(crate) format: InputFormat,
+
+    /// Read the event from stdin (accepted explicitly for automation clarity).
+    #[arg(long)]
+    pub(crate) stdin: bool,
+
+    /// Read a fractal.input.v1 JSON envelope from stdin.
+    #[arg(long, conflicts_with = "format")]
+    pub(crate) json: bool,
+
+    /// Input mode for text normalization (`fractal-command` or `dictation`).
+    #[arg(long, default_value = "fractal-command")]
+    pub(crate) mode: String,
+
+    /// Require a human to type the event-specific confirmation on `/dev/tty`.
+    #[arg(long)]
+    pub(crate) confirm: bool,
+
+    /// Normalize, classify, and print the event without compiling or executing.
+    #[arg(long)]
+    pub(crate) preview: bool,
+
+    /// Port for the live execution-graph board.
+    #[arg(long, default_value_t = DEFAULT_GRAPH_PORT)]
+    pub(crate) port: u16,
+
+    /// Trusted workspace in which the graph should execute (defaults to cwd).
+    #[arg(long, value_name = "PATH")]
+    pub(crate) repo: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum InputFormat {
+    Text,
+    Json,
+}
+
+/// Arguments accepted by `fractal voice` and `fractal dictate`.
+#[derive(Debug, Args)]
+pub(crate) struct VoiceArgs {
+    /// Superwhisper mode key. Falls back to the matching FRACTAL_SUPERWHISPER_* env.
+    #[arg(long)]
+    pub(crate) mode_key: Option<String>,
+
+    /// Delay between selecting the mode and starting recording.
+    #[arg(long, default_value_t = 200)]
+    pub(crate) delay_ms: u64,
+
+    /// Print the deep links without opening Superwhisper.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
 }
 
 /// Submission mode understood by the CLI skeleton.
@@ -434,6 +642,132 @@ mod tests {
 
         let version = Cli::try_parse_from(["fractal", "version"]).unwrap();
         assert!(matches!(version.command, Some(Command::Version)));
+    }
+
+    #[test]
+    fn parses_ingest_and_voice_commands() {
+        let ingest = Cli::try_parse_from([
+            "fractal",
+            "ingest",
+            "--source",
+            "superwhisper",
+            "--format",
+            "text",
+            "--stdin",
+            "--preview",
+        ])
+        .unwrap();
+        let Some(Command::Ingest(args)) = ingest.command else {
+            panic!("expected ingest command");
+        };
+        assert_eq!(args.source, "superwhisper");
+        assert_eq!(args.format, InputFormat::Text);
+        assert!(args.stdin);
+        assert!(args.preview);
+
+        let json = Cli::try_parse_from(["fractal", "ingest", "--json"]).unwrap();
+        assert!(matches!(
+            json.command,
+            Some(Command::Ingest(IngestArgs { json: true, .. }))
+        ));
+
+        let voice = Cli::try_parse_from([
+            "fractal",
+            "voice",
+            "--mode-key",
+            "fractal-command",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert!(matches!(
+            voice.command,
+            Some(Command::Voice(VoiceArgs {
+                mode_key: Some(ref key),
+                dry_run: true,
+                ..
+            })) if key == "fractal-command"
+        ));
+
+        let dictate = Cli::try_parse_from(["fractal", "dictate", "--dry-run"]).unwrap();
+        assert!(matches!(
+            dictate.command,
+            Some(Command::Dictate(VoiceArgs { dry_run: true, .. }))
+        ));
+    }
+
+    #[test]
+    fn parses_native_and_cross_platform_mobile_commands() {
+        let ios = Cli::try_parse_from([
+            "fractal",
+            "ios",
+            "Build a personal expense tracker",
+            "--launch",
+        ])
+        .unwrap();
+        assert!(matches!(
+            ios.command,
+            Some(Command::Ios(IosArgs {
+                launch: true,
+                ref request,
+                ..
+            })) if request == "Build a personal expense tracker"
+        ));
+
+        let mobile = Cli::try_parse_from([
+            "fractal",
+            "mobile",
+            "Build a personal expense tracker",
+            "--framework",
+            "expo",
+            "--platforms",
+            "ios,android",
+            "--launch",
+            "ios",
+        ])
+        .unwrap();
+        let Some(Command::Mobile(args)) = mobile.command else {
+            panic!("expected mobile command");
+        };
+        assert_eq!(args.framework, MobileFramework::Expo);
+        assert_eq!(
+            args.platforms,
+            vec![MobilePlatform::Ios, MobilePlatform::Android]
+        );
+        assert_eq!(args.launch, Some(MobilePlatform::Ios));
+    }
+
+    #[test]
+    fn parses_login_and_sync_commands() {
+        let login = Cli::try_parse_from([
+            "fractal",
+            "login",
+            "--server",
+            "http://127.0.0.1:3000",
+            "--no-open",
+            "--timeout",
+            "30",
+        ])
+        .unwrap();
+        assert!(matches!(
+            login.command,
+            Some(Command::Login(LoginArgs {
+                no_open: true,
+                timeout: 30,
+                ..
+            }))
+        ));
+
+        let sync =
+            Cli::try_parse_from(["fractal", "sync", "--enable", "--github", "--repo", "/tmp/app"])
+                .unwrap();
+        assert!(matches!(
+            sync.command,
+            Some(Command::Sync(SyncArgs {
+                enable: true,
+                github: true,
+                ..
+            }))
+        ));
     }
 
     #[test]

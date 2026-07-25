@@ -225,6 +225,12 @@ fn verify_graph_hash(graph: &Value, claimed: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a graph's schema-independent content hash without writing it.
+pub(crate) fn verify_graph_document(graph: &Value) -> Result<()> {
+    let claimed = claimed_hash(graph)?;
+    verify_graph_hash(graph, claimed)
+}
+
 fn atomic_write(root: &Path, destination: &Path, bytes: &[u8]) -> Result<()> {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temp_path = root.join(format!(".graph-{}-{sequence}.tmp", process::id()));

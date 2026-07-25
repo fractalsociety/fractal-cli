@@ -81,5 +81,11 @@ pub(crate) fn run_via_coordinate(
     // Drive execution to completion. External Coordinate worker bridges could
     // consume the same durable queue; the local host executes so the run is
     // turnkey either way.
-    execute::run_multi_agent(graph, workspace, agents, board)
+    execute::run_multi_agent(
+        graph,
+        workspace,
+        agents,
+        board,
+        &std::collections::BTreeSet::new(),
+    )
 }

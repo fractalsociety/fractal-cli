@@ -214,11 +214,31 @@ pub(crate) fn evolve(
     let context_bp = context_features(cause_index(&cause), attempt);
 
     let mut bandit = load_bandit();
-    let arm = select_arm(&mut bandit, &context_bp)?;
+    let mut arm = select_arm(&mut bandit, &context_bp)?;
 
+    // Apply the chosen structural arm; if it cannot apply (e.g. the verification
+    // node it would grow already exists), fall back to `repair`, which re-instructs
+    // existing nodes and adds nothing — so evolution always yields a valid child
+    // instead of failing the whole run.
     let result = match arm.as_str() {
-        ARM_GROW => apply_grow(graph, current_hash, failed_node, &attribution)?,
-        ARM_DIFFERENTIATE => apply_differentiate(graph, current_hash, failed_node, attempt)?,
+        ARM_GROW => match apply_grow(graph, current_hash, failed_node, &attribution) {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("  ⟳ grow not applicable ({error:#}); falling back to repair");
+                arm = ARM_REPAIR.to_owned();
+                apply_repair(graph, current_hash, failed_node)?
+            }
+        },
+        ARM_DIFFERENTIATE => {
+            match apply_differentiate(graph, current_hash, failed_node, attempt) {
+                Ok(result) => result,
+                Err(error) => {
+                    eprintln!("  ⟳ differentiate not applicable ({error:#}); falling back to repair");
+                    arm = ARM_REPAIR.to_owned();
+                    apply_repair(graph, current_hash, failed_node)?
+                }
+            }
+        }
         _ => apply_repair(graph, current_hash, failed_node)?,
     };
 
@@ -260,13 +280,38 @@ pub(crate) fn evolve(
 /// `grow.verification`: use the real `propose_verification_growth` to add a
 /// verification node + success edge off a code node, then apply that bounded,
 /// grammar-checked proposal to the harness graph.
+/// A code node that does NOT already have a grown verification child, so growing
+/// off it adds a fresh `verify.<node>.*` checkpoint instead of colliding with an
+/// existing one (which the compiler rejects). Falls back to any code node.
+fn grow_source_without_verify(graph: &Value) -> Option<String> {
+    let ids: BTreeSet<String> = graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| node.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let has_verify_child =
+        |id: &str| ids.iter().any(|other| other.starts_with(&format!("verify.{id}.")));
+    graph
+        .get("nodes")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|node| is_code_node(node))
+        .filter_map(|node| node.get("id").and_then(Value::as_str))
+        .rfind(|id| !has_verify_child(id))
+        .map(str::to_owned)
+}
+
 fn apply_grow(
     graph: &Value,
     current_hash: &str,
     failed_node: &str,
     attribution: &AttributionReport,
 ) -> Result<ArmResult> {
-    let source = source_code_node(graph).unwrap_or_else(|| failed_node.to_owned());
+    let source = grow_source_without_verify(graph)
+        .or_else(|| source_code_node(graph))
+        .unwrap_or_else(|| failed_node.to_owned());
     grow_arm(
         graph,
         current_hash,
@@ -698,9 +743,12 @@ fn splice_repair_child(graph: &Value, failed_node: &str) -> Value {
                     .unwrap_or("")
                     .to_owned();
                 node["instruction"] = json!(format!(
-                    "{instruction}\n\nREPAIR: a previous attempt FAILED verification at \
-                     `{failed_node}`. Read any error output, fix the implementation and tests so \
-                     the whole suite passes."
+                    "{instruction}\n\nREPAIR: a previous attempt did NOT succeed at `{failed_node}` \
+                     (it failed verification, or the agent got stuck / timed out). Read any error \
+                     output and fix the implementation and tests so the whole suite passes. If the \
+                     earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid \
+                     long-running or interactive operations and produce a minimal, correct version \
+                     quickly."
                 ));
             }
         }
@@ -1143,9 +1191,12 @@ fn reinstruct_genome_code_nodes(harness: &mut Value, failed_node: &str) {
                     .unwrap_or("")
                     .to_owned();
                 node["instruction"] = json!(format!(
-                    "{instruction}\n\nREPAIR: a previous attempt FAILED verification at \
-                     `{failed_node}`. Read any error output, fix the implementation and tests so \
-                     the whole suite passes."
+                    "{instruction}\n\nREPAIR: a previous attempt did NOT succeed at `{failed_node}` \
+                     (it failed verification, or the agent got stuck / timed out). Read any error \
+                     output and fix the implementation and tests so the whole suite passes. If the \
+                     earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid \
+                     long-running or interactive operations and produce a minimal, correct version \
+                     quickly."
                 ));
             }
         }

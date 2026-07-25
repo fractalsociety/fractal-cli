@@ -1,0 +1,538 @@
+//! Normalized multimodal ingress and the Superwhisper launcher.
+//!
+//! Transcripts are data, never shell source. They enter through stdin, normalize
+//! to `fractal.input.v1`, pass a conservative risk gate, and only then reach the
+//! existing intent → graph → governed-execution pipeline.
+
+use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::path::Path;
+use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use crate::cli::{IngestArgs, InputFormat, VoiceArgs};
+
+const INPUT_SCHEMA: &str = "fractal.input.v1";
+const MAX_INPUT_BYTES: usize = 64 * 1024;
+const DEFAULT_COMMAND_MODE: &str = "fractal-command";
+const DICTATION_MODE: &str = "dictation";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InputEvent {
+    pub(crate) schema: String,
+    pub(crate) source: String,
+    pub(crate) modality: String,
+    pub(crate) content: String,
+    #[serde(default = "default_command_mode")]
+    pub(crate) mode: String,
+    #[serde(default)]
+    pub(crate) timestamp: String,
+    #[serde(default)]
+    pub(crate) context: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum Risk {
+    ReadOnly,
+    ReversibleWrite,
+    Destructive,
+    ExternalSideEffect,
+}
+
+impl std::fmt::Display for Risk {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ReadOnly => "READ_ONLY",
+            Self::ReversibleWrite => "REVERSIBLE_WRITE",
+            Self::Destructive => "DESTRUCTIVE",
+            Self::ExternalSideEffect => "EXTERNAL_SIDE_EFFECT",
+        })
+    }
+}
+
+fn default_command_mode() -> String {
+    DEFAULT_COMMAND_MODE.to_owned()
+}
+
+/// Read and process one stdin event. Non-read-only voice events fail closed
+/// unless the caller explicitly requested a typed `/dev/tty` confirmation.
+pub(crate) fn run(
+    args: &IngestArgs,
+    fractalwork_override: Option<&Path>,
+    coordinate: bool,
+) -> Result<()> {
+    let event = read_event(args)?;
+    let risk = classify_risk(&event.content);
+
+    if args.preview {
+        println!("{}", serde_json::to_string_pretty(&event)?);
+        println!("risk: {risk}");
+        return Ok(());
+    }
+
+    if event.mode == DICTATION_MODE {
+        print!("{}", event.content);
+        return Ok(());
+    }
+    if event.mode != DEFAULT_COMMAND_MODE {
+        bail!(
+            "unsupported input mode {:?}; expected {DEFAULT_COMMAND_MODE:?} or {DICTATION_MODE:?}",
+            event.mode
+        );
+    }
+
+    // "resume project N" is a control command that continues an already-approved
+    // project — route it directly, bypassing the build write-confirmation gate so
+    // it works hands-free by voice.
+    if let Some(number) = crate::projects::parse_resume_command(&event.content) {
+        println!("Normalized {} {} input · resume command", event.source, event.modality);
+        return crate::interactive::resume_project(
+            number,
+            fractalwork_override,
+            args.port,
+            coordinate,
+        )
+        .map(|_| ());
+    }
+
+    println!(
+        "Normalized {} {} input · risk {risk}",
+        event.source, event.modality
+    );
+    if risk != Risk::ReadOnly {
+        println!(
+            "Interpreted instruction:\n  {}",
+            event.content.replace('\n', "\n  ")
+        );
+        io::stdout().flush().ok();
+        if !args.confirm {
+            bail!(
+                "{risk} voice input was not executed; review it and rerun manually with --confirm for typed confirmation"
+            );
+        }
+        confirm_on_tty(&event, risk)?;
+    }
+
+    crate::interactive::execute_ingested(
+        &event.content,
+        args.repo.as_deref(),
+        fractalwork_override,
+        coordinate,
+        args.port,
+    )
+    .map(|_| ())
+}
+
+fn read_event(args: &IngestArgs) -> Result<InputEvent> {
+    if !args.stdin && atty_like_stdin() {
+        bail!("ingest reads stdin; pipe a transcript or pass --stdin explicitly");
+    }
+    let mut input = String::new();
+    io::stdin()
+        .take((MAX_INPUT_BYTES + 1) as u64)
+        .read_to_string(&mut input)
+        .context("read input event from stdin")?;
+    if input.len() > MAX_INPUT_BYTES {
+        bail!("input exceeds the {MAX_INPUT_BYTES}-byte limit");
+    }
+
+    let format = if args.json {
+        InputFormat::Json
+    } else {
+        args.format
+    };
+    let mut event = match format {
+        InputFormat::Text => InputEvent {
+            schema: INPUT_SCHEMA.to_owned(),
+            source: args.source.clone(),
+            modality: if args.source.eq_ignore_ascii_case("superwhisper") {
+                "voice".to_owned()
+            } else {
+                "text".to_owned()
+            },
+            content: input,
+            mode: args.mode.clone(),
+            timestamp: now_rfc3339(),
+            context: BTreeMap::new(),
+        },
+        InputFormat::Json => {
+            serde_json::from_str::<InputEvent>(&input).context("parse fractal.input.v1 JSON")?
+        }
+    };
+    normalize_and_validate(&mut event)?;
+    Ok(event)
+}
+
+fn normalize_and_validate(event: &mut InputEvent) -> Result<()> {
+    if event.schema != INPUT_SCHEMA {
+        bail!(
+            "unsupported input schema {:?}; expected {INPUT_SCHEMA:?}",
+            event.schema
+        );
+    }
+    event.source = event.source.trim().to_owned();
+    event.modality = event.modality.trim().to_ascii_lowercase();
+    event.mode = event.mode.trim().to_ascii_lowercase();
+    event.content = event.content.trim().to_owned();
+    if event.timestamp.trim().is_empty() {
+        event.timestamp = now_rfc3339();
+    }
+    if event.source.is_empty()
+        || event.source.len() > 64
+        || !event
+            .source
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+    {
+        bail!("source must be 1-64 characters from [A-Za-z0-9._:-]");
+    }
+    if !matches!(event.modality.as_str(), "voice" | "text") {
+        bail!("modality must be \"voice\" or \"text\"");
+    }
+    if !matches!(event.mode.as_str(), DEFAULT_COMMAND_MODE | DICTATION_MODE) {
+        bail!("mode must be {DEFAULT_COMMAND_MODE:?} or {DICTATION_MODE:?}");
+    }
+    if !looks_like_rfc3339(&event.timestamp) {
+        bail!("timestamp must be an RFC 3339 date-time");
+    }
+    if event.content.is_empty() {
+        bail!("input content is empty");
+    }
+    if event.content.len() > MAX_INPUT_BYTES {
+        bail!("input content exceeds the {MAX_INPUT_BYTES}-byte limit");
+    }
+    Ok(())
+}
+
+/// Conservative deterministic classifier. Specific dangerous classes win over
+/// generic read verbs ("show and then delete" is destructive, never read-only).
+pub(crate) fn classify_risk(content: &str) -> Risk {
+    let text = content.to_ascii_lowercase();
+    let external = [
+        "send ",
+        "reply to ",
+        "publish ",
+        "post ",
+        "deploy ",
+        "push ",
+        "purchase ",
+        "buy ",
+        "pay ",
+        "transfer ",
+        "submit ",
+        "upload ",
+        "open a pull request",
+        "create a pull request",
+        "call the api",
+        "call an api",
+    ];
+    if external.iter().any(|term| text.contains(term)) {
+        return Risk::ExternalSideEffect;
+    }
+    let destructive = [
+        "delete ",
+        "remove ",
+        "wipe ",
+        "erase ",
+        "destroy ",
+        "drop database",
+        "truncate ",
+        "reset --hard",
+        "force push",
+        "uninstall ",
+        "revoke ",
+        "kill all",
+    ];
+    if destructive.iter().any(|term| text.contains(term)) {
+        return Risk::Destructive;
+    }
+    let writes = [
+        "create ",
+        "write ",
+        "edit ",
+        "modify ",
+        "update ",
+        "fix ",
+        "repair ",
+        "build ",
+        "implement ",
+        "install ",
+        "start ",
+        "run ",
+        "commit ",
+        "branch ",
+        "rename ",
+        "move ",
+        "change ",
+    ];
+    if writes.iter().any(|term| text.contains(term)) {
+        return Risk::ReversibleWrite;
+    }
+    let read_prefixes = [
+        "show ",
+        "list ",
+        "check ",
+        "inspect ",
+        "read ",
+        "review ",
+        "summarize ",
+        "search ",
+        "find ",
+        "explain ",
+        "report ",
+        "navigate ",
+        "what ",
+        "where ",
+        "how ",
+        "status",
+    ];
+    if read_prefixes
+        .iter()
+        .any(|prefix| text.trim_start().starts_with(prefix))
+    {
+        Risk::ReadOnly
+    } else {
+        // Unknown voice intent is never assumed harmless.
+        Risk::ReversibleWrite
+    }
+}
+
+fn looks_like_rfc3339(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 20
+        && bytes.get(4) == Some(&b'-')
+        && bytes.get(7) == Some(&b'-')
+        && matches!(bytes.get(10), Some(b'T' | b't' | b' '))
+        && bytes.get(13) == Some(&b':')
+        && bytes.get(16) == Some(&b':')
+        && (value.ends_with('Z')
+            || value.ends_with('z')
+            || value
+                .get(19..)
+                .is_some_and(|suffix| suffix.contains('+') || suffix.contains('-')))
+}
+
+fn event_fingerprint(event: &InputEvent) -> Result<String> {
+    let bytes = serde_json::to_vec(event)?;
+    let digest = Sha256::digest(bytes);
+    Ok(digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn confirm_on_tty(event: &InputEvent, risk: Risk) -> Result<()> {
+    let fingerprint = event_fingerprint(event)?;
+    let expected = format!("CONFIRM {fingerprint}");
+    let mut tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .context(
+            "typed confirmation requires an interactive terminal; voice confirmation is refused",
+        )?;
+    writeln!(
+        tty,
+        "{risk} input requires typed confirmation. Type exactly: {expected}"
+    )?;
+    write!(tty, "> ")?;
+    tty.flush()?;
+    let mut answer = String::new();
+    io::BufReader::new(tty)
+        .read_line(&mut answer)
+        .context("read typed confirmation")?;
+    if answer.len() > 128 {
+        bail!("confirmation was too long; nothing was executed");
+    }
+    if answer.trim() != expected {
+        bail!("confirmation did not match; nothing was executed");
+    }
+    Ok(())
+}
+
+/// Launch a Superwhisper mode and then its recording window using documented
+/// deep links. `dictate=true` uses a separate mode-key environment variable.
+pub(crate) fn launch_voice(args: &VoiceArgs, dictate: bool) -> Result<()> {
+    let env_key = if dictate {
+        "FRACTAL_SUPERWHISPER_DICTATE_MODE_KEY"
+    } else {
+        "FRACTAL_SUPERWHISPER_MODE_KEY"
+    };
+    let mode_key = args
+        .mode_key
+        .clone()
+        .or_else(|| std::env::var(env_key).ok())
+        .filter(|value| !value.trim().is_empty());
+    let links = voice_links(mode_key.as_deref())?;
+    if args.dry_run {
+        for link in links {
+            println!("open {link}");
+        }
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    bail!("Superwhisper deep-link launching is supported on macOS only");
+    #[cfg(target_os = "macos")]
+    {
+        for (index, link) in links.iter().enumerate() {
+            let status = Command::new("open")
+                .arg(link)
+                .status()
+                .with_context(|| format!("open Superwhisper deep link {link}"))?;
+            if !status.success() {
+                bail!("macOS open failed for {link} ({status})");
+            }
+            if index + 1 < links.len() {
+                std::thread::sleep(Duration::from_millis(args.delay_ms));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn voice_links(mode_key: Option<&str>) -> Result<Vec<String>> {
+    let mut links = Vec::new();
+    if let Some(key) = mode_key {
+        let key = key.trim();
+        if key.is_empty()
+            || key.len() > 128
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            bail!("Superwhisper mode key must use only [A-Za-z0-9._-]");
+        }
+        links.push(format!("superwhisper://mode?key={key}"));
+    }
+    links.push("superwhisper://record".to_owned());
+    Ok(links)
+}
+
+fn atty_like_stdin() -> bool {
+    io::stdin().is_terminal()
+}
+
+fn now_rfc3339() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = day_seconds / 3_600;
+    let minute = day_seconds % 3_600 / 60;
+    let second = day_seconds % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+// Howard Hinnant's civil-from-days algorithm; `days` is relative to 1970-01-01.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(content: &str) -> InputEvent {
+        InputEvent {
+            schema: INPUT_SCHEMA.to_owned(),
+            source: "superwhisper".to_owned(),
+            modality: "voice".to_owned(),
+            content: content.to_owned(),
+            mode: DEFAULT_COMMAND_MODE.to_owned(),
+            timestamp: String::new(),
+            context: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn normalizes_a_json_voice_event() {
+        let mut value = event("  Show experiment status.  ");
+        normalize_and_validate(&mut value).unwrap();
+        assert_eq!(value.content, "Show experiment status.");
+        assert!(value.timestamp.ends_with('Z'));
+    }
+
+    #[test]
+    fn rejects_unknown_schema_and_empty_content() {
+        let mut wrong = event("hello");
+        wrong.schema = "fractal.input.v2".to_owned();
+        assert!(normalize_and_validate(&mut wrong).is_err());
+        let mut empty = event("   ");
+        assert!(normalize_and_validate(&mut empty).is_err());
+        let mut bad_mode = event("hello");
+        bad_mode.mode = "unsafe-bypass".to_owned();
+        assert!(normalize_and_validate(&mut bad_mode).is_err());
+        let mut bad_timestamp = event("hello");
+        bad_timestamp.timestamp = "yesterday".to_owned();
+        assert!(normalize_and_validate(&mut bad_timestamp).is_err());
+    }
+
+    #[test]
+    fn risk_order_fails_closed() {
+        assert_eq!(classify_risk("Show experiment status"), Risk::ReadOnly);
+        assert_eq!(
+            classify_risk("Create a new benchmark branch"),
+            Risk::ReversibleWrite
+        );
+        assert_eq!(
+            classify_risk("Show status and delete all failed runs"),
+            Risk::Destructive
+        );
+        assert_eq!(
+            classify_risk("Summarize this and send an email"),
+            Risk::ExternalSideEffect
+        );
+        assert_eq!(classify_risk("Review email regressions"), Risk::ReadOnly);
+        assert_eq!(classify_risk("Do the thing"), Risk::ReversibleWrite);
+    }
+
+    #[test]
+    fn voice_links_validate_mode_keys() {
+        assert_eq!(
+            voice_links(Some("fractal-command_1")).unwrap(),
+            vec![
+                "superwhisper://mode?key=fractal-command_1",
+                "superwhisper://record"
+            ]
+        );
+        assert_eq!(voice_links(None).unwrap(), vec!["superwhisper://record"]);
+        assert!(voice_links(Some("bad&record=true")).is_err());
+    }
+
+    #[test]
+    fn timestamp_conversion_has_known_epoch() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(20_000), (2024, 10, 4));
+    }
+
+    #[test]
+    fn fingerprint_is_stable() {
+        let value = event("show status");
+        assert_eq!(
+            event_fingerprint(&value).unwrap(),
+            event_fingerprint(&value).unwrap()
+        );
+    }
+}
