@@ -255,7 +255,7 @@ pub(crate) fn run_end_to_end(
             {
                 eprintln!("  project graph note: {error:#}");
             } else {
-                crate::project_sync::maybe_sync(workspace);
+                let _ = crate::project_sync::maybe_sync(workspace);
             }
 
             // Board follows the evolution: re-point the live board to the child

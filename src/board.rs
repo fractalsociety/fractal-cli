@@ -201,17 +201,33 @@ impl Counts {
 
 /// Open the default execution-graph board in the macOS browser.
 pub(crate) fn open() -> Result<()> {
+    open_url(DEFAULT_BOARD_URL)?;
+    println!("Opened {DEFAULT_BOARD_URL}");
+    Ok(())
+}
+
+/// Open one already-validated board or project URL in the macOS browser.
+pub(crate) fn open_url(url: &str) -> Result<()> {
     let status = Command::new("open")
-        .arg(DEFAULT_BOARD_URL)
+        .arg(url)
         .status()
         .context("failed to launch the macOS `open` command")?;
     if status.success() {
-        println!("Opened {DEFAULT_BOARD_URL}");
         Ok(())
     } else {
         Err(anyhow!(
-            "macOS `open` could not open {DEFAULT_BOARD_URL} (exit status {status})"
+            "macOS `open` could not open {url} (exit status {status})"
         ))
+    }
+}
+
+/// Select the page shown after graph publication. The localhost server remains
+/// the execution-status backend, while an authenticated cloud URL becomes the
+/// browser destination.
+pub(crate) fn browser_target(project_url: Option<&str>, port: u16) -> (String, bool) {
+    match project_url {
+        Some(url) => (url.to_owned(), true),
+        None => (format!("http://127.0.0.1:{port}/"), false),
     }
 }
 
@@ -530,5 +546,17 @@ mod tests {
         assert!(output.contains("Tasks: 3 total, 1 complete, 1 active, 1 incomplete"));
         assert!(output.contains("Gates: 2 total, 1 complete, 0 active, 1 incomplete"));
         assert!(output.contains("P0 — Front door: 1/3 (33%)"));
+    }
+
+    #[test]
+    fn authenticated_projects_prefer_the_cloud_browser_target() {
+        let (cloud, is_cloud) =
+            browser_target(Some("https://fractalsociety.com/james/app"), 8092);
+        assert_eq!(cloud, "https://fractalsociety.com/james/app");
+        assert!(is_cloud);
+
+        let (local, is_cloud) = browser_target(None, 8092);
+        assert_eq!(local, "http://127.0.0.1:8092/");
+        assert!(!is_cloud);
     }
 }

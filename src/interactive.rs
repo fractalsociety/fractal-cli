@@ -641,15 +641,18 @@ fn drive_committed_graph(
     resume_completed: &BTreeSet<String>,
     board_preseed: Option<&BTreeSet<String>>,
 ) -> Option<crate::execute::RunOutcome> {
-    match graph_store::load_graph(hash)
+    let project_url = match graph_store::load_graph(hash)
         .and_then(|graph| crate::project_file::persist(workspace, &graph, request))
     {
         Ok(path) => {
             println!("  ◇ Project graph: {}", path.display());
-            crate::project_sync::maybe_sync(workspace);
+            crate::project_sync::maybe_sync(workspace)
         }
-        Err(error) => eprintln!("  project graph note: {error:#}"),
-    }
+        Err(error) => {
+            eprintln!("  project graph note: {error:#}");
+            None
+        }
+    };
     let number = crate::projects::register(workspace);
     println!(
         "  📁 Project #{number} · {} (say \"resume project {number}\" to continue later)",
@@ -658,9 +661,26 @@ fn drive_committed_graph(
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
     );
-    println!("  → opening the live board for this graph…");
-    if let Err(error) = board::serve_graph(hash, port, None, false, board_preseed) {
+    let (browser_target, is_cloud_target) = board::browser_target(project_url.as_deref(), port);
+    println!(
+        "  → opening the {} execution graph…",
+        if is_cloud_target {
+            "published Fractal Society"
+        } else {
+            "local"
+        }
+    );
+    if let Err(error) = board::serve_graph(hash, port, None, is_cloud_target, board_preseed) {
         eprintln!("  (board unavailable: {error:#})");
+    }
+    if is_cloud_target {
+        if let Err(error) = board::open_url(&browser_target) {
+            eprintln!("  (Fractal Society page unavailable: {error:#}; opening local board)");
+            let (local_board_url, _) = board::browser_target(None, port);
+            if let Err(fallback_error) = board::open_url(&local_board_url) {
+                eprintln!("  (local board unavailable: {fallback_error:#})");
+            }
+        }
     }
     if agents.is_empty() {
         println!(
@@ -750,7 +770,7 @@ fn drive_committed_graph(
             };
             println!("  {mark} {} · worked for {elapsed}\n", outcome.detail);
             if outcome.failed_node.is_none() {
-                crate::project_sync::maybe_sync(workspace);
+                let _ = crate::project_sync::maybe_sync(workspace);
             }
             Some(outcome)
         }

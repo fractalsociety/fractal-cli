@@ -108,15 +108,20 @@ pub(crate) fn run(args: &SyncArgs) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn maybe_sync(workspace: &Path) {
+/// Publish the current project when cloud sync is enabled and return the
+/// authenticated Fractal Society page that should be shown to the user.
+pub(crate) fn maybe_sync(workspace: &Path) -> Option<String> {
+    if std::env::var_os("FRACTAL_OFFLINE").is_some() {
+        return None;
+    }
     match load_preference(workspace) {
-        Some(preference) if !preference.enabled => return,
+        Some(preference) if !preference.enabled => return None,
         Some(_) => {}
         None => {
             // No login means purely local/offline operation, without a warning
             // on every graph build. A valid login enables private web sync.
             if crate::auth::load_session().is_err() {
-                return;
+                return None;
             }
         }
     }
@@ -133,8 +138,12 @@ pub(crate) fn maybe_sync(workspace: &Path) {
             if let Some(repository) = repository {
                 println!("  ↗ GitHub graph: {}", repository.github_graph_url);
             }
+            Some(response.project_url)
         }
-        Err(error) => eprintln!("  sync note: {error:#}"),
+        Err(error) => {
+            eprintln!("  sync note: {error:#}");
+            None
+        }
     }
 }
 
@@ -220,10 +229,20 @@ fn upload(workspace: &Path, repository: Option<&RepositoryLink>) -> Result<SyncR
         .header("ETag")
         .and_then(parse_etag)
         .unwrap_or_else(|| document.graph_hash.clone());
-    let result: SyncResponse =
+    let mut result: SyncResponse =
         serde_json::from_reader(response.into_reader()).context("decode project sync response")?;
-    if result.project_url.is_empty() {
-        bail!("Fractal Society returned an empty project URL");
+    if result.project_url.starts_with('/') {
+        result.project_url = format!(
+            "{}{}",
+            session.server.trim_end_matches('/'),
+            result.project_url
+        );
+    }
+    if !is_safe_project_url(&result.project_url) {
+        bail!(
+            "Fractal Society returned an invalid project URL: {}",
+            result.project_url
+        );
     }
     let account = session.account_identity();
     save_state(
@@ -236,6 +255,26 @@ fn upload(workspace: &Path, repository: Option<&RepositoryLink>) -> Result<SyncR
         },
     )?;
     Ok(result)
+}
+
+fn is_safe_project_url(project_url: &str) -> bool {
+    project_url.starts_with("https://")
+        || has_loopback_http_authority(project_url, "127.0.0.1")
+        || has_loopback_http_authority(project_url, "localhost")
+        || has_loopback_http_authority(project_url, "[::1]")
+}
+
+fn has_loopback_http_authority(project_url: &str, authority: &str) -> bool {
+    project_url
+        .strip_prefix("http://")
+        .and_then(|rest| rest.strip_prefix(authority))
+        .is_some_and(|rest| {
+            rest.is_empty()
+                || rest.starts_with(':')
+                || rest.starts_with('/')
+                || rest.starts_with('?')
+                || rest.starts_with('#')
+        })
 }
 
 fn publish_local_github(workspace: &Path) -> Result<Option<RepositoryLink>> {
@@ -632,5 +671,18 @@ mod tests {
             Some(format!("sha256:{}", "a".repeat(64)))
         );
         assert!(parse_etag("\"not-a-hash\"").is_none());
+    }
+
+    #[test]
+    fn browser_project_urls_require_https_or_a_loopback_server() {
+        assert!(is_safe_project_url(
+            "https://fractalsociety.com/builder/project"
+        ));
+        assert!(is_safe_project_url("http://127.0.0.1:3000/builder/project"));
+        assert!(is_safe_project_url("http://localhost:3000/builder/project"));
+        assert!(!is_safe_project_url("http://fractalsociety.com/project"));
+        assert!(!is_safe_project_url("http://localhost.evil.test/project"));
+        assert!(!is_safe_project_url("file:///tmp/project"));
+        assert!(!is_safe_project_url(""));
     }
 }

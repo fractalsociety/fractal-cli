@@ -59,6 +59,7 @@ fn run(cli: Cli) -> Result<()> {
     match (request, command) {
         (None, None) => {
             if offline {
+                std::env::set_var("FRACTAL_OFFLINE", "1");
                 println!("Offline mode: Fractal Society login and cloud sync are disabled.\n");
             } else {
                 auth::ensure_login()?;
@@ -221,13 +222,14 @@ fn print_submit_plan(
     // P1.4 — auto-open the viewer on submit: when build mode durably committed a
     // graph, launch its own board and open it (unless suppressed with --no-open).
     if let Some(graph_hash) = plan.committed_graph_hash {
+        let mut project_url = None;
         if let Some(workspace) = repo {
             match graph_store::load_graph(&graph_hash)
                 .and_then(|graph| project_file::persist(workspace, &graph, request))
             {
                 Ok(path) => {
                     println!("Project graph: {}", path.display());
-                    project_sync::maybe_sync(workspace);
+                    project_url = project_sync::maybe_sync(workspace);
                 }
                 Err(error) => eprintln!("project graph note: {error:#}"),
             }
@@ -236,8 +238,31 @@ fn print_submit_plan(
             println!(
                 "Skipping viewer (--no-open). Open it with:\n  fractal graph board {graph_hash} --port {port}"
             );
-        } else if let Err(error) = board::serve_graph(&graph_hash, port, None, false, None) {
-            eprintln!("warning: could not auto-open the execution-graph viewer: {error:#}");
+        } else {
+            let (browser_target, is_cloud_target) =
+                board::browser_target(project_url.as_deref(), port);
+            if let Err(error) = board::serve_graph(
+                &graph_hash,
+                port,
+                None,
+                is_cloud_target,
+                None,
+            ) {
+                eprintln!("warning: could not serve the execution-graph viewer: {error:#}");
+            }
+            if is_cloud_target {
+                if let Err(error) = board::open_url(&browser_target) {
+                    eprintln!(
+                        "warning: could not open Fractal Society: {error:#}; opening local board"
+                    );
+                    let (local, _) = board::browser_target(None, port);
+                    if let Err(fallback_error) = board::open_url(&local) {
+                        eprintln!(
+                            "warning: could not open the local execution graph: {fallback_error:#}"
+                        );
+                    }
+                }
+            }
         }
     }
     Ok(())
