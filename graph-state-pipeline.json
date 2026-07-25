@@ -306,6 +306,27 @@
       "checked_out_at": "2026-07-23T16:09:33.478601+00:00",
       "released_at": "2026-07-23T16:11:29.350523+00:00",
       "completed_at": "2026-07-23T17:06:53.287709+00:00"
+    },
+    "P8.1": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T08:14:53.393758+00:00",
+      "completed_at": "2026-07-25T08:28:25.586862+00:00"
+    },
+    "P8.2": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T09:12:56.129694+00:00",
+      "completed_at": "2026-07-25T09:18:36.435141+00:00"
+    },
+    "P8.3": {
+      "agent_id": "codex/cli-sync",
+      "agent_label": "Codex \u00b7 CLI Sync",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T17:47:03.872981+00:00",
+      "completed_at": "2026-07-25T17:56:12.947253+00:00"
     }
   }
 }
