@@ -89,6 +89,34 @@ pub(crate) fn run(
         );
     }
 
+    // Control phrases are intercepted before ordinary intent execution. This is
+    // deliberately narrow: a stop/status request must not become a new build.
+    if let Some(control) = parse_run_control(&event.content) {
+        println!(
+            "Normalized {} {} input · run control",
+            event.source, event.modality
+        );
+        return match control {
+            VoiceRunControl::StopCurrent => crate::run_control::stop(&crate::cli::StopArgs {
+                project: None,
+                all: false,
+            }),
+            VoiceRunControl::StopAll => crate::run_control::stop(&crate::cli::StopArgs {
+                project: None,
+                all: true,
+            }),
+            VoiceRunControl::StopProject(project) => {
+                crate::run_control::stop(&crate::cli::StopArgs {
+                    project: Some(project),
+                    all: false,
+                })
+            }
+            VoiceRunControl::StatusRunning => {
+                crate::run_control::status(&crate::cli::StatusArgs { running: true })
+            }
+        };
+    }
+
     // "resume project N" is a control command that continues an already-approved
     // project — route it directly, bypassing the build write-confirmation gate so
     // it works hands-free by voice.
@@ -129,6 +157,70 @@ pub(crate) fn run(
         args.port,
     )
     .map(|_| ())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum VoiceRunControl {
+    StopCurrent,
+    StopAll,
+    StopProject(String),
+    StatusRunning,
+}
+
+fn parse_run_control(input: &str) -> Option<VoiceRunControl> {
+    let cleaned = input
+        .trim()
+        .trim_matches(|character: char| character.is_ascii_punctuation())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lower = cleaned.to_ascii_lowercase();
+    let starts_stop = ["stop ", "halt ", "cancel ", "abort "]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+    if starts_stop
+        && lower.contains("all")
+        && ["fractal", "build", "project", "process"]
+            .iter()
+            .any(|word| lower.contains(word))
+    {
+        return Some(VoiceRunControl::StopAll);
+    }
+    if starts_stop {
+        for marker in [
+            "stop project ",
+            "halt project ",
+            "cancel project ",
+            "abort project ",
+        ] {
+            if let Some(project) = lower.strip_prefix(marker) {
+                let project = project.trim();
+                if !project.is_empty()
+                    && !matches!(project, "build" | "current" | "the current build")
+                {
+                    return Some(VoiceRunControl::StopProject(project.to_owned()));
+                }
+            }
+        }
+        if ["fractal", "build", "project", "current"]
+            .iter()
+            .any(|word| lower.contains(word))
+        {
+            return Some(VoiceRunControl::StopCurrent);
+        }
+    }
+    let asks_status = ["status", "show ", "list ", "check "]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+    if asks_status
+        && lower.contains("running")
+        && ["fractal", "build", "project"]
+            .iter()
+            .any(|word| lower.contains(word))
+    {
+        return Some(VoiceRunControl::StatusRunning);
+    }
+    None
 }
 
 fn read_event(args: &IngestArgs) -> Result<InputEvent> {
@@ -519,6 +611,27 @@ mod tests {
         );
         assert_eq!(voice_links(None).unwrap(), vec!["superwhisper://record"]);
         assert!(voice_links(Some("bad&record=true")).is_err());
+    }
+
+    #[test]
+    fn recognizes_only_explicit_run_control_phrases() {
+        assert_eq!(
+            parse_run_control("Stop all Fractal builds."),
+            Some(VoiceRunControl::StopAll)
+        );
+        assert_eq!(
+            parse_run_control("halt the current build"),
+            Some(VoiceRunControl::StopCurrent)
+        );
+        assert_eq!(
+            parse_run_control("stop project expense tracker"),
+            Some(VoiceRunControl::StopProject("expense tracker".to_owned()))
+        );
+        assert_eq!(
+            parse_run_control("show running Fractal builds"),
+            Some(VoiceRunControl::StatusRunning)
+        );
+        assert_eq!(parse_run_control("build a stop watch"), None);
     }
 
     #[test]

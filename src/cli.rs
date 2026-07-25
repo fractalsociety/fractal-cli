@@ -73,6 +73,10 @@ pub(crate) enum Command {
     Projects,
     /// Resume a project by its number (also: say "resume project N" by voice).
     Resume(ResumeArgs),
+    /// Stop the active project, a named project, or every running build.
+    Stop(StopArgs),
+    /// Inspect live Fractal build processes.
+    Status(StatusArgs),
     /// Log in through Fractal Society in the browser.
     Login(LoginArgs),
     /// Remove the locally stored Fractal Society session.
@@ -115,6 +119,24 @@ pub(crate) struct SyncArgs {
     /// Require the local GitHub push to succeed instead of treating it as fail-soft.
     #[arg(long)]
     pub(crate) github: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct StopArgs {
+    /// Stop a running project by folder name, slug, or absolute workspace path.
+    #[arg(long, value_name = "NAME", conflicts_with = "all")]
+    pub(crate) project: Option<String>,
+
+    /// Stop every running Fractal build.
+    #[arg(long)]
+    pub(crate) all: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct StatusArgs {
+    /// Show only builds that are currently running.
+    #[arg(long)]
+    pub(crate) running: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -705,6 +727,42 @@ mod tests {
             dictate.command,
             Some(Command::Dictate(VoiceArgs { dry_run: true, .. }))
         ));
+    }
+
+    #[test]
+    fn parses_run_control_commands() {
+        assert!(matches!(
+            Cli::try_parse_from(["fractal", "stop"]).unwrap().command,
+            Some(Command::Stop(StopArgs {
+                project: None,
+                all: false
+            }))
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["fractal", "stop", "--project", "expense-app"])
+                .unwrap()
+                .command,
+            Some(Command::Stop(StopArgs {
+                project: Some(ref project),
+                all: false
+            })) if project == "expense-app"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["fractal", "stop", "--all"])
+                .unwrap()
+                .command,
+            Some(Command::Stop(StopArgs {
+                project: None,
+                all: true
+            }))
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["fractal", "status", "--running"])
+                .unwrap()
+                .command,
+            Some(Command::Status(StatusArgs { running: true }))
+        ));
+        assert!(Cli::try_parse_from(["fractal", "stop", "--all", "--project", "app"]).is_err());
     }
 
     #[test]

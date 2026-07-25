@@ -4,6 +4,8 @@
 //! produced. This is what turns a typed request into an actual artifact.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
@@ -225,15 +227,21 @@ pub(crate) fn run_agent_prompt(
 ) -> Result<AgentRun> {
     // Detach the worker's stdin: headless agents (e.g. `claude -p`) otherwise
     // inherit the CLI's piped stdin and block reading it instead of exiting.
-    let mut child = worker_command(kind, prompt)?
+    let mut command = worker_command(kind, prompt)?;
+    command
         .current_dir(workspace)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to launch worker `{kind}` (is it on PATH?)"))?;
+    let worker = crate::run_control::WorkerGuard::register(child.id());
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         match child.try_wait()? {
             Some(status) => {
+                drop(worker);
                 return Ok(AgentRun {
                     ok: status.success(),
                     timed_out: false,
@@ -241,8 +249,9 @@ pub(crate) fn run_agent_prompt(
             }
             None => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
+                    crate::run_control::terminate_worker(child.id());
                     let _ = child.wait();
+                    drop(worker);
                     return Ok(AgentRun {
                         ok: false,
                         timed_out: true,
@@ -466,6 +475,7 @@ fn validate_closeout(prd: &Value, closeout: &Value) -> Result<usize> {
 /// Best-effort report of a node transition to the live board so the dashboard
 /// turns yellow (checkout) then green (complete) as agents work.
 fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str) {
+    crate::run_control::node_transition(board, node, action, agent);
     if let Some(base) = board {
         let url = format!(
             "{}/api/tasks/{}/{}",

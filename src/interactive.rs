@@ -549,6 +549,7 @@ fn execute_request(
     agents: &[String],
     backend: Backend,
 ) -> Result<Option<crate::execute::RunOutcome>> {
+    let _run = crate::run_control::RunGuard::start_or_join(workspace, request, port)?;
     println!("\n→ Understanding: {request}");
     let classification = intent::fractalwork_dir(fractalwork_override)
         .and_then(|directory| intent::classify(request, &directory));
@@ -651,6 +652,13 @@ fn drive_committed_graph(
     board_preseed: Option<&BTreeSet<String>>,
     browser_already_open: bool,
 ) -> Option<crate::execute::RunOutcome> {
+    let _run = match crate::run_control::RunGuard::start_or_join(workspace, request, port) {
+        Ok(run) => run,
+        Err(error) => {
+            eprintln!("  run-control note: {error:#}");
+            return None;
+        }
+    };
     let project_url = match graph_store::load_graph(hash)
         .and_then(|graph| crate::project_file::persist(workspace, &graph, request))
     {
@@ -708,6 +716,7 @@ fn drive_committed_graph(
         println!("  → executing in {}…", workspace.display());
     }
     let board_url = format!("http://127.0.0.1:{port}");
+    crate::run_control::set_graph(hash, &board_url);
 
     // Router evolution (closing the loop): before running, ask the accumulated
     // outcome memory which model is the cheapest *acceptable* one for this

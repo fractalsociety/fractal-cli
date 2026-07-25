@@ -24,6 +24,7 @@ mod project_sync;
 mod rlvr;
 mod router;
 mod run;
+mod run_control;
 mod safety;
 mod supervise;
 mod ui;
@@ -182,6 +183,8 @@ fn run(cli: Cli) -> Result<()> {
             interactive::resume_project(args.number, fractalwork.as_deref(), args.port, coordinate)
                 .map(|_| ())
         }
+        (None, Some(Command::Stop(args))) => run_control::stop(&args),
+        (None, Some(Command::Status(args))) => run_control::status(&args),
         (None, Some(Command::Login(args))) => auth::run_login(&args),
         (None, Some(Command::Logout)) => auth::logout(),
         (None, Some(Command::Sync(args))) => project_sync::run(&args),

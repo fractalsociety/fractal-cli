@@ -358,6 +358,7 @@ dependencies = [
  "fractal-evolution",
  "fractal-harnessc",
  "fractal-verify",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.11.0",
