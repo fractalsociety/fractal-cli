@@ -488,6 +488,64 @@ pub(crate) fn execute_ingested(
     )
 }
 
+/// Create a fresh, narrowly scoped workspace for a request approved through the
+/// native Fractal Voice companion. The companion may grant trust only beneath
+/// `~/fractal-projects`; ordinary voice ingest can never grant workspace trust.
+pub(crate) fn prepare_managed_voice_workspace(request: &str) -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is unavailable for managed voice projects")?;
+    let root = home.join("fractal-projects");
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("create managed project root {}", root.display()))?;
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("resolve managed project root {}", root.display()))?;
+
+    let slug = managed_project_slug(request);
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let workspace = root.join(format!("{slug}-{suffix}"));
+    std::fs::create_dir(&workspace)
+        .with_context(|| format!("create managed voice project {}", workspace.display()))?;
+    let workspace = workspace
+        .canonicalize()
+        .with_context(|| format!("resolve managed voice project {}", workspace.display()))?;
+    if !workspace.starts_with(&root) || workspace == root {
+        anyhow::bail!("managed voice workspace escaped its project root");
+    }
+    persist_trust(&trust_store_path(), &workspace)?;
+    println!("Created managed voice project: {}", workspace.display());
+    Ok(workspace)
+}
+
+fn managed_project_slug(request: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for character in request.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            if slug.len() >= 48 {
+                break;
+            }
+            slug.push(character);
+            previous_dash = false;
+        } else if !slug.is_empty() && !previous_dash {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "voice-project".to_owned()
+    } else {
+        slug
+    }
+}
+
 /// Resume a project by its stable number — used by `fractal resume <N>` and by the
 /// voice/typed "resume project N" command. Continues from the saved checkpoint.
 pub(crate) fn resume_project(
@@ -834,5 +892,20 @@ fn map_classification(classification: &intent::TaskClassification) -> IntentClas
         verification_level: classification.verification.clone(),
         likely_tools: classification.tools.clone(),
         external_calls_allowed: classification.external_calls,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::managed_project_slug;
+
+    #[test]
+    fn managed_voice_project_slugs_are_portable_and_bounded() {
+        assert_eq!(
+            managed_project_slug("Build me a personal expense tracker!"),
+            "build-me-a-personal-expense-tracker"
+        );
+        assert_eq!(managed_project_slug("⚡️"), "voice-project");
+        assert!(managed_project_slug(&"project ".repeat(20)).len() <= 48);
     }
 }

@@ -58,8 +58,11 @@ fn run_moonshine(
     if !moonshine_ready(&paths) {
         bail!("Moonshine is not set up; run `fractal voice setup` once");
     }
-    if !std::io::stdin().is_terminal() {
-        bail!("native microphone recording requires an interactive terminal");
+    if !args.app_control && !std::io::stdin().is_terminal() {
+        bail!(
+            "native microphone recording requires an interactive terminal \
+             (or the Fractal Voice companion)"
+        );
     }
     write_bridge(&paths)?;
     eprintln!("  🎙 Moonshine v2 Medium is listening locally.");

@@ -356,6 +356,14 @@ pub(crate) struct VoiceArgs {
     /// Port for the execution graph launched by a Moonshine command.
     #[arg(long, default_value_t = DEFAULT_GRAPH_PORT)]
     pub(crate) port: u16,
+
+    /// Accept start/stop control from a trusted native companion over stdin.
+    #[arg(long, hide = true)]
+    pub(crate) app_control: bool,
+
+    /// Create and trust a fresh workspace under ~/fractal-projects.
+    #[arg(long, hide = true, conflicts_with = "repo")]
+    pub(crate) managed_project: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -786,6 +794,18 @@ mod tests {
             setup.command,
             Some(Command::Voice(VoiceArgs {
                 command: Some(VoiceCommand::Setup),
+                ..
+            }))
+        ));
+        let companion =
+            Cli::try_parse_from(["fractal", "voice", "--app-control", "--managed-project"])
+                .unwrap();
+        assert!(matches!(
+            companion.command,
+            Some(Command::Voice(VoiceArgs {
+                engine: VoiceEngine::Moonshine,
+                app_control: true,
+                managed_project: true,
                 ..
             }))
         ));

@@ -96,3 +96,37 @@ the pinned official `moonshine-voice` package. Once setup is complete,
 transcription does not require a cloud account or send microphone audio to
 Fractal Society. Spoken text is passed as structured data, never interpolated
 into a shell command.
+
+### Fractal Voice for macOS
+
+The repository includes a lightweight native menu-bar companion under
+`macos/FractalVoice`. Its first-run guide explains the shortcut and build flow.
+Press `⌃⌥Space` once to start local Moonshine recording, then press it again to
+stop and immediately begin the project.
+
+Each shortcut-triggered build receives a fresh workspace beneath
+`~/fractal-projects`. The companion automatically approves only reversible
+project creation in that managed location. Destructive requests and requests
+with external side effects remain blocked for terminal review.
+
+Build the signed local app bundle and distributable archive:
+
+```sh
+scripts/build-macos-app.sh
+```
+
+Local builds receive an ad-hoc signature. Set `FRACTAL_CODESIGN_IDENTITY` to a
+Developer ID Application certificate when producing a public build; that
+archive must also be notarized before distribution outside your own Mac.
+
+Artifacts are written to:
+
+```text
+dist/Fractal Voice.app
+dist/FractalVoice-macOS.zip
+```
+
+The app bundle contains the matching `fractal` binary, while Moonshine’s runtime
+and model remain in the shared `~/.fractal` cache. From the menu bar you can
+reopen onboarding, inspect activity, open generated projects, or stop all
+running Fractal builds.

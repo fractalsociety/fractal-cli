@@ -71,12 +71,15 @@ pub(crate) fn run(
     let event = read_event(args)?;
     process_event(
         event,
-        args.preview,
-        args.confirm,
-        args.repo.as_deref(),
-        args.port,
-        fractalwork_override,
-        coordinate,
+        EventOptions {
+            preview: args.preview,
+            confirm: args.confirm,
+            managed_project: false,
+            repo: args.repo.as_deref(),
+            port: args.port,
+            fractalwork_override,
+            coordinate,
+        },
     )
 }
 
@@ -110,27 +113,32 @@ pub(crate) fn run_voice_transcript(
     normalize_and_validate(&mut event)?;
     process_event(
         event,
-        args.preview,
-        args.confirm,
-        args.repo.as_deref(),
-        args.port,
-        fractalwork_override,
-        coordinate,
+        EventOptions {
+            preview: args.preview,
+            confirm: args.confirm,
+            managed_project: args.managed_project,
+            repo: args.repo.as_deref(),
+            port: args.port,
+            fractalwork_override,
+            coordinate,
+        },
     )
 }
 
-fn process_event(
-    event: InputEvent,
+struct EventOptions<'a> {
     preview: bool,
     confirm: bool,
-    repo: Option<&Path>,
+    managed_project: bool,
+    repo: Option<&'a Path>,
     port: u16,
-    fractalwork_override: Option<&Path>,
+    fractalwork_override: Option<&'a Path>,
     coordinate: bool,
-) -> Result<()> {
+}
+
+fn process_event(event: InputEvent, options: EventOptions<'_>) -> Result<()> {
     let risk = classify_risk(&event.content);
 
-    if preview {
+    if options.preview {
         println!("{}", serde_json::to_string_pretty(&event)?);
         println!("risk: {risk}");
         return Ok(());
@@ -183,9 +191,28 @@ fn process_event(
             "Normalized {} {} input · resume command",
             event.source, event.modality
         );
-        return crate::interactive::resume_project(number, fractalwork_override, port, coordinate)
-            .map(|_| ());
+        return crate::interactive::resume_project(
+            number,
+            options.fractalwork_override,
+            options.port,
+            options.coordinate,
+        )
+        .map(|_| ());
     }
+
+    let managed_workspace = if options.managed_project {
+        if matches!(risk, Risk::Destructive | Risk::ExternalSideEffect) {
+            bail!(
+                "{risk} voice input cannot run automatically from the Fractal Voice app; \
+                 review and run it from a terminal"
+            );
+        }
+        Some(crate::interactive::prepare_managed_voice_workspace(
+            &event.content,
+        )?)
+    } else {
+        None
+    };
 
     println!(
         "Normalized {} {} input · risk {risk}",
@@ -197,20 +224,29 @@ fn process_event(
             event.content.replace('\n', "\n  ")
         );
         io::stdout().flush().ok();
-        if !confirm {
+        if managed_workspace.is_some() && risk == Risk::ReversibleWrite {
+            println!(
+                "Managed project approval: reversible build scoped to {}",
+                managed_workspace
+                    .as_deref()
+                    .expect("managed workspace exists")
+                    .display()
+            );
+        } else if !options.confirm {
             bail!(
                 "{risk} voice input was not executed; review it and rerun manually with --confirm for typed confirmation"
             );
+        } else {
+            confirm_on_tty(&event, risk)?;
         }
-        confirm_on_tty(&event, risk)?;
     }
 
     crate::interactive::execute_ingested(
         &event.content,
-        repo,
-        fractalwork_override,
-        coordinate,
-        port,
+        managed_workspace.as_deref().or(options.repo),
+        options.fractalwork_override,
+        options.coordinate,
+        options.port,
     )
     .map(|_| ())
 }
