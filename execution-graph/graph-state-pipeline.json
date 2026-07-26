@@ -1,0 +1,395 @@
+{
+  "schema": "fractal.execution_graph_view_state.v1",
+  "work_id": "fractal-cli-pipeline",
+  "title": "Build the Fractal Pipeline \u2014 fractal CLI end-to-end",
+  "active": [],
+  "note": "Seeded 2026-07-23. Wiring the intent\u2192graph\u2192coordinate\u2192runtime\u2192verifier\u2192DataEvol pipeline + fractal CLI + Cursor worker + self-evolution loop. See FRACTAL_PIPELINE_TASKS.md and FRACTAL_PIPELINE_INVENTORY.md. Reuse existing substrate; do not rebuild.",
+  "assignments": {
+    "P0.1": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T11:41:58.761083+00:00",
+      "completed_at": "2026-07-23T13:11:47.426883+00:00"
+    },
+    "P3.1": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T13:11:22.821786+00:00",
+      "completed_at": "2026-07-23T13:18:51.617068+00:00"
+    },
+    "P0.2": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T13:11:47.506804+00:00",
+      "completed_at": "2026-07-23T13:28:11.251669+00:00"
+    },
+    "P0.3": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T13:16:14.322994+00:00",
+      "completed_at": "2026-07-23T13:20:32.468367+00:00"
+    },
+    "P3.2": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T13:19:45.687028+00:00",
+      "completed_at": "2026-07-23T13:23:50.336377+00:00"
+    },
+    "P3.3": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T13:24:05.066035+00:00",
+      "completed_at": "2026-07-23T13:29:04.045337+00:00"
+    },
+    "P4.1": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T13:26:34.772773+00:00",
+      "completed_at": "2026-07-23T13:28:50.695797+00:00"
+    },
+    "P0.4": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T13:28:15.454014+00:00",
+      "completed_at": "2026-07-23T13:32:10.632113+00:00"
+    },
+    "P2.1": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T13:29:42.806778+00:00",
+      "completed_at": "2026-07-23T13:37:19.937376+00:00"
+    },
+    "P1.1": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T13:32:44.301560+00:00",
+      "completed_at": "2026-07-23T13:53:51.132070+00:00"
+    },
+    "P4.2": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T13:33:22.899149+00:00",
+      "completed_at": "2026-07-23T13:34:56.205260+00:00"
+    },
+    "P4.3": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T13:35:23.703448+00:00",
+      "completed_at": "2026-07-23T13:38:04.525215+00:00"
+    },
+    "P2.2": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T13:52:40.602818+00:00",
+      "completed_at": "2026-07-23T14:13:11.622664+00:00"
+    },
+    "P4.4": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T13:52:52.212298+00:00",
+      "completed_at": "2026-07-23T13:55:27.170289+00:00"
+    },
+    "P1.2": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T13:53:51.256134+00:00",
+      "completed_at": "2026-07-23T14:01:41.197038+00:00"
+    },
+    "P4.5": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T13:57:33.843736+00:00",
+      "completed_at": "2026-07-23T14:02:09.374074+00:00"
+    },
+    "P1.3": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "Claude \u00b7 Fable Orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T14:01:41.317080+00:00",
+      "completed_at": "2026-07-23T14:20:02.238815+00:00"
+    },
+    "P4.6": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T14:16:28.866936+00:00",
+      "completed_at": "2026-07-23T14:22:01.641373+00:00"
+    },
+    "P2.3": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T14:16:32.114006+00:00",
+      "completed_at": "2026-07-23T14:21:37.305777+00:00"
+    },
+    "P1.4": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "claude/fable-orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T14:20:22.146392+00:00",
+      "completed_at": "2026-07-23T14:23:34.580212+00:00"
+    },
+    "P2.4": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T14:24:39.146520+00:00",
+      "completed_at": "2026-07-23T14:33:50.306697+00:00"
+    },
+    "P4.7": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T14:24:53.595241+00:00",
+      "completed_at": "2026-07-23T14:28:31.014188+00:00"
+    },
+    "P7.1": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "claude/fable-orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T14:28:33.385822+00:00",
+      "completed_at": "2026-07-23T14:32:11.484797+00:00"
+    },
+    "P5.1": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "claude/fable-orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T14:33:37.153989+00:00",
+      "completed_at": "2026-07-23T14:35:54.358064+00:00"
+    },
+    "P7.2": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T14:35:27.607230+00:00",
+      "completed_at": "2026-07-23T14:38:23.859649+00:00"
+    },
+    "P3.4": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "claude/fable-orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T14:36:40.535963+00:00",
+      "completed_at": "2026-07-23T14:45:35.790822+00:00"
+    },
+    "P5.2": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T15:59:00.362537+00:00",
+      "completed_at": "2026-07-23T16:49:24.447416+00:00"
+    },
+    "P2.G1": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T14:51:32.894057+00:00",
+      "completed_at": "2026-07-23T14:52:41.937770+00:00"
+    },
+    "P7.3": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T14:51:48.578792+00:00",
+      "completed_at": "2026-07-23T14:54:36.019019+00:00"
+    },
+    "P2.G2": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T14:54:33.772946+00:00",
+      "completed_at": "2026-07-23T14:58:32.813510+00:00"
+    },
+    "P2.G3": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T15:21:10.100888+00:00",
+      "completed_at": "2026-07-23T15:24:28.795724+00:00"
+    },
+    "P7.4": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T15:21:53.948799+00:00",
+      "completed_at": "2026-07-23T15:24:23.991748+00:00"
+    },
+    "P6.1": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T15:28:06.040800+00:00",
+      "completed_at": "2026-07-23T15:33:47.762815+00:00"
+    },
+    "P7.5": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T15:29:44.719277+00:00",
+      "completed_at": "2026-07-23T15:31:15.995326+00:00"
+    },
+    "P6.2": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T15:38:38.514328+00:00",
+      "completed_at": "2026-07-23T15:46:44.110745+00:00"
+    },
+    "P7.6": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T15:38:48.021341+00:00",
+      "completed_at": "2026-07-23T15:39:51.465893+00:00"
+    },
+    "P6.3": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T15:41:41.575016+00:00",
+      "completed_at": "2026-07-23T15:44:44.328640+00:00"
+    },
+    "P6.4": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T15:53:39.530214+00:00",
+      "completed_at": "2026-07-23T15:56:32.312494+00:00"
+    },
+    "P6.5": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T15:54:19.817227+00:00",
+      "completed_at": "2026-07-23T15:57:59.508550+00:00"
+    },
+    "P6.6": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "claude/fable-orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T15:55:18.762181+00:00",
+      "completed_at": "2026-07-23T15:58:16.289150+00:00"
+    },
+    "P5.3": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T16:03:25.377005+00:00",
+      "completed_at": "2026-07-23T16:06:06.645915+00:00"
+    },
+    "P5.4": {
+      "agent_id": "cursor/auto",
+      "agent_label": "Cursor \u00b7 Auto",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T16:09:55.283598+00:00",
+      "completed_at": "2026-07-23T16:13:53.852431+00:00"
+    },
+    "P5.5": {
+      "agent_id": "claude/fable-orchestrator",
+      "agent_label": "claude/fable-orchestrator",
+      "state": "completed",
+      "checked_out_at": "2026-07-23T16:09:33.478601+00:00",
+      "released_at": "2026-07-23T16:11:29.350523+00:00",
+      "completed_at": "2026-07-23T17:06:53.287709+00:00"
+    },
+    "P8.1": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T08:14:53.393758+00:00",
+      "completed_at": "2026-07-25T08:28:25.586862+00:00"
+    },
+    "P8.2": {
+      "agent_id": "codex/root",
+      "agent_label": "Codex \u00b7 root",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T09:12:56.129694+00:00",
+      "completed_at": "2026-07-25T09:18:36.435141+00:00"
+    },
+    "P8.3": {
+      "agent_id": "codex/cli-sync",
+      "agent_label": "Codex \u00b7 CLI Sync",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T17:47:03.872981+00:00",
+      "completed_at": "2026-07-25T17:56:12.947253+00:00"
+    },
+    "P8.4": {
+      "agent_id": "codex/lead-planning",
+      "agent_label": "Codex \u00b7 Lead Planning",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T20:40:36.933945+00:00",
+      "completed_at": "2026-07-25T20:55:35.493191+00:00"
+    },
+    "P8.5": {
+      "agent_id": "codex/planning-cloud-ux",
+      "agent_label": "Codex \u00b7 Planning/Cloud UX",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T21:22:15.143796+00:00",
+      "completed_at": "2026-07-25T21:29:01.673829+00:00"
+    },
+    "P8.6": {
+      "agent_id": "codex/early-cloud-graph",
+      "agent_label": "Codex \u00b7 Early Cloud Graph",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T21:46:54.211924+00:00",
+      "completed_at": "2026-07-25T21:57:38.465374+00:00"
+    },
+    "P8.7": {
+      "agent_id": "codex/project-route-fix",
+      "agent_label": "Codex \u00b7 Project Route Fix",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T22:03:45.851921+00:00",
+      "completed_at": "2026-07-25T22:08:48.293069+00:00"
+    },
+    "P8.8": {
+      "agent_id": "codex/run-control",
+      "agent_label": "Codex \u00b7 Run Control",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T22:13:06.133246+00:00",
+      "completed_at": "2026-07-25T22:24:42.139434+00:00"
+    },
+    "P8.9": {
+      "agent_id": "codex/cloud-graph-parity",
+      "agent_label": "Codex \u00b7 Cloud Graph Parity",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T22:59:58.433981+00:00",
+      "completed_at": "2026-07-25T23:11:53.906439+00:00"
+    },
+    "P8.10": {
+      "agent_id": "codex/evolved-graph-liveness",
+      "agent_label": "Codex \u00b7 Evolved Graph Liveness",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T23:32:37.734271+00:00",
+      "completed_at": "2026-07-25T23:40:27.845931+00:00"
+    },
+    "P8.11": {
+      "agent_id": "codex/execution-waves",
+      "agent_label": "Codex \u00b7 Execution Waves",
+      "state": "completed",
+      "checked_out_at": "2026-07-26T07:14:03.133712+00:00",
+      "completed_at": "2026-07-26T07:29:08.829788+00:00"
+    },
+    "P8.12": {
+      "agent_id": "codex/planning-stream",
+      "agent_label": "Codex \u00b7 Planning Stream",
+      "state": "completed",
+      "checked_out_at": "2026-07-26T12:08:34.494437+00:00",
+      "completed_at": "2026-07-26T12:14:02.873413+00:00"
+    }
+  }
+}
