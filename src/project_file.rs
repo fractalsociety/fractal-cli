@@ -34,6 +34,19 @@ pub(crate) struct ExecutionState {
     pub(crate) schema: String,
     pub(crate) phase: String,
     pub(crate) assignments: BTreeMap<String, ExecutionAssignment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) progress: Option<PlanningProgress>,
+    pub(crate) updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct PlanningProgress {
+    pub(crate) schema: String,
+    pub(crate) message: String,
+    pub(crate) step: u32,
+    pub(crate) elapsed_seconds: u64,
+    pub(crate) agent_label: String,
+    pub(crate) source: String,
     pub(crate) updated_at: String,
 }
 
@@ -69,10 +82,16 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
     reject_secret_fields(graph)?;
     let slug = slug_for(workspace);
     let now = timestamp();
-    let execution = load(workspace)
-        .ok()
+    let current = load(workspace).ok();
+    let execution = current
+        .as_ref()
         .filter(|current| current.graph_hash == graph_hash)
-        .and_then(|current| current.execution)
+        .and_then(|current| current.execution.clone())
+        .or_else(|| {
+            current
+                .as_ref()
+                .and_then(|current| execution_from_parent(current, graph, &now))
+        })
         .or_else(|| execution_from_local_board(graph_hash, graph, &now))
         .or_else(|| {
             Some(ExecutionState {
@@ -84,6 +103,7 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
                 }
                 .to_owned(),
                 assignments: BTreeMap::new(),
+                progress: None,
                 updated_at: now.clone(),
             })
         });
@@ -105,6 +125,41 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
     let bytes = serde_json::to_vec_pretty(&document)?;
     atomic_write(&destination, &bytes)?;
     Ok(destination)
+}
+
+/// Repoint an existing portable project at a committed evolved child graph while
+/// retaining its human-facing title. Lineage-compatible execution attribution is
+/// preserved by `persist`, so completed parent nodes do not disappear from the
+/// cloud graph when a verifier or repair node is grafted.
+pub(crate) fn persist_evolved(workspace: &Path, graph: &Value) -> Result<PathBuf> {
+    let title = load(workspace)
+        .map(|document| document.project.title)
+        .unwrap_or_else(|_| slug_for(workspace));
+    persist(workspace, graph, &title)
+}
+
+fn execution_from_parent(
+    current: &FractalProject,
+    graph: &Value,
+    updated_at: &str,
+) -> Option<ExecutionState> {
+    if graph.get("parent_graph").and_then(Value::as_str) != Some(current.graph_hash.as_str()) {
+        return None;
+    }
+    let mut execution = current.execution.clone()?;
+    let node_ids = graph
+        .get("nodes")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|node| node.get("id").and_then(Value::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    execution
+        .assignments
+        .retain(|node, _| node_ids.contains(node.as_str()));
+    execution.phase = "executing".to_owned();
+    execution.progress = None;
+    execution.updated_at = updated_at.to_owned();
+    Some(execution)
 }
 
 fn execution_from_local_board(
@@ -144,6 +199,7 @@ fn execution_from_local_board(
         }
         .to_owned(),
         assignments,
+        progress: None,
         updated_at: updated_at.to_owned(),
     })
 }
@@ -172,9 +228,11 @@ pub(crate) fn transition(
         schema: "fractal.execution_state.v1".to_owned(),
         phase: "executing".to_owned(),
         assignments: BTreeMap::new(),
+        progress: None,
         updated_at: now.clone(),
     });
     execution.phase = "executing".to_owned();
+    execution.progress = None;
     match action {
         "checkout" => {
             let checked_out_at = execution
@@ -286,6 +344,7 @@ pub(crate) fn release_stale_assignments(workspace: &Path) -> Result<bool> {
         return Ok(false);
     }
     execution.phase = "halted".to_owned();
+    execution.progress = None;
     execution.updated_at = now.clone();
     document.updated_at = now;
     write_document(workspace, &document)?;
@@ -303,9 +362,48 @@ pub(crate) fn set_execution_phase(workspace: &Path, phase: &str) -> Result<()> {
         schema: "fractal.execution_state.v1".to_owned(),
         phase: phase.to_owned(),
         assignments: BTreeMap::new(),
+        progress: None,
         updated_at: now.clone(),
     });
     execution.phase = phase.to_owned();
+    if phase != "planning" {
+        execution.progress = None;
+    }
+    execution.updated_at = now.clone();
+    document.updated_at = now;
+    write_document(workspace, &document)
+}
+
+pub(crate) fn update_planning_progress(
+    workspace: &Path,
+    message: &str,
+    step: u32,
+    elapsed_seconds: u64,
+    agent_label: &str,
+    source: &str,
+) -> Result<()> {
+    let _guard = project_file_lock();
+    let mut document = load(workspace)?;
+    let now = timestamp();
+    let execution = document.execution.get_or_insert_with(|| ExecutionState {
+        schema: "fractal.execution_state.v1".to_owned(),
+        phase: "planning".to_owned(),
+        assignments: BTreeMap::new(),
+        progress: None,
+        updated_at: now.clone(),
+    });
+    if execution.phase != "planning" {
+        return Ok(());
+    }
+    execution.progress = Some(PlanningProgress {
+        schema: "fractal.planning_progress.v1".to_owned(),
+        message: message.chars().take(500).collect(),
+        step,
+        elapsed_seconds,
+        agent_label: agent_label.chars().take(120).collect(),
+        source: source.chars().take(240).collect(),
+        updated_at: now.clone(),
+    });
     execution.updated_at = now.clone();
     document.updated_at = now;
     write_document(workspace, &document)
@@ -341,6 +439,19 @@ fn validate(document: &FractalProject) -> Result<()> {
             )
         {
             bail!("invalid fractal.execution_state.v1 document");
+        }
+        if let Some(progress) = &execution.progress {
+            if progress.schema != "fractal.planning_progress.v1"
+                || execution.phase != "planning"
+                || progress.message.trim().is_empty()
+                || progress.message.chars().count() > 500
+                || progress.step == 0
+                || progress.agent_label.trim().is_empty()
+                || progress.agent_label.chars().count() > 120
+                || progress.source.chars().count() > 240
+            {
+                bail!("invalid fractal.planning_progress.v1 document");
+            }
         }
         let node_ids = document
             .graph
@@ -582,6 +693,97 @@ mod tests {
         let execution = load(&workspace)?.execution.expect("execution state");
         assert_eq!(execution.phase, "halted");
         assert_eq!(execution.assignments["test"].state, "released");
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn planning_progress_updates_portable_state_without_changing_graph_hash() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [{
+                "id": "lead_planning",
+                "capability": "control.plan",
+                "instruction": "Plan it."
+            }],
+            "edges": []
+        });
+        graph["graph_hash"] = Value::String(
+            fractal_contracts::canonical_sha256(&graph)
+                .map_err(|error| anyhow::anyhow!("hash fixture: {error}"))?,
+        );
+        persist(&workspace, &graph, "Plan app")?;
+        let original_hash = load(&workspace)?.graph_hash;
+
+        update_planning_progress(
+            &workspace,
+            "⏳ [claude] is selecting the architecture",
+            2,
+            30,
+            "claude",
+            "APP_PRD.md",
+        )?;
+
+        let document = load(&workspace)?;
+        assert_eq!(document.graph_hash, original_hash);
+        let execution = document.execution.expect("execution state");
+        assert_eq!(execution.phase, "planning");
+        let progress = execution.progress.expect("planning progress");
+        assert_eq!(progress.schema, "fractal.planning_progress.v1");
+        assert_eq!(progress.step, 2);
+        assert_eq!(progress.elapsed_seconds, 30);
+        assert!(progress.message.contains("selecting the architecture"));
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn evolved_child_preserves_parent_execution_and_has_a_valid_hash() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut parent = json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [
+                {"id": "build", "capability": "code.generate", "instruction": "Build it."},
+                {"id": "test", "capability": "project.tests.execute", "instruction": "Test it."}
+            ],
+            "edges": [{"from": "build", "to": "test"}]
+        });
+        parent["graph_hash"] = Value::String(
+            fractal_contracts::canonical_sha256(&parent)
+                .map_err(|error| anyhow::anyhow!("hash fixture: {error}"))?,
+        );
+        persist(&workspace, &parent, "Build app")?;
+        transition(&workspace, "build", "complete", "cursor", "Cursor")?;
+
+        let parent_hash = parent["graph_hash"].as_str().unwrap().to_owned();
+        let mut child = parent.clone();
+        child["parent_graph"] = Value::String(parent_hash);
+        child["nodes"].as_array_mut().unwrap().push(json!({
+            "id": "verify.build.harness",
+            "capability": "project.tests.execute",
+            "instruction": "Verify it."
+        }));
+        child["edges"].as_array_mut().unwrap().push(json!({
+            "from": "build",
+            "to": "verify.build.harness"
+        }));
+        child.as_object_mut().unwrap().remove("graph_hash");
+        child["graph_hash"] = Value::String(
+            fractal_contracts::canonical_sha256(&child)
+                .map_err(|error| anyhow::anyhow!("hash fixture: {error}"))?,
+        );
+
+        persist_evolved(&workspace, &child)?;
+        let document = load(&workspace)?;
+        crate::graph_store::verify_graph_document(&document.graph)?;
+        assert_eq!(document.graph_hash, child["graph_hash"]);
+        let execution = document.execution.expect("execution state");
+        assert_eq!(execution.phase, "executing");
+        assert_eq!(execution.assignments["build"].state, "completed");
+        assert!(!execution.assignments.contains_key("verify.build.harness"));
         fs::remove_dir_all(workspace)?;
         Ok(())
     }

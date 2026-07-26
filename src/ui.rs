@@ -2,6 +2,7 @@
 //! feel: a styled input bar and a live "worked for Xm Ys" spinner.
 
 use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
@@ -38,20 +39,26 @@ pub(crate) struct ProgressHeartbeat {
 }
 
 impl ProgressHeartbeat {
-    pub(crate) fn planning(lead: &str, source: &str) -> Self {
+    pub(crate) fn planning(lead: &str, source: &str, workspace: &Path) -> Self {
         let interval = std::env::var("FRACTAL_PLANNING_HEARTBEAT_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
             .map(Duration::from_millis)
             .unwrap_or(Duration::from_secs(15));
-        Self::planning_with_interval(lead, source, interval)
+        Self::planning_with_interval(lead, source, workspace, interval)
     }
 
-    fn planning_with_interval(lead: &str, source: &str, interval: Duration) -> Self {
+    fn planning_with_interval(
+        lead: &str,
+        source: &str,
+        workspace: &Path,
+        interval: Duration,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let lead = lead.to_owned();
         let source = source.to_owned();
+        let workspace = workspace.to_path_buf();
         let started = Instant::now();
         let handle = std::thread::spawn(move || {
             let mut tick = 0usize;
@@ -59,12 +66,22 @@ impl ProgressHeartbeat {
                 match receiver.recv_timeout(interval) {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {
-                        println!(
-                            "  {} · {}",
-                            planning_message(tick, &lead, &source),
-                            format_elapsed(started.elapsed())
-                        );
+                        let message = planning_message(tick, &lead, &source);
+                        let elapsed = started.elapsed();
+                        println!("  {} · {}", message, format_elapsed(elapsed));
                         let _ = std::io::stdout().flush();
+                        if crate::project_file::update_planning_progress(
+                            &workspace,
+                            &message,
+                            tick as u32 + 1,
+                            elapsed.as_secs(),
+                            &lead,
+                            &source,
+                        )
+                        .is_ok()
+                        {
+                            crate::project_sync::maybe_sync_runtime(&workspace);
+                        }
                         tick += 1;
                     }
                 }

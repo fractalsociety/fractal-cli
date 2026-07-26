@@ -293,7 +293,7 @@ fn plan_project(
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(900_000);
-    let heartbeat = crate::ui::ProgressHeartbeat::planning(lead_agent, source_name);
+    let heartbeat = crate::ui::ProgressHeartbeat::planning(lead_agent, source_name, workspace);
     let run = crate::execute::run_agent_prompt(lead_agent, &prompt, workspace, planner_timeout_ms);
     heartbeat.stop();
     let run = run.with_context(|| format!("lead planner `{lead_agent}` failed to run"))?;
