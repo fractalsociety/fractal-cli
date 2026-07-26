@@ -363,11 +363,14 @@ fn resolve_exec_graph_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
         return Ok(PathBuf::from(directory));
     }
 
-    // In a source checkout CARGO_MANIFEST_DIR is `<repo>/fractal-cli`, so the
-    // sibling viewer is stable regardless of the caller's working directory.
-    // Installed builds can override this source-tree fallback with the flag or
-    // FRACTAL_EXEC_GRAPH_DIR.
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+    // The standalone repository owns its viewer. Keep the parent-directory
+    // fallback for binaries built from the historical Fractalmaster layout.
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let standalone = manifest.join("execution-graph");
+    if standalone.join("server.py").is_file() {
+        return Ok(standalone);
+    }
+    let repository = manifest
         .parent()
         .context("cannot resolve repository root from the fractal-cli manifest")?;
     Ok(repository.join("execution-graph"))

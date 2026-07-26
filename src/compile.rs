@@ -8,7 +8,7 @@ use serde_json::{json, Map, Value};
 use crate::harness::HarnessSelection;
 
 const CODE_HARNESS_FIXTURE: &str = include_str!(
-    "../../../FractalRuntime/contracts/v1/fixtures/fractal-compiled-harness-v1-python-repair.json"
+    "../../FractalRuntime/contracts/v1/fixtures/fractal-compiled-harness-v1-python-repair.json"
 );
 
 /// Resolve a selected starter harness to a compiler-ready harness document.

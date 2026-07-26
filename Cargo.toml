@@ -3,6 +3,7 @@ name = "fractal-cli"
 version = "0.1.0"
 edition = "2021"
 description = "CLI front door for the Fractal pipeline"
+repository = "https://github.com/fractalsociety/fractal-cli"
 
 [[bin]]
 name = "fractal"
@@ -11,11 +12,11 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-fractal-chain = { path = "../fractal-chain" }
-fractal-contracts = { path = "../../FractalRuntime/crates/fractal-contracts" }
-fractal-evolution = { path = "../../FractalRuntime/crates/fractal-evolution" }
-fractal-harnessc = { path = "../../FractalRuntime/crates/fractal-harnessc" }
-fractal-verify = { path = "../../FractalRuntime/crates/fractal-verify" }
+fractal-chain = { path = "crates/fractal-chain" }
+fractal-contracts = { path = "../FractalRuntime/crates/fractal-contracts" }
+fractal-evolution = { path = "../FractalRuntime/crates/fractal-evolution" }
+fractal-harnessc = { path = "../FractalRuntime/crates/fractal-harnessc" }
+fractal-verify = { path = "../FractalRuntime/crates/fractal-verify" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
