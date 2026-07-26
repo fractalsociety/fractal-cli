@@ -40,7 +40,7 @@ private enum DialogueStage: Equatable {
 @MainActor
 final class BuildCoordinator: ObservableObject {
     @Published private(set) var state: VoiceState = .idle
-    @Published private(set) var latestActivity = "Checking bundled offline assets…"
+    @Published private(set) var latestActivity = "Checking offline voice engine…"
     @Published private(set) var voiceReady = false
     @Published private(set) var shortcutReady = false
     @Published private(set) var shortcutStatus = "Registering ⌥Space…"
@@ -82,13 +82,17 @@ final class BuildCoordinator: ObservableObject {
             withIntermediateDirectories: true
         )
         try? vocabularyEngine.installPersonalTemplateIfNeeded()
+        refreshVoiceReadiness()
+    }
+
+    func refreshVoiceReadiness() {
         voiceReady = Self.graniteAssets() != nil
             && Self.graniteExecutable() != nil
             && (try? KokoroSpeaker.assets()) != nil
             && Self.fractalExecutable() != nil
         latestActivity = voiceReady
             ? "Press ⌥Space to speak"
-            : "Offline assets are missing — reinstall Fractal Voice"
+            : "Voice models are downloading — open Welcome for progress"
         if voiceReady {
             startGraniteServer()
         }
@@ -1283,13 +1287,20 @@ final class BuildCoordinator: ObservableObject {
     }
 
     nonisolated static func graniteAssets() -> (model: URL, projector: URL)? {
-        guard let resources = Bundle.main.resourceURL else {
-            return nil
-        }
-        let directory = resources.appendingPathComponent(
-            "GraniteModels/granite-speech-4.1-2b-q4",
-            isDirectory: true
+        let local = VoiceModelManager.graniteDirectory
+        let bundled = Bundle.main.resourceURL?.appendingPathComponent(
+            "GraniteModels/granite-speech-4.1-2b-q4", isDirectory: true
         )
+        let directory = [local, bundled].compactMap { $0 }.first { directory in
+            FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent(
+                    "granite-speech-4.1-2b-Q4_K_M.gguf"
+                ).path
+            ) && FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent("mmproj-model-f16.gguf").path
+            )
+        }
+        guard let directory else { return nil }
         let model = directory.appendingPathComponent(
             "granite-speech-4.1-2b-Q4_K_M.gguf"
         )

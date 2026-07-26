@@ -45,9 +45,10 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         NSApp.setActivationPolicy(.accessory)
         configureStatusItem()
         setupComplete = UserDefaults.standard.bool(forKey: "completedOnboarding")
-        if setupComplete {
+        if setupComplete && coordinator.voiceReady {
             installGlobalHotKey()
         } else {
+            setupComplete = false
             coordinator.reportSetupRequired()
         }
         NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)

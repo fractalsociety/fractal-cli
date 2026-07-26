@@ -156,6 +156,29 @@ final class FractalVoiceTests: XCTestCase {
         )
     }
 
+    func testVoiceEngineConfigurationLeavesRoomForLocalAndAPIProviders() {
+        let configuration = VoiceEngineConfiguration()
+        XCTAssertEqual(configuration.schema, "fractal.voice_engine.v1")
+        XCTAssertEqual(configuration.transcriptionProvider, "granite-local")
+        XCTAssertEqual(configuration.speechProvider, "kokoro-local")
+        XCTAssertNil(configuration.customTranscriptionModel)
+        XCTAssertNil(configuration.customSpeechModel)
+        XCTAssertNil(configuration.apiProvider)
+    }
+
+    func testDownloadedVoiceModelsLiveOutsideTheApplicationBundle() {
+        XCTAssertTrue(
+            VoiceModelManager.graniteDirectory.path.hasSuffix(
+                "/.fractal/models/granite-speech-4.1-2b-q4"
+            )
+        )
+        XCTAssertTrue(
+            VoiceModelManager.kokoroDirectory.path.hasSuffix(
+                "/.fractal/models/kokoro-82m-bf16"
+            )
+        )
+    }
+
     func testAgentAuthenticationOutputParsersAreExplicit() {
         XCTAssertTrue(
             SetupReadiness.authenticationSucceeded(

@@ -4,7 +4,7 @@ import KokoroSwift
 import MLX
 
 /// Offline speech output for the short confirmation prompts in Fractal Voice.
-/// The model and one voice embedding are bundled with the signed application.
+/// The default model is downloaded once and runs entirely on the user's Mac.
 final class KokoroSpeaker {
     private let synthesisQueue = DispatchQueue(
         label: "com.fractalsociety.voice.kokoro",
@@ -135,13 +135,19 @@ final class KokoroSpeaker {
     }
 
     static func assets() throws -> (model: URL, voice: URL) {
-        guard let resources = Bundle.main.resourceURL else {
+        let local = VoiceModelManager.kokoroDirectory
+        let bundled = Bundle.main.resourceURL?.appendingPathComponent(
+            "KokoroModels/Kokoro-82M-bf16", isDirectory: true
+        )
+        guard let directory = [local, bundled].compactMap({ $0 }).first(where: {
+            FileManager.default.fileExists(
+                atPath: $0.appendingPathComponent("kokoro-v1_0.safetensors").path
+            ) && FileManager.default.fileExists(
+                atPath: $0.appendingPathComponent("af_heart.safetensors").path
+            )
+        }) else {
             throw KokoroSpeakerError.assetsMissing
         }
-        let directory = resources.appendingPathComponent(
-            "KokoroModels/Kokoro-82M-bf16",
-            isDirectory: true
-        )
         let model = directory.appendingPathComponent("kokoro-v1_0.safetensors")
         let voice = directory.appendingPathComponent("af_heart.safetensors")
         guard
@@ -181,7 +187,7 @@ private enum KokoroSpeakerError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .assetsMissing:
-            return "The bundled Kokoro 82M speech model is missing."
+            return "The Kokoro speech model is not installed yet."
         case .voiceEmbeddingMissing:
             return "The bundled Kokoro voice could not be loaded."
         case .noAudio:

@@ -4,19 +4,21 @@ struct OnboardingView: View {
     @ObservedObject var coordinator: BuildCoordinator
     let finish: () -> Void
     @StateObject private var readiness = SetupReadiness()
+    @StateObject private var voiceModels = VoiceModelManager()
     @State private var page = 0
 
-    private let pageCount = 6
+    private let pageCount = 7
 
     var body: some View {
         VStack(spacing: 0) {
             Group {
                 switch page {
-                case 0: accountPage
-                case 1: agentPage
-                case 2: githubPage
-                case 3: readinessPage
-                case 4: shortcutPage
+                case 0: voiceModelPage
+                case 1: accountPage
+                case 2: agentPage
+                case 3: githubPage
+                case 4: readinessPage
+                case 5: shortcutPage
                 default: buildPage
                 }
             }
@@ -36,11 +38,11 @@ struct OnboardingView: View {
                     Button("Back") { page -= 1 }
                 }
                 if page < pageCount - 1 {
-                    Button(page == 3 && !readiness.isReady ? "Complete setup to continue" : "Next") {
+                    Button(page == 4 && !readiness.isReady ? "Complete setup to continue" : "Next") {
                         page += 1
                     }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(page == 3 && !readiness.isReady)
+                    .disabled(page == 4 && !readiness.isReady)
                 } else if readiness.isReady && coordinator.voiceReady {
                     Button("Start using Fractal Voice", action: finish)
                         .keyboardShortcut(.defaultAction)
@@ -61,12 +63,88 @@ struct OnboardingView: View {
         )
         .task {
             readiness.refresh()
+            voiceModels.startIfNeeded()
         }
         .onChange(of: page) { _, newPage in
-            if newPage == 0 || newPage == 3 || newPage == pageCount - 1 {
+            if newPage == 1 || newPage == 4 || newPage == pageCount - 1 {
                 readiness.refresh()
             }
         }
+        .onChange(of: voiceModels.isReady) { _, ready in
+            if ready {
+                coordinator.refreshVoiceReadiness()
+            }
+        }
+    }
+
+    private var voiceModelPage: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            Label("Install your private voice engine", systemImage: "waveform.badge.magnifyingglass")
+                .font(.system(size: 31, weight: .bold, design: .rounded))
+            Text("Fractal Voice is a small app download. On first launch it installs about 2.5 GB of verified speech models so your recordings and spoken confirmations stay on this Mac.")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            explanation(
+                icon: "lock.shield",
+                title: "Private after installation",
+                detail: "Granite Speech transcribes locally and Kokoro speaks locally. Your microphone audio is not uploaded to a transcription service."
+            )
+            explanation(
+                icon: "externaldrive",
+                title: "Downloaded once",
+                detail: "Models are stored in ~/.fractal/models and reused by future app updates. Downloads resume if the connection is interrupted."
+            )
+            explanation(
+                icon: "slider.horizontal.3",
+                title: "Provider-ready",
+                detail: "Fractal saves a versioned voice-engine configuration. Future releases can offer another local model, a model you choose, or an API provider."
+            )
+
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text(voiceModelStatus).font(.headline)
+                    Spacer()
+                    Text(voiceModelProgress).font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                }
+                ProgressView(value: voiceModels.progress)
+                    .progressViewStyle(.linear)
+                Text(voiceModels.currentFile)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if case .failed(let message) = voiceModels.state {
+                    Text(message).font(.callout).foregroundStyle(.red)
+                    Button("Retry download") { voiceModels.retry() }
+                }
+            }
+            .padding(16)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+
+            Text("You can continue account setup while the download finishes. Voice building unlocks only after every file passes its SHA-256 security check.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+        .padding(44)
+    }
+
+    private var voiceModelStatus: String {
+        switch voiceModels.state {
+        case .checking: return "Checking installed models…"
+        case .downloading: return "Installing offline voice models"
+        case .ready: return "Offline voice engine ready"
+        case .failed: return "Download needs attention"
+        }
+    }
+
+    private var voiceModelProgress: String {
+        ByteCountFormatter.string(
+            fromByteCount: voiceModels.downloadedBytes,
+            countStyle: .file
+        ) + " / " + ByteCountFormatter.string(
+            fromByteCount: voiceModels.totalBytes,
+            countStyle: .file
+        )
     }
 
     private var accountPage: some View {
@@ -326,7 +404,9 @@ struct OnboardingView: View {
             Label(
                 coordinator.voiceReady
                     ? "Offline Granite speech and Kokoro voice engines are ready."
-                    : coordinator.latestActivity,
+                    : voiceModels.isReady
+                        ? coordinator.latestActivity
+                        : "Voice models are still installing — return to the first page for progress.",
                 systemImage: coordinator.voiceReady ? "checkmark.seal.fill" : "arrow.down.circle.fill"
             )
             .font(.callout.weight(.medium))

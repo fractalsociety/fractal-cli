@@ -124,7 +124,7 @@ macOS app to explicitly select a project's vocabulary.
 Press `⌥Space` once to start local recording. Fractal detects the end of the
 utterance after a short natural pause; pressing the shortcut again remains a
 manual stop override.
-Fractal speaks the interpreted request with the bundled Kokoro 82M model and
+Fractal speaks the interpreted request with the locally installed Kokoro 82M model and
 asks for confirmation. Answer yes or no by voice, or use the matching buttons.
 After approval, Fractal asks for a project name, repeats it, and requires a
 second spoken or clicked confirmation before any build starts. A rejected
@@ -133,11 +133,13 @@ Each conversational reply opens the microphone automatically and advances after
 speech followed by roughly one second of silence. A silent microphone closes
 after 60 seconds; press `⌥Space` to resume that question.
 
-Unlike terminal voice setup, the macOS app is a complete offline distribution:
-it bundles IBM Granite Speech 4.1 2B Q4_K_M, its speech projector, Kokoro 82M
-with the `af_heart` voice, and pinned native runtimes. A clean Apple Silicon Mac
-needs no Python environment, model download, account, or network connection for
-speech recognition or speech output. Granite
+The macOS release is a lightweight app containing the pinned native runtimes.
+On first launch it explains and automatically downloads IBM Granite Speech 4.1
+2B Q4_K_M, its speech projector, Kokoro 82M, and the `af_heart` voice into
+`~/.fractal/models`. Downloads resume after interruption and every model must
+pass its pinned SHA-256 checksum. After that one-time installation, speech
+recognition and output run locally without sending microphone audio to a cloud
+service. Granite
 receives the built-in, personal, and active-project terminology as a keyword
 bias list, then the deterministic vocabulary layer cleans exact configured
 mishearings before the instruction reaches Fractal.
@@ -147,22 +149,21 @@ Each shortcut-triggered build receives a fresh workspace beneath
 project creation in that managed location. Destructive requests and requests
 with external side effects remain blocked for terminal review.
 
-Prepare the pinned model and inference runtime, then build the signed local app
+Prepare the pinned inference runtime, then build the signed lightweight app
 bundle and distributable archive:
 
 ```sh
 xcodebuild -downloadComponent MetalToolchain
 scripts/prepare-granite-speech.sh
-scripts/prepare-kokoro.sh
 scripts/build-macos-app.sh
 ```
 
-The release builder verifies the Granite and Kokoro artifacts before copying
-them and requires Xcode's compiled MLX Metal shader bundle. Set
-`FRACTAL_GRANITE_MODEL_DIR`, `FRACTAL_KOKORO_MODEL_DIR`, and
-`FRACTAL_LLAMA_CLI` to override the build caches. End users do not need those
-caches because the models, voices, speech projector, and inference runtimes are
-copied into the application bundle.
+The release builder includes the native Granite runtime and Xcode's compiled
+MLX Metal shader bundle, but not model weights. The app downloads model weights
+from pinned revisions on first launch. A versioned
+`~/.fractal/voice-engine.json` selects the default `granite-local` transcription
+and `kokoro-local` speech providers and reserves fields for custom local models
+and future API providers.
 
 Local builds receive an ad-hoc signature. Set `FRACTAL_CODESIGN_IDENTITY` to a
 Developer ID Application certificate when producing a public build; that
@@ -175,8 +176,8 @@ dist/Fractal Voice.app
 dist/FractalVoice-macOS.zip
 ```
 
-The app bundle contains the matching `fractal` binary, native runtime, model,
-and third-party license notice. From the menu bar you can reopen onboarding,
+The app bundle contains the matching `fractal` binary, native runtimes,
+checksum manifests, and third-party license notice. From the menu bar you can reopen onboarding,
 inspect activity, open generated projects, or stop all running Fractal builds.
 Finalized text is sent over stdin to the managed-project ingest boundary; it is
 never interpolated into a command line.
