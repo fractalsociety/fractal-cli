@@ -29,7 +29,12 @@ final class BuildCoordinator: ObservableObject {
     private var process: Process?
     private var recorder: NativeVoiceRecorder?
     private var outputBuffer = ""
+    private var outputLineBuffer = ""
     private var hud: RecordingHUD?
+    private var stopCommand: Process?
+    private var stopRequested = false
+    private var restartRequested = false
+    private var activeWorkspace: URL?
 
     let projectsURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("fractal-projects", isDirectory: true)
@@ -76,7 +81,10 @@ final class BuildCoordinator: ObservableObject {
 
         state = .preparing
         latestActivity = "Loading Moonshine v2 Medium locally…"
-        hud = RecordingHUD()
+        hud = RecordingHUD(
+            onStop: { [weak self] in self?.stopCurrentBuild() },
+            onRestart: { [weak self] in self?.restartVoiceCommand() }
+        )
         hud?.showPreparing()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
@@ -140,6 +148,14 @@ final class BuildCoordinator: ObservableObject {
         latestActivity = "Stop requested for all Fractal builds"
     }
 
+    func stopCurrentBuild() {
+        requestBuildStop(restart: false)
+    }
+
+    func restartVoiceCommand() {
+        requestBuildStop(restart: true)
+    }
+
     func openProjects() {
         try? FileManager.default.createDirectory(
             at: projectsURL,
@@ -172,6 +188,10 @@ final class BuildCoordinator: ObservableObject {
 
     private func startBuild(transcript: String) {
         let transcript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        if stopRequested {
+            finishRequestedStopBeforeBuild()
+            return
+        }
         guard !transcript.isEmpty else {
             recordingFailed(VoiceAppError.noSpeech)
             return
@@ -198,6 +218,8 @@ final class BuildCoordinator: ObservableObject {
         task.standardError = combinedOutput
 
         outputBuffer = ""
+        outputLineBuffer = ""
+        activeWorkspace = nil
         combinedOutput.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
@@ -217,7 +239,7 @@ final class BuildCoordinator: ObservableObject {
             process = task
             stdin.fileHandleForWriting.write(Data(transcript.utf8))
             try stdin.fileHandleForWriting.close()
-            latestActivity = "Instruction understood — creating the project…"
+            setActivity("Heard: “\(Self.compact(transcript, limit: 180))”")
         } catch {
             recordingFailed(error)
         }
@@ -239,19 +261,130 @@ final class BuildCoordinator: ObservableObject {
         if outputBuffer.count > 32_000 {
             outputBuffer.removeFirst(outputBuffer.count - 32_000)
         }
-        if text.contains("Created managed voice project:") {
-            latestActivity = "Project created — lead agent is planning…"
-        } else if text.contains("opening the project now") || text.contains("Planning graph:") {
-            latestActivity = "Execution graph is live — planning your build…"
-        } else if text.contains("executing with") || text.contains("→ executing in") {
-            latestActivity = "Workers are building from the execution graph…"
-        } else if text.contains("Interpreted instruction:") {
-            latestActivity = "Instruction understood — creating the project…"
+        outputLineBuffer += text.replacingOccurrences(of: "\r", with: "\n")
+        let lines = outputLineBuffer.split(
+            separator: "\n",
+            omittingEmptySubsequences: false
+        )
+        outputLineBuffer = String(lines.last ?? "")
+        for line in lines.dropLast() {
+            consumeLine(String(line))
+        }
+    }
+
+    private func consumeLine(_ rawLine: String) {
+        let line = Self.cleanTerminalLine(rawLine)
+        guard !line.isEmpty else { return }
+        if let prefix = line.range(of: "Created managed voice project:") {
+            let path = line[prefix.upperBound...].trimmingCharacters(in: .whitespaces)
+            if !path.isEmpty {
+                activeWorkspace = URL(fileURLWithPath: path, isDirectory: true)
+            }
+        }
+        if let summary = Self.activitySummary(for: line) {
+            setActivity(summary)
+        }
+    }
+
+    private func setActivity(_ activity: String) {
+        latestActivity = activity
+        if state == .building {
+            hud?.updateBuilding(summary: activity)
+        }
+    }
+
+    private func requestBuildStop(restart: Bool) {
+        guard state == .building else {
+            if restart, state != .preparing, state != .recording {
+                startRecording()
+            }
+            return
+        }
+        stopRequested = true
+        restartRequested = restart
+        let activity = restart
+            ? "Stopping this attempt — the microphone will reopen…"
+            : "Pausing this build and preserving its completed work…"
+        latestActivity = activity
+        hud?.showStopping(restarting: restart)
+
+        guard let running = process else {
+            return
+        }
+        guard let executable = Self.fractalExecutable() else {
+            running.terminate()
+            return
+        }
+        let stop = Process()
+        stop.executableURL = executable
+        if let activeWorkspace {
+            stop.arguments = ["stop", "--project", activeWorkspace.path]
+        } else {
+            // Before the CLI announces its managed workspace there is no graph
+            // checkpoint to preserve, so only terminate this known child.
+            running.terminate()
+            return
+        }
+        stop.environment = Self.processEnvironment()
+        stop.standardInput = FileHandle.nullDevice
+        stop.standardOutput = FileHandle.nullDevice
+        stop.standardError = FileHandle.nullDevice
+        stop.terminationHandler = { [weak self] finished in
+            let failed = finished.terminationStatus != 0
+            Task { @MainActor in
+                if failed, self?.process?.isRunning == true {
+                    self?.process?.terminate()
+                }
+                self?.stopCommand = nil
+            }
+        }
+        do {
+            try stop.run()
+            stopCommand = stop
+        } catch {
+            running.terminate()
+        }
+    }
+
+    private func finishRequestedStopBeforeBuild() {
+        let restart = restartRequested
+        stopRequested = false
+        restartRequested = false
+        recorder?.close()
+        recorder = nil
+        if restart {
+            hud?.close()
+            hud = nil
+            state = .idle
+            startRecording()
+        } else {
+            hud?.close()
+            hud = nil
+            state = .idle
+            latestActivity = "Voice command cancelled before the build started"
         }
     }
 
     private func finished(exitCode: Int32) {
         process = nil
+        stopCommand = nil
+        if stopRequested {
+            let restart = restartRequested
+            stopRequested = false
+            restartRequested = false
+            activeWorkspace = nil
+            hud?.close()
+            hud = nil
+            state = .idle
+            if restart {
+                latestActivity = "Previous attempt stopped — listening again…"
+                startRecording()
+            } else {
+                latestActivity = "Build paused — completed work can be resumed later"
+                notify(title: "Fractal build paused", body: latestActivity)
+            }
+            return
+        }
         hud?.close()
         hud = nil
         if exitCode == 0 {
@@ -267,6 +400,50 @@ final class BuildCoordinator: ObservableObject {
             latestActivity = detail.isEmpty ? "Open the log for details" : detail
             notify(title: "Fractal needs attention", body: latestActivity)
         }
+    }
+
+    nonisolated static func activitySummary(for rawLine: String) -> String? {
+        let line = cleanTerminalLine(rawLine)
+        guard !line.isEmpty else { return nil }
+        if line.contains("Created managed voice project:") {
+            return "Project created — lead agent is preparing the plan…"
+        }
+        if line.contains("Interpreted instruction:") {
+            return "Instruction understood — creating the project…"
+        }
+        if line.contains("opening the project now") || line.contains("Planning graph:") {
+            return "Execution graph is live — lead planning is underway…"
+        }
+        if line.contains("⏳ [") {
+            return compact(line, limit: 220)
+        }
+        if line.contains("lead proposed") || line.contains("compiling the execution graph") {
+            return compact(line, limit: 220)
+        }
+        if line.contains("executing with") || line.contains("→ executing in") {
+            return "Workers are building from the execution graph…"
+        }
+        if line.contains("✓") || line.contains("✗") {
+            return compact(line, limit: 220)
+        }
+        return nil
+    }
+
+    nonisolated static func cleanTerminalLine(_ line: String) -> String {
+        line.replacingOccurrences(
+            of: "\u{001B}\\[[0-9;?]*[ -/]*[@-~]",
+            with: "",
+            options: .regularExpression
+        )
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    nonisolated static func compact(_ text: String, limit: Int) -> String {
+        let singleLine = text
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        guard singleLine.count > limit else { return singleLine }
+        return "\(singleLine.prefix(max(1, limit - 1)))…"
     }
 
     private func notify(title: String, body: String) {

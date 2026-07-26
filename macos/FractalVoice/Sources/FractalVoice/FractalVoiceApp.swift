@@ -90,6 +90,10 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         menu.addItem(item("Open Projects", #selector(openProjects)))
         menu.addItem(item("Open Activity Log", #selector(openLog)))
         menu.addItem(.separator())
+        if coordinator.state == .building {
+            menu.addItem(item("Stop Current Build", #selector(stopCurrentBuild)))
+            menu.addItem(item("Restart Voice Command", #selector(restartVoiceCommand)))
+        }
         menu.addItem(item("Stop All Fractal Builds", #selector(stopBuilds)))
         menu.addItem(.separator())
         menu.addItem(item("Quit Fractal Voice", #selector(quit), key: "q"))
@@ -147,6 +151,14 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
 
     @objc private func stopBuilds() {
         coordinator.stopAllBuilds()
+    }
+
+    @objc private func stopCurrentBuild() {
+        coordinator.stopCurrentBuild()
+    }
+
+    @objc private func restartVoiceCommand() {
+        coordinator.restartVoiceCommand()
     }
 
     @objc private func quit() {
