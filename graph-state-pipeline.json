@@ -383,6 +383,13 @@
       "state": "completed",
       "checked_out_at": "2026-07-26T07:14:03.133712+00:00",
       "completed_at": "2026-07-26T07:29:08.829788+00:00"
+    },
+    "P8.12": {
+      "agent_id": "codex/planning-stream",
+      "agent_label": "Codex \u00b7 Planning Stream",
+      "state": "completed",
+      "checked_out_at": "2026-07-26T12:08:34.494437+00:00",
+      "completed_at": "2026-07-26T12:14:02.873413+00:00"
     }
   }
 }
