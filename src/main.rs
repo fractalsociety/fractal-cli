@@ -29,6 +29,7 @@ mod safety;
 mod supervise;
 mod ui;
 mod verify;
+mod voice;
 mod work_builder;
 
 use std::process::ExitCode;
@@ -94,8 +95,12 @@ fn run(cli: Cli) -> Result<()> {
         (None, Some(Command::Ingest(args))) => {
             ingest::run(&args, fractalwork.as_deref(), coordinate)
         }
-        (None, Some(Command::Voice(args))) => ingest::launch_voice(&args, false),
-        (None, Some(Command::Dictate(args))) => ingest::launch_voice(&args, true),
+        (None, Some(Command::Voice(args))) => {
+            voice::run(&args, false, fractalwork.as_deref(), coordinate)
+        }
+        (None, Some(Command::Dictate(args))) => {
+            voice::run(&args, true, fractalwork.as_deref(), coordinate)
+        }
         (None, Some(Command::Graph(args))) => match args.command {
             GraphCommand::Open => board::open(),
             GraphCommand::Board(args) => board::serve_graph(

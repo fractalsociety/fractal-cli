@@ -39,3 +39,60 @@ Authenticated projects publish their portable `.fractal/project.fractal`
 execution state to [fractalsociety.com](https://fractalsociety.com). Planner
 heartbeats, dependency waves, agent checkout, and completion state are reflected
 in the live online graph.
+
+## Voice
+
+Fractal ships one voice interface with two interchangeable backends:
+
+- **Moonshine v2 Medium Streaming** is the default. Speech recognition runs
+  locally on the device and finalized text enters the same normalized intent,
+  risk classification, confirmation, and execution-graph pipeline as typed
+  input.
+- **Superwhisper** remains available as an optional macOS compatibility
+  backend.
+
+Install the isolated Moonshine runtime and verified model once:
+
+```sh
+fractal voice setup
+fractal voice engines
+```
+
+Then speak a command:
+
+```sh
+fractal voice
+```
+
+Press Enter when you have finished speaking. Read-only requests can run
+immediately. Requests that modify a project require the existing typed
+confirmation gate:
+
+```sh
+fractal voice --confirm --repo /path/to/trusted/project
+```
+
+Use dictation when you want to review the transcript without executing it:
+
+```sh
+fractal dictate
+```
+
+To launch the optional Superwhisper integration instead:
+
+```sh
+fractal voice \
+  --engine superwhisper \
+  --mode-key YOUR_FRACTAL_COMMAND_MODE_KEY
+```
+
+The mode key can also be provided through
+`FRACTAL_SUPERWHISPER_MODE_KEY` (or
+`FRACTAL_SUPERWHISPER_DICTATE_MODE_KEY` for dictation).
+
+Moonshine is installed under `~/.fractal/voice/moonshine`, while its model is
+cached under `~/.fractal/models/moonshine-v2-medium-streaming`. The setup uses
+the pinned official `moonshine-voice` package. Once setup is complete,
+transcription does not require a cloud account or send microphone audio to
+Fractal Society. Spoken text is passed as structured data, never interpolated
+into a shell command.

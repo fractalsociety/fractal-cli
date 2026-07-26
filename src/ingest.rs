@@ -1,4 +1,4 @@
-//! Normalized multimodal ingress and the Superwhisper launcher.
+//! Normalized multimodal ingress shared by every voice backend.
 //!
 //! Transcripts are data, never shell source. They enter through stdin, normalize
 //! to `fractal.input.v1`, pass a conservative risk gate, and only then reach the
@@ -8,8 +8,7 @@ use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::Path;
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -70,9 +69,68 @@ pub(crate) fn run(
     coordinate: bool,
 ) -> Result<()> {
     let event = read_event(args)?;
+    process_event(
+        event,
+        args.preview,
+        args.confirm,
+        args.repo.as_deref(),
+        args.port,
+        fractalwork_override,
+        coordinate,
+    )
+}
+
+pub(crate) fn run_voice_transcript(
+    transcript: &str,
+    dictate: bool,
+    args: &VoiceArgs,
+    fractalwork_override: Option<&Path>,
+    coordinate: bool,
+) -> Result<()> {
+    let mut context = BTreeMap::new();
+    context.insert("engine".to_owned(), Value::String("moonshine".to_owned()));
+    context.insert(
+        "model".to_owned(),
+        Value::String("moonshine-v2-medium-streaming".to_owned()),
+    );
+    let mut event = InputEvent {
+        schema: INPUT_SCHEMA.to_owned(),
+        source: "moonshine.v2.medium".to_owned(),
+        modality: "voice".to_owned(),
+        content: transcript.to_owned(),
+        mode: if dictate {
+            DICTATION_MODE
+        } else {
+            DEFAULT_COMMAND_MODE
+        }
+        .to_owned(),
+        timestamp: now_rfc3339(),
+        context,
+    };
+    normalize_and_validate(&mut event)?;
+    process_event(
+        event,
+        args.preview,
+        args.confirm,
+        args.repo.as_deref(),
+        args.port,
+        fractalwork_override,
+        coordinate,
+    )
+}
+
+fn process_event(
+    event: InputEvent,
+    preview: bool,
+    confirm: bool,
+    repo: Option<&Path>,
+    port: u16,
+    fractalwork_override: Option<&Path>,
+    coordinate: bool,
+) -> Result<()> {
     let risk = classify_risk(&event.content);
 
-    if args.preview {
+    if preview {
         println!("{}", serde_json::to_string_pretty(&event)?);
         println!("risk: {risk}");
         return Ok(());
@@ -121,14 +179,12 @@ pub(crate) fn run(
     // project — route it directly, bypassing the build write-confirmation gate so
     // it works hands-free by voice.
     if let Some(number) = crate::projects::parse_resume_command(&event.content) {
-        println!("Normalized {} {} input · resume command", event.source, event.modality);
-        return crate::interactive::resume_project(
-            number,
-            fractalwork_override,
-            args.port,
-            coordinate,
-        )
-        .map(|_| ());
+        println!(
+            "Normalized {} {} input · resume command",
+            event.source, event.modality
+        );
+        return crate::interactive::resume_project(number, fractalwork_override, port, coordinate)
+            .map(|_| ());
     }
 
     println!(
@@ -141,7 +197,7 @@ pub(crate) fn run(
             event.content.replace('\n', "\n  ")
         );
         io::stdout().flush().ok();
-        if !args.confirm {
+        if !confirm {
             bail!(
                 "{risk} voice input was not executed; review it and rerun manually with --confirm for typed confirmation"
             );
@@ -151,10 +207,10 @@ pub(crate) fn run(
 
     crate::interactive::execute_ingested(
         &event.content,
-        args.repo.as_deref(),
+        repo,
         fractalwork_override,
         coordinate,
-        args.port,
+        port,
     )
     .map(|_| ())
 }
@@ -450,64 +506,6 @@ fn confirm_on_tty(event: &InputEvent, risk: Risk) -> Result<()> {
     Ok(())
 }
 
-/// Launch a Superwhisper mode and then its recording window using documented
-/// deep links. `dictate=true` uses a separate mode-key environment variable.
-pub(crate) fn launch_voice(args: &VoiceArgs, dictate: bool) -> Result<()> {
-    let env_key = if dictate {
-        "FRACTAL_SUPERWHISPER_DICTATE_MODE_KEY"
-    } else {
-        "FRACTAL_SUPERWHISPER_MODE_KEY"
-    };
-    let mode_key = args
-        .mode_key
-        .clone()
-        .or_else(|| std::env::var(env_key).ok())
-        .filter(|value| !value.trim().is_empty());
-    let links = voice_links(mode_key.as_deref())?;
-    if args.dry_run {
-        for link in links {
-            println!("open {link}");
-        }
-        return Ok(());
-    }
-    #[cfg(not(target_os = "macos"))]
-    bail!("Superwhisper deep-link launching is supported on macOS only");
-    #[cfg(target_os = "macos")]
-    {
-        for (index, link) in links.iter().enumerate() {
-            let status = Command::new("open")
-                .arg(link)
-                .status()
-                .with_context(|| format!("open Superwhisper deep link {link}"))?;
-            if !status.success() {
-                bail!("macOS open failed for {link} ({status})");
-            }
-            if index + 1 < links.len() {
-                std::thread::sleep(Duration::from_millis(args.delay_ms));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn voice_links(mode_key: Option<&str>) -> Result<Vec<String>> {
-    let mut links = Vec::new();
-    if let Some(key) = mode_key {
-        let key = key.trim();
-        if key.is_empty()
-            || key.len() > 128
-            || !key
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        {
-            bail!("Superwhisper mode key must use only [A-Za-z0-9._-]");
-        }
-        links.push(format!("superwhisper://mode?key={key}"));
-    }
-    links.push("superwhisper://record".to_owned());
-    Ok(links)
-}
-
 fn atty_like_stdin() -> bool {
     io::stdin().is_terminal()
 }
@@ -598,19 +596,6 @@ mod tests {
         );
         assert_eq!(classify_risk("Review email regressions"), Risk::ReadOnly);
         assert_eq!(classify_risk("Do the thing"), Risk::ReversibleWrite);
-    }
-
-    #[test]
-    fn voice_links_validate_mode_keys() {
-        assert_eq!(
-            voice_links(Some("fractal-command_1")).unwrap(),
-            vec![
-                "superwhisper://mode?key=fractal-command_1",
-                "superwhisper://record"
-            ]
-        );
-        assert_eq!(voice_links(None).unwrap(), vec!["superwhisper://record"]);
-        assert!(voice_links(Some("bad&record=true")).is_err());
     }
 
     #[test]

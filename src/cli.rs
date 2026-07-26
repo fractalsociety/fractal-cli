@@ -51,9 +51,9 @@ pub(crate) enum Command {
     Mobile(MobileArgs),
     /// Normalize stdin into fractal.input.v1 and route it through the safety gate.
     Ingest(IngestArgs),
-    /// Switch to a Superwhisper command mode and start recording.
+    /// Record a command with native Moonshine (default) or Superwhisper.
     Voice(VoiceArgs),
-    /// Switch to a Superwhisper dictation mode and start recording.
+    /// Record dictation with native Moonshine (default) or Superwhisper.
     Dictate(VoiceArgs),
     /// Open or inspect the live execution-graph board.
     Graph(GraphArgs),
@@ -321,17 +321,64 @@ pub(crate) enum InputFormat {
 /// Arguments accepted by `fractal voice` and `fractal dictate`.
 #[derive(Debug, Args)]
 pub(crate) struct VoiceArgs {
+    /// Voice backend. Moonshine runs locally and is the default.
+    #[arg(long, value_enum, default_value_t = VoiceEngine::Moonshine)]
+    pub(crate) engine: VoiceEngine,
+
+    /// Set up Moonshine or show installed voice-engine status.
+    #[command(subcommand)]
+    pub(crate) command: Option<VoiceCommand>,
+
     /// Superwhisper mode key. Falls back to the matching FRACTAL_SUPERWHISPER_* env.
     #[arg(long)]
     pub(crate) mode_key: Option<String>,
 
-    /// Delay between selecting the mode and starting recording.
+    /// Superwhisper delay between selecting the mode and starting recording.
     #[arg(long, default_value_t = 200)]
     pub(crate) delay_ms: u64,
 
-    /// Print the deep links without opening Superwhisper.
+    /// Show what would run without recording or launching another application.
     #[arg(long)]
     pub(crate) dry_run: bool,
+
+    /// Normalize and print the Moonshine transcript without executing it.
+    #[arg(long)]
+    pub(crate) preview: bool,
+
+    /// Permit a typed confirmation prompt for non-read-only voice commands.
+    #[arg(long)]
+    pub(crate) confirm: bool,
+
+    /// Trusted project workspace for a Moonshine command.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) repo: Option<PathBuf>,
+
+    /// Port for the execution graph launched by a Moonshine command.
+    #[arg(long, default_value_t = DEFAULT_GRAPH_PORT)]
+    pub(crate) port: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum VoiceEngine {
+    Moonshine,
+    Superwhisper,
+}
+
+impl std::fmt::Display for VoiceEngine {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Moonshine => "moonshine",
+            Self::Superwhisper => "superwhisper",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Subcommand)]
+pub(crate) enum VoiceCommand {
+    /// Install the isolated Moonshine runtime and Medium Streaming model.
+    Setup,
+    /// Show availability and selection for every supported voice backend.
+    Engines,
 }
 
 /// Submission mode understood by the CLI skeleton.
@@ -708,6 +755,8 @@ mod tests {
         let voice = Cli::try_parse_from([
             "fractal",
             "voice",
+            "--engine",
+            "superwhisper",
             "--mode-key",
             "fractal-command",
             "--dry-run",
@@ -717,6 +766,7 @@ mod tests {
             voice.command,
             Some(Command::Voice(VoiceArgs {
                 mode_key: Some(ref key),
+                engine: VoiceEngine::Superwhisper,
                 dry_run: true,
                 ..
             })) if key == "fractal-command"
@@ -725,7 +775,19 @@ mod tests {
         let dictate = Cli::try_parse_from(["fractal", "dictate", "--dry-run"]).unwrap();
         assert!(matches!(
             dictate.command,
-            Some(Command::Dictate(VoiceArgs { dry_run: true, .. }))
+            Some(Command::Dictate(VoiceArgs {
+                engine: VoiceEngine::Moonshine,
+                dry_run: true,
+                ..
+            }))
+        ));
+        let setup = Cli::try_parse_from(["fractal", "voice", "setup"]).unwrap();
+        assert!(matches!(
+            setup.command,
+            Some(Command::Voice(VoiceArgs {
+                command: Some(VoiceCommand::Setup),
+                ..
+            }))
         ));
     }
 
