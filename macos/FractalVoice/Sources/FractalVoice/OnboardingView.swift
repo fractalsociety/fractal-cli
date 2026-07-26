@@ -62,6 +62,11 @@ struct OnboardingView: View {
         .task {
             readiness.refresh()
         }
+        .onChange(of: page) { _, newPage in
+            if newPage == 0 || newPage == 3 || newPage == pageCount - 1 {
+                readiness.refresh()
+            }
+        }
     }
 
     private var accountPage: some View {
@@ -94,7 +99,7 @@ struct OnboardingView: View {
             } label: {
                 Label(
                     readiness.snapshot.fractalSocietyAuthenticated
-                        ? "Fractal Society connected"
+                        ? "Connected \(readiness.snapshot.fractalSocietyAccount ?? "to Fractal Society")"
                         : readiness.isConnectingSociety ? "Waiting for browser sign-in…" : "Connect Fractal Society account",
                     systemImage: readiness.snapshot.fractalSocietyAuthenticated
                         ? "checkmark.circle.fill"
@@ -109,7 +114,7 @@ struct OnboardingView: View {
 
             Text(
                 readiness.snapshot.fractalSocietyAuthenticated
-                    ? "Connected \(readiness.snapshot.fractalSocietyAccount ?? "account"). You can continue setup."
+                    ? "Your account is verified. You can continue setup."
                     : readiness.societyLoginMessage
                         ?? "If the button cannot open, run `fractal login` in Terminal, complete the email flow, then return and choose Check again."
             )

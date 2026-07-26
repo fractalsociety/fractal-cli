@@ -46,19 +46,35 @@ final class SetupReadiness: ObservableObject {
     @Published private(set) var hasChecked = false
     @Published private(set) var isConnectingSociety = false
     @Published private(set) var societyLoginMessage: String?
+    private var refreshQueued = false
 
     var isReady: Bool { snapshot.isReady }
 
     func refresh() {
-        guard !isChecking else { return }
+        guard !isChecking else {
+            refreshQueued = true
+            return
+        }
         isChecking = true
 
         DispatchQueue.global(qos: .userInitiated).async {
             let result = Self.checkSystem()
             DispatchQueue.main.async {
+                let shouldRefreshAgain = self.refreshQueued
                 self.snapshot = result
                 self.hasChecked = true
                 self.isChecking = false
+                if result.fractalSocietyAuthenticated {
+                    self.societyLoginMessage = nil
+                } else if !shouldRefreshAgain
+                    && self.societyLoginMessage == Self.verifyingSocietyMessage {
+                    self.societyLoginMessage =
+                        "Authorization finished, but the account could not be verified. Choose Connect to try again."
+                }
+                if shouldRefreshAgain {
+                    self.refreshQueued = false
+                    self.refresh()
+                }
             }
         }
     }
@@ -93,10 +109,12 @@ final class SetupReadiness: ObservableObject {
                 )
                 DispatchQueue.main.async {
                     self.isConnectingSociety = false
-                    self.societyLoginMessage = process.terminationStatus == 0
-                        ? "Connected. Checking your account…"
-                        : Self.loginFailureMessage(output)
-                    self.refresh()
+                    if process.terminationStatus == 0 {
+                        self.societyLoginMessage = Self.verifyingSocietyMessage
+                        self.refresh()
+                    } else {
+                        self.societyLoginMessage = Self.loginFailureMessage(output)
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -106,6 +124,9 @@ final class SetupReadiness: ObservableObject {
             }
         }
     }
+
+    nonisolated static let verifyingSocietyMessage =
+        "Authorization complete. Verifying your account…"
 
     nonisolated static let agentTemplates: [AgentSetup] = [
         AgentSetup(

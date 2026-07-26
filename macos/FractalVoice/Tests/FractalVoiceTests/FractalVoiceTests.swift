@@ -146,6 +146,16 @@ final class FractalVoiceTests: XCTestCase {
         )
     }
 
+    func testFractalSocietyVerificationMessageDoesNotClaimConnectionEarly() {
+        XCTAssertEqual(
+            SetupReadiness.verifyingSocietyMessage,
+            "Authorization complete. Verifying your account…"
+        )
+        XCTAssertFalse(
+            SetupReadiness.verifyingSocietyMessage.lowercased().contains("connected")
+        )
+    }
+
     func testAgentAuthenticationOutputParsersAreExplicit() {
         XCTAssertTrue(
             SetupReadiness.authenticationSucceeded(
