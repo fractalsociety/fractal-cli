@@ -369,6 +369,20 @@
       "state": "completed",
       "checked_out_at": "2026-07-25T22:59:58.433981+00:00",
       "completed_at": "2026-07-25T23:11:53.906439+00:00"
+    },
+    "P8.10": {
+      "agent_id": "codex/evolved-graph-liveness",
+      "agent_label": "Codex \u00b7 Evolved Graph Liveness",
+      "state": "completed",
+      "checked_out_at": "2026-07-25T23:32:37.734271+00:00",
+      "completed_at": "2026-07-25T23:40:27.845931+00:00"
+    },
+    "P8.11": {
+      "agent_id": "codex/execution-waves",
+      "agent_label": "Codex \u00b7 Execution Waves",
+      "state": "completed",
+      "checked_out_at": "2026-07-26T07:14:03.133712+00:00",
+      "completed_at": "2026-07-26T07:29:08.829788+00:00"
     }
   }
 }

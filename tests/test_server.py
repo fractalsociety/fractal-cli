@@ -137,6 +137,63 @@ class ParsePrdTests(unittest.TestCase):
         )
         self.assertEqual(view["groups"][0]["edges"], committed["edges"])
 
+    def test_graph_view_preserves_dependency_derived_execution_labels(self):
+        committed = {
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_waves",
+            "nodes": [
+                {
+                    "id": "plan",
+                    "kind": "control",
+                    "capability": "control.plan",
+                    "title": "Plan",
+                    "instruction": "Plan the work.",
+                    "execution": {"mode": "sequential", "wave": 1, "parallel_group": None},
+                },
+                {
+                    "id": "app",
+                    "kind": "tool",
+                    "capability": "code.generate",
+                    "title": "Build app",
+                    "instruction": "Build the app.",
+                    "execution": {"mode": "parallel", "wave": 2, "parallel_group": "wave-2"},
+                },
+                {
+                    "id": "tests",
+                    "kind": "tool",
+                    "capability": "code.generate",
+                    "title": "Write tests",
+                    "instruction": "Write tests.",
+                    "execution": {"mode": "parallel", "wave": 2, "parallel_group": "wave-2"},
+                },
+            ],
+            "edges": [
+                {"from": "plan", "to": "app", "condition": "success"},
+                {"from": "plan", "to": "tests", "condition": "success"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            graph_path = root / "graph.json"
+            state_path = root / "state.json"
+            graph_path.write_text(json.dumps(committed), encoding="utf-8")
+            state_path.write_text(
+                json.dumps({
+                    "graph_id": "fg_waves",
+                    "assignments": {
+                        "plan": {"state": "completed", "agent_id": "claude"},
+                    },
+                }),
+                encoding="utf-8",
+            )
+            tasks = parse_graph(graph_path, state_path)["groups"][0]["tasks"]
+
+        self.assertEqual(tasks[0]["title"], "Plan")
+        self.assertEqual(tasks[0]["instruction"], "Plan the work.")
+        self.assertEqual(tasks[1]["execution"]["mode"], "parallel")
+        self.assertEqual(tasks[1]["execution"]["wave"], 2)
+        self.assertEqual(tasks[2]["execution"]["parallel_group"], "wave-2")
+
     def test_graph_node_lifecycle_is_persistent_attributed_and_conflict_safe(self):
         committed = {
             "schema": "fractal.execution_graph.v1",

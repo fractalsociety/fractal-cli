@@ -52,16 +52,37 @@ function renderGraph() {
   const nodes = taskView ? group.tasks : state.data.overview.nodes;
   const edges = taskView ? group.edges : state.data.overview.edges;
   const width = taskView ? 238 : 190;
-  const height = taskView ? 80 : 100;
-  const columns = taskView ? 4 : 0;
+  const height = taskView ? 92 : 100;
   const positions = {};
+  const displayWaves = {};
 
   if (taskView) {
-    nodes.forEach((node, index) => {
-      const row = Math.floor(index / columns);
-      const logicalColumn = index % columns;
-      const column = row % 2 ? columns - logicalColumn - 1 : logicalColumn;
-      positions[node.id] = [155 + column * 290, 105 + row * 130];
+    const fallbackWave = new Map();
+    const unresolved = new Set(nodes.map(node => node.id));
+    let wave = 1;
+    while (unresolved.size) {
+      const ready = [...unresolved].filter(id =>
+        edges.filter(edge => edge.to === id && edge.condition !== "failure")
+          .every(edge => fallbackWave.has(edge.from)));
+      const frontier = ready.length ? ready : [...unresolved];
+      frontier.forEach(id => { fallbackWave.set(id, wave); unresolved.delete(id); });
+      wave += 1;
+    }
+    const waveGroups = new Map();
+    nodes.forEach(node => {
+      const declaredWave = Number(node.execution?.wave);
+      const nodeWave = Number.isInteger(declaredWave) && declaredWave >= 0
+        ? declaredWave
+        : fallbackWave.get(node.id) || 1;
+      displayWaves[node.id] = nodeWave;
+      if (!waveGroups.has(nodeWave)) waveGroups.set(nodeWave, []);
+      waveGroups.get(nodeWave).push(node);
+    });
+    [...waveGroups.entries()].sort(([a], [b]) => a - b).forEach(([nodeWave, waveNodes], columnIndex) => {
+      waveNodes.forEach((node, index) => {
+        const verticalOffset = (index - (waveNodes.length - 1) / 2) * 128;
+        positions[node.id] = [155 + columnIndex * 290, 300 + verticalOffset];
+      });
     });
   } else {
     // Use the curated layout when present (the Mac Runtime M-board); otherwise lay
@@ -79,9 +100,18 @@ function renderGraph() {
     });
   }
 
-  const contentWidth = taskView ? 1180 : 1745;
-  const rows = taskView ? Math.ceil(nodes.length / columns) : 6;
-  const contentHeight = taskView ? Math.max(600, 145 + rows * 130) : 760;
+  const taskWaves = taskView
+    ? new Set(nodes.map(node => displayWaves[node.id] ?? 1)).size
+    : 0;
+  const maxWaveSize = taskView
+    ? Math.max(1, ...Object.values(nodes.reduce((counts, node) => {
+      const nodeWave = displayWaves[node.id] ?? 1;
+      counts[nodeWave] = (counts[nodeWave] || 0) + 1;
+      return counts;
+    }, {})))
+    : 0;
+  const contentWidth = taskView ? Math.max(1000, 310 + (taskWaves - 1) * 290) : 1745;
+  const contentHeight = taskView ? Math.max(600, 220 + maxWaveSize * 128) : 760;
   svg.setAttribute("viewBox", `0 0 ${contentWidth} ${contentHeight}`);
   svg.style.width = `${Math.max(1000, contentWidth)}px`;
   svg.style.height = `${contentHeight}px`;
@@ -136,7 +166,10 @@ function renderGraph() {
       item.append(label);
     });
     const meta = svgElement("text", { class: "meta-label", x: -width / 2 + 17, y: height / 2 - 13 });
-    meta.textContent = taskView ? statusNames[node.status].toUpperCase() : `${node.completed} / ${node.total} VERIFIED`;
+    const executionLabel = node.execution
+      ? `W${node.execution.wave} · ${String(node.execution.mode || "sequential").toUpperCase()} · `
+      : "";
+    meta.textContent = taskView ? `${executionLabel}${statusNames[node.status].toUpperCase()}` : `${node.completed} / ${node.total} VERIFIED`;
     item.append(meta);
     const select = () => selectNode(node, taskView ? "task" : "milestone");
     item.addEventListener("click", select);
@@ -167,6 +200,22 @@ function selectNode(node, kind) {
     document.getElementById("node-assignment").textContent = at ? `${activity} · ${new Date(at).toLocaleString()}` : activity;
   } else {
     assignmentWrap.classList.add("hidden");
+  }
+  const executionWrap = document.getElementById("node-execution-wrap");
+  if (kind === "task" && node.execution) {
+    executionWrap.classList.remove("hidden");
+    const group = node.execution.parallel_group ? ` · ${node.execution.parallel_group}` : "";
+    document.getElementById("node-execution").textContent =
+      `Wave ${node.execution.wave} · ${node.execution.mode}${group}`;
+  } else {
+    executionWrap.classList.add("hidden");
+  }
+  const instructionWrap = document.getElementById("node-instruction-wrap");
+  if (kind === "task" && node.instruction) {
+    instructionWrap.classList.remove("hidden");
+    document.getElementById("node-instruction").textContent = node.instruction;
+  } else {
+    instructionWrap.classList.add("hidden");
   }
   const progressWrap = document.getElementById("node-progress-wrap");
   const open = document.getElementById("open-milestone");

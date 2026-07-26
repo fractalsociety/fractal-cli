@@ -668,7 +668,21 @@ def parse_graph(graph_path: Path, state_path: Path | None = None) -> dict[str, A
     # Only a *single* root is the lead planner. A graph with several independent
     # roots has no single planning step, so it reveals everything immediately.
     planner = roots[0] if len(roots) == 1 else None
-    planning = planner is not None and node_status(planner)[0] != "complete"
+    # The "planning" reveal is ONLY for a brand-new graph before anything has run.
+    # It must NOT re-collapse the board mid-run: an evolved child (grown/repaired,
+    # so it carries `parent_graph`) or any graph where a node has already started
+    # or completed is past planning — show the whole graph. Otherwise a mid-run
+    # re-serve of a grown child would hide every task behind "planning…".
+    any_started = any(
+        node_status(node["id"])[0] in ("active", "complete") for node in nodes
+    )
+    is_evolved = bool(graph.get("parent_graph"))
+    planning = (
+        planner is not None
+        and node_status(planner)[0] != "complete"
+        and not is_evolved
+        and not any_started
+    )
     visible_ids = {planner} if planning else {node["id"] for node in nodes}
 
     tasks = []
@@ -676,19 +690,24 @@ def parse_graph(graph_path: Path, state_path: Path | None = None) -> dict[str, A
         if node["id"] not in visible_ids:
             continue
         status, assignment = node_status(node["id"])
-        title = f"{node['kind']}: {node['capability']}"
+        execution = node.get("execution")
+        execution = dict(execution) if isinstance(execution, dict) else None
+        title = str(node.get("title") or f"{node['kind']}: {node['capability']}")
         if planning and node["id"] == planner:
             title = "🧠 planning the task breakdown…"
-        tasks.append(
-            {
-                "id": node["id"],
-                "title": title,
-                "kind": "task",
-                "status": status,
-                "checked": status == "complete",
-                "assignment": assignment,
-            }
-        )
+        task = {
+            "id": node["id"],
+            "title": title,
+            "kind": "task",
+            "status": status,
+            "checked": status == "complete",
+            "assignment": assignment,
+        }
+        if node.get("instruction"):
+            task["instruction"] = str(node["instruction"])
+        if execution is not None:
+            task["execution"] = execution
+        tasks.append(task)
     group_edges = [
         {
             key: edge[key]
