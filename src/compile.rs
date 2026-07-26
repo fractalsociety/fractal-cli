@@ -1,6 +1,6 @@
 //! Selected-harness compilation into `fractal.execution_graph.v1`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
@@ -325,13 +325,149 @@ pub(crate) fn recompile(work: &Value, harness: &Value, target_id: &str) -> Resul
     // on this copy, leaving the submitted FractalWork object unchanged.
     augment_work_authorizations(&mut authorized_work, harness)?;
 
-    fractal_harnessc::compile(
+    let mut graph = fractal_harnessc::compile(
         &authorized_work,
         harness,
         &registry,
         target_from_id(target_id),
     )
-    .map_err(|error| anyhow!("fractal-harnessc compile failed: {error}"))
+    .map_err(|error| anyhow!("fractal-harnessc compile failed: {error}"))?;
+    annotate_execution_flow(&mut graph, harness)?;
+    Ok(graph)
+}
+
+fn annotate_execution_flow(graph: &mut Value, harness: &Value) -> Result<()> {
+    let graph_edges = graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .cloned()
+        .context("compiled execution graph edges must be an array")?;
+    let graph_nodes = graph
+        .get_mut("nodes")
+        .and_then(Value::as_array_mut)
+        .context("compiled execution graph nodes must be an array")?;
+    let node_ids: BTreeSet<String> = graph_nodes
+        .iter()
+        .filter_map(|node| node.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let lead_planning_roots: BTreeSet<String> = graph_nodes
+        .iter()
+        .filter(|node| node.get("capability").and_then(Value::as_str) == Some("control.plan"))
+        .filter_map(|node| node.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let mut predecessors: BTreeMap<String, Vec<String>> =
+        node_ids.iter().map(|id| (id.clone(), Vec::new())).collect();
+    for edge in &graph_edges {
+        if edge.get("condition").and_then(Value::as_str) == Some("failure") {
+            continue;
+        }
+        if let (Some(from), Some(to)) = (
+            edge.get("from").and_then(Value::as_str),
+            edge.get("to").and_then(Value::as_str),
+        ) {
+            if let Some(values) = predecessors.get_mut(to) {
+                values.push(from.to_owned());
+            }
+        }
+    }
+    let mut waves: BTreeMap<String, u32> = BTreeMap::new();
+    while waves.len() < node_ids.len() {
+        let before = waves.len();
+        for id in &node_ids {
+            if waves.contains_key(id) {
+                continue;
+            }
+            let dependencies = &predecessors[id];
+            if dependencies
+                .iter()
+                .all(|dependency| waves.contains_key(dependency))
+            {
+                let wave = if dependencies.is_empty() && lead_planning_roots.contains(id) {
+                    0
+                } else {
+                    dependencies
+                        .iter()
+                        .filter_map(|dependency| waves.get(dependency))
+                        .copied()
+                        .max()
+                        .unwrap_or(0)
+                        + 1
+                };
+                waves.insert(id.clone(), wave);
+            }
+        }
+        if waves.len() == before {
+            bail!("compiled graph execution flow contains a dependency cycle");
+        }
+    }
+    let mut wave_sizes = BTreeMap::new();
+    for wave in waves.values() {
+        *wave_sizes.entry(*wave).or_insert(0_usize) += 1;
+    }
+    let titles: BTreeMap<&str, &str> = harness
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| {
+            Some((
+                node.get("id")?.as_str()?,
+                node.get("title")?.as_str()?.trim(),
+            ))
+        })
+        .filter(|(_, title)| !title.is_empty())
+        .collect();
+    for node in graph_nodes {
+        let id = node
+            .get("id")
+            .and_then(Value::as_str)
+            .context("compiled graph node is missing id")?
+            .to_owned();
+        let wave = waves[&id];
+        let parallel = wave_sizes[&wave] > 1;
+        node["execution"] = json!({
+            "mode": if parallel { "parallel" } else { "sequential" },
+            "wave": wave,
+            "parallel_group": if parallel {
+                Value::String(format!("wave-{wave}"))
+            } else {
+                Value::Null
+            },
+        });
+        if let Some(title) = titles.get(id.as_str()) {
+            node["title"] = Value::String((*title).to_owned());
+        }
+    }
+    let flow_waves = wave_sizes
+        .iter()
+        .map(|(wave, size)| {
+            json!({
+                "wave": wave,
+                "mode": if *size > 1 { "parallel" } else { "sequential" },
+                "parallel_group": if *size > 1 {
+                    Value::String(format!("wave-{wave}"))
+                } else {
+                    Value::Null
+                },
+                "nodes": waves.iter()
+                    .filter(|(_, node_wave)| *node_wave == wave)
+                    .map(|(id, _)| Value::String(id.clone()))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    graph["execution_flow"] = json!({
+        "schema": "fractal.execution_flow.v1",
+        "waves": flow_waves,
+    });
+    let object = graph
+        .as_object_mut()
+        .context("compiled execution graph must be an object")?;
+    object.remove("graph_hash");
+    let graph_hash = fractal_contracts::canonical_sha256(&Value::Object(object.clone()))
+        .map_err(|error| anyhow!("execution flow graph hashing failed: {error}"))?;
+    object.insert("graph_hash".to_owned(), Value::String(graph_hash));
+    Ok(())
 }
 
 fn augment_work_authorizations(work: &mut Value, harness: &Value) -> Result<()> {
@@ -459,6 +595,15 @@ mod tests {
         assert!(graph["nodes"]
             .as_array()
             .is_some_and(|nodes| !nodes.is_empty()));
+        assert_eq!(
+            graph["execution_flow"]["schema"],
+            "fractal.execution_flow.v1"
+        );
+        assert!(graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|node| node["execution"]["wave"].as_u64().is_some()));
     }
 
     #[test]
@@ -511,6 +656,22 @@ mod tests {
         assert_eq!(
             review_deps,
             vec!["implementation_ready".to_owned(), "tests_ready".to_owned()]
+        );
+        let node = |id: &str| {
+            graph["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["id"] == id)
+                .unwrap()
+        };
+        let implement = node("implement");
+        let author_tests = node("author_tests");
+        assert_eq!(implement["execution"]["mode"], "parallel");
+        assert_eq!(author_tests["execution"]["mode"], "parallel");
+        assert_eq!(
+            implement["execution"]["parallel_group"],
+            author_tests["execution"]["parallel_group"]
         );
     }
 

@@ -11,6 +11,7 @@
 //! `commit_graph` path as the built-in harnesses, so evolution, the recompile hop,
 //! and the mid-run supervisor all work on the decomposed graph for free.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -68,20 +69,31 @@ struct AcceptanceCriterion {
     verification: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 struct PlannedProject {
     prd: StructuredPrd,
     tasks: Vec<Task>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct TaskExecution {
+    mode: String,
+    wave: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_group: Option<String>,
+}
+
 /// One task from the lead's decomposition.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 struct Task {
     id: String,
     title: String,
     capability: String,
     instruction: String,
     depends_on: Vec<String>,
+    execution: TaskExecution,
+    #[serde(skip)]
+    declared_execution: Option<TaskExecution>,
 }
 
 /// Expand any ordinary request into a structured PRD and committed task graph.
@@ -298,7 +310,17 @@ fn plan_project(
     let raw = std::fs::read_to_string(&plan_path).map_err(|_| {
         anyhow!("planner did not write fractal-plan.json (the PRD may be too large or unclear)")
     })?;
-    parse_and_validate(&raw)
+    let planned = parse_and_validate(&raw)?;
+    // Persist the normalized contract, not the planner's unchecked labels. This
+    // guarantees every saved plan contains the same execution waves the graph
+    // compiler and scheduler will actually use, even when an older lead omits
+    // the optional declaration.
+    let temporary = plan_path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temporary, serde_json::to_vec_pretty(&planned)?)
+        .with_context(|| format!("write normalized plan {}", temporary.display()))?;
+    std::fs::rename(&temporary, &plan_path)
+        .with_context(|| format!("replace normalized plan {}", plan_path.display()))?;
+    Ok(planned)
 }
 
 fn planning_prompt(source_text: &str, source_name: &str) -> String {
@@ -329,10 +351,17 @@ fn planning_prompt(source_text: &str, source_name: &str) -> String {
              \"title\": \"one line\",\n\
              \"capability\": \"code.generate|code.edit|project.tests.execute|content.analyze\",\n\
              \"instruction\": \"a self-contained directive an agent can execute in this workspace with no other context\",\n\
-             \"depends_on\": [\"ids of tasks that must finish first\"]\n\
+             \"depends_on\": [\"ids of tasks that must finish first\"],\n\
+             \"execution\": {{\n\
+               \"mode\": \"parallel|sequential\",\n\
+               \"wave\": 1,\n\
+               \"parallel_group\": \"wave-1 (required for parallel; omit for sequential)\"\n\
+             }}\n\
            }}]\n\
          }}\n\n\
          Rules: {min}-{max} tasks; ids unique; `depends_on` must reference earlier task ids only and form a DAG (no cycles); \
+         every task MUST label its dependency-ready execution wave and whether it runs `parallel` (two or more tasks become ready in that same wave) or `sequential` (it is the only task in its wave); \
+         roots are wave 1, every other task is wave 1 + the maximum wave of its dependencies, and all parallel tasks in wave N use `parallel_group`: `wave-N`; \
          every `instruction` must be concrete and standalone (name the files to create/edit and what they must contain/do); \
          architecture must name at least one component; include at least one observable acceptance criterion; \
          include at least one `project.tests.execute` task that depends on implementation and verifies the stated acceptance criteria using the repository's real native/package test suite; \
@@ -411,12 +440,19 @@ fn parse_and_validate(raw: &str) -> Result<PlannedProject> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let declared_execution = parse_execution_declaration(item, &id)?;
         tasks.push(Task {
             id,
             title,
             capability,
             instruction,
             depends_on,
+            execution: TaskExecution {
+                mode: "sequential".to_owned(),
+                wave: 0,
+                parallel_group: None,
+            },
+            declared_execution,
         });
     }
 
@@ -444,6 +480,7 @@ fn parse_and_validate(raw: &str) -> Result<PlannedProject> {
         }
     }
     tasks = topological_sort(tasks)?;
+    assign_and_validate_execution_waves(&mut tasks)?;
     if !tasks
         .iter()
         .any(|task| task.capability.ends_with("tests.execute"))
@@ -451,6 +488,88 @@ fn parse_and_validate(raw: &str) -> Result<PlannedProject> {
         bail!("lead plan must contain a gating tests task");
     }
     Ok(PlannedProject { prd, tasks })
+}
+
+fn parse_execution_declaration(item: &Value, id: &str) -> Result<Option<TaskExecution>> {
+    let Some(value) = item.get("execution") else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .with_context(|| format!("task `{id}` execution label must be an object"))?;
+    let mode = object
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(mode.as_str(), "parallel" | "sequential") {
+        bail!("task `{id}` execution.mode must be `parallel` or `sequential`");
+    }
+    let wave = object
+        .get("wave")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .with_context(|| format!("task `{id}` execution.wave must be a positive integer"))?;
+    let parallel_group = object
+        .get("parallel_group")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    Ok(Some(TaskExecution {
+        mode,
+        wave,
+        parallel_group,
+    }))
+}
+
+fn assign_and_validate_execution_waves(tasks: &mut [Task]) -> Result<()> {
+    let mut wave_by_id = BTreeMap::new();
+    for task in tasks.iter() {
+        let wave = task
+            .depends_on
+            .iter()
+            .filter_map(|dependency| wave_by_id.get(dependency))
+            .copied()
+            .max()
+            .unwrap_or(0_u32)
+            + 1;
+        wave_by_id.insert(task.id.clone(), wave);
+    }
+    let mut wave_sizes = BTreeMap::new();
+    for wave in wave_by_id.values() {
+        *wave_sizes.entry(*wave).or_insert(0_usize) += 1;
+    }
+    for task in tasks {
+        let wave = wave_by_id[&task.id];
+        let parallel = wave_sizes[&wave] > 1;
+        let expected = TaskExecution {
+            mode: if parallel { "parallel" } else { "sequential" }.to_owned(),
+            wave,
+            parallel_group: parallel.then(|| format!("wave-{wave}")),
+        };
+        if let Some(declared) = &task.declared_execution {
+            if declared.mode != expected.mode
+                || declared.wave != expected.wave
+                || declared.parallel_group != expected.parallel_group
+            {
+                bail!(
+                    "task `{}` execution label disagrees with its dependencies: declared {} wave {} {:?}, expected {} wave {} {:?}",
+                    task.id,
+                    declared.mode,
+                    declared.wave,
+                    declared.parallel_group,
+                    expected.mode,
+                    expected.wave,
+                    expected.parallel_group
+                );
+            }
+        }
+        task.execution = expected;
+    }
+    Ok(())
 }
 
 fn validate_structured_prd(prd: &StructuredPrd) -> Result<()> {
@@ -687,6 +806,10 @@ mod tests {
         );
         let planned = parse_and_validate(&raw).expect("valid plan");
         assert_eq!(planned.tasks.len(), 2);
+        assert_eq!(planned.tasks[0].execution.mode, "sequential");
+        assert_eq!(planned.tasks[0].execution.wave, 1);
+        assert_eq!(planned.tasks[1].execution.mode, "sequential");
+        assert_eq!(planned.tasks[1].execution.wave, 2);
         let genome = build_harness_genome(&planned.tasks, "X.md");
         let ids: Vec<&str> = genome["nodes"]
             .as_array()
@@ -711,6 +834,39 @@ mod tests {
             .iter()
             .any(|e| e["from"] == "tests" && e["to"] == "lead_closeout");
         assert!(closer_edge);
+    }
+
+    #[test]
+    fn derives_parallel_waves_and_rejects_labels_that_disagree_with_edges() {
+        let parallel = valid_plan(
+            r#"[
+          {"id":"app","capability":"code.generate","instruction":"build app","depends_on":[]},
+          {"id":"tests","capability":"project.tests.execute","instruction":"write tests","depends_on":[]},
+          {"id":"verify","capability":"project.tests.execute","instruction":"run tests","depends_on":["app","tests"]}
+        ]"#,
+        );
+        let planned = parse_and_validate(&parallel).expect("parallel plan");
+        assert_eq!(planned.tasks[0].execution.mode, "parallel");
+        assert_eq!(planned.tasks[0].execution.wave, 1);
+        assert_eq!(
+            planned.tasks[0].execution.parallel_group.as_deref(),
+            Some("wave-1")
+        );
+        assert_eq!(planned.tasks[1].execution.mode, "parallel");
+        assert_eq!(planned.tasks[2].execution.mode, "sequential");
+        assert_eq!(planned.tasks[2].execution.wave, 2);
+
+        let mislabeled = valid_plan(
+            r#"[
+          {"id":"app","capability":"code.generate","instruction":"build app","depends_on":[],"execution":{"mode":"sequential","wave":1}},
+          {"id":"tests","capability":"project.tests.execute","instruction":"write tests","depends_on":[],"execution":{"mode":"sequential","wave":1}},
+          {"id":"verify","capability":"project.tests.execute","instruction":"run tests","depends_on":["app","tests"],"execution":{"mode":"sequential","wave":2}}
+        ]"#,
+        );
+        assert!(parse_and_validate(&mislabeled)
+            .unwrap_err()
+            .to_string()
+            .contains("disagrees with its dependencies"));
     }
 
     #[test]
@@ -806,5 +962,6 @@ mod tests {
         let nodes = graph["nodes"].as_array().expect("nodes");
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0]["capability"], "control.plan");
+        assert_eq!(nodes[0]["execution"]["wave"], 0);
     }
 }
