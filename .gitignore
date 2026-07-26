@@ -3,6 +3,8 @@
 /macos/FractalVoice/.build/
 /macos/FractalVoice/.xcode-build/
 /dist/
+/dist-app-store/
+/artifacts/
 *.tmp
 *.profraw
 .DS_Store

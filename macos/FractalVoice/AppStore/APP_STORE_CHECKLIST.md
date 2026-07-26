@@ -39,6 +39,8 @@
 
 ## Release validation
 
+- Keep App Store output isolated with
+  `FRACTAL_DIST_DIR="$PWD/dist-app-store"`.
 - Archive using the App Store provisioning profile.
 - Validate the archive in Xcode Organizer.
 - Test the sandboxed build from a clean macOS user account.

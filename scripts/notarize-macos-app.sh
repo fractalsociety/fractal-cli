@@ -2,8 +2,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP="$ROOT/dist/Fractal Voice.app"
-ARCHIVE="$ROOT/dist/FractalVoice-macOS.zip"
+DIST="${FRACTAL_DIST_DIR:-$ROOT/dist}"
+APP="$DIST/Fractal Voice.app"
+ARCHIVE="$DIST/FractalVoice-macOS.zip"
 PROFILE="${FRACTAL_NOTARY_PROFILE:-fractal-notarytool}"
 IDENTITY="${FRACTAL_CODESIGN_IDENTITY:-}"
 
@@ -27,7 +28,9 @@ if ! xcrun notarytool history --keychain-profile "$PROFILE" >/dev/null 2>&1; the
   exit 1
 fi
 
-FRACTAL_CODESIGN_IDENTITY="$IDENTITY" "$ROOT/scripts/build-macos-app.sh"
+FRACTAL_DIST_DIR="$DIST" \
+  FRACTAL_CODESIGN_IDENTITY="$IDENTITY" \
+  "$ROOT/scripts/build-macos-app.sh"
 
 codesign --verify --deep --strict --verbose=2 "$APP"
 SIGNATURE_DETAILS="$(codesign --display --verbose=4 "$APP" 2>&1)"
@@ -59,7 +62,7 @@ spctl --assess --type execute --verbose=4 "$APP"
 
 rm -f "$ARCHIVE"
 (
-  cd "$ROOT/dist"
+  cd "$DIST"
   ditto -c -k --sequesterRsrc --keepParent \
     "Fractal Voice.app" \
     "FractalVoice-macOS.zip"

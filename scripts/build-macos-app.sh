@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PACKAGE="$ROOT/macos/FractalVoice"
-DIST="$ROOT/dist"
+DIST="${FRACTAL_DIST_DIR:-$ROOT/dist}"
 APP="$DIST/Fractal Voice.app"
 CONTENTS="$APP/Contents"
 DEFAULT_LLAMA_CLI="$HOME/.cache/fractal-build/llama.cpp/build-fractal/bin/llama-cli"
