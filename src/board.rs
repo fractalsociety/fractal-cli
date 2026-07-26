@@ -312,14 +312,24 @@ pub(crate) fn serve_graph(
         );
     }
 
-    Command::new("python3")
+    let mut command = Command::new("python3");
+    command
         .arg(&server_path)
         .arg("--graph")
         .arg(&graph_file)
         .arg("--state")
         .arg(&state_file)
         .arg("--port")
-        .arg(port.to_string())
+        .arg(port.to_string());
+    if let Some(workspace) = crate::run_control::current_workspace() {
+        let executable = std::env::current_exe().context("resolve Fractal executable")?;
+        command
+            .arg("--fractal-bin")
+            .arg(executable)
+            .arg("--workspace")
+            .arg(workspace);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -553,8 +563,7 @@ mod tests {
 
     #[test]
     fn authenticated_projects_prefer_the_cloud_browser_target() {
-        let (cloud, is_cloud) =
-            browser_target(Some("https://fractalsociety.com/james/app"), 8092);
+        let (cloud, is_cloud) = browser_target(Some("https://fractalsociety.com/james/app"), 8092);
         assert_eq!(cloud, "https://fractalsociety.com/james/app");
         assert!(is_cloud);
 

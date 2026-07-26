@@ -1,7 +1,7 @@
 "use strict";
 
 const NS = "http://www.w3.org/2000/svg";
-const state = { data: null, view: "overview", selected: null, initialized: false };
+const state = { data: null, view: "overview", selected: null, initialized: false, pausing: false };
 const statusNames = { complete: "Complete", active: "In progress", incomplete: "Incomplete" };
 
 const overviewPositions = {
@@ -260,6 +260,49 @@ function resetInspector() {
   document.getElementById("inspector-content").classList.add("hidden");
 }
 
+function renderRunControl() {
+  const control = state.data?.run_control;
+  const button = document.getElementById("pause-build");
+  const live = document.getElementById("live-state");
+  if (!control?.available) {
+    button.classList.add("hidden");
+    return;
+  }
+  button.classList.remove("hidden");
+  const halted = control.phase === "halted";
+  button.disabled = halted || state.pausing;
+  button.textContent = halted
+    ? "✓ Build Paused"
+    : state.pausing
+      ? "Pausing…"
+      : "Ⅱ Pause Build";
+  button.classList.toggle("paused", halted);
+  live.classList.toggle("paused", halted);
+  live.lastChild.textContent = halted ? " BUILD PAUSED" : " BUILD RUNNING";
+}
+
+async function pauseBuild() {
+  const control = state.data?.run_control;
+  if (!control?.available || control.phase === "halted" || state.pausing) return;
+  if (!window.confirm("Pause this build after preserving its completed graph waves?")) return;
+  state.pausing = true;
+  renderRunControl();
+  try {
+    const response = await fetch("/api/run/pause", {
+      method: "POST",
+      headers: { "X-Fractal-Control-Token": control.token }
+    });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error || `Pause returned ${response.status}`);
+    await loadGraph();
+  } catch (error) {
+    window.alert(`Fractal could not pause this build: ${error.message}`);
+  } finally {
+    state.pausing = false;
+    renderRunControl();
+  }
+}
+
 async function loadGraph() {
   const button = document.getElementById("refresh");
   button.disabled = true;
@@ -267,6 +310,7 @@ async function loadGraph() {
     const response = await fetch(`/api/graph?t=${Date.now()}`);
     if (!response.ok) throw new Error(`Graph API returned ${response.status}`);
     state.data = await response.json();
+    renderRunControl();
     const totals = state.data.totals;
     document.getElementById("percent").textContent = `${totals.percent}%`;
     document.getElementById("completed").textContent = totals.complete;
@@ -299,5 +343,6 @@ async function loadGraph() {
 
 document.getElementById("refresh").addEventListener("click", loadGraph);
 document.getElementById("back").addEventListener("click", showOverview);
+document.getElementById("pause-build").addEventListener("click", pauseBuild);
 loadGraph();
 setInterval(loadGraph, 2000);

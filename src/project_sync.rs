@@ -53,6 +53,17 @@ struct RemoteError {
     current_hash: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ControlEnvelope {
+    command: Option<ControlCommand>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlCommand {
+    command_id: String,
+    action: String,
+}
+
 enum PutFailure {
     Status(u16, Box<ureq::Response>),
     Transport(anyhow::Error),
@@ -152,6 +163,55 @@ pub(crate) fn sync_runtime_now(workspace: &Path) -> Result<()> {
         None => {}
     }
     upload(workspace, None).map(|_| ())
+}
+
+/// Poll the authenticated Fractal Society project for an owner-requested pause.
+/// The command is acknowledged before local cancellation, preventing a page
+/// refresh from repeatedly stopping a later resumed run.
+pub(crate) fn poll_pause_command(workspace: &Path) -> Result<bool> {
+    if std::env::var_os("FRACTAL_OFFLINE").is_some() {
+        return Ok(false);
+    }
+    let session = match crate::auth::load_session() {
+        Ok(session) => session,
+        Err(_) => return Ok(false),
+    };
+    let document = match crate::project_file::load(workspace) {
+        Ok(document) => document,
+        Err(_) => return Ok(false),
+    };
+    let endpoint = format!(
+        "{}/api/cli/projects/{}/control",
+        session.server.trim_end_matches('/'),
+        document.project.slug
+    );
+    let response = match ureq::get(&endpoint)
+        .set("Authorization", &format!("Bearer {}", session.access_token))
+        .timeout(std::time::Duration::from_secs(3))
+        .call()
+    {
+        Ok(response) => response,
+        Err(ureq::Error::Status(404, _)) => return Ok(false),
+        Err(error) => return Err(anyhow::anyhow!(error)).context("poll hosted graph control"),
+    };
+    let envelope: ControlEnvelope =
+        serde_json::from_reader(response.into_reader()).context("decode hosted graph control")?;
+    let Some(command) = envelope.command else {
+        return Ok(false);
+    };
+    if command.action != "pause" {
+        return Ok(false);
+    }
+    let body = serde_json::json!({ "command_id": command.command_id }).to_string();
+    match ureq::post(&endpoint)
+        .set("Authorization", &format!("Bearer {}", session.access_token))
+        .set("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(3))
+        .send_string(&body)
+    {
+        Ok(_) => Ok(true),
+        Err(error) => Err(anyhow::anyhow!(error)).context("acknowledge hosted graph control"),
+    }
 }
 
 fn maybe_sync_with_options(workspace: &Path, publish_github: bool) -> Option<String> {

@@ -9,6 +9,8 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import subprocess
 import tempfile
 import threading
 from datetime import datetime, timezone
@@ -33,6 +35,7 @@ TASK_NODE_ID_RE = re.compile(r"^[A-Z]\d+\.(?:\d+|G\d+)$")
 GRAPH_NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 TASK_ACTION_RE = re.compile(r"^/api/tasks/([^/]+)/(checkout|complete|release)$")
 DEVELOPMENT_RE = re.compile(r"^/api/development$")
+RUN_PAUSE_RE = re.compile(r"^/api/run/pause$")
 AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$")
 STATE_WRITE_LOCK = threading.Lock()
 RESHAPING_OPS = frozenset({"grow", "repair"})
@@ -803,6 +806,9 @@ class GraphHandler(SimpleHTTPRequestHandler):
     prd_path = DEFAULT_PRD
     state_path = DEFAULT_STATE
     graph_path: Path | None = None
+    fractal_bin: Path | None = None
+    workspace: Path | None = None
+    control_token = secrets.token_urlsafe(32)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, directory=str(APP_DIR), **kwargs)
@@ -811,9 +817,11 @@ class GraphHandler(SimpleHTTPRequestHandler):
         route = self.path.split("?", 1)[0]
         if route == "/api/graph":
             if self.graph_path is not None:
-                self._send_json(parse_graph(self.graph_path, self.state_path))
+                graph = parse_graph(self.graph_path, self.state_path)
             else:
-                self._send_json(parse_prd(self.prd_path, self.state_path))
+                graph = parse_prd(self.prd_path, self.state_path)
+            graph["run_control"] = self._run_control_payload()
+            self._send_json(graph)
             return
         if route == "/api/health":
             self._send_json({"ok": True, "service": "fractal-execution-graph"})
@@ -822,6 +830,9 @@ class GraphHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         route = self.path.split("?", 1)[0]
+        if RUN_PAUSE_RE.fullmatch(route):
+            self._handle_pause_post()
+            return
         if DEVELOPMENT_RE.fullmatch(route):
             self._handle_development_post()
             return
@@ -873,6 +884,67 @@ class GraphHandler(SimpleHTTPRequestHandler):
             self._send_json({"error": str(error)}, error.status)
         except (json.JSONDecodeError, ValueError):
             self._send_json({"error": "request body must be valid JSON"}, HTTPStatus.BAD_REQUEST)
+
+    def _run_control_payload(self) -> dict[str, Any]:
+        if self.fractal_bin is None or self.workspace is None:
+            return {"available": False, "phase": "unmanaged"}
+        phase = "running"
+        project_state = _read_json(self.workspace / ".fractal" / "run-state.json")
+        stored_phase = project_state.get("status")
+        if isinstance(stored_phase, str) and stored_phase in {
+            "running", "halted", "completed"
+        }:
+            phase = stored_phase
+        return {
+            "available": True,
+            "phase": phase,
+            "token": self.control_token,
+            "project": self.workspace.name,
+        }
+
+    def _handle_pause_post(self) -> None:
+        if self.fractal_bin is None or self.workspace is None:
+            self._send_json(
+                {"error": "this board is not attached to an active Fractal build"},
+                HTTPStatus.CONFLICT,
+            )
+            return
+        supplied = self.headers.get("X-Fractal-Control-Token", "")
+        if not secrets.compare_digest(supplied, self.control_token):
+            self._send_json({"error": "invalid graph control token"}, HTTPStatus.FORBIDDEN)
+            return
+        try:
+            result = subprocess.run(
+                [
+                    str(self.fractal_bin),
+                    "stop",
+                    "--project",
+                    str(self.workspace),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            self._send_json(
+                {"error": f"could not pause build: {error}"},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+        if result.returncode != 0:
+            self._send_json(
+                {"error": result.stdout.strip() or "Fractal could not pause this build"},
+                HTTPStatus.CONFLICT,
+            )
+            return
+        self._send_json({
+            "ok": True,
+            "phase": "halted",
+            "message": "Build paused. Completed graph waves remain resumable.",
+        })
 
     def _handle_development_post(self) -> None:
         if self.graph_path is None:
@@ -927,10 +999,20 @@ def main() -> None:
     parser.add_argument("--prd", type=Path, default=DEFAULT_PRD)
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--graph", type=Path)
+    parser.add_argument("--fractal-bin", type=Path)
+    parser.add_argument("--workspace", type=Path)
     args = parser.parse_args()
     GraphHandler.prd_path = args.prd.resolve()
     GraphHandler.state_path = args.state.resolve()
     GraphHandler.graph_path = args.graph.resolve() if args.graph is not None else None
+    if (args.fractal_bin is None) != (args.workspace is None):
+        parser.error("--fractal-bin and --workspace must be provided together")
+    GraphHandler.fractal_bin = (
+        args.fractal_bin.resolve() if args.fractal_bin is not None else None
+    )
+    GraphHandler.workspace = (
+        args.workspace.resolve() if args.workspace is not None else None
+    )
     server = ThreadingHTTPServer((args.host, args.port), GraphHandler)
     print(f"Fractal execution graph: http://{args.host}:{args.port}/", flush=True)
     try:

@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -574,6 +575,81 @@ Gate M0 — `READY`:
                 self.assertTrue(developed["development"]["visible"])
                 self.assertTrue(developed["development"]["grew_or_repaired"])
                 self.assertEqual(developed["development"]["reshaping_count"], 1)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_http_pause_requires_token_and_invokes_narrow_fractal_stop(self):
+        committed = {
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_pause",
+            "nodes": [{"id": "build", "kind": "tool", "capability": "code.edit"}],
+            "edges": [],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            graph_path = root / "graph.json"
+            state_path = root / "graph-state.json"
+            workspace = root / "trusted-workspace"
+            run_state = workspace / ".fractal" / "run-state.json"
+            run_state.parent.mkdir(parents=True)
+            run_state.write_text('{"status":"running"}\n', encoding="utf-8")
+            graph_path.write_text(json.dumps(committed), encoding="utf-8")
+            arguments = root / "arguments.txt"
+            executable = root / "fractal-test"
+            executable.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s\\n' \"$@\" > '{arguments}'\n"
+                f"printf '%s\\n' '{{\"status\":\"halted\"}}' > '{run_state}'\n",
+                encoding="utf-8",
+            )
+            os.chmod(executable, 0o700)
+
+            class TemporaryGraphHandler(GraphHandler):
+                def log_message(self, format, *args):  # noqa: A002
+                    pass
+
+            TemporaryGraphHandler.graph_path = graph_path
+            TemporaryGraphHandler.state_path = state_path
+            TemporaryGraphHandler.fractal_bin = executable
+            TemporaryGraphHandler.workspace = workspace
+            TemporaryGraphHandler.control_token = "test-control-token"
+            server = ThreadingHTTPServer(("127.0.0.1", 0), TemporaryGraphHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                with urlopen(f"{base}/api/graph") as response:
+                    graph = json.load(response)
+                self.assertEqual(graph["run_control"]["phase"], "running")
+                self.assertEqual(graph["run_control"]["token"], "test-control-token")
+
+                unauthorized = Request(
+                    f"{base}/api/run/pause",
+                    data=b"",
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(unauthorized)
+                self.assertEqual(error.exception.code, HTTPStatus.FORBIDDEN)
+
+                pause = Request(
+                    f"{base}/api/run/pause",
+                    data=b"",
+                    headers={"X-Fractal-Control-Token": "test-control-token"},
+                    method="POST",
+                )
+                with urlopen(pause) as response:
+                    result = json.load(response)
+                self.assertTrue(result["ok"])
+                self.assertEqual(
+                    arguments.read_text(encoding="utf-8").splitlines(),
+                    ["stop", "--project", str(workspace)],
+                )
+                with urlopen(f"{base}/api/graph") as response:
+                    halted = json.load(response)
+                self.assertEqual(halted["run_control"]["phase"], "halted")
             finally:
                 server.shutdown()
                 server.server_close()

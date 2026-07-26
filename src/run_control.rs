@@ -78,6 +78,7 @@ impl RunGuard {
         write_run(&run)?;
         write_project_state(&run).ok();
         std::env::set_var(RUN_ID_ENV, &run_id);
+        start_hosted_control_monitor(run_id.clone());
         Ok(Self {
             run_id: Some(run_id),
         })
@@ -209,6 +210,48 @@ pub(crate) fn workspace_is_running(workspace: &Path) -> bool {
         runs.iter()
             .any(|run| Path::new(&run.workspace) == workspace)
     })
+}
+
+/// Return the trusted workspace registered for the current coordinator. This is
+/// used to provision narrow loopback graph controls without accepting a path
+/// from the browser.
+pub(crate) fn current_workspace() -> Option<PathBuf> {
+    let run_id = std::env::var_os(RUN_ID_ENV)?;
+    read_run(&run_id.to_string_lossy())
+        .ok()
+        .flatten()
+        .filter(|run| run.status == "running")
+        .map(|run| PathBuf::from(run.workspace))
+}
+
+fn start_hosted_control_monitor(run_id: String) {
+    thread::spawn(move || {
+        let mut consecutive_errors = 0_u32;
+        loop {
+            thread::sleep(Duration::from_secs(3));
+            let Ok(Some(run)) = read_run(&run_id) else {
+                break;
+            };
+            if run.status != "running" {
+                break;
+            }
+            match crate::project_sync::poll_pause_command(Path::new(&run.workspace)) {
+                Ok(true) => {
+                    if let Err(error) = halt(&run) {
+                        eprintln!("  hosted pause note: {error:#}");
+                    }
+                    break;
+                }
+                Ok(false) => consecutive_errors = 0,
+                Err(error) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    if consecutive_errors == 1 || consecutive_errors.is_multiple_of(20) {
+                        eprintln!("  hosted pause poll note: {error:#}");
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn halt(original: &ActiveRun) -> Result<()> {
