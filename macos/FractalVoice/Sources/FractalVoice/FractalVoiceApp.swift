@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import Darwin
 import SwiftUI
 
 @main
@@ -12,6 +13,23 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
     private var observations = Set<AnyCancellable>()
 
     static func main() {
+        if ProcessInfo.processInfo.environment["FRACTAL_VOICE_SELF_TEST"] == "1" {
+            do {
+                guard let modelURL = BuildCoordinator.offlineModelURL(),
+                      BuildCoordinator.fractalExecutable() != nil else {
+                    throw OfflineSelfTestError.missingAssets
+                }
+                let recorder = try NativeVoiceRecorder(modelURL: modelURL)
+                recorder.close()
+                print("Fractal Voice offline runtime: ready")
+                exit(0)
+            } catch {
+                FileHandle.standardError.write(
+                    Data("Fractal Voice offline runtime: \(error)\n".utf8)
+                )
+                exit(1)
+            }
+        }
         let application = NSApplication.shared
         let delegate = FractalVoiceApp()
         application.delegate = delegate
@@ -65,7 +83,7 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         )
         toggle.keyEquivalentModifierMask = [.control, .option]
         toggle.target = self
-        toggle.isEnabled = coordinator.state != .building
+        toggle.isEnabled = ![.building, .preparing].contains(coordinator.state)
         menu.addItem(toggle)
 
         menu.addItem(item("Show Welcome", #selector(showOnboarding)))
@@ -139,6 +157,7 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         let symbol: String
         switch state {
         case .idle: symbol = "waveform.circle"
+        case .preparing: symbol = "sparkles"
         case .recording: symbol = "record.circle.fill"
         case .building: symbol = "hammer.circle.fill"
         case .failed: symbol = "exclamationmark.circle.fill"
@@ -148,4 +167,8 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
             accessibilityDescription: state.label
         )
     }
+}
+
+private enum OfflineSelfTestError: Error {
+    case missingAssets
 }

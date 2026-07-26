@@ -35,11 +35,8 @@ struct OnboardingView: View {
                     Button("Start using Fractal Voice", action: finish)
                         .keyboardShortcut(.defaultAction)
                 } else {
-                    Button("Install voice model") {
-                        coordinator.installVoiceModel()
-                    }
-                    .disabled(coordinator.state == .building)
-                    .keyboardShortcut(.defaultAction)
+                    Button("Loading offline voice engine…") {}
+                        .disabled(true)
                 }
             }
             .padding(20)
@@ -73,7 +70,7 @@ struct OnboardingView: View {
                     RoundedRectangle(cornerRadius: 16)
                         .stroke(Color.secondary.opacity(0.2))
                 )
-            Text("Moonshine transcribes locally on your Mac.")
+            Text("Moonshine and its voice model are included and run entirely on your Mac.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -107,13 +104,13 @@ struct OnboardingView: View {
                 Image(systemName: coordinator.voiceReady ? "checkmark.seal.fill" : "arrow.down.circle.fill")
                     .foregroundStyle(coordinator.voiceReady ? .green : .indigo)
                 Text(coordinator.voiceReady
-                    ? "Local voice model is ready."
+                    ? "Complete offline voice engine is ready."
                     : coordinator.latestActivity)
                     .font(.callout.weight(.medium))
             }
             .padding(12)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-            Text("Automatic voice builds are limited to fresh, reversible projects under ~/fractal-projects. Destructive and external actions remain blocked.")
+            Text("No model download, Python environment, account, or cloud transcription is required. Automatic voice builds are limited to fresh, reversible projects under ~/fractal-projects.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

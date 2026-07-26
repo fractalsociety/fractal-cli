@@ -104,6 +104,13 @@ The repository includes a lightweight native menu-bar companion under
 Press `⌃⌥Space` once to start local Moonshine recording, then press it again to
 stop and immediately begin the project.
 
+Unlike terminal voice setup, the macOS app is a complete offline distribution:
+it statically links the official `moonshine-swift` v0.0.73 runtime and bundles
+the English Moonshine v2 Medium Streaming model. A clean Mac needs no Python
+environment, model download, Moonshine account, or network connection for
+transcription. The model loads when recording begins and unloads after the
+transcript is finalized so the menu-bar app remains lightweight while idle.
+
 Each shortcut-triggered build receives a fresh workspace beneath
 `~/fractal-projects`. The companion automatically approves only reversible
 project creation in that managed location. Destructive requests and requests
@@ -114,6 +121,11 @@ Build the signed local app bundle and distributable archive:
 ```sh
 scripts/build-macos-app.sh
 ```
+
+The release builder reads verified model files from the CLI's existing cache.
+Set `FRACTAL_MOONSHINE_MODEL_DIR` to an equivalent model directory on a clean
+build machine. End users do not need this cache because the files are copied
+into the application bundle.
 
 Local builds receive an ad-hoc signature. Set `FRACTAL_CODESIGN_IDENTITY` to a
 Developer ID Application certificate when producing a public build; that
@@ -126,7 +138,8 @@ dist/Fractal Voice.app
 dist/FractalVoice-macOS.zip
 ```
 
-The app bundle contains the matching `fractal` binary, while Moonshine’s runtime
-and model remain in the shared `~/.fractal` cache. From the menu bar you can
-reopen onboarding, inspect activity, open generated projects, or stop all
-running Fractal builds.
+The app bundle contains the matching `fractal` binary, native runtime, model,
+and third-party license notice. From the menu bar you can reopen onboarding,
+inspect activity, open generated projects, or stop all running Fractal builds.
+Finalized text is sent over stdin to the managed-project ingest boundary; it is
+never interpolated into a command line.

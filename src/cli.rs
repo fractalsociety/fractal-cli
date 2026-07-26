@@ -310,6 +310,10 @@ pub(crate) struct IngestArgs {
     /// Trusted workspace in which the graph should execute (defaults to cwd).
     #[arg(long, value_name = "PATH")]
     pub(crate) repo: Option<PathBuf>,
+
+    /// Create a fresh managed workspace for the signed native macOS companion.
+    #[arg(long, hide = true, conflicts_with = "repo")]
+    pub(crate) managed_project: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -357,13 +361,6 @@ pub(crate) struct VoiceArgs {
     #[arg(long, default_value_t = DEFAULT_GRAPH_PORT)]
     pub(crate) port: u16,
 
-    /// Accept start/stop control from a trusted native companion over stdin.
-    #[arg(long, hide = true)]
-    pub(crate) app_control: bool,
-
-    /// Create and trust a fresh workspace under ~/fractal-projects.
-    #[arg(long, hide = true, conflicts_with = "repo")]
-    pub(crate) managed_project: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -797,17 +794,22 @@ mod tests {
                 ..
             }))
         ));
-        let companion =
-            Cli::try_parse_from(["fractal", "voice", "--app-control", "--managed-project"])
-                .unwrap();
+        let companion = Cli::try_parse_from([
+            "fractal",
+            "ingest",
+            "--source",
+            "fractal-mac-app",
+            "--stdin",
+            "--managed-project",
+        ])
+        .unwrap();
         assert!(matches!(
             companion.command,
-            Some(Command::Voice(VoiceArgs {
-                engine: VoiceEngine::Moonshine,
-                app_control: true,
+            Some(Command::Ingest(IngestArgs {
+                source,
                 managed_project: true,
                 ..
-            }))
+            })) if source == "fractal-mac-app"
         ));
     }
 

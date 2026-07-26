@@ -4,6 +4,7 @@ import UserNotifications
 
 enum VoiceState: Equatable {
     case idle
+    case preparing
     case recording
     case building
     case failed(String)
@@ -11,6 +12,7 @@ enum VoiceState: Equatable {
     var label: String {
         switch self {
         case .idle: return "Ready"
+        case .preparing: return "Starting voice engine…"
         case .recording: return "Listening…"
         case .building: return "Building…"
         case .failed(let message): return message
@@ -21,11 +23,11 @@ enum VoiceState: Equatable {
 @MainActor
 final class BuildCoordinator: ObservableObject {
     @Published private(set) var state: VoiceState = .idle
-    @Published private(set) var latestActivity = "Press ⌃⌥Space to speak"
+    @Published private(set) var latestActivity = "Checking bundled offline assets…"
     @Published private(set) var voiceReady = false
 
     private var process: Process?
-    private var input: FileHandle?
+    private var recorder: NativeVoiceRecorder?
     private var outputBuffer = ""
     private var hud: RecordingHUD?
 
@@ -35,17 +37,23 @@ final class BuildCoordinator: ObservableObject {
         .appendingPathComponent("Library/Logs/FractalVoice.log")
 
     init() {
-        checkVoiceReadiness()
         try? FileManager.default.createDirectory(
             at: projectsURL,
             withIntermediateDirectories: true
         )
+        voiceReady = Self.offlineModelURL() != nil && Self.fractalExecutable() != nil
+        latestActivity = voiceReady
+            ? "Press ⌃⌥Space to speak"
+            : "Offline assets are missing — reinstall Fractal Voice"
     }
 
     func toggleRecording() {
         switch state {
         case .idle, .failed:
             startRecording()
+        case .preparing:
+            NSSound.beep()
+            latestActivity = "The offline voice engine is still starting"
         case .recording:
             stopRecordingAndBuild()
         case .building:
@@ -56,14 +64,120 @@ final class BuildCoordinator: ObservableObject {
 
     func startRecording() {
         guard process == nil else { return }
-        guard let executable = Self.fractalExecutable() else {
-            state = .failed("Fractal CLI not found")
-            latestActivity = "Reinstall Fractal Voice or install the Fractal CLI"
+        guard voiceReady, let modelURL = Self.offlineModelURL() else {
+            state = .failed("Offline voice assets are not ready")
+            latestActivity = "Reinstall the complete Fractal Voice application"
             return
         }
-        guard voiceReady else {
-            state = .failed("Voice model needs setup")
-            latestActivity = "Open Welcome and install the local voice model"
+        if let recorder {
+            beginRecording(with: recorder)
+            return
+        }
+
+        state = .preparing
+        latestActivity = "Loading Moonshine v2 Medium locally…"
+        hud = RecordingHUD()
+        hud?.showPreparing()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let recorder = try NativeVoiceRecorder(modelURL: modelURL)
+                self?.configureCallbacks(for: recorder)
+                Task { @MainActor in
+                    self?.recorder = recorder
+                    self?.beginRecording(with: recorder)
+                }
+            } catch {
+                Task { @MainActor in
+                    self?.recordingFailed(error)
+                }
+            }
+        }
+    }
+
+    private func beginRecording(with recorder: NativeVoiceRecorder) {
+        do {
+            try recorder.start()
+            state = .recording
+            latestActivity = "Listening locally — press ⌃⌥Space again to build"
+            hud?.showListening()
+            NSSound(named: "Tink")?.play()
+        } catch {
+            state = .failed("Could not start microphone capture")
+            latestActivity = error.localizedDescription
+        }
+    }
+
+    func stopRecordingAndBuild() {
+        guard state == .recording, let recorder else { return }
+        state = .building
+        latestActivity = "Finishing the local transcript…"
+        hud?.showBuilding()
+        NSSound(named: "Pop")?.play()
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let transcript = try recorder.stop()
+                recorder.close()
+                Task { @MainActor in
+                    self?.recorder = nil
+                    self?.startBuild(transcript: transcript)
+                }
+            } catch {
+                Task { @MainActor in
+                    self?.recordingFailed(error)
+                }
+            }
+        }
+    }
+
+    func stopAllBuilds() {
+        guard let executable = Self.fractalExecutable() else { return }
+        let stop = Process()
+        stop.executableURL = executable
+        stop.arguments = ["stop", "--all"]
+        stop.environment = Self.processEnvironment()
+        try? stop.run()
+        latestActivity = "Stop requested for all Fractal builds"
+    }
+
+    func openProjects() {
+        try? FileManager.default.createDirectory(
+            at: projectsURL,
+            withIntermediateDirectories: true
+        )
+        NSWorkspace.shared.open(projectsURL)
+    }
+
+    func openLog() {
+        ensureLogParent()
+        if !FileManager.default.fileExists(atPath: logURL.path) {
+            FileManager.default.createFile(atPath: logURL.path, contents: Data())
+        }
+        NSWorkspace.shared.open(logURL)
+    }
+
+    nonisolated private func configureCallbacks(for recorder: NativeVoiceRecorder) {
+        recorder.onPartialTranscript = { [weak self] transcript in
+            guard !transcript.isEmpty else { return }
+            Task { @MainActor in
+                self?.latestActivity = transcript
+            }
+        }
+        recorder.onError = { [weak self] message in
+            Task { @MainActor in
+                self?.latestActivity = message
+            }
+        }
+    }
+
+    private func startBuild(transcript: String) {
+        let transcript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !transcript.isEmpty else {
+            recordingFailed(VoiceAppError.noSpeech)
+            return
+        }
+        guard let executable = Self.fractalExecutable() else {
+            recordingFailed(VoiceAppError.cliMissing)
             return
         }
 
@@ -71,7 +185,13 @@ final class BuildCoordinator: ObservableObject {
         let stdin = Pipe()
         let combinedOutput = Pipe()
         task.executableURL = executable
-        task.arguments = ["voice", "--app-control", "--managed-project"]
+        task.arguments = [
+            "ingest",
+            "--source", "fractal-mac-app",
+            "--format", "text",
+            "--stdin",
+            "--managed-project"
+        ]
         task.environment = Self.processEnvironment()
         task.standardInput = stdin
         task.standardOutput = combinedOutput
@@ -95,119 +215,22 @@ final class BuildCoordinator: ObservableObject {
         do {
             try task.run()
             process = task
-            input = stdin.fileHandleForWriting
-            state = .recording
-            latestActivity = "Listening locally — press ⌃⌥Space again to build"
-            hud = RecordingHUD()
-            hud?.show()
-            NSSound(named: "Tink")?.play()
+            stdin.fileHandleForWriting.write(Data(transcript.utf8))
+            try stdin.fileHandleForWriting.close()
+            latestActivity = "Instruction understood — creating the project…"
         } catch {
-            state = .failed("Could not start voice capture")
-            latestActivity = error.localizedDescription
+            recordingFailed(error)
         }
     }
 
-    func stopRecordingAndBuild() {
-        guard state == .recording, let input else { return }
-        input.write(Data("\n".utf8))
-        try? input.close()
-        self.input = nil
-        state = .building
-        latestActivity = "Transcribing locally, then starting your build…"
-        hud?.showBuilding()
-        NSSound(named: "Pop")?.play()
-    }
-
-    func stopAllBuilds() {
-        guard let executable = Self.fractalExecutable() else { return }
-        let stop = Process()
-        stop.executableURL = executable
-        stop.arguments = ["stop", "--all"]
-        stop.environment = Self.processEnvironment()
-        try? stop.run()
-        latestActivity = "Stop requested for all Fractal builds"
-    }
-
-    func installVoiceModel() {
-        guard process == nil, let executable = Self.fractalExecutable() else {
-            state = .failed("Fractal CLI not found")
-            return
-        }
-        let task = Process()
-        let output = Pipe()
-        task.executableURL = executable
-        task.arguments = ["voice", "setup"]
-        task.environment = Self.processEnvironment()
-        task.standardOutput = output
-        task.standardError = output
-        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            Task { @MainActor in
-                self?.consume(text)
-            }
-        }
-        task.terminationHandler = { [weak self] finished in
-            output.fileHandleForReading.readabilityHandler = nil
-            Task { @MainActor in
-                self?.process = nil
-                self?.voiceReady = finished.terminationStatus == 0
-                self?.state = finished.terminationStatus == 0
-                    ? .idle
-                    : .failed("Voice setup failed")
-                self?.latestActivity = finished.terminationStatus == 0
-                    ? "Voice is ready — press ⌃⌥Space"
-                    : "See the Fractal Voice log for setup details"
-            }
-        }
-        do {
-            try task.run()
-            process = task
-            state = .building
-            latestActivity = "Installing the private on-device voice model…"
-        } catch {
-            state = .failed("Could not start voice setup")
-            latestActivity = error.localizedDescription
-        }
-    }
-
-    func checkVoiceReadiness() {
-        guard let executable = Self.fractalExecutable() else {
-            voiceReady = false
-            return
-        }
-        let task = Process()
-        let output = Pipe()
-        task.executableURL = executable
-        task.arguments = ["voice", "engines"]
-        task.environment = Self.processEnvironment()
-        task.standardOutput = output
-        task.standardError = output
-        do {
-            try task.run()
-            task.waitUntilExit()
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            let text = String(data: data, encoding: .utf8) ?? ""
-            voiceReady = task.terminationStatus == 0 && text.contains("moonshine") && text.contains("ready")
-        } catch {
-            voiceReady = false
-        }
-    }
-
-    func openProjects() {
-        try? FileManager.default.createDirectory(
-            at: projectsURL,
-            withIntermediateDirectories: true
-        )
-        NSWorkspace.shared.open(projectsURL)
-    }
-
-    func openLog() {
-        ensureLogParent()
-        if !FileManager.default.fileExists(atPath: logURL.path) {
-            FileManager.default.createFile(atPath: logURL.path, contents: Data())
-        }
-        NSWorkspace.shared.open(logURL)
+    private func recordingFailed(_ error: Error) {
+        process = nil
+        recorder?.close()
+        recorder = nil
+        hud?.close()
+        hud = nil
+        state = .failed("Voice command stopped")
+        latestActivity = error.localizedDescription
     }
 
     private func consume(_ text: String) {
@@ -229,7 +252,6 @@ final class BuildCoordinator: ObservableObject {
 
     private func finished(exitCode: Int32) {
         process = nil
-        input = nil
         hud?.close()
         hud = nil
         if exitCode == 0 {
@@ -285,6 +307,27 @@ final class BuildCoordinator: ObservableObject {
         )
     }
 
+    nonisolated static func offlineModelURL() -> URL? {
+        guard let model = Bundle.main.resourceURL?
+            .appendingPathComponent("MoonshineModels/medium-streaming-en", isDirectory: true)
+        else {
+            return nil
+        }
+        let required = [
+            "adapter.ort",
+            "cross_kv.ort",
+            "decoder_kv.ort",
+            "decoder_kv_with_attention.ort",
+            "encoder.ort",
+            "frontend.ort",
+            "streaming_config.json",
+            "tokenizer.bin"
+        ]
+        return required.allSatisfy {
+            FileManager.default.fileExists(atPath: model.appendingPathComponent($0).path)
+        } ? model : nil
+    }
+
     nonisolated static func fractalExecutable() -> URL? {
         let fileManager = FileManager.default
         let bundled = Bundle.main.resourceURL?.appendingPathComponent("fractal")
@@ -312,5 +355,17 @@ final class BuildCoordinator: ObservableObject {
         environment["PATH"] = additions.joined(separator: ":")
         environment["HOME"] = home
         return environment
+    }
+}
+
+private enum VoiceAppError: LocalizedError {
+    case noSpeech
+    case cliMissing
+
+    var errorDescription: String? {
+        switch self {
+        case .noSpeech: return "No speech was detected. Press the shortcut and try again."
+        case .cliMissing: return "The bundled Fractal CLI is missing."
+        }
     }
 }

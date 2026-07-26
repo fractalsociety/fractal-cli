@@ -12,4 +12,8 @@ final class FractalVoiceTests: XCTestCase {
         XCTAssertTrue(path.contains(".local/bin"))
         XCTAssertTrue(path.contains("/opt/homebrew/bin"))
     }
+
+    func testPreparingStateExplainsNativeEngineStartup() {
+        XCTAssertEqual(VoiceState.preparing.label, "Starting voice engine…")
+    }
 }

@@ -69,12 +69,15 @@ pub(crate) fn run(
     coordinate: bool,
 ) -> Result<()> {
     let event = read_event(args)?;
+    if args.managed_project && !managed_project_source_allowed(&event.source) {
+        bail!("managed project ingest is reserved for the native Fractal Voice app");
+    }
     process_event(
         event,
         EventOptions {
             preview: args.preview,
             confirm: args.confirm,
-            managed_project: false,
+            managed_project: args.managed_project,
             repo: args.repo.as_deref(),
             port: args.port,
             fractalwork_override,
@@ -116,7 +119,7 @@ pub(crate) fn run_voice_transcript(
         EventOptions {
             preview: args.preview,
             confirm: args.confirm,
-            managed_project: args.managed_project,
+            managed_project: false,
             repo: args.repo.as_deref(),
             port: args.port,
             fractalwork_override,
@@ -201,7 +204,7 @@ fn process_event(event: InputEvent, options: EventOptions<'_>) -> Result<()> {
     }
 
     let managed_workspace = if options.managed_project {
-        if matches!(risk, Risk::Destructive | Risk::ExternalSideEffect) {
+        if !managed_project_risk_allowed(risk) {
             bail!(
                 "{risk} voice input cannot run automatically from the Fractal Voice app; \
                  review and run it from a terminal"
@@ -249,6 +252,14 @@ fn process_event(event: InputEvent, options: EventOptions<'_>) -> Result<()> {
         options.port,
     )
     .map(|_| ())
+}
+
+fn managed_project_source_allowed(source: &str) -> bool {
+    source == "fractal-mac-app"
+}
+
+fn managed_project_risk_allowed(risk: Risk) -> bool {
+    matches!(risk, Risk::ReadOnly | Risk::ReversibleWrite)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -632,6 +643,15 @@ mod tests {
         );
         assert_eq!(classify_risk("Review email regressions"), Risk::ReadOnly);
         assert_eq!(classify_risk("Do the thing"), Risk::ReversibleWrite);
+    }
+
+    #[test]
+    fn native_companion_boundary_is_source_and_risk_scoped() {
+        assert!(managed_project_source_allowed("fractal-mac-app"));
+        assert!(!managed_project_source_allowed("terminal"));
+        assert!(managed_project_risk_allowed(Risk::ReversibleWrite));
+        assert!(!managed_project_risk_allowed(Risk::Destructive));
+        assert!(!managed_project_risk_allowed(Risk::ExternalSideEffect));
     }
 
     #[test]

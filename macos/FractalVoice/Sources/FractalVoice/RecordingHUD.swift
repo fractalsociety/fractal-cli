@@ -22,14 +22,18 @@ final class RecordingHUD {
         window.contentView = NSHostingView(rootView: content)
     }
 
-    func show() {
-        model.isBuilding = false
+    func showPreparing() {
+        model.phase = .preparing
         position()
         window.orderFrontRegardless()
     }
 
+    func showListening() {
+        model.phase = .listening
+    }
+
     func showBuilding() {
-        model.isBuilding = true
+        model.phase = .building
     }
 
     func close() {
@@ -48,7 +52,13 @@ final class RecordingHUD {
 
 @MainActor
 private final class HUDModel: ObservableObject {
-    @Published var isBuilding = false
+    @Published var phase: HUDPhase = .preparing
+}
+
+private enum HUDPhase {
+    case preparing
+    case listening
+    case building
 }
 
 private struct RecordingHUDView: View {
@@ -59,16 +69,16 @@ private struct RecordingHUDView: View {
         HStack(spacing: 16) {
             ZStack {
                 Circle()
-                    .fill(model.isBuilding ? Color.indigo.opacity(0.2) : Color.red.opacity(0.18))
+                    .fill(accent.opacity(0.18))
                     .frame(width: pulse ? 50 : 38, height: pulse ? 50 : 38)
-                Image(systemName: model.isBuilding ? "hammer.fill" : "waveform")
+                Image(systemName: icon)
                     .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(model.isBuilding ? .indigo : .red)
+                    .foregroundStyle(accent)
             }
             VStack(alignment: .leading, spacing: 4) {
-                Text(model.isBuilding ? "Starting your build" : "Fractal is listening")
+                Text(title)
                     .font(.headline)
-                Text(model.isBuilding ? "Transcribing locally…" : "Press ⌃⌥Space again to stop")
+                Text(detail)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -86,6 +96,34 @@ private struct RecordingHUDView: View {
             withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
                 pulse = true
             }
+        }
+    }
+
+    private var accent: Color {
+        model.phase == .listening ? .red : .indigo
+    }
+
+    private var icon: String {
+        switch model.phase {
+        case .preparing: return "sparkles"
+        case .listening: return "waveform"
+        case .building: return "hammer.fill"
+        }
+    }
+
+    private var title: String {
+        switch model.phase {
+        case .preparing: return "Starting offline voice"
+        case .listening: return "Fractal is listening"
+        case .building: return "Starting your build"
+        }
+    }
+
+    private var detail: String {
+        switch model.phase {
+        case .preparing: return "Loading Moonshine v2 Medium…"
+        case .listening: return "Press ⌃⌥Space again to stop"
+        case .building: return "Finishing the local transcript…"
         }
     }
 }
