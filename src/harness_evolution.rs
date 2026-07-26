@@ -229,20 +229,18 @@ pub(crate) fn evolve(
                 apply_repair(graph, current_hash, failed_node)?
             }
         },
-        ARM_DIFFERENTIATE => {
-            match apply_differentiate(graph, current_hash, failed_node, attempt) {
-                Ok(result) => result,
-                Err(error) => {
-                    eprintln!("  ⟳ differentiate not applicable ({error:#}); falling back to repair");
-                    arm = ARM_REPAIR.to_owned();
-                    apply_repair(graph, current_hash, failed_node)?
-                }
+        ARM_DIFFERENTIATE => match apply_differentiate(graph, current_hash, failed_node, attempt) {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("  ⟳ differentiate not applicable ({error:#}); falling back to repair");
+                arm = ARM_REPAIR.to_owned();
+                apply_repair(graph, current_hash, failed_node)?
             }
-        }
+        },
         _ => apply_repair(graph, current_hash, failed_node)?,
     };
 
-    let child_hash = commit_child(result.child_graph.clone())?;
+    let (child_hash, child_graph) = commit_child(result.child_graph.clone())?;
 
     // If the child came from a genuine genome recompile, persist its source so a
     // subsequent evolution can mutate + recompile the child harness too.
@@ -267,7 +265,7 @@ pub(crate) fn evolve(
 
     Ok(Evolution {
         child_hash,
-        child_graph: result.child_graph,
+        child_graph,
         arm,
         context_bp,
         cause,
@@ -291,8 +289,10 @@ fn grow_source_without_verify(graph: &Value) -> Option<String> {
         .flatten()
         .filter_map(|node| node.get("id").and_then(Value::as_str).map(str::to_owned))
         .collect();
-    let has_verify_child =
-        |id: &str| ids.iter().any(|other| other.starts_with(&format!("verify.{id}.")));
+    let has_verify_child = |id: &str| {
+        ids.iter()
+            .any(|other| other.starts_with(&format!("verify.{id}.")))
+    };
     graph
         .get("nodes")
         .and_then(Value::as_array)?
@@ -450,7 +450,7 @@ pub(crate) fn grow_proactive(
         },
     )?;
 
-    let child_hash = commit_child(result.child_graph.clone())?;
+    let (child_hash, child_graph) = commit_child(result.child_graph.clone())?;
     if let Some((harness, work, target_id)) = &result.recompiled_source {
         graph_store::persist_source(&child_hash, harness, work, target_id).ok();
     }
@@ -469,7 +469,7 @@ pub(crate) fn grow_proactive(
 
     Ok(Evolution {
         child_hash,
-        child_graph: result.child_graph,
+        child_graph,
         arm: ARM_GROW.to_owned(),
         context_bp: context_features(cause_index("harness"), 0),
         cause: "progress".to_owned(),
@@ -1284,7 +1284,13 @@ fn stamp_lineage(child: &mut Value, parent_hash: &str, arm: &str) {
 
 /// Recompute the content hash (canonical over the graph minus `graph_hash`) and
 /// commit the child graph to the store.
-fn commit_child(mut child: Value) -> Result<String> {
+fn commit_child(mut child: Value) -> Result<(String, Value)> {
+    stamp_child_hash(&mut child)?;
+    let record = graph_store::commit_graph(&child)?;
+    Ok((record.graph_hash, child))
+}
+
+fn stamp_child_hash(child: &mut Value) -> Result<String> {
     let mut hash_input = child
         .as_object()
         .cloned()
@@ -1292,7 +1298,25 @@ fn commit_child(mut child: Value) -> Result<String> {
     hash_input.remove("graph_hash");
     let graph_hash = fractal_contracts::canonical_sha256(&Value::Object(hash_input))
         .map_err(|error| anyhow!("child graph hashing failed: {error}"))?;
-    child["graph_hash"] = json!(graph_hash);
-    let record = graph_store::commit_graph(&child)?;
-    Ok(record.graph_hash)
+    child["graph_hash"] = json!(&graph_hash);
+    Ok(graph_hash)
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::*;
+
+    #[test]
+    fn committed_child_value_carries_its_recomputed_hash() {
+        let mut child = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_hash": "sha256:stale-parent-hash",
+            "parent_graph": "sha256:parent",
+            "nodes": [{"id": "verify.new", "capability": "project.tests.execute"}],
+            "edges": []
+        });
+        let hash = stamp_child_hash(&mut child).unwrap();
+        assert_eq!(child["graph_hash"].as_str(), Some(hash.as_str()));
+        crate::graph_store::verify_graph_document(&child).unwrap();
+    }
 }

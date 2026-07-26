@@ -6,8 +6,12 @@
 //! least one model-verifier verdict must all be present. A failing suite fails
 //! the hidden-regression floor and denies completion.
 
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
@@ -55,7 +59,18 @@ fn xcode_test_command(workspace: &Path) -> Option<Command> {
         .args(["-scheme", &scheme])
         .arg("-destination")
         .arg(format!("platform=iOS Simulator,name={simulator}"))
-        .args(["CODE_SIGNING_ALLOWED=NO", "test"]);
+        .args([
+            "-destination-timeout",
+            "60",
+            "-test-timeouts-enabled",
+            "YES",
+            "-default-test-execution-time-allowance",
+            "60",
+            "-maximum-test-execution-time-allowance",
+            "120",
+            "CODE_SIGNING_ALLOWED=NO",
+            "test",
+        ]);
     Some(command)
 }
 
@@ -69,6 +84,71 @@ pub(crate) struct FloorVerdict {
 struct SuiteRun {
     ok: bool,
     output_hash: String,
+    timed_out: bool,
+}
+
+fn verify_timeout_ms() -> u64 {
+    std::env::var("FRACTAL_VERIFY_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(300_000)
+}
+
+/// Capture a verifier without allowing XCTest, a package manager, or a test
+/// runner to hold the entire execution graph forever. Output is drained on
+/// background readers so verbose builds cannot deadlock on full pipe buffers.
+fn run_bounded(command: &mut Command, timeout_ms: u64) -> Result<SuiteRun> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn()?;
+    let worker = crate::run_control::WorkerGuard::register(child.id());
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(ref mut stream) = stdout {
+            let _ = stream.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(ref mut stream) = stderr {
+            let _ = stream.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let (ok, timed_out) = loop {
+        if let Some(status) = child.try_wait()? {
+            break (status.success(), false);
+        }
+        if Instant::now() >= deadline {
+            crate::run_control::terminate_worker(child.id());
+            let _ = child.wait();
+            break (false, true);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    drop(worker);
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(&stdout);
+    hasher.update(&stderr);
+    let mut output_hash = String::from("sha256:");
+    for byte in hasher.finalize() {
+        output_hash.push_str(&format!("{byte:02x}"));
+    }
+    Ok(SuiteRun {
+        ok,
+        output_hash,
+        timed_out,
+    })
 }
 
 /// Build the command that runs a Python project's suite for real. Preference:
@@ -163,20 +243,8 @@ fn run_suite(workspace: &Path) -> Result<Option<SuiteRun>> {
         return Ok(None);
     };
 
-    match command.current_dir(workspace).output() {
-        Ok(output) => {
-            let mut hasher = Sha256::new();
-            hasher.update(&output.stdout);
-            hasher.update(&output.stderr);
-            let mut output_hash = String::from("sha256:");
-            for byte in hasher.finalize() {
-                output_hash.push_str(&format!("{byte:02x}"));
-            }
-            Ok(Some(SuiteRun {
-                ok: output.status.success(),
-                output_hash,
-            }))
-        }
+    match run_bounded(command.current_dir(workspace), verify_timeout_ms()) {
+        Ok(run) => Ok(Some(run)),
         // The runner itself could not launch — unverifiable, not a failure.
         Err(_) => Ok(None),
     }
@@ -250,12 +318,32 @@ pub(crate) fn evaluate_workspace(
             detail: format!("evidence floor denied completion: {missing:?}"),
         },
     };
-    Ok(Some(verdict))
+    Ok(Some(if run.timed_out {
+        FloorVerdict {
+            complete: false,
+            detail: format!(
+                "verification timed out after {}s; process group terminated",
+                verify_timeout_ms() / 1000
+            ),
+        }
+    } else {
+        verdict
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn verifier_processes_have_a_hard_timeout() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 2"]);
+        let run = run_bounded(&mut command, 50).unwrap();
+        assert!(!run.ok);
+        assert!(run.timed_out);
+    }
 
     #[test]
     fn xcode_project_selects_native_simulator_test_runner() {

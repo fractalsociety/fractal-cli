@@ -237,13 +237,6 @@ pub(crate) fn run_supervised(
     let mut grown: BTreeSet<String> = BTreeSet::new();
     let mut midrun = 0u32;
     let min_hops = min_verify_hops();
-    // Native/compiled projects (iOS/Swift, SwiftPM) cannot be verified mid-build —
-    // the whole project must compile before any test runs, so a proactive graft
-    // that runs `xcodebuild test` on a half-written project always fails and turns
-    // the board red. Skip proactive grafts for them; the final acceptance gate
-    // verifies once everything is in place.
-    let native = native_project(workspace);
-
     loop {
         let frontier = execute::ready_frontier(&graph, &completed);
         if frontier.is_empty() {
@@ -280,12 +273,19 @@ pub(crate) fn run_supervised(
         }
 
         // ── Mid-run morphogenesis: read this wave's progress signals ──
-        if midrun >= MAX_MIDRUN || native {
+        // Re-detect this after every wave: a generated iOS project starts in an
+        // empty directory and only becomes recognizably native after XcodeGen or
+        // SwiftPM files are written. A one-time check at startup incorrectly
+        // grafted several full xcodebuild suites into half-built applications.
+        if midrun >= MAX_MIDRUN || native_project(workspace) {
             continue;
         }
         let nodes_now = all_node_ids(&graph);
-        let has_verify_child =
-            |id: &str| nodes_now.iter().any(|other| other.starts_with(&format!("verify.{id}.")));
+        let has_verify_child = |id: &str| {
+            nodes_now
+                .iter()
+                .any(|other| other.starts_with(&format!("verify.{id}.")))
+        };
         // Value-of-grafting: only graft a verification if it is genuinely worth it
         // — the node has dependent work at risk AND its output is not already
         // checked for at least `min_hops` steps (so an early check catches a defect
@@ -329,6 +329,15 @@ pub(crate) fn run_supervised(
                     &evolution,
                     midrun,
                 );
+
+                if let Err(error) =
+                    crate::project_file::persist_evolved(workspace, &evolution.child_graph)
+                {
+                    eprintln!("  project graph note: {error:#}");
+                } else {
+                    crate::project_sync::maybe_sync_runtime(workspace);
+                }
+                crate::run_control::set_graph(&evolution.child_hash, board.unwrap_or_default());
 
                 // Board follows the adapted graph immediately.
                 if let Some(url) = board {
@@ -548,7 +557,10 @@ mod tests {
             "edges":[{"from":"x","to":"y"}]
         });
         let none: BTreeSet<String> = BTreeSet::new();
-        assert_eq!(hops_to_nearest_pending_verifier(&g, "x", &none), NO_DOWNSTREAM_VERIFIER);
+        assert_eq!(
+            hops_to_nearest_pending_verifier(&g, "x", &none),
+            NO_DOWNSTREAM_VERIFIER
+        );
     }
 
     #[test]

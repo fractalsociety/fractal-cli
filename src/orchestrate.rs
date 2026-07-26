@@ -257,6 +257,10 @@ pub(crate) fn run_end_to_end(
             } else {
                 let _ = crate::project_sync::maybe_sync(workspace);
             }
+            crate::run_control::set_graph(
+                &evolution.child_hash,
+                board.unwrap_or_default(),
+            );
 
             // Board follows the evolution: re-point the live board to the child
             // graph so the grown / differentiated / repaired tasks appear on the

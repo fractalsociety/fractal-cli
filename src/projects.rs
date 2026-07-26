@@ -93,8 +93,10 @@ pub(crate) fn by_number(number: u32) -> Option<Project> {
 /// Backfill the registry from any resumable checkpoints not yet numbered — so
 /// projects started before the registry existed still get stable numbers.
 pub(crate) fn sync() {
-    let known: std::collections::BTreeSet<String> =
-        load().into_iter().map(|project| project.workspace).collect();
+    let known: std::collections::BTreeSet<String> = load()
+        .into_iter()
+        .map(|project| project.workspace)
+        .collect();
     for cp in crate::checkpoint::list_resumable() {
         if !known.contains(&cp.workspace) {
             register(Path::new(&cp.workspace));
@@ -138,7 +140,10 @@ mod tests {
         assert_eq!(parse_resume_command("continue project 2"), Some(2));
         assert_eq!(parse_resume_command("pick up project #7 please"), Some(7));
         // Not resume commands:
-        assert_eq!(parse_resume_command("build an expense tracker with 3 tabs"), None);
+        assert_eq!(
+            parse_resume_command("build an expense tracker with 3 tabs"),
+            None
+        );
         assert_eq!(parse_resume_command("resume the workout"), None); // no number/#
         assert_eq!(parse_resume_command("make project alpha"), None); // no resume verb
     }
