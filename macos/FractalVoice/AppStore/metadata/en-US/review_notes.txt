@@ -1,0 +1,7 @@
+Fractal Voice is a menu-bar developer tool.
+
+First launch downloads local speech models and then guides the reviewer through Fractal Society, Git, and coding-agent setup. Microphone access is requested only when the reviewer starts recording.
+
+App Review will need a working review account and a supported coding-agent CLI. Add the review credentials and exact test workflow in App Store Connect; do not commit credentials to this repository.
+
+The app creates source-code projects and invokes user-configured developer tools. Its App Sandbox implementation must be completed and validated before this build is submitted.

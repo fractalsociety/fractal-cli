@@ -1,0 +1,16 @@
+Fractal Voice turns a spoken software idea into an organized build.
+
+Hold Option–Space, describe what you want to create, confirm the transcription, and name the project. Fractal creates a structured execution graph, coordinates your configured coding agents, and shows live progress while they work.
+
+Voice transcription and spoken confirmations run locally after the optional model download. Fractal Voice verifies every model file before using it.
+
+Features:
+• Conversational voice project setup
+• Local speech recognition and text-to-speech
+• Structured PRD and execution graph generation
+• Live task and agent progress
+• Stop and restart controls
+• Fractal Society project sharing
+• Git-based project history
+
+Fractal Voice requires a Fractal Society account, Git, and at least one supported coding-agent CLI.

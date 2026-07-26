@@ -16,6 +16,8 @@
     <string>Fractal Voice</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
     <key>CFBundleShortVersionString</key>
 	<string>0.9.0</string>
     <key>CFBundleVersion</key>
@@ -28,5 +30,7 @@
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Fractal Voice uses your microphone to transcribe spoken project instructions locally on your Mac.</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 ACFI LLC. All rights reserved.</string>
 </dict>
 </plist>

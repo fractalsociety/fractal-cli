@@ -38,6 +38,7 @@ mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$(dirname "$LLAMA_DEST")"
 cp "$XCODE_PRODUCTS/FractalVoice" "$CONTENTS/MacOS/FractalVoice"
 cp "$ROOT/target/release/fractal" "$CONTENTS/Resources/fractal"
 cp "$PACKAGE/Info.plist" "$CONTENTS/Info.plist"
+cp "$PACKAGE/PrivacyInfo.xcprivacy" "$CONTENTS/Resources/PrivacyInfo.xcprivacy"
 cp "$PACKAGE/THIRD_PARTY_NOTICES.txt" "$CONTENTS/Resources/THIRD_PARTY_NOTICES.txt"
 if [[ ! -x "$LLAMA_CLI" ]]; then
   echo "Missing Granite inference engine: $LLAMA_CLI" >&2
@@ -71,16 +72,25 @@ for resource_bundle in "$XCODE_PRODUCTS"/*.bundle; do
 done
 
 SIGNING_IDENTITY="${FRACTAL_CODESIGN_IDENTITY:--}"
+MAIN_ENTITLEMENTS="${FRACTAL_CODESIGN_MAIN_ENTITLEMENTS:-}"
+CHILD_ENTITLEMENTS="${FRACTAL_CODESIGN_CHILD_ENTITLEMENTS:-}"
 if [[ "$SIGNING_IDENTITY" == "-" ]]; then
   codesign --force --deep --sign - "$APP"
 else
-  codesign \
-    --force \
-    --deep \
-    --options runtime \
-    --timestamp \
-    --sign "$SIGNING_IDENTITY" \
-    "$APP"
+  while IFS= read -r -d '' executable; do
+    if file "$executable" | grep -q 'Mach-O'; then
+      sign_args=(--force --options runtime --timestamp --sign "$SIGNING_IDENTITY")
+      if [[ "$executable" == "$CONTENTS/MacOS/FractalVoice" ]]; then
+        [[ -z "$MAIN_ENTITLEMENTS" ]] || sign_args+=(--entitlements "$MAIN_ENTITLEMENTS")
+      else
+        [[ -z "$CHILD_ENTITLEMENTS" ]] || sign_args+=(--entitlements "$CHILD_ENTITLEMENTS")
+      fi
+      codesign "${sign_args[@]}" "$executable"
+    fi
+  done < <(find "$CONTENTS" -type f -perm -111 -print0)
+  app_sign_args=(--force --options runtime --timestamp --sign "$SIGNING_IDENTITY")
+  [[ -z "$MAIN_ENTITLEMENTS" ]] || app_sign_args+=(--entitlements "$MAIN_ENTITLEMENTS")
+  codesign "${app_sign_args[@]}" "$APP"
 fi
 
 cd "$DIST"
