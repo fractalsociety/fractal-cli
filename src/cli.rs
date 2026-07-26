@@ -314,6 +314,10 @@ pub(crate) struct IngestArgs {
     /// Create a fresh managed workspace for the signed native macOS companion.
     #[arg(long, hide = true, conflicts_with = "repo")]
     pub(crate) managed_project: bool,
+
+    /// Confirmed display name for a native managed project.
+    #[arg(long, hide = true, requires = "managed_project", value_name = "NAME")]
+    pub(crate) project_name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -801,6 +805,8 @@ mod tests {
             "fractal-mac-app",
             "--stdin",
             "--managed-project",
+            "--project-name",
+            "Pocket Ledger",
         ])
         .unwrap();
         assert!(matches!(
@@ -808,8 +814,9 @@ mod tests {
             Some(Command::Ingest(IngestArgs {
                 source,
                 managed_project: true,
+                project_name: Some(project_name),
                 ..
-            })) if source == "fractal-mac-app"
+            })) if source == "fractal-mac-app" && project_name == "Pocket Ledger"
         ));
     }
 

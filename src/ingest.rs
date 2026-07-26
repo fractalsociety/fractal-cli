@@ -78,6 +78,7 @@ pub(crate) fn run(
             preview: args.preview,
             confirm: args.confirm,
             managed_project: args.managed_project,
+            project_name: args.project_name.as_deref(),
             repo: args.repo.as_deref(),
             port: args.port,
             fractalwork_override,
@@ -120,6 +121,7 @@ pub(crate) fn run_voice_transcript(
             preview: args.preview,
             confirm: args.confirm,
             managed_project: false,
+            project_name: None,
             repo: args.repo.as_deref(),
             port: args.port,
             fractalwork_override,
@@ -132,6 +134,7 @@ struct EventOptions<'a> {
     preview: bool,
     confirm: bool,
     managed_project: bool,
+    project_name: Option<&'a str>,
     repo: Option<&'a Path>,
     port: u16,
     fractalwork_override: Option<&'a Path>,
@@ -210,7 +213,11 @@ fn process_event(event: InputEvent, options: EventOptions<'_>) -> Result<()> {
                  review and run it from a terminal"
             );
         }
+        crate::project_sync::ensure_new_project_name_available(
+            options.project_name.unwrap_or(&event.content),
+        )?;
         Some(crate::interactive::prepare_managed_voice_workspace(
+            options.project_name.unwrap_or(&event.content),
             &event.content,
         )?)
     } else {

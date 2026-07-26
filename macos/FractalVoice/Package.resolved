@@ -1,13 +1,40 @@
 {
-  "originHash" : "f53b615e03d1623057a926d6749fea548f0c8bfc465497ee1e504791dbc60f25",
+  "originHash" : "377b785c80abdafa5f750ea9270a07e1981bc85434384f8034d5388c1546714f",
   "pins" : [
     {
-      "identity" : "moonshine-swift",
+      "identity" : "mlx-swift",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/moonshine-ai/moonshine-swift.git",
+      "location" : "https://github.com/ml-explore/mlx-swift",
       "state" : {
-        "revision" : "16c4f059a3758671903907e92587fa69246ce8d7",
-        "version" : "0.0.73"
+        "revision" : "61b9e011e09a62b489f6bd647958f1555bdf2896",
+        "version" : "0.31.3"
+      }
+    },
+    {
+      "identity" : "mlxutilslibrary",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/mlalma/MLXUtilsLibrary.git",
+      "state" : {
+        "revision" : "41f6cfd5d68b65aa3c65a34efe3b71c371ed915b",
+        "version" : "0.0.6"
+      }
+    },
+    {
+      "identity" : "swift-numerics",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-numerics",
+      "state" : {
+        "revision" : "0c0290ff6b24942dadb83a929ffaaa1481df04a2",
+        "version" : "1.1.1"
+      }
+    },
+    {
+      "identity" : "zipfoundation",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/weichsel/ZIPFoundation.git",
+      "state" : {
+        "revision" : "22787ffb59de99e5dc1fbfe80b19c97a904ad48d",
+        "version" : "0.9.20"
       }
     }
   ],

@@ -1,6 +1,8 @@
 /target/
 /crates/fractal-chain/target/
 /macos/FractalVoice/.build/
+/macos/FractalVoice/.xcode-build/
 /dist/
 *.tmp
+*.profraw
 .DS_Store

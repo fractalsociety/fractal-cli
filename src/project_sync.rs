@@ -70,6 +70,7 @@ enum PutFailure {
 }
 
 static UPLOAD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+pub(crate) const PROJECT_NAME_TAKEN_MARKER: &str = "FRACTAL_PROJECT_NAME_TAKEN";
 
 fn preference_path(workspace: &Path) -> PathBuf {
     workspace.join(".fractal").join("sync.json")
@@ -134,6 +135,39 @@ pub(crate) fn maybe_sync(workspace: &Path) -> Option<String> {
 /// The full graph performs the normal GitHub sync after planning completes.
 pub(crate) fn maybe_sync_planning(workspace: &Path) -> Option<String> {
     maybe_sync_with_options(workspace, false)
+}
+
+/// Refuse to start a new managed voice project when its profile URL already
+/// belongs to another project. A missing Fractal Society login means there is
+/// no profile publication to collide with, so local-only builds remain valid.
+pub(crate) fn ensure_new_project_name_available(name: &str) -> Result<()> {
+    if std::env::var_os("FRACTAL_OFFLINE").is_some() {
+        return Ok(());
+    }
+    let session = match crate::auth::load_session() {
+        Ok(session) => session,
+        Err(_) => return Ok(()),
+    };
+    let slug = crate::project_file::slug_from(name);
+    let endpoint = format!(
+        "{}/api/cli/projects/{slug}",
+        session.server.trim_end_matches('/')
+    );
+    match ureq::get(&endpoint)
+        .set("Authorization", &format!("Bearer {}", session.access_token))
+        .timeout(std::time::Duration::from_secs(5))
+        .call()
+    {
+        Ok(_) => bail!("{PROJECT_NAME_TAKEN_MARKER}:{slug}"),
+        Err(ureq::Error::Status(404, _)) => Ok(()),
+        Err(ureq::Error::Status(status, response)) => bail!(
+            "check project-name availability failed with HTTP {status}: {}",
+            remote_error_message(response)
+        ),
+        Err(error) => {
+            Err(anyhow::anyhow!(error)).context("check Fractal Society project-name availability")
+        }
+    }
 }
 
 /// Coalesce a node checkout/completion into the authenticated cloud graph
@@ -303,33 +337,11 @@ fn upload(workspace: &Path, repository: Option<&RepositoryLink>) -> Result<SyncR
         prior_hash.as_deref(),
     ) {
         Ok(response) => response,
-        Err(PutFailure::Status(428, response)) if prior_hash.is_none() => {
-            let current_hash =
-                fetch_remote_hash(&endpoint, &session.access_token).with_context(|| {
-                    format!(
-                        "bootstrap remote state after server required an update precondition: {}",
-                        remote_error_message(*response)
-                    )
-                })?;
-            match put_project(
-                &endpoint,
-                &session.access_token,
-                &encoded,
-                Some(&current_hash),
-            ) {
-                Ok(response) => response,
-                Err(PutFailure::Status(409, response)) => {
-                    bail!("project sync conflict: {}", remote_error_message(*response))
-                }
-                Err(PutFailure::Status(status, response)) => bail!(
-                    "retry project graph upload failed with HTTP {status}: {}",
-                    remote_error_message(*response)
-                ),
-                Err(PutFailure::Transport(error)) => {
-                    return Err(error).context("retry project graph upload")
-                }
-            }
-        }
+        Err(PutFailure::Status(409 | 412 | 428, response)) if prior_hash.is_none() => bail!(
+            "{PROJECT_NAME_TAKEN_MARKER}:{} ({})",
+            document.project.slug,
+            remote_error_message(*response)
+        ),
         Err(PutFailure::Status(409, response)) => {
             bail!("project sync conflict: {}", remote_error_message(*response))
         }
@@ -620,6 +632,10 @@ fn put_project(
         .set("Content-Type", "application/json");
     if let Some(hash) = if_match {
         request = request.set("If-Match", hash);
+    } else {
+        // Creation is create-only. Standards-compliant servers reject this PUT
+        // if another project claimed the slug after the preflight check.
+        request = request.set("If-None-Match", "*");
     }
     match request.send_string(body) {
         Ok(response) => Ok(response),
@@ -628,18 +644,6 @@ fn put_project(
         }
         Err(error) => Err(PutFailure::Transport(error.into())),
     }
-}
-
-fn fetch_remote_hash(endpoint: &str, access_token: &str) -> Result<String> {
-    let response = ureq::get(endpoint)
-        .set("Authorization", &format!("Bearer {access_token}"))
-        .call()
-        .context("fetch current remote project")?;
-    let etag = response
-        .header("ETag")
-        .and_then(parse_etag)
-        .context("remote project response is missing a valid ETag")?;
-    Ok(etag)
 }
 
 fn parse_etag(raw: &str) -> Option<String> {

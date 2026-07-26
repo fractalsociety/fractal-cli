@@ -11,16 +11,21 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
     private var hotKey: GlobalHotKey?
     private var onboardingWindow: NSWindow?
     private var observations = Set<AnyCancellable>()
+    private var setupComplete = false
 
     static func main() {
         if ProcessInfo.processInfo.environment["FRACTAL_VOICE_SELF_TEST"] == "1" {
             do {
-                guard let modelURL = BuildCoordinator.offlineModelURL(),
+                guard BuildCoordinator.graniteAssets() != nil,
+                      BuildCoordinator.graniteExecutable() != nil,
+                      BuildCoordinator.graniteServerExecutable() != nil,
+                      (try? KokoroSpeaker.assets()) != nil,
                       BuildCoordinator.fractalExecutable() != nil else {
                     throw OfflineSelfTestError.missingAssets
                 }
-                let recorder = try NativeVoiceRecorder(modelURL: modelURL)
-                recorder.close()
+                let shortcut = try GlobalHotKey {}
+                try KokoroSpeaker.synthesisSelfTest()
+                withExtendedLifetime(shortcut) {}
                 print("Fractal Voice offline runtime: ready")
                 exit(0)
             } catch {
@@ -39,16 +44,29 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         configureStatusItem()
-        hotKey = GlobalHotKey { [weak self] in
-            self?.coordinator.toggleRecording()
+        setupComplete = UserDefaults.standard.bool(forKey: "completedOnboarding")
+        if setupComplete {
+            installGlobalHotKey()
+        } else {
+            coordinator.reportSetupRequired()
         }
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
+            .sink { [weak self] _ in
+                guard self?.setupComplete == true else { return }
+                self?.installGlobalHotKey()
+            }
+            .store(in: &observations)
         coordinator.$state
             .sink { [weak self] state in self?.updateStatusIcon(state) }
             .store(in: &observations)
 
-        if !UserDefaults.standard.bool(forKey: "completedOnboarding") {
+        if !setupComplete {
             showOnboarding()
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        coordinator.shutdown()
     }
 
     private func configureStatusItem() {
@@ -73,6 +91,13 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         let detail = NSMenuItem(title: coordinator.latestActivity, action: nil, keyEquivalent: "")
         detail.isEnabled = false
         menu.addItem(detail)
+        let shortcut = NSMenuItem(
+            title: coordinator.shortcutStatus,
+            action: nil,
+            keyEquivalent: ""
+        )
+        shortcut.isEnabled = false
+        menu.addItem(shortcut)
         menu.addItem(.separator())
 
         let toggleTitle = coordinator.state == .recording ? "Stop Recording & Build" : "Start Recording"
@@ -81,12 +106,19 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
             action: #selector(toggleRecording),
             keyEquivalent: " "
         )
-        toggle.keyEquivalentModifierMask = [.control, .option]
+        toggle.keyEquivalentModifierMask = [.option]
         toggle.target = self
-        toggle.isEnabled = ![.building, .preparing].contains(coordinator.state)
+        toggle.isEnabled = setupComplete
+            && ![.building, .preparing].contains(coordinator.state)
         menu.addItem(toggle)
+        if setupComplete && !coordinator.shortcutReady {
+            menu.addItem(item("Retry ⌥Space Shortcut", #selector(retryShortcut)))
+        }
 
         menu.addItem(item("Show Welcome", #selector(showOnboarding)))
+        if coordinator.microphoneDenied {
+            menu.addItem(item("Open Microphone Settings", #selector(openMicrophoneSettings)))
+        }
         menu.addItem(item("Open Projects", #selector(openProjects)))
         menu.addItem(item("Open Activity Log", #selector(openLog)))
         menu.addItem(.separator())
@@ -109,6 +141,25 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         coordinator.toggleRecording()
     }
 
+    @objc private func retryShortcut() {
+        installGlobalHotKey()
+    }
+
+    private func installGlobalHotKey() {
+        hotKey = nil
+        do {
+            hotKey = try GlobalHotKey { [weak self] in
+                self?.coordinator.toggleRecording()
+            }
+            coordinator.reportShortcutReady()
+        } catch {
+            coordinator.reportShortcutFailure(
+                error.localizedDescription
+                    + " Quit the conflicting app, then choose Retry Shortcut from the Fractal menu."
+            )
+        }
+    }
+
     @objc func showOnboarding() {
         if let onboardingWindow {
             onboardingWindow.makeKeyAndOrderFront(nil)
@@ -118,10 +169,12 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         NSApp.setActivationPolicy(.regular)
         let view = OnboardingView(coordinator: coordinator) { [weak self] in
             UserDefaults.standard.set(true, forKey: "completedOnboarding")
+            self?.setupComplete = true
+            self?.installGlobalHotKey()
             self?.onboardingWindow?.close()
         }
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: 500),
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 600),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -143,6 +196,10 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
 
     @objc private func openProjects() {
         coordinator.openProjects()
+    }
+
+    @objc private func openMicrophoneSettings() {
+        coordinator.openMicrophoneSettings()
     }
 
     @objc private func openLog() {

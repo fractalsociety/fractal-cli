@@ -26,6 +26,8 @@ pub(crate) struct FractalProject {
 pub(crate) struct ProjectIdentity {
     pub(crate) slug: String,
     pub(crate) title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt: Option<String>,
     pub(crate) visibility: String,
 }
 
@@ -63,9 +65,41 @@ pub(crate) struct ExecutionAssignment {
 }
 
 static PROJECT_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const MANAGED_IDENTITY_SCHEMA: &str = "fractal.managed-project-identity.v1";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ManagedProjectIdentity {
+    schema: String,
+    slug: String,
+    title: String,
+    #[serde(default)]
+    prompt: Option<String>,
+}
 
 pub(crate) fn path(workspace: &Path) -> PathBuf {
     workspace.join(".fractal").join("project.fractal")
+}
+
+/// Pin the user-confirmed name for a managed voice project. Every later
+/// planning/execution persist reads this record, so lead request text cannot
+/// replace the dashboard title or hosted URL slug.
+pub(crate) fn configure_managed_identity(
+    workspace: &Path,
+    name: &str,
+    prompt: &str,
+) -> Result<()> {
+    let title = clean_title(name, workspace);
+    let slug = slug_from(&title);
+    let identity = ManagedProjectIdentity {
+        schema: MANAGED_IDENTITY_SCHEMA.to_owned(),
+        slug,
+        title,
+        prompt: Some(prompt.trim().to_owned()),
+    };
+    let destination = managed_identity_path(workspace);
+    let directory = destination.parent().expect("managed identity has parent");
+    fs::create_dir_all(directory).with_context(|| format!("create {}", directory.display()))?;
+    atomic_write(&destination, &serde_json::to_vec_pretty(&identity)?)
 }
 
 pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<PathBuf> {
@@ -80,7 +114,19 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
     crate::graph_store::verify_graph_document(graph)
         .context("refuse to persist an execution graph with an invalid hash")?;
     reject_secret_fields(graph)?;
-    let slug = slug_for(workspace);
+    let managed_identity = load_managed_identity(workspace)?;
+    let slug = managed_identity
+        .as_ref()
+        .map(|identity| identity.slug.clone())
+        .unwrap_or_else(|| slug_for(workspace));
+    let title = managed_identity
+        .as_ref()
+        .map(|identity| identity.title.clone())
+        .unwrap_or_else(|| clean_title(title, workspace));
+    let prompt = managed_identity
+        .as_ref()
+        .and_then(|identity| identity.prompt.clone())
+        .unwrap_or_else(|| title.clone());
     let now = timestamp();
     let current = load(workspace).ok();
     let execution = current
@@ -111,7 +157,8 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
         schema: "fractal.project.v1".to_owned(),
         project: ProjectIdentity {
             slug,
-            title: clean_title(title, workspace),
+            title,
+            prompt: Some(prompt),
             visibility: "private".to_owned(),
         },
         graph_hash: graph_hash.to_owned(),
@@ -538,6 +585,10 @@ fn slug_for(workspace: &Path) -> String {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "project".to_owned());
+    slug_from(&raw)
+}
+
+pub(crate) fn slug_from(raw: &str) -> String {
     let mut slug = String::new();
     let mut separator = false;
     for character in raw.chars().flat_map(char::to_lowercase) {
@@ -557,6 +608,29 @@ fn slug_for(workspace: &Path) -> String {
     } else {
         slug
     }
+}
+
+fn managed_identity_path(workspace: &Path) -> PathBuf {
+    workspace.join(".fractal").join("managed-project.json")
+}
+
+fn load_managed_identity(workspace: &Path) -> Result<Option<ManagedProjectIdentity>> {
+    let path = managed_identity_path(workspace);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let identity: ManagedProjectIdentity = serde_json::from_slice(
+        &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("decode {}", path.display()))?;
+    if identity.schema != MANAGED_IDENTITY_SCHEMA
+        || identity.slug.is_empty()
+        || identity.title.is_empty()
+        || slug_from(&identity.slug) != identity.slug
+    {
+        bail!("managed project identity is malformed");
+    }
+    Ok(Some(identity))
 }
 
 fn clean_title(title: &str, workspace: &Path) -> String {
@@ -658,6 +732,38 @@ mod tests {
         );
         let encoded = fs::read_to_string(stored)?;
         assert!(!encoded.contains(workspace.to_string_lossy().as_ref()));
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn managed_voice_name_controls_dashboard_title_and_url_slug() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        configure_managed_identity(
+            &workspace,
+            "Pocket Ledger",
+            "Build me a personal expense tracker",
+        )?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [],
+            "edges": []
+        });
+        graph["graph_hash"] = Value::String(
+            fractal_contracts::canonical_sha256(&graph)
+                .map_err(|error| anyhow::anyhow!("hash fixture: {error}"))?,
+        );
+
+        persist(&workspace, &graph, "Build me a personal expense tracker")?;
+        let document = load(&workspace)?;
+
+        assert_eq!(document.project.title, "Pocket Ledger");
+        assert_eq!(document.project.slug, "pocket-ledger");
+        assert_eq!(
+            document.project.prompt.as_deref(),
+            Some("Build me a personal expense tracker")
+        );
         fs::remove_dir_all(workspace)?;
         Ok(())
     }

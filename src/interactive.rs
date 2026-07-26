@@ -491,7 +491,7 @@ pub(crate) fn execute_ingested(
 /// Create a fresh, narrowly scoped workspace for a request approved through the
 /// native Fractal Voice companion. The companion may grant trust only beneath
 /// `~/fractal-projects`; ordinary voice ingest can never grant workspace trust.
-pub(crate) fn prepare_managed_voice_workspace(request: &str) -> Result<PathBuf> {
+pub(crate) fn prepare_managed_voice_workspace(name: &str, prompt: &str) -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .context("HOME is unavailable for managed voice projects")?;
@@ -502,7 +502,7 @@ pub(crate) fn prepare_managed_voice_workspace(request: &str) -> Result<PathBuf> 
         .canonicalize()
         .with_context(|| format!("resolve managed project root {}", root.display()))?;
 
-    let slug = managed_project_slug(request);
+    let slug = managed_project_slug(name);
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -516,6 +516,7 @@ pub(crate) fn prepare_managed_voice_workspace(request: &str) -> Result<PathBuf> 
     if !workspace.starts_with(&root) || workspace == root {
         anyhow::bail!("managed voice workspace escaped its project root");
     }
+    crate::project_file::configure_managed_identity(&workspace, name, prompt)?;
     persist_trust(&trust_store_path(), &workspace)?;
     println!("Created managed voice project: {}", workspace.display());
     Ok(workspace)
