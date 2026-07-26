@@ -75,31 +75,44 @@ struct OnboardingView: View {
 
             explanation(
                 icon: "envelope.badge",
-                title: "Enter your email",
-                detail: "Fractal Society emails you a secure, single-use magic link. The same page signs in returning users and creates new accounts."
+                title: "1. Connect with your email",
+                detail: "Choose Connect below. Fractal opens a secure browser page where you enter your email and receive a single-use magic link."
             )
             explanation(
-                icon: "at",
-                title: "Choose your username once",
-                detail: "Your username becomes the home for project URLs such as fractalsociety.com/@username/project-name."
+                icon: "checkmark.shield",
+                title: "2. Approve Fractal CLI",
+                detail: "Open the email link, finish your username if this is a new account, then approve the code shown by Fractal. Return to this app afterward."
             )
             explanation(
                 icon: "point.3.connected.trianglepath.dotted",
-                title: "See every Fractal CLI project",
-                detail: "The CLI publishes your live execution graph so you can follow agents, share progress, and stop a build from the web."
+                title: "3. Confirm the connected account",
+                detail: "The setup check verifies the saved CLI session with Fractal Society. Your live execution graphs will publish under that account."
             )
 
-            Link(
-                destination: URL(string: "https://fractalsociety.com/account/login")!
-            ) {
-                Label("Create or sign in to my account", systemImage: "safari")
+            Button {
+                readiness.connectFractalSociety()
+            } label: {
+                Label(
+                    readiness.snapshot.fractalSocietyAuthenticated
+                        ? "Fractal Society connected"
+                        : readiness.isConnectingSociety ? "Waiting for browser sign-in…" : "Connect Fractal Society account",
+                    systemImage: readiness.snapshot.fractalSocietyAuthenticated
+                        ? "checkmark.circle.fill"
+                        : "safari"
+                )
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 12)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
+            .disabled(readiness.isConnectingSociety || readiness.snapshot.fractalSocietyAuthenticated)
 
-            Text("After opening the email link, return here and continue setup. Fractal CLI will use the same account when it opens your project graphs.")
+            Text(
+                readiness.snapshot.fractalSocietyAuthenticated
+                    ? "Connected \(readiness.snapshot.fractalSocietyAccount ?? "account"). You can continue setup."
+                    : readiness.societyLoginMessage
+                        ?? "If the button cannot open, run `fractal login` in Terminal, complete the email flow, then return and choose Check again."
+            )
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -200,7 +213,7 @@ struct OnboardingView: View {
                 }
                 .disabled(readiness.isChecking)
             }
-            Text("Fractal Voice unlocks when at least one AI CLI is signed in and GitHub is connected.")
+            Text("Fractal Voice unlocks when Fractal Society, at least one AI CLI, and GitHub are all connected.")
                 .font(.title3)
                 .foregroundStyle(.secondary)
 
@@ -218,6 +231,18 @@ struct OnboardingView: View {
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
 
             VStack(spacing: 0) {
+                statusRow(
+                    title: "Fractal Society",
+                    detail: readiness.snapshot.fractalSocietyAuthenticated
+                        ? "Signed in \(readiness.snapshot.fractalSocietyAccount ?? "")"
+                        : readiness.snapshot.fractalCLIInstalled ? "Account connection required" : "Fractal CLI missing",
+                    ready: readiness.snapshot.fractalSocietyAuthenticated,
+                    actionTitle: readiness.snapshot.fractalSocietyAuthenticated ? nil : "Connect",
+                    action: readiness.snapshot.fractalCLIInstalled
+                        ? { readiness.connectFractalSociety() }
+                        : nil
+                )
+                Divider()
                 statusRow(
                     title: "Git",
                     detail: readiness.snapshot.gitInstalled ? "Installed" : "Not installed",
@@ -311,7 +336,9 @@ struct OnboardingView: View {
         title: String,
         detail: String,
         ready: Bool,
-        link: URL? = nil
+        link: URL? = nil,
+        actionTitle: String? = nil,
+        action: (() -> Void)? = nil
     ) -> some View {
         HStack(spacing: 12) {
             Image(systemName: ready ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
@@ -321,6 +348,10 @@ struct OnboardingView: View {
             Text(detail).font(.callout).foregroundStyle(.secondary)
             if let link {
                 Link("Setup", destination: link)
+            }
+            if let actionTitle, let action {
+                Button(actionTitle, action: action)
+                    .disabled(readiness.isConnectingSociety)
             }
         }
         .padding(.horizontal, 15)

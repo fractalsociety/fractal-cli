@@ -83,6 +83,9 @@ pub(crate) fn server_url(override_url: Option<&str>) -> Result<String> {
 }
 
 pub(crate) fn run_login(args: &LoginArgs) -> Result<()> {
+    if args.status {
+        return report_login_status();
+    }
     let server = server_url(args.server.as_deref())?;
     let authorization: DeviceAuthorization = post_json(
         &format!("{server}/api/cli/auth/device"),
@@ -230,7 +233,24 @@ pub(crate) fn ensure_login() -> Result<()> {
         server: None,
         no_open: false,
         timeout: 300,
+        status: false,
     })
+}
+
+fn report_login_status() -> Result<()> {
+    let session = load_session()?;
+    if !validate_remote_session(&session)? {
+        bail!("Fractal Society session expired; run `fractal login` again");
+    }
+    println!(
+        "Signed in to Fractal Society{}.",
+        session
+            .username
+            .as_deref()
+            .map(|name| format!(" as @{name}"))
+            .unwrap_or_default()
+    );
+    Ok(())
 }
 
 fn validate_remote_session(session: &StoredSession) -> Result<bool> {

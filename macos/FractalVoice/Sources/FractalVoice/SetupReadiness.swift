@@ -21,13 +21,21 @@ struct SetupSnapshot: Equatable, Sendable {
     var gitInstalled: Bool
     var githubCLIInstalled: Bool
     var githubAuthenticated: Bool
+    var fractalCLIInstalled: Bool
+    var fractalSocietyAuthenticated: Bool
+    var fractalSocietyAccount: String?
 
     var hasReadyAgent: Bool {
         agents.contains(where: \.authenticated)
     }
 
     var isReady: Bool {
-        hasReadyAgent && gitInstalled && githubCLIInstalled && githubAuthenticated
+        hasReadyAgent
+            && gitInstalled
+            && githubCLIInstalled
+            && githubAuthenticated
+            && fractalCLIInstalled
+            && fractalSocietyAuthenticated
     }
 }
 
@@ -36,6 +44,8 @@ final class SetupReadiness: ObservableObject {
     @Published private(set) var snapshot = SetupReadiness.emptySnapshot
     @Published private(set) var isChecking = false
     @Published private(set) var hasChecked = false
+    @Published private(set) var isConnectingSociety = false
+    @Published private(set) var societyLoginMessage: String?
 
     var isReady: Bool { snapshot.isReady }
 
@@ -49,6 +59,50 @@ final class SetupReadiness: ObservableObject {
                 self.snapshot = result
                 self.hasChecked = true
                 self.isChecking = false
+            }
+        }
+    }
+
+    func connectFractalSociety() {
+        guard !isConnectingSociety else { return }
+        let environment = BuildCoordinator.processEnvironment()
+        let path = environment["PATH"] ?? ""
+        guard let executableURL = Self.findExecutable("fractal", path: path) else {
+            societyLoginMessage = "Fractal CLI is missing. Reinstall Fractal Voice."
+            return
+        }
+
+        isConnectingSociety = true
+        societyLoginMessage = "Opening secure browser sign-in…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            let pipe = Pipe()
+            process.executableURL = executableURL
+            process.arguments = ["login"]
+            process.environment = environment
+            process.standardOutput = pipe
+            process.standardError = pipe
+            process.standardInput = FileHandle.nullDevice
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let output = String(
+                    decoding: pipe.fileHandleForReading.readDataToEndOfFile(),
+                    as: UTF8.self
+                )
+                DispatchQueue.main.async {
+                    self.isConnectingSociety = false
+                    self.societyLoginMessage = process.terminationStatus == 0
+                        ? "Connected. Checking your account…"
+                        : Self.loginFailureMessage(output)
+                    self.refresh()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isConnectingSociety = false
+                    self.societyLoginMessage = "Could not start Fractal CLI login."
+                }
             }
         }
     }
@@ -93,7 +147,10 @@ final class SetupReadiness: ObservableObject {
             agents: agentTemplates,
             gitInstalled: false,
             githubCLIInstalled: false,
-            githubAuthenticated: false
+            githubAuthenticated: false,
+            fractalCLIInstalled: false,
+            fractalSocietyAuthenticated: false,
+            fractalSocietyAccount: nil
         )
     }
 
@@ -118,12 +175,36 @@ final class SetupReadiness: ObservableObject {
 
         let git = run(["git", "--version"])
         let github = run(["gh", "auth", "status"])
+        let fractal = run(["fractal", "login", "--status"])
         return SetupSnapshot(
             agents: agents,
             gitInstalled: git.launched && git.exitCode == 0,
             githubCLIInstalled: github.launched,
-            githubAuthenticated: github.launched && github.exitCode == 0
+            githubAuthenticated: github.launched && github.exitCode == 0,
+            fractalCLIInstalled: fractal.launched,
+            fractalSocietyAuthenticated: fractal.launched && fractal.exitCode == 0,
+            fractalSocietyAccount: fractal.exitCode == 0
+                ? societyAccount(from: fractal.output)
+                : nil
         )
+    }
+
+    nonisolated static func societyAccount(from output: String) -> String? {
+        guard let range = output.range(of: " as @") else { return nil }
+        let suffix = output[range.upperBound...]
+        let username = suffix.prefix { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+        return username.isEmpty ? nil : "@\(username)"
+    }
+
+    nonisolated static func loginFailureMessage(_ output: String) -> String {
+        let compact = output
+            .split(whereSeparator: \.isNewline)
+            .last
+            .map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return compact?.isEmpty == false
+            ? compact!
+            : "Sign-in was not completed. Choose Connect to try again."
     }
 
     nonisolated static func authenticationSucceeded(

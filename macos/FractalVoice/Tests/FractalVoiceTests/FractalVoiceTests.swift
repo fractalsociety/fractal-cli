@@ -79,7 +79,10 @@ final class FractalVoiceTests: XCTestCase {
             agents: agents,
             gitInstalled: true,
             githubCLIInstalled: true,
-            githubAuthenticated: true
+            githubAuthenticated: true,
+            fractalCLIInstalled: true,
+            fractalSocietyAuthenticated: true,
+            fractalSocietyAccount: "@builder"
         )
         XCTAssertTrue(ready.hasReadyAgent)
         XCTAssertTrue(ready.isReady)
@@ -89,7 +92,10 @@ final class FractalVoiceTests: XCTestCase {
             agents: agents,
             gitInstalled: true,
             githubCLIInstalled: true,
-            githubAuthenticated: true
+            githubAuthenticated: true,
+            fractalCLIInstalled: true,
+            fractalSocietyAuthenticated: true,
+            fractalSocietyAccount: "@builder"
         )
         XCTAssertFalse(signedOut.isReady)
     }
@@ -102,9 +108,42 @@ final class FractalVoiceTests: XCTestCase {
             agents: agents,
             gitInstalled: true,
             githubCLIInstalled: true,
-            githubAuthenticated: false
+            githubAuthenticated: false,
+            fractalCLIInstalled: true,
+            fractalSocietyAuthenticated: true,
+            fractalSocietyAccount: "@builder"
         )
         XCTAssertFalse(snapshot.isReady)
+    }
+
+    func testSetupRequiresFractalSocietyAuthentication() {
+        var agents = SetupReadiness.agentTemplates
+        agents[0].installed = true
+        agents[0].authenticated = true
+        let snapshot = SetupSnapshot(
+            agents: agents,
+            gitInstalled: true,
+            githubCLIInstalled: true,
+            githubAuthenticated: true,
+            fractalCLIInstalled: true,
+            fractalSocietyAuthenticated: false,
+            fractalSocietyAccount: nil
+        )
+        XCTAssertFalse(snapshot.isReady)
+    }
+
+    func testFractalSocietyUsernameIsReadFromLoginStatus() {
+        XCTAssertEqual(
+            SetupReadiness.societyAccount(
+                from: "Signed in to Fractal Society as @james-star."
+            ),
+            "@james-star"
+        )
+        XCTAssertNil(
+            SetupReadiness.societyAccount(
+                from: "Signed in to Fractal Society."
+            )
+        )
     }
 
     func testAgentAuthenticationOutputParsersAreExplicit() {

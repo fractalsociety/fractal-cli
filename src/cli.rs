@@ -100,6 +100,10 @@ pub(crate) struct LoginArgs {
     /// Maximum seconds to wait for browser authorization.
     #[arg(long, default_value_t = 300)]
     pub(crate) timeout: u64,
+
+    /// Verify the saved Fractal Society session without starting a login.
+    #[arg(long)]
+    pub(crate) status: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -907,6 +911,7 @@ mod tests {
             "--no-open",
             "--timeout",
             "30",
+            "--status",
         ])
         .unwrap();
         assert!(matches!(
@@ -914,6 +919,7 @@ mod tests {
             Some(Command::Login(LoginArgs {
                 no_open: true,
                 timeout: 30,
+                status: true,
                 ..
             }))
         ));
