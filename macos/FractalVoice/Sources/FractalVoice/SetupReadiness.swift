@@ -82,8 +82,7 @@ final class SetupReadiness: ObservableObject {
     func connectFractalSociety() {
         guard !isConnectingSociety else { return }
         let environment = BuildCoordinator.processEnvironment()
-        let path = environment["PATH"] ?? ""
-        guard let executableURL = Self.findExecutable("fractal", path: path) else {
+        guard let executableURL = BuildCoordinator.fractalExecutable() else {
             societyLoginMessage = "Fractal CLI is missing. Reinstall Fractal Voice."
             return
         }
@@ -196,7 +195,7 @@ final class SetupReadiness: ObservableObject {
 
         let git = run(["git", "--version"])
         let github = run(["gh", "auth", "status"])
-        let fractal = run(["fractal", "login", "--status"])
+        let fractal = runFractal(["login", "--status"])
         return SetupSnapshot(
             agents: agents,
             gitInstalled: git.launched && git.exitCode == 0,
@@ -278,6 +277,49 @@ final class SetupReadiness: ObservableObject {
         }
 
         let deadline = Date().addingTimeInterval(8)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if process.isRunning {
+            process.terminate()
+            process.waitUntilExit()
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return CommandResult(
+            launched: true,
+            exitCode: process.terminationStatus,
+            output: String(decoding: data, as: UTF8.self)
+        )
+    }
+
+    nonisolated private static func runFractal(_ arguments: [String]) -> CommandResult {
+        guard let executableURL = BuildCoordinator.fractalExecutable() else {
+            return CommandResult(launched: false, exitCode: -1, output: "")
+        }
+        return run(executableURL: executableURL, arguments: arguments)
+    }
+
+    nonisolated private static func run(
+        executableURL: URL,
+        arguments: [String]
+    ) -> CommandResult {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.environment = BuildCoordinator.processEnvironment()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        process.standardInput = FileHandle.nullDevice
+
+        do {
+            try process.run()
+        } catch {
+            return CommandResult(launched: false, exitCode: -1, output: "")
+        }
+
+        let deadline = Date().addingTimeInterval(15)
         while process.isRunning && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.05)
         }
