@@ -84,6 +84,7 @@ pub(crate) struct FloorVerdict {
 struct SuiteRun {
     ok: bool,
     output_hash: String,
+    output_excerpt: String,
     timed_out: bool,
 }
 
@@ -144,11 +145,69 @@ fn run_bounded(command: &mut Command, timeout_ms: u64) -> Result<SuiteRun> {
     for byte in hasher.finalize() {
         output_hash.push_str(&format!("{byte:02x}"));
     }
+    let combined = [stdout.as_slice(), stderr.as_slice()].concat();
+    let output = String::from_utf8_lossy(&combined);
+    let output_excerpt = output
+        .chars()
+        .rev()
+        .take(2_000)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
     Ok(SuiteRun {
         ok,
         output_hash,
+        output_excerpt,
         timed_out,
     })
+}
+
+fn node_supports_webstorage_opt_out() -> bool {
+    Command::new("node")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|version| {
+            version
+                .trim()
+                .trim_start_matches('v')
+                .split('.')
+                .next()
+                .and_then(|major| major.parse::<u32>().ok())
+        })
+        .is_some_and(|major| major >= 25)
+}
+
+fn npm_test_command(workspace: &Path) -> Command {
+    let package = std::fs::read_to_string(workspace.join("package.json"))
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok());
+    let test_script = package
+        .as_ref()
+        .and_then(|value| value.pointer("/scripts/test"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+
+    let mut command = Command::new("npm");
+    command.env("CI", "true");
+    if node_supports_webstorage_opt_out() {
+        let existing = std::env::var("NODE_OPTIONS").unwrap_or_default();
+        let options = format!("{existing} --no-experimental-webstorage")
+            .trim()
+            .to_owned();
+        command.env("NODE_OPTIONS", options);
+    }
+    command.args(["test", "--silent"]);
+    if test_script.contains("vitest") {
+        command.args(["--", "--run"]);
+        if workspace.join("e2e").is_dir() {
+            command.args(["--exclude", "e2e/**"]);
+        }
+    }
+    command
 }
 
 /// Build the command that runs a Python project's suite for real. Preference:
@@ -236,9 +295,7 @@ fn run_suite(workspace: &Path) -> Result<Option<SuiteRun>> {
         c.args(["run", "fractal:verify", "--silent"]);
         c
     } else if has("package.json") {
-        let mut c = Command::new("npm");
-        c.args(["test", "--silent"]);
-        c
+        npm_test_command(workspace)
     } else {
         return Ok(None);
     };
@@ -315,7 +372,14 @@ pub(crate) fn evaluate_workspace(
         },
         CompletionDecision::Incomplete { missing } => FloorVerdict {
             complete: false,
-            detail: format!("evidence floor denied completion: {missing:?}"),
+            detail: if run.ok {
+                format!("evidence floor denied completion: {missing:?}")
+            } else {
+                format!(
+                    "workspace test command failed; evidence floor denied completion: {missing:?}\n{}",
+                    run.output_excerpt.trim()
+                )
+            },
         },
     };
     Ok(Some(if run.timed_out {
@@ -362,6 +426,38 @@ mod tests {
             .iter()
             .any(|arg| arg.starts_with("platform=iOS Simulator,name=")));
         assert_eq!(args.last().map(String::as_str), Some("test"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn vitest_is_forced_to_run_once_and_excludes_playwright_directory() {
+        let root =
+            std::env::temp_dir().join(format!("fractal-vitest-command-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("e2e")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"test":"vitest"}}"#,
+        )
+        .unwrap();
+        let command = npm_test_command(&root);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            ["test", "--silent", "--", "--run", "--exclude", "e2e/**"]
+        );
+        assert_eq!(
+            command.get_envs().find_map(|(key, value)| {
+                if key == "CI" {
+                    value.map(|value| value.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            }),
+            Some("true".to_owned())
+        );
         std::fs::remove_dir_all(root).ok();
     }
 }

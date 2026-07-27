@@ -490,7 +490,7 @@ fn splice_grow_child(graph: &Value, growth: &fractal_evolution::GrowthProposal) 
         nodes.push(json!({
             "id": node_id,
             "kind": "verification",
-            "capability": "python.tests.execute",
+            "capability": "project.tests.execute",
             "instruction": "Re-run the acceptance suite against the produced artifact; \
                             fail if any test fails."
         }));
@@ -1166,7 +1166,7 @@ fn harness_add_verification(harness: &mut Value, source: &str, verify_id: &str) 
     if let Some(nodes) = harness.get_mut("nodes").and_then(Value::as_array_mut) {
         nodes.push(json!({
             "id": verify_id,
-            "capability": "python.tests.execute",
+            "capability": "project.tests.execute",
             "memory_scopes": ["work:goal", "workspace:root", "acceptance:spec"],
             "preconditions": precondition,
             "produced_state": [format!("{verify_id}_passed")],
