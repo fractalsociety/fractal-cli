@@ -172,7 +172,7 @@ pub(crate) fn stop(args: &StopArgs) -> Result<()> {
         runs = select_runs(runs, args.project.as_deref())?;
     }
     for run in &runs {
-        halt(run)?;
+        halt(run, None)?;
         println!("Stopped {} ({})", run.project, run.workspace);
     }
     println!(
@@ -236,13 +236,13 @@ fn start_hosted_control_monitor(run_id: String) {
                 break;
             }
             match crate::project_sync::poll_pause_command(Path::new(&run.workspace)) {
-                Ok(true) => {
-                    if let Err(error) = halt(&run) {
+                Ok(Some(command_id)) => {
+                    if let Err(error) = halt(&run, Some(&command_id)) {
                         eprintln!("  hosted pause note: {error:#}");
                     }
                     break;
                 }
-                Ok(false) => consecutive_errors = 0,
+                Ok(None) => consecutive_errors = 0,
                 Err(error) => {
                     consecutive_errors = consecutive_errors.saturating_add(1);
                     if consecutive_errors == 1 || consecutive_errors.is_multiple_of(20) {
@@ -254,7 +254,7 @@ fn start_hosted_control_monitor(run_id: String) {
     });
 }
 
-fn halt(original: &ActiveRun) -> Result<()> {
+fn halt(original: &ActiveRun, hosted_command_id: Option<&str>) -> Result<()> {
     let mut run = original.clone();
     run.status = "halted".to_owned();
     run.updated_at_ms = now_ms();
@@ -288,15 +288,20 @@ fn halt(original: &ActiveRun) -> Result<()> {
     for group in &run.worker_groups {
         signal_group(*group, libc::SIGTERM);
     }
-    if let Err(error) = crate::project_sync::sync_runtime_now(workspace) {
-        eprintln!("  halted graph sync note: {error:#}");
-    }
     thread::sleep(Duration::from_millis(250));
     for group in &run.worker_groups {
         signal_group(*group, libc::SIGKILL);
     }
     if process_alive(run.pid) && is_fractal_process(run.pid) {
         signal_process(run.pid, libc::SIGKILL);
+    }
+    if let Some(command_id) = hosted_command_id {
+        if let Err(error) = crate::project_sync::mark_pause_agents_stopped(workspace, command_id) {
+            eprintln!("  hosted pause progress note: {error:#}");
+        }
+    }
+    if let Err(error) = crate::project_sync::sync_runtime_halt_now(workspace) {
+        eprintln!("  halted graph sync note: {error:#}");
     }
     Ok(())
 }

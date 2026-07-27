@@ -6,10 +6,11 @@
 //! remote and the user's existing `git`/`gh` authentication, then sends only
 //! sanitized public repository links to Fractal Society.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -69,7 +70,58 @@ enum PutFailure {
     Transport(anyhow::Error),
 }
 
-static UPLOAD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+#[derive(Default)]
+struct UploadSchedule {
+    active: bool,
+    waiting_priority: usize,
+}
+
+#[derive(Default)]
+struct UploadScheduler {
+    state: Mutex<UploadSchedule>,
+    ready: Condvar,
+}
+
+struct UploadPermit<'a> {
+    scheduler: &'a UploadScheduler,
+}
+
+impl UploadScheduler {
+    fn acquire(&self, priority: bool) -> UploadPermit<'_> {
+        let mut state = self.state.lock().expect("project upload scheduler");
+        if priority {
+            state.waiting_priority += 1;
+        }
+        while state.active || (!priority && state.waiting_priority > 0) {
+            state = self.ready.wait(state).expect("project upload scheduler");
+        }
+        if priority {
+            state.waiting_priority -= 1;
+        }
+        state.active = true;
+        UploadPermit { scheduler: self }
+    }
+}
+
+impl Drop for UploadPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .scheduler
+            .state
+            .lock()
+            .expect("project upload scheduler");
+        state.active = false;
+        self.scheduler.ready.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct RuntimeSync {
+    dirty: bool,
+}
+
+static UPLOAD_SCHEDULER: OnceLock<UploadScheduler> = OnceLock::new();
+static RUNTIME_SYNCS: OnceLock<Mutex<BTreeMap<PathBuf, RuntimeSync>>> = OnceLock::new();
 pub(crate) const PROJECT_NAME_TAKEN_MARKER: &str = "FRACTAL_PROJECT_NAME_TAKEN";
 
 fn preference_path(workspace: &Path) -> PathBuf {
@@ -112,7 +164,7 @@ pub(crate) fn run(args: &SyncArgs) -> Result<()> {
             None
         }
     };
-    let response = upload(&workspace, repository.as_ref())?;
+    let response = upload(&workspace, repository.as_ref(), false)?;
     println!("Project URL: {}", response.project_url);
     if let Some(repository) = repository {
         println!("GitHub graph: {}", repository.github_graph_url);
@@ -170,19 +222,40 @@ pub(crate) fn ensure_new_project_name_available(name: &str) -> Result<()> {
     }
 }
 
-/// Coalesce a node checkout/completion into the authenticated cloud graph
-/// without blocking the worker or creating a GitHub commit for every state
-/// transition. Every upload reads the latest project document after acquiring
-/// the shared upload lock, so delayed transitions cannot overwrite newer ones.
+/// Coalesce node transitions into at most one active and one follow-up upload
+/// per workspace. Every pass reads the newest project document after receiving
+/// its upload permit, so intermediate transition states collapse naturally.
 pub(crate) fn maybe_sync_runtime(workspace: &Path) {
     if std::env::var_os("FRACTAL_OFFLINE").is_some() {
         return;
     }
-    let workspace = workspace.to_path_buf();
-    std::thread::spawn(move || {
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let syncs = RUNTIME_SYNCS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    {
+        let mut syncs = syncs.lock().expect("runtime sync registry");
+        if let Some(sync) = syncs.get_mut(&workspace) {
+            sync.dirty = true;
+            return;
+        }
+        syncs.insert(workspace.clone(), RuntimeSync::default());
+    }
+    std::thread::spawn(move || loop {
         if let Err(error) = sync_runtime_now(&workspace) {
             eprintln!("  live graph sync note: {error:#}");
         }
+        let mut syncs = RUNTIME_SYNCS
+            .get()
+            .expect("runtime sync registry")
+            .lock()
+            .expect("runtime sync registry");
+        if syncs.get(&workspace).is_some_and(|sync| sync.dirty) {
+            syncs.insert(workspace.clone(), RuntimeSync::default());
+            continue;
+        }
+        syncs.remove(&workspace);
+        break;
     });
 }
 
@@ -196,23 +269,37 @@ pub(crate) fn sync_runtime_now(workspace: &Path) -> Result<()> {
         None if crate::auth::load_session().is_err() => return Ok(()),
         None => {}
     }
-    upload(workspace, None).map(|_| ())
+    upload(workspace, None, false).map(|_| ())
+}
+
+/// Publish a halted graph ahead of queued routine transition uploads.
+pub(crate) fn sync_runtime_halt_now(workspace: &Path) -> Result<()> {
+    if std::env::var_os("FRACTAL_OFFLINE").is_some() {
+        return Ok(());
+    }
+    match load_preference(workspace) {
+        Some(preference) if !preference.enabled => return Ok(()),
+        Some(_) => {}
+        None if crate::auth::load_session().is_err() => return Ok(()),
+        None => {}
+    }
+    upload(workspace, None, true).map(|_| ())
 }
 
 /// Poll the authenticated Fractal Society project for an owner-requested pause.
 /// The command is acknowledged before local cancellation, preventing a page
 /// refresh from repeatedly stopping a later resumed run.
-pub(crate) fn poll_pause_command(workspace: &Path) -> Result<bool> {
+pub(crate) fn poll_pause_command(workspace: &Path) -> Result<Option<String>> {
     if std::env::var_os("FRACTAL_OFFLINE").is_some() {
-        return Ok(false);
+        return Ok(None);
     }
     let session = match crate::auth::load_session() {
         Ok(session) => session,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(None),
     };
     let document = match crate::project_file::load(workspace) {
         Ok(document) => document,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(None),
     };
     let endpoint = format!(
         "{}/api/cli/projects/{}/control",
@@ -225,27 +312,57 @@ pub(crate) fn poll_pause_command(workspace: &Path) -> Result<bool> {
         .call()
     {
         Ok(response) => response,
-        Err(ureq::Error::Status(404, _)) => return Ok(false),
+        Err(ureq::Error::Status(404, _)) => return Ok(None),
         Err(error) => return Err(anyhow::anyhow!(error)).context("poll hosted graph control"),
     };
     let envelope: ControlEnvelope =
         serde_json::from_reader(response.into_reader()).context("decode hosted graph control")?;
     let Some(command) = envelope.command else {
-        return Ok(false);
+        return Ok(None);
     };
     if command.action != "pause" {
-        return Ok(false);
+        return Ok(None);
     }
-    let body = serde_json::json!({ "command_id": command.command_id }).to_string();
+    let body = serde_json::json!({
+        "command_id": command.command_id,
+        "status": "accepted",
+    })
+    .to_string();
     match ureq::post(&endpoint)
         .set("Authorization", &format!("Bearer {}", session.access_token))
         .set("Content-Type", "application/json")
         .timeout(std::time::Duration::from_secs(3))
         .send_string(&body)
     {
-        Ok(_) => Ok(true),
+        Ok(_) => Ok(Some(command.command_id)),
         Err(error) => Err(anyhow::anyhow!(error)).context("acknowledge hosted graph control"),
     }
+}
+
+/// Report that the coordinator and worker process groups have been terminated.
+/// The final `synchronized` state is set by the server only after it receives
+/// the halted project graph.
+pub(crate) fn mark_pause_agents_stopped(workspace: &Path, command_id: &str) -> Result<()> {
+    let session = crate::auth::load_session()?;
+    let document = crate::project_file::load(workspace)?;
+    let endpoint = format!(
+        "{}/api/cli/projects/{}/control",
+        session.server.trim_end_matches('/'),
+        document.project.slug
+    );
+    let body = serde_json::json!({
+        "command_id": command_id,
+        "status": "agents_stopped",
+    })
+    .to_string();
+    ureq::post(&endpoint)
+        .set("Authorization", &format!("Bearer {}", session.access_token))
+        .set("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(3))
+        .send_string(&body)
+        .map(|_| ())
+        .map_err(anyhow::Error::new)
+        .context("report stopped agents to hosted graph")
 }
 
 fn maybe_sync_with_options(workspace: &Path, publish_github: bool) -> Option<String> {
@@ -274,7 +391,7 @@ fn maybe_sync_with_options(workspace: &Path, publish_github: bool) -> Option<Str
     } else {
         None
     };
-    match upload(workspace, repository.as_ref()) {
+    match upload(workspace, repository.as_ref(), false) {
         Ok(response) => {
             println!("  ↗ Project URL: {}", response.project_url);
             if let Some(repository) = repository {
@@ -293,11 +410,14 @@ fn maybe_sync_with_options(workspace: &Path, publish_github: bool) -> Option<Str
     }
 }
 
-fn upload(workspace: &Path, repository: Option<&RepositoryLink>) -> Result<SyncResponse> {
-    let _guard = UPLOAD_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("project upload lock");
+fn upload(
+    workspace: &Path,
+    repository: Option<&RepositoryLink>,
+    priority: bool,
+) -> Result<SyncResponse> {
+    let _permit = UPLOAD_SCHEDULER
+        .get_or_init(UploadScheduler::default)
+        .acquire(priority);
     crate::project_file::backfill_execution(workspace).ok();
     if !crate::run_control::workspace_is_running(workspace) {
         crate::project_file::release_stale_assignments(workspace).ok();
