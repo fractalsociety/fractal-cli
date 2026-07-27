@@ -87,6 +87,10 @@ pub(crate) enum Command {
     Handoff(HandoffArgs),
     /// Accept a secure website task handoff and work on its review branch.
     Contribute(ContributeArgs),
+    /// Email a secure project invitation after explicit confirmation.
+    Invite(InviteArgs),
+    /// Ask an X user for project help after preview and explicit confirmation.
+    ShareX(ShareXArgs),
     /// Deprecated compatibility bridge; external desktop apps should use `handoff`.
     Bridge(BridgeArgs),
     /// Print the Fractal CLI version.
@@ -107,6 +111,64 @@ pub(crate) struct ContributeArgs {
     pub(crate) token: String,
 
     /// Fractal Society origin that issued the handoff.
+    #[arg(long, value_name = "URL")]
+    pub(crate) server: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum InvitationRole {
+    Maintainer,
+    Contributor,
+    Viewer,
+}
+
+impl InvitationRole {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Maintainer => "maintainer",
+            Self::Contributor => "contributor",
+            Self::Viewer => "viewer",
+        }
+    }
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct InviteArgs {
+    /// Fractal Society project slug.
+    #[arg(long, value_name = "SLUG")]
+    pub(crate) project: String,
+    /// Recipient email address.
+    #[arg(long, value_name = "EMAIL")]
+    pub(crate) email: String,
+    /// Access granted by the invitation.
+    #[arg(long, value_enum, default_value_t = InvitationRole::Contributor)]
+    pub(crate) role: InvitationRole,
+    /// Plain-language description of the help or compute requested.
+    #[arg(long = "message", visible_alias = "help-request", value_name = "TEXT")]
+    pub(crate) message: Option<String>,
+    /// Confirm the external email side effect.
+    #[arg(long)]
+    pub(crate) yes: bool,
+    /// Fractal Society origin (defaults to the saved login server).
+    #[arg(long, value_name = "URL")]
+    pub(crate) server: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ShareXArgs {
+    /// Fractal Society project slug.
+    #[arg(long, value_name = "SLUG")]
+    pub(crate) project: String,
+    /// X handle to mention.
+    #[arg(long, value_name = "HANDLE")]
+    pub(crate) handle: String,
+    /// Plain-language description of the help or compute requested.
+    #[arg(long = "message", visible_alias = "help-request", value_name = "TEXT")]
+    pub(crate) message: Option<String>,
+    /// Publish the displayed preview to X.
+    #[arg(long)]
+    pub(crate) yes: bool,
+    /// Fractal Society origin (defaults to the saved login server).
     #[arg(long, value_name = "URL")]
     pub(crate) server: Option<String>,
 }
@@ -985,6 +1047,52 @@ mod tests {
                 github: true,
                 ..
             }))
+        ));
+    }
+
+    #[test]
+    fn parses_confirmed_email_and_x_help_commands() {
+        let invite = Cli::try_parse_from([
+            "fractal",
+            "invite",
+            "--project",
+            "coffee-2",
+            "--email",
+            "helper@example.com",
+            "--role",
+            "contributor",
+            "--message",
+            "Task 2.1 and spare compute",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            invite.command,
+            Some(Command::Invite(InviteArgs {
+                ref project,
+                role: InvitationRole::Contributor,
+                yes: true,
+                ..
+            })) if project == "coffee-2"
+        ));
+
+        let share = Cli::try_parse_from([
+            "fractal",
+            "share-x",
+            "--project",
+            "coffee-2",
+            "--handle",
+            "@helper",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            share.command,
+            Some(Command::ShareX(ShareXArgs {
+                ref handle,
+                yes: true,
+                ..
+            })) if handle == "@helper"
         ));
     }
 

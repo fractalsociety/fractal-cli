@@ -130,6 +130,46 @@ or the calling tool's direct stdin API. Do not interpolate the description into
 shell syntax. `--name` must be the user-confirmed project name, not a shortened
 version of the build prompt.
 
+### Invite collaborators or ask for help
+
+ChatGPT Desktop and other external agents may also use Fractal's authenticated
+sharing commands. Email and X posting are external side effects: first collect
+the exact recipient or X handle, project slug, permission, and help request.
+Show the user what will be sent and obtain explicit confirmation. Never infer
+confirmation from the original build request.
+
+Preview an email invitation without sending it:
+
+```sh
+fractal invite \
+  --project 'coffee-2' \
+  --email 'helper@example.com' \
+  --role contributor \
+  --message 'Please help with task 2.1 and spare compute for the test wave.'
+```
+
+After the user explicitly says to send that invitation, repeat the same command
+with `--yes`. Fractal Society creates a secure seven-day invitation and sends
+it through the configured production mail service. Report success only when
+Fractal prints `Invitation email sent successfully`.
+
+Preview a public X help request:
+
+```sh
+fractal share-x \
+  --project 'coffee-2' \
+  --handle '@helper' \
+  --message 'Please help with task 2.1 and spare agent compute for tests.'
+```
+
+Read the generated post back to the user. Only after they explicitly approve
+that exact public post, repeat the command with `--yes`. If Fractal opens an X
+connection page, let the user authorize their own X account and then repeat the
+confirmed command. Report success only when Fractal returns the final X post
+URL. Do not post arbitrary agent-authored content, silently change the tagged
+handle, reuse an old confirmation, or treat voice transcription alone as
+confirmation.
+
 ## Operate an existing graph
 
 Use Fractal's public commands rather than editing graph JSON:
