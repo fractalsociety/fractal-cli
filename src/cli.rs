@@ -74,6 +74,7 @@ pub(crate) enum Command {
     /// Resume a project by its number (also: say "resume project N" by voice).
     Resume(ResumeArgs),
     /// Stop the active project, a named project, or every running build.
+    #[command(visible_alias = "pause")]
     Stop(StopArgs),
     /// Inspect live Fractal build processes.
     Status(StatusArgs),
@@ -962,6 +963,15 @@ mod tests {
         ));
         assert!(matches!(
             Cli::try_parse_from(["fractal", "stop", "--project", "expense-app"])
+                .unwrap()
+                .command,
+            Some(Command::Stop(StopArgs {
+                project: Some(ref project),
+                all: false
+            })) if project == "expense-app"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["fractal", "pause", "--project", "expense-app"])
                 .unwrap()
                 .command,
             Some(Command::Stop(StopArgs {

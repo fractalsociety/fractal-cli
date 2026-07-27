@@ -204,6 +204,29 @@ workers claim its nodes. Never edit `.fractal/project.fractal` directly.
 Use `fractal stop --all` only when the user explicitly wants every running
 Fractal build stopped.
 
+### Pause one project from an external desktop agent
+
+When the user asks ChatGPT Desktop, Codex Desktop, or another external agent to
+pause a specific project, first identify its exact running name and then pause
+only that project:
+
+```sh
+fractal status --running
+fractal pause --project 'EXACT_PROJECT_NAME'
+fractal status --running
+```
+
+`fractal pause` is a visible alias for `fractal stop`. It halts the selected
+coordinator and its workers while preserving completed graph waves so the
+project remains resumable. The project name may be its folder name, graph slug,
+or absolute workspace path. If a short name is ambiguous, use the absolute path
+printed by `fractal status --running`.
+
+Report success only after Fractal prints `Stopped PROJECT` and the final status
+no longer lists that project. Never substitute `--all` unless the user
+explicitly asks to pause every running build. Do not kill agent or terminal
+processes directly.
+
 If `.fractal/project.fractal` exists but no build is running, inspect
 `fractal projects` and resume the registered project. Do not manufacture
 checkout or completion entries. The current `fractal node` command is not a
