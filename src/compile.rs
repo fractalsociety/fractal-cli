@@ -417,6 +417,13 @@ fn annotate_execution_flow(graph: &mut Value, harness: &Value) -> Result<()> {
         })
         .filter(|(_, title)| !title.is_empty())
         .collect();
+    let amendment_metadata: BTreeMap<String, Value> = harness
+        .get("fractal_amendments")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(id, metadata)| (id.clone(), metadata.clone()))
+        .collect();
     let mut wave_positions: BTreeMap<u32, u32> = BTreeMap::new();
     for node in graph_nodes {
         let id = node
@@ -439,6 +446,18 @@ fn annotate_execution_flow(graph: &mut Value, harness: &Value) -> Result<()> {
                 Value::Null
             },
         });
+        if let Some(metadata) = amendment_metadata.get(&id) {
+            for key in [
+                "amendment_kind",
+                "branch_id",
+                "branch_parent",
+                "branch_depth",
+            ] {
+                if let Some(value) = metadata.get(key) {
+                    node["execution"][key] = value.clone();
+                }
+            }
+        }
         if let Some(title) = titles.get(id.as_str()) {
             node["title"] = Value::String((*title).to_owned());
         }
@@ -542,7 +561,7 @@ mod tests {
     use fractal_harnessc::Target;
     use serde_json::{json, Value};
 
-    use super::compile_graph;
+    use super::{annotate_execution_flow, compile_graph, harness_for, recompile};
 
     /// Isolate `FRACTAL_HOME` (compile now persists a genome sidecar) and
     /// serialize with the other tests that mutate the environment.
@@ -720,5 +739,68 @@ mod tests {
         assert_eq!(graph["schema"], "fractal.execution_graph.v1");
         assert_eq!(graph["nodes"].as_array().map(Vec::len), Some(3));
         assert_eq!(graph["edges"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn compiled_execution_flow_carries_branch_layout_metadata() {
+        let mut graph = json!({
+            "nodes": [
+                {"id":"anchor","capability":"code.generate"},
+                {"id":"branch.build","capability":"code.generate"}
+            ],
+            "edges": [
+                {"from":"anchor","to":"branch.build","condition":"success"}
+            ]
+        });
+        let harness = json!({
+            "nodes": [
+                {"id":"anchor","title":"Anchor"},
+                {"id":"branch.build","title":"Build branch"}
+            ],
+            "fractal_amendments": {
+                "branch.build": {
+                    "amendment_kind":"branch",
+                    "branch_id":"branch.amend_1",
+                    "branch_parent":"anchor",
+                    "branch_depth":1
+                }
+            }
+        });
+        annotate_execution_flow(&mut graph, &harness).unwrap();
+        let branch = graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["id"] == "branch.build")
+            .unwrap();
+        assert_eq!(branch["execution"]["amendment_kind"], "branch");
+        assert_eq!(branch["execution"]["branch_parent"], "anchor");
+        assert_eq!(branch["execution"]["branch_depth"], 1);
+    }
+
+    #[test]
+    fn recompilation_accepts_persisted_branch_metadata() {
+        let selection = select_harness("nl.code");
+        let mut harness = harness_for(
+            &selection,
+            "Build a tiny CLI that reverses a string.",
+            &["the CLI reverses a string".to_owned()],
+        );
+        harness["fractal_amendments"] = json!({
+            "implement": {
+                "amendment_kind":"branch",
+                "branch_id":"branch.amend_1",
+                "branch_parent":"plan",
+                "branch_depth":1
+            }
+        });
+        let graph = recompile(&representative_work(), &harness, "darwin-arm64").unwrap();
+        let implement = graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["id"] == "implement")
+            .unwrap();
+        assert_eq!(implement["execution"]["branch_id"], "branch.amend_1");
     }
 }

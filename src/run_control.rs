@@ -274,7 +274,9 @@ pub(crate) fn queue_active_amendment(task_ref: &str, instruction: &str) -> Resul
     crate::amendments::queue(
         Path::new(&runs[0].workspace),
         command_id,
+        "add_branch",
         task_ref,
+        None,
         instruction,
         "voice",
     )?;

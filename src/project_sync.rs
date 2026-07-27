@@ -66,6 +66,8 @@ struct ControlCommand {
     #[serde(default)]
     task_ref: String,
     #[serde(default)]
+    wave: Option<u32>,
+    #[serde(default)]
     instruction: String,
 }
 
@@ -329,19 +331,28 @@ pub(crate) fn poll_control_command(workspace: &Path) -> Result<Option<HostedCont
     let Some(command) = envelope.command else {
         return Ok(None);
     };
-    if command.action == "add_branch" {
+    if matches!(command.action.as_str(), "add_branch" | "add_wave_task") {
         crate::amendments::queue(
             workspace,
             &command.command_id,
+            &command.action,
             &command.task_ref,
+            command.wave,
             &command.instruction,
             "fractal-society",
         )?;
         update_hosted_command(workspace, &command.command_id, "accepted", None)?;
-        println!(
-            "  ✓ accepted hosted branch request for task {}; lead planner will apply it between waves",
-            command.task_ref
-        );
+        if command.action == "add_wave_task" {
+            println!(
+                "  ✓ accepted hosted task request for wave {}; lead planner will apply it at the next safe boundary",
+                command.wave.unwrap_or_default()
+            );
+        } else {
+            println!(
+                "  ✓ accepted hosted branch request for task {}; lead planner will apply it between waves",
+                command.task_ref
+            );
+        }
         return Ok(Some(HostedControl::AmendmentQueued));
     }
     if command.action != "pause" {
