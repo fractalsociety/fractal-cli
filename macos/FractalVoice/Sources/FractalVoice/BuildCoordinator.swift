@@ -73,9 +73,14 @@ final class BuildCoordinator: ObservableObject {
     private var dialogueGeneration = 0
     private var transcriptRetryCount = 0
     private var recordingTimeout: Task<Void, Never>?
+    private var terminationAfterPause: (() -> Void)?
 
     var projectsURL: URL { AppRuntime.projectsURL }
     let logURL = AppRuntime.logURL
+
+    var hasActiveBuild: Bool {
+        process?.isRunning == true || bridgeBuildTask != nil
+    }
 
     var canAcceptExternalBuild: Bool {
         process == nil
@@ -181,6 +186,15 @@ final class BuildCoordinator: ObservableObject {
             graniteServerProcess?.terminate()
         }
         graniteServerProcess = nil
+    }
+
+    func pauseBuildForApplicationTermination(completion: @escaping () -> Void) {
+        guard hasActiveBuild else {
+            completion()
+            return
+        }
+        terminationAfterPause = completion
+        stopCurrentBuild()
     }
 
     func reportShortcutReady() {
@@ -1458,6 +1472,9 @@ final class BuildCoordinator: ObservableObject {
                 latestActivity = "Build paused — completed work can be resumed later"
                 notify(title: "Fractal build paused", body: latestActivity)
             }
+            let completion = terminationAfterPause
+            terminationAfterPause = nil
+            completion?()
             return
         }
         if exitCode != 0, Self.projectNameWasTaken(outputBuffer) {

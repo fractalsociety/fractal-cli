@@ -85,6 +85,29 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         coordinator.shutdown()
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard coordinator.hasActiveBuild else {
+            return .terminateNow
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "A Fractal build is still running"
+        alert.informativeText =
+            "Quitting now could interrupt the active agents. Keep Fractal Voice open, "
+            + "or pause the build safely and preserve its completed tasks before quitting."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Keep Building")
+        alert.addButton(withTitle: "Pause Build and Quit")
+
+        guard alert.runModal() == .alertSecondButtonReturn else {
+            return .terminateCancel
+        }
+        coordinator.pauseBuildForApplicationTermination {
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
         guard filenames.count == 1 else {
             sender.reply(toOpenOrPrint: .failure)

@@ -45,12 +45,16 @@ struct ProjectRunState<'a> {
 
 pub(crate) struct RunGuard {
     run_id: Option<String>,
+    workspace: Option<PathBuf>,
 }
 
 impl RunGuard {
     pub(crate) fn start_or_join(workspace: &Path, request: &str, _port: u16) -> Result<Self> {
         if std::env::var_os(RUN_ID_ENV).is_some() {
-            return Ok(Self { run_id: None });
+            return Ok(Self {
+                run_id: None,
+                workspace: None,
+            });
         }
         let workspace = workspace
             .canonicalize()
@@ -81,6 +85,7 @@ impl RunGuard {
         start_hosted_control_monitor(run_id.clone());
         Ok(Self {
             run_id: Some(run_id),
+            workspace: Some(workspace),
         })
     }
 }
@@ -92,13 +97,41 @@ impl Drop for RunGuard {
         };
         if let Ok(Some(mut run)) = read_run(&run_id) {
             if run.status == "running" {
-                run.status = "completed".to_owned();
+                // Dropping the coordinator is not proof that the graph finished.
+                // The desktop app may quit, an output pipe may close, or the CLI
+                // may unwind after an execution error. Only the persisted graph
+                // can prove completion; every other exit remains resumable.
+                run.status = terminal_status(
+                    self.workspace
+                        .as_deref()
+                        .unwrap_or_else(|| Path::new(&run.workspace)),
+                )
+                .to_owned();
                 run.updated_at_ms = now_ms();
                 write_project_state(&run).ok();
                 fs::remove_file(run_path(&run_id)).ok();
             }
         }
         std::env::remove_var(RUN_ID_ENV);
+    }
+}
+
+fn terminal_status(workspace: &Path) -> &'static str {
+    let path = workspace.join(".fractal").join("project.fractal");
+    let phase = fs::read_to_string(path)
+        .ok()
+        .and_then(|document| serde_json::from_str::<serde_json::Value>(&document).ok())
+        .and_then(|document| {
+            document
+                .get("execution")
+                .and_then(|execution| execution.get("phase"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    if phase.as_deref() == Some("completed") {
+        "completed"
+    } else {
+        "interrupted"
     }
 }
 
@@ -544,6 +577,33 @@ fn is_fractal_process(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinator_exit_is_completed_only_when_the_graph_proves_it() {
+        let root = std::env::temp_dir().join(format!(
+            "fractal-run-terminal-status-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let directory = root.join(".fractal");
+        fs::create_dir_all(&directory).unwrap();
+
+        fs::write(
+            directory.join("project.fractal"),
+            r#"{"execution":{"phase":"executing"}}"#,
+        )
+        .unwrap();
+        assert_eq!(terminal_status(&root), "interrupted");
+
+        fs::write(
+            directory.join("project.fractal"),
+            r#"{"execution":{"phase":"completed"}}"#,
+        )
+        .unwrap();
+        assert_eq!(terminal_status(&root), "completed");
+
+        fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn project_selection_is_exact_and_case_insensitive() {

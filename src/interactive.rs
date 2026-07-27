@@ -608,13 +608,14 @@ pub(crate) fn resume_project(
     if agents.is_empty() {
         anyhow::bail!("no build agents (claude/codex/cursor/hermes) found on PATH");
     }
+    let mut completed: BTreeSet<String> = cp.completed.iter().cloned().collect();
+    completed.extend(crate::project_file::completed_nodes(&workspace));
     println!(
         "↻ Resuming project #{number} ({}) — {}/{} tasks already done, continuing the rest…\n",
         project.label,
-        cp.completed.len(),
+        completed.len(),
         cp.total
     );
-    let completed: BTreeSet<String> = cp.completed.iter().cloned().collect();
     let classification = intent::fractalwork_dir(fractalwork_override)
         .and_then(|dir| intent::classify(&cp.request, &dir));
     let task_group = task_group_for(&classification, &cp.request);

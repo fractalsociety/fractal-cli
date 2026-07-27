@@ -1,6 +1,6 @@
 //! Standardized, portable per-project execution graph.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -349,6 +349,23 @@ pub(crate) fn transition(
     execution.updated_at = now.clone();
     document.updated_at = now;
     write_document(workspace, &document)
+}
+
+/// Completed assignments persisted by workers themselves. This is the recovery
+/// source of truth when a coordinator disappears after dispatching a wave: those
+/// workers may finish after the last checkpoint was written.
+pub(crate) fn completed_nodes(workspace: &Path) -> BTreeSet<String> {
+    load(workspace)
+        .ok()
+        .and_then(|document| document.execution)
+        .map(|execution| {
+            execution
+                .assignments
+                .into_iter()
+                .filter_map(|(node, assignment)| (assignment.state == "completed").then_some(node))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) fn backfill_execution(workspace: &Path) -> Result<bool> {
