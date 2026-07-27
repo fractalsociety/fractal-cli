@@ -156,19 +156,21 @@ Fractal prints `Invitation email sent successfully`.
 Preview a public X help request:
 
 ```sh
+fractal connect-x --project 'coffee-2'
+
 fractal share-x \
   --project 'coffee-2' \
   --handle '@helper' \
   --message 'Please help with task 2.1 and spare agent compute for tests.'
 ```
 
-Read the generated post back to the user. Only after they explicitly approve
-that exact public post, repeat the command with `--yes`. If Fractal opens an X
-connection page, let the user authorize their own X account and then repeat the
-confirmed command. Report success only when Fractal returns the final X post
-URL. Do not post arbitrary agent-authored content, silently change the tagged
-handle, reuse an old confirmation, or treat voice transcription alone as
-confirmation.
+Use `fractal connect-x` when the account is not connected; it transfers the
+existing CLI login into the browser with a short-lived, single-use handoff, then
+opens X authorization. Read the generated post back to the user. Only after
+they explicitly approve that exact public post, repeat `fractal share-x` with
+`--yes`. Report success only when Fractal returns the final X post URL. Do not
+post arbitrary agent-authored content, silently change the tagged handle, reuse
+an old confirmation, or treat voice transcription alone as confirmation.
 
 ## Operate an existing graph
 

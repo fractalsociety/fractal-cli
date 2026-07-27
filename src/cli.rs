@@ -91,6 +91,8 @@ pub(crate) enum Command {
     Invite(InviteArgs),
     /// Ask an X user for project help after preview and explicit confirmation.
     ShareX(ShareXArgs),
+    /// Connect the signed-in Fractal Society account to X in the browser.
+    ConnectX(ConnectXArgs),
     /// Deprecated compatibility bridge; external desktop apps should use `handoff`.
     Bridge(BridgeArgs),
     /// Print the Fractal CLI version.
@@ -171,6 +173,19 @@ pub(crate) struct ShareXArgs {
     /// Fractal Society origin (defaults to the saved login server).
     #[arg(long, value_name = "URL")]
     pub(crate) server: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ConnectXArgs {
+    /// Return to this project slug after X authorization.
+    #[arg(long, value_name = "SLUG")]
+    pub(crate) project: Option<String>,
+    /// Fractal Society origin (defaults to the saved login server).
+    #[arg(long, value_name = "URL")]
+    pub(crate) server: Option<String>,
+    /// Print the secure URL instead of opening the browser.
+    #[arg(long)]
+    pub(crate) no_open: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1093,6 +1108,17 @@ mod tests {
                 yes: true,
                 ..
             })) if handle == "@helper"
+        ));
+
+        let connect =
+            Cli::try_parse_from(["fractal", "connect-x", "--project", "coffee-2"]).unwrap();
+        assert!(matches!(
+            connect.command,
+            Some(Command::ConnectX(ConnectXArgs {
+                project: Some(ref project),
+                no_open: false,
+                ..
+            })) if project == "coffee-2"
         ));
     }
 

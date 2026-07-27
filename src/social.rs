@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use crate::cli::{InviteArgs, ShareXArgs};
+use crate::cli::{ConnectXArgs, InviteArgs, ShareXArgs};
 
 #[derive(Deserialize)]
 struct InviteResponse {
@@ -24,6 +24,14 @@ struct XResponse {
     post_url: Option<String>,
     #[serde(default)]
     connect_url: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BrowserHandoffResponse {
+    #[serde(default)]
+    browser_url: Option<String>,
     #[serde(default)]
     error: Option<String>,
 }
@@ -208,6 +216,51 @@ pub(crate) fn share_x(args: &ShareXArgs) -> Result<()> {
         "Posted to X successfully: {}",
         result.post_url.context("X returned no post URL")?
     );
+    Ok(())
+}
+
+pub(crate) fn connect_x(args: &ConnectXArgs) -> Result<()> {
+    let (session, server) = session_and_server(args.server.as_deref())?;
+    let username = session
+        .username
+        .as_deref()
+        .context("Fractal Society username missing; run `fractal login` again")?;
+    let next = args
+        .project
+        .as_deref()
+        .map(|project| format!("/@{}/{}", segment(username), segment(project)))
+        .unwrap_or_else(|| "/account/projects".to_owned());
+    let redirect_path = format!("/api/providers/x/authorize?next={}", segment(&next));
+    let endpoint = format!(
+        "{}/api/fractal/auth/browser-handoff",
+        server.trim_end_matches('/')
+    );
+    let (status, response) = request(
+        "POST",
+        &endpoint,
+        &session.access_token,
+        &serde_json::json!({ "redirect_path": redirect_path }),
+    )?;
+    let result: BrowserHandoffResponse =
+        serde_json::from_str(&response).context("decode browser handoff response")?;
+    if !(200..300).contains(&status) {
+        bail!(
+            "{}",
+            result
+                .error
+                .unwrap_or_else(|| format!("browser handoff failed with HTTP {status}"))
+        );
+    }
+    let url = result
+        .browser_url
+        .context("Fractal Society returned no browser connection URL")?;
+    println!("Authorize X for Fractal Society:\n  {url}");
+    if !args.no_open {
+        Command::new("open")
+            .arg(&url)
+            .status()
+            .context("open X authorization in browser")?;
+    }
     Ok(())
 }
 
