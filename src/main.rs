@@ -6,6 +6,7 @@ mod chain;
 mod checkpoint;
 mod cli;
 mod compile;
+mod contribute;
 mod coordinate;
 mod dataevol;
 mod decompose;
@@ -197,6 +198,9 @@ fn run(cli: Cli) -> Result<()> {
         (None, Some(Command::Logout)) => auth::logout(),
         (None, Some(Command::Sync(args))) => project_sync::run(&args),
         (None, Some(Command::Handoff(args))) => handoff::run(&args),
+        (None, Some(Command::Contribute(args))) => {
+            contribute::run(&args, fractalwork.as_deref(), coordinate)
+        }
         (None, Some(Command::Bridge(args))) => match args.command {
             BridgeCommand::Serve { port } => {
                 bridge::serve(port, fractalwork.as_deref(), coordinate)

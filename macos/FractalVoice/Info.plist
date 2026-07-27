@@ -16,7 +16,7 @@
     <string>Fractal Voice</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
-    <key>CFBundleDocumentTypes</key>
+	<key>CFBundleDocumentTypes</key>
     <array>
         <dict>
             <key>CFBundleTypeName</key>
@@ -28,7 +28,20 @@
             <key>LSItemContentTypes</key>
             <array>
                 <string>com.fractalsociety.build-request</string>
-            </array>
+	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleURLName</key>
+			<string>Fractal Society Task Handoff</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>fractalvoice</string>
+			</array>
+		</dict>
+	</array>
         </dict>
     </array>
     <key>UTExportedTypeDeclarations</key>

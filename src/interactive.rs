@@ -546,6 +546,13 @@ fn install_managed_agent_instructions(workspace: &Path) -> Result<()> {
         .with_context(|| format!("write managed agent instructions {}", destination.display()))
 }
 
+pub(crate) fn trust_managed_workspace(workspace: &Path) -> Result<()> {
+    let workspace = workspace
+        .canonicalize()
+        .with_context(|| format!("resolve managed workspace {}", workspace.display()))?;
+    persist_trust(&trust_store_path(), &workspace)
+}
+
 fn managed_project_slug(request: &str) -> String {
     let mut slug = String::new();
     let mut previous_dash = false;

@@ -348,6 +348,59 @@ final class BuildCoordinator: ObservableObject {
         )
     }
 
+    func startWebsiteTask(token: String, server: URL, action: String) throws {
+        guard canAcceptExternalBuild else {
+            throw ExternalBuildStartError.busy
+        }
+        guard let executable = Self.fractalExecutable() else {
+            throw ExternalBuildStartError.cliMissing
+        }
+
+        cancelDialogueInput()
+        stopRequested = false
+        restartRequested = false
+        state = .building
+        latestActivity = action == "resume"
+            ? "Resume accepted — locating the saved project checkpoint…"
+            : "Task accepted — preparing its dedicated review branch…"
+        hud?.close()
+        hud = RecordingHUD(
+            onStop: { [weak self] in self?.stopCurrentBuild() },
+            onRestart: { [weak self] in self?.restartVoiceCommand() }
+        )
+        hud?.showBuilding(summary: latestActivity)
+
+        let task = Process()
+        let combinedOutput = Pipe()
+        task.executableURL = executable
+        task.arguments = [
+            "contribute",
+            "--token", token,
+            "--server", server.absoluteString,
+        ]
+        task.environment = Self.processEnvironment()
+        task.standardOutput = combinedOutput
+        task.standardError = combinedOutput
+        outputBuffer = ""
+        outputLineBuffer = ""
+        activeWorkspace = nil
+        combinedOutput.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            Task { @MainActor in self?.consume(text) }
+        }
+        task.terminationHandler = { [weak self] finished in
+            combinedOutput.fileHandleForReading.readabilityHandler = nil
+            Task { @MainActor in self?.finished(exitCode: finished.terminationStatus) }
+        }
+        do {
+            try task.run()
+            process = task
+        } catch {
+            recordingFailed(error)
+        }
+    }
+
     func requestMicrophonePermission(startRecordingWhenGranted: Bool = false) {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:

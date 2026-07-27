@@ -85,6 +85,8 @@ pub(crate) enum Command {
     Sync(SyncArgs),
     /// Hand a named managed build to the native Fractal Voice app.
     Handoff(HandoffArgs),
+    /// Accept a secure website task handoff and work on its review branch.
+    Contribute(ContributeArgs),
     /// Deprecated compatibility bridge; external desktop apps should use `handoff`.
     Bridge(BridgeArgs),
     /// Print the Fractal CLI version.
@@ -96,6 +98,17 @@ pub(crate) struct HandoffArgs {
     /// Confirmed project name used for its folder, graph title, and profile URL.
     #[arg(long = "name", visible_alias = "project-name", value_name = "NAME")]
     pub(crate) project_name: String,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ContributeArgs {
+    /// Short-lived, single-use task handoff issued by Fractal Society.
+    #[arg(long, value_name = "TOKEN")]
+    pub(crate) token: String,
+
+    /// Fractal Society origin that issued the handoff.
+    #[arg(long, value_name = "URL")]
+    pub(crate) server: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]

@@ -97,6 +97,24 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         sender.reply(toOpenOrPrint: handled ? .success : .failure)
     }
 
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard urls.count == 1 else { return }
+        do {
+            let handoff = try WebsiteTaskHandoff(url: urls[0])
+            guard setupComplete else {
+                showOnboarding()
+                throw WebsiteTaskHandoffError.setupRequired
+            }
+            try coordinator.startWebsiteTask(
+                token: handoff.token,
+                server: handoff.server,
+                action: handoff.action
+            )
+        } catch {
+            coordinator.reportExternalBuildFailure(error.localizedDescription)
+        }
+    }
+
     private func startExternalHandoffMonitoring() {
         externalHandoffTimer?.invalidate()
         externalHandoffTimer = Timer.scheduledTimer(
@@ -350,6 +368,46 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         case .chatGPTDesktop, .superwhisper:
             hotKey = nil
             coordinator.activateExternalVoice(mode)
+        }
+    }
+}
+
+private struct WebsiteTaskHandoff {
+    let token: String
+    let server: URL
+    let action: String
+
+    init(url: URL) throws {
+        guard
+            url.scheme?.lowercased() == "fractalvoice",
+            ["work", "resume"].contains(url.host?.lowercased() ?? ""),
+            let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+            let token = components.queryItems?.first(where: { $0.name == "token" })?.value,
+            token.hasPrefix("fth_"),
+            token.count <= 512,
+            let serverValue = components.queryItems?.first(where: { $0.name == "server" })?.value,
+            let server = URL(string: serverValue),
+            server.scheme == "https",
+            server.host?.lowercased() == "fractalsociety.com"
+        else {
+            throw WebsiteTaskHandoffError.invalid
+        }
+        self.token = token
+        self.server = server
+        self.action = url.host!.lowercased()
+    }
+}
+
+private enum WebsiteTaskHandoffError: LocalizedError {
+    case invalid
+    case setupRequired
+
+    var errorDescription: String? {
+        switch self {
+        case .invalid:
+            return "The Fractal Society task handoff is invalid or came from an untrusted site."
+        case .setupRequired:
+            return "Complete Fractal Voice setup before opening a project task."
         }
     }
 }
