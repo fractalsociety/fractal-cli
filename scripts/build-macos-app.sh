@@ -13,12 +13,13 @@ DEFAULT_LLAMA_SERVER="$HOME/.cache/fractal-build/llama.cpp/build-fractal/bin/lla
 LLAMA_SERVER="${FRACTAL_LLAMA_SERVER:-$DEFAULT_LLAMA_SERVER}"
 LLAMA_SERVER_DEST="$CONTENTS/Resources/Granite/bin/llama-server"
 XCODE_PRODUCTS="$PACKAGE/.xcode-build/Build/Products/Release"
+SWIFT_CONDITIONS="${FRACTAL_SWIFT_CONDITIONS:-}"
 
 cd "$ROOT"
 cargo build --release
 
 cd "$PACKAGE"
-xcodebuild \
+xcode_args=(
   -scheme FractalVoice \
   -configuration Release \
   -destination "platform=macOS,arch=arm64" \
@@ -26,6 +27,11 @@ xcodebuild \
   build \
   CODE_SIGNING_ALLOWED=NO \
   -quiet
+)
+if [[ -n "$SWIFT_CONDITIONS" ]]; then
+  xcode_args+=("SWIFT_ACTIVE_COMPILATION_CONDITIONS=$SWIFT_CONDITIONS")
+fi
+xcodebuild "${xcode_args[@]}"
 
 if [[ ! -f "$XCODE_PRODUCTS/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib" ]]; then
   echo "Missing MLX Metal shader library." >&2
@@ -40,6 +46,10 @@ cp "$ROOT/target/release/fractal" "$CONTENTS/Resources/fractal"
 cp "$PACKAGE/Info.plist" "$CONTENTS/Info.plist"
 cp "$PACKAGE/PrivacyInfo.xcprivacy" "$CONTENTS/Resources/PrivacyInfo.xcprivacy"
 cp "$PACKAGE/THIRD_PARTY_NOTICES.txt" "$CONTENTS/Resources/THIRD_PARTY_NOTICES.txt"
+if [[ -n "${FRACTAL_EMBEDDED_PROVISIONING_PROFILE:-}" ]]; then
+  cp "$FRACTAL_EMBEDDED_PROVISIONING_PROFILE" \
+    "$CONTENTS/embedded.provisionprofile"
+fi
 if [[ ! -x "$LLAMA_CLI" ]]; then
   echo "Missing Granite inference engine: $LLAMA_CLI" >&2
   echo "Run scripts/prepare-granite-speech.sh first." >&2
@@ -72,10 +82,24 @@ for resource_bundle in "$XCODE_PRODUCTS"/*.bundle; do
 done
 
 SIGNING_IDENTITY="${FRACTAL_CODESIGN_IDENTITY:--}"
-MAIN_ENTITLEMENTS="${FRACTAL_CODESIGN_MAIN_ENTITLEMENTS:-}"
+DEFAULT_MAIN_ENTITLEMENTS="$PACKAGE/DeveloperID.entitlements"
+MAIN_ENTITLEMENTS="${FRACTAL_CODESIGN_MAIN_ENTITLEMENTS:-$DEFAULT_MAIN_ENTITLEMENTS}"
 CHILD_ENTITLEMENTS="${FRACTAL_CODESIGN_CHILD_ENTITLEMENTS:-}"
 if [[ "$SIGNING_IDENTITY" == "-" ]]; then
-  codesign --force --deep --sign - "$APP"
+  while IFS= read -r -d '' executable; do
+    if file "$executable" | grep -q 'Mach-O'; then
+      sign_args=(--force --sign -)
+      if [[ "$executable" == "$CONTENTS/MacOS/FractalVoice" ]]; then
+        [[ -z "$MAIN_ENTITLEMENTS" ]] || sign_args+=(--entitlements "$MAIN_ENTITLEMENTS")
+      else
+        [[ -z "$CHILD_ENTITLEMENTS" ]] || sign_args+=(--entitlements "$CHILD_ENTITLEMENTS")
+      fi
+      codesign "${sign_args[@]}" "$executable"
+    fi
+  done < <(find "$CONTENTS" -type f -perm -111 -print0)
+  app_sign_args=(--force --sign -)
+  [[ -z "$MAIN_ENTITLEMENTS" ]] || app_sign_args+=(--entitlements "$MAIN_ENTITLEMENTS")
+  codesign "${app_sign_args[@]}" "$APP"
 else
   while IFS= read -r -d '' executable; do
     if file "$executable" | grep -q 'Mach-O'; then
@@ -91,6 +115,14 @@ else
   app_sign_args=(--force --options runtime --timestamp --sign "$SIGNING_IDENTITY")
   [[ -z "$MAIN_ENTITLEMENTS" ]] || app_sign_args+=(--entitlements "$MAIN_ENTITLEMENTS")
   codesign "${app_sign_args[@]}" "$APP"
+fi
+
+if [[ "$SIGNING_IDENTITY" != "-" ]]; then
+  APP_ENTITLEMENTS="$(codesign -d --entitlements - "$APP" 2>&1)"
+  if [[ "$APP_ENTITLEMENTS" != *"com.apple.security.device.audio-input"* ]]; then
+    echo "Signed application is missing the required microphone entitlement." >&2
+    exit 1
+  fi
 fi
 
 cd "$DIST"

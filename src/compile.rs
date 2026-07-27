@@ -417,6 +417,7 @@ fn annotate_execution_flow(graph: &mut Value, harness: &Value) -> Result<()> {
         })
         .filter(|(_, title)| !title.is_empty())
         .collect();
+    let mut wave_positions: BTreeMap<u32, u32> = BTreeMap::new();
     for node in graph_nodes {
         let id = node
             .get("id")
@@ -424,10 +425,14 @@ fn annotate_execution_flow(graph: &mut Value, harness: &Value) -> Result<()> {
             .context("compiled graph node is missing id")?
             .to_owned();
         let wave = waves[&id];
+        let position = wave_positions.entry(wave).or_insert(0);
+        *position += 1;
+        let task_number = format!("{wave}.{position}");
         let parallel = wave_sizes[&wave] > 1;
         node["execution"] = json!({
             "mode": if parallel { "parallel" } else { "sequential" },
             "wave": wave,
+            "task_number": task_number,
             "parallel_group": if parallel {
                 Value::String(format!("wave-{wave}"))
             } else {
@@ -599,11 +604,12 @@ mod tests {
             graph["execution_flow"]["schema"],
             "fractal.execution_flow.v1"
         );
-        assert!(graph["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|node| node["execution"]["wave"].as_u64().is_some()));
+        assert!(graph["nodes"].as_array().unwrap().iter().all(|node| {
+            node["execution"]["wave"].as_u64().is_some()
+                && node["execution"]["task_number"]
+                    .as_str()
+                    .is_some_and(|value| value.contains('.'))
+        }));
     }
 
     #[test]

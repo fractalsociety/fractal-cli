@@ -31,7 +31,8 @@
 - Create the macOS app record for `com.fractalsociety.voice`.
 - Supply SKU, pricing, territories, age rating, content-rights declaration,
   and Digital Services Act trader status.
-- Publish and enter working Support and Privacy Policy URLs.
+- Enter the published Support URL: `https://fractalsociety.com/support`.
+- Enter the published Privacy Policy URL: `https://fractalsociety.com/privacy`.
 - Complete App Privacy answers consistent with `PrivacyInfo.xcprivacy`.
 - Provide one to ten Mac screenshots without transparency.
 - Provide App Review contact information, a test account, and review workflow.

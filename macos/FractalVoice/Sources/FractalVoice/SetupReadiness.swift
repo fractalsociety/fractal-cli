@@ -46,6 +46,7 @@ final class SetupReadiness: ObservableObject {
     @Published private(set) var hasChecked = false
     @Published private(set) var isConnectingSociety = false
     @Published private(set) var societyLoginMessage: String?
+    @Published private(set) var bridgeMessage: String?
     private var refreshQueued = false
 
     var isReady: Bool { snapshot.isReady }
@@ -64,6 +65,14 @@ final class SetupReadiness: ObservableObject {
                 self.snapshot = result
                 self.hasChecked = true
                 self.isChecking = false
+                #if APP_STORE
+                if result.fractalCLIInstalled {
+                    self.bridgeMessage = "Bridge connected and authenticated on this Mac."
+                } else if self.bridgeMessage?.contains("Checking") == true {
+                    self.bridgeMessage =
+                        "The bridge could not be reached. Run `fractal bridge install` in Terminal and try again."
+                }
+                #endif
                 if result.fractalSocietyAuthenticated {
                     self.societyLoginMessage = nil
                 } else if !shouldRefreshAgain
@@ -81,6 +90,26 @@ final class SetupReadiness: ObservableObject {
 
     func connectFractalSociety() {
         guard !isConnectingSociety else { return }
+        #if APP_STORE
+        isConnectingSociety = true
+        societyLoginMessage = "Opening secure browser sign-in through the local bridge…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Result { try LocalBridge.login() }
+            DispatchQueue.main.async {
+                self.isConnectingSociety = false
+                switch result {
+                case .success(let response) where response.ok:
+                    self.societyLoginMessage = Self.verifyingSocietyMessage
+                    self.refresh()
+                case .success(let response):
+                    self.societyLoginMessage = Self.loginFailureMessage(response.output)
+                case .failure(let error):
+                    self.societyLoginMessage = error.localizedDescription
+                }
+            }
+        }
+        return
+        #else
         let environment = BuildCoordinator.processEnvironment()
         guard let executableURL = BuildCoordinator.fractalExecutable() else {
             societyLoginMessage = "Fractal CLI is missing. Reinstall Fractal Voice."
@@ -122,6 +151,21 @@ final class SetupReadiness: ObservableObject {
                 }
             }
         }
+        #endif
+    }
+
+    func pairBridge(token: String) {
+        do {
+            try LocalBridge.savePairingToken(token)
+            bridgeMessage = "Pairing token saved securely. Checking the local bridge…"
+            refresh()
+        } catch {
+            bridgeMessage = error.localizedDescription
+        }
+    }
+
+    func reportBridgeMessage(_ message: String) {
+        bridgeMessage = message
     }
 
     nonisolated static let verifyingSocietyMessage =
@@ -175,6 +219,28 @@ final class SetupReadiness: ObservableObject {
     }
 
     nonisolated static func checkSystem() -> SetupSnapshot {
+        #if APP_STORE
+        guard let bridge = try? LocalBridge.readiness() else {
+            return emptySnapshot
+        }
+        var agents = agentTemplates
+        for bridgeAgent in bridge.agents {
+            guard let index = agents.firstIndex(where: { $0.id == bridgeAgent.id }) else {
+                continue
+            }
+            agents[index].installed = bridgeAgent.installed
+            agents[index].authenticated = bridgeAgent.authenticated
+        }
+        return SetupSnapshot(
+            agents: agents,
+            gitInstalled: bridge.gitInstalled,
+            githubCLIInstalled: bridge.githubCLIInstalled,
+            githubAuthenticated: bridge.githubAuthenticated,
+            fractalCLIInstalled: true,
+            fractalSocietyAuthenticated: bridge.fractalSocietyAuthenticated,
+            fractalSocietyAccount: bridge.fractalSocietyAccount
+        )
+        #else
         var agents = agentTemplates
         let checks: [(String, [String])] = [
             ("codex", ["codex", "login", "status"]),
@@ -207,6 +273,7 @@ final class SetupReadiness: ObservableObject {
                 ? societyAccount(from: fractal.output)
                 : nil
         )
+        #endif
     }
 
     nonisolated static func societyAccount(from output: String) -> String? {

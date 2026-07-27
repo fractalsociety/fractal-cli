@@ -231,6 +231,19 @@ pub(crate) fn verify_graph_document(graph: &Value) -> Result<()> {
     verify_graph_hash(graph, claimed)
 }
 
+/// Recompute a graph's canonical content hash after an authorized structural
+/// mutation adds lineage metadata or task nodes.
+pub(crate) fn rehash_graph(graph: &mut Value) -> Result<String> {
+    let object = graph
+        .as_object_mut()
+        .context("execution graph must be an object")?;
+    object.remove("graph_hash");
+    let hash = fractal_contracts::canonical_sha256(&Value::Object(object.clone()))
+        .map_err(|error| anyhow!("canonical execution graph hashing failed: {error}"))?;
+    object.insert("graph_hash".to_owned(), Value::String(hash.clone()));
+    Ok(hash)
+}
+
 fn atomic_write(root: &Path, destination: &Path, bytes: &[u8]) -> Result<()> {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temp_path = root.join(format!(".graph-{}-{sequence}.tmp", process::id()));

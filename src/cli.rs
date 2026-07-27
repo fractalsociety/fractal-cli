@@ -83,8 +83,46 @@ pub(crate) enum Command {
     Logout,
     /// Publish this project's standardized graph (explicitly or opt-in).
     Sync(SyncArgs),
+    /// Hand a named managed build to the native Fractal Voice app.
+    Handoff(HandoffArgs),
+    /// Deprecated compatibility bridge; external desktop apps should use `handoff`.
+    Bridge(BridgeArgs),
     /// Print the Fractal CLI version.
     Version,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct HandoffArgs {
+    /// Confirmed project name used for its folder, graph title, and profile URL.
+    #[arg(long = "name", visible_alias = "project-name", value_name = "NAME")]
+    pub(crate) project_name: String,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct BridgeArgs {
+    #[command(subcommand)]
+    pub(crate) command: BridgeCommand,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub(crate) enum BridgeCommand {
+    /// Run the loopback-only bridge in the foreground.
+    Serve {
+        #[arg(long, default_value_t = 18_372)]
+        port: u16,
+    },
+    /// Install and start the per-user launch agent.
+    Install {
+        #[arg(long, default_value_t = 18_372)]
+        port: u16,
+    },
+    /// Print the pairing token for entry into Fractal Voice.
+    Token,
+    /// Verify that the local bridge is reachable.
+    Status {
+        #[arg(long, default_value_t = 18_372)]
+        port: u16,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -368,7 +406,6 @@ pub(crate) struct VoiceArgs {
     /// Port for the execution graph launched by a Moonshine command.
     #[arg(long, default_value_t = DEFAULT_GRAPH_PORT)]
     pub(crate) port: u16,
-
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -924,9 +961,10 @@ mod tests {
             }))
         ));
 
-        let sync =
-            Cli::try_parse_from(["fractal", "sync", "--enable", "--github", "--repo", "/tmp/app"])
-                .unwrap();
+        let sync = Cli::try_parse_from([
+            "fractal", "sync", "--enable", "--github", "--repo", "/tmp/app",
+        ])
+        .unwrap();
         assert!(matches!(
             sync.command,
             Some(Command::Sync(SyncArgs {
@@ -934,6 +972,17 @@ mod tests {
                 github: true,
                 ..
             }))
+        ));
+    }
+
+    #[test]
+    fn parses_bridge_free_native_handoff() {
+        let cli = Cli::try_parse_from(["fractal", "handoff", "--name", "Hello World"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Handoff(HandoffArgs {
+                ref project_name
+            })) if project_name == "Hello World"
         ));
     }
 

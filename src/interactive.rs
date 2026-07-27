@@ -13,6 +13,8 @@ use crate::orchestrate::Backend;
 use crate::work_builder::IntentClassification;
 use crate::{board, execute, graph_store, intent, pipeline};
 
+const MANAGED_AGENT_INSTRUCTIONS: &str = include_str!("../AGENTS.md");
+
 /// Launch the interactive session in the current working directory.
 pub(crate) fn run(fractalwork_override: Option<&Path>, coordinate_flag: bool) -> Result<()> {
     let workspace = std::env::current_dir().context("cannot resolve the current directory")?;
@@ -490,12 +492,24 @@ pub(crate) fn execute_ingested(
 
 /// Create a fresh, narrowly scoped workspace for a request approved through the
 /// native Fractal Voice companion. The companion may grant trust only beneath
-/// `~/fractal-projects`; ordinary voice ingest can never grant workspace trust.
+/// its configured managed-project root; ordinary voice ingest can never grant
+/// workspace trust.
 pub(crate) fn prepare_managed_voice_workspace(name: &str, prompt: &str) -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is unavailable for managed voice projects")?;
-    let root = home.join("fractal-projects");
+    let root = match std::env::var_os("FRACTAL_PROJECTS_DIR") {
+        Some(configured) if !configured.is_empty() => {
+            let configured = PathBuf::from(configured);
+            if !configured.is_absolute() {
+                anyhow::bail!("FRACTAL_PROJECTS_DIR must be an absolute path");
+            }
+            configured
+        }
+        _ => {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .context("HOME is unavailable for managed voice projects")?;
+            home.join("fractal-projects")
+        }
+    };
     std::fs::create_dir_all(&root)
         .with_context(|| format!("create managed project root {}", root.display()))?;
     let root = root
@@ -516,10 +530,20 @@ pub(crate) fn prepare_managed_voice_workspace(name: &str, prompt: &str) -> Resul
     if !workspace.starts_with(&root) || workspace == root {
         anyhow::bail!("managed voice workspace escaped its project root");
     }
+    install_managed_agent_instructions(&workspace)?;
     crate::project_file::configure_managed_identity(&workspace, name, prompt)?;
     persist_trust(&trust_store_path(), &workspace)?;
     println!("Created managed voice project: {}", workspace.display());
     Ok(workspace)
+}
+
+fn install_managed_agent_instructions(workspace: &Path) -> Result<()> {
+    let destination = workspace.join("AGENTS.md");
+    if destination.exists() {
+        return Ok(());
+    }
+    std::fs::write(&destination, MANAGED_AGENT_INSTRUCTIONS)
+        .with_context(|| format!("write managed agent instructions {}", destination.display()))
 }
 
 fn managed_project_slug(request: &str) -> String {
@@ -898,7 +922,7 @@ fn map_classification(classification: &intent::TaskClassification) -> IntentClas
 
 #[cfg(test)]
 mod tests {
-    use super::managed_project_slug;
+    use super::{install_managed_agent_instructions, managed_project_slug};
 
     #[test]
     fn managed_voice_project_slugs_are_portable_and_bounded() {
@@ -908,5 +932,26 @@ mod tests {
         );
         assert_eq!(managed_project_slug("⚡️"), "voice-project");
         assert!(managed_project_slug(&"project ".repeat(20)).len() <= 48);
+    }
+
+    #[test]
+    fn managed_voice_projects_receive_fractal_agent_instructions() {
+        let workspace = std::env::temp_dir().join(format!(
+            "fractal-agents-instructions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&workspace).unwrap();
+
+        install_managed_agent_instructions(&workspace).unwrap();
+        let instructions = std::fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
+
+        assert!(instructions.contains("Fractal owns orchestration"));
+        assert!(instructions.contains("FRACTAL_WORKER"));
+        assert!(instructions.contains(".fractal/project.fractal"));
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 }

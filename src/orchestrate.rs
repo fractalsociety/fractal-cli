@@ -199,19 +199,23 @@ pub(crate) fn run_end_to_end(
                 .failed_node
                 .clone()
                 .unwrap_or_else(|| "acceptance".to_owned());
-            let evolution =
-                match crate::harness_evolution::evolve(&graph, &current_hash, &failed_node, attempt) {
-                    Ok(evolution) => evolution,
-                    Err(error) => {
-                        // A failed evolution must NEVER destroy the whole build. Log
-                        // it, stop evolving, and return the partial outcome — the
-                        // checkpoint is kept so the run can be resumed.
-                        eprintln!(
+            let evolution = match crate::harness_evolution::evolve(
+                &graph,
+                &current_hash,
+                &failed_node,
+                attempt,
+            ) {
+                Ok(evolution) => evolution,
+                Err(error) => {
+                    // A failed evolution must NEVER destroy the whole build. Log
+                    // it, stop evolving, and return the partial outcome — the
+                    // checkpoint is kept so the run can be resumed.
+                    eprintln!(
                             "  ⟳ harness evolution unavailable ({error:#}); keeping progress and stopping evolution"
                         );
-                        break outcome;
-                    }
-                };
+                    break outcome;
+                }
+            };
             println!(
                 "  ⟳ verified failure at `{failed_node}` (cause: {}) — harness evolution: {} [{}]",
                 evolution.cause, evolution.note, evolution.arm
@@ -257,10 +261,7 @@ pub(crate) fn run_end_to_end(
             } else {
                 let _ = crate::project_sync::maybe_sync(workspace);
             }
-            crate::run_control::set_graph(
-                &evolution.child_hash,
-                board.unwrap_or_default(),
-            );
+            crate::run_control::set_graph(&evolution.child_hash, board.unwrap_or_default());
 
             // Board follows the evolution: re-point the live board to the child
             // graph so the grown / differentiated / repaired tasks appear on the

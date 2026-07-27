@@ -63,6 +63,15 @@ struct ControlEnvelope {
 struct ControlCommand {
     command_id: String,
     action: String,
+    #[serde(default)]
+    task_ref: String,
+    #[serde(default)]
+    instruction: String,
+}
+
+pub(crate) enum HostedControl {
+    Pause(String),
+    AmendmentQueued,
 }
 
 enum PutFailure {
@@ -289,7 +298,7 @@ pub(crate) fn sync_runtime_halt_now(workspace: &Path) -> Result<()> {
 /// Poll the authenticated Fractal Society project for an owner-requested pause.
 /// The command is acknowledged before local cancellation, preventing a page
 /// refresh from repeatedly stopping a later resumed run.
-pub(crate) fn poll_pause_command(workspace: &Path) -> Result<Option<String>> {
+pub(crate) fn poll_control_command(workspace: &Path) -> Result<Option<HostedControl>> {
     if std::env::var_os("FRACTAL_OFFLINE").is_some() {
         return Ok(None);
     }
@@ -320,6 +329,21 @@ pub(crate) fn poll_pause_command(workspace: &Path) -> Result<Option<String>> {
     let Some(command) = envelope.command else {
         return Ok(None);
     };
+    if command.action == "add_branch" {
+        crate::amendments::queue(
+            workspace,
+            &command.command_id,
+            &command.task_ref,
+            &command.instruction,
+            "fractal-society",
+        )?;
+        update_hosted_command(workspace, &command.command_id, "accepted", None)?;
+        println!(
+            "  ✓ accepted hosted branch request for task {}; lead planner will apply it between waves",
+            command.task_ref
+        );
+        return Ok(Some(HostedControl::AmendmentQueued));
+    }
     if command.action != "pause" {
         return Ok(None);
     }
@@ -334,9 +358,52 @@ pub(crate) fn poll_pause_command(workspace: &Path) -> Result<Option<String>> {
         .timeout(std::time::Duration::from_secs(3))
         .send_string(&body)
     {
-        Ok(_) => Ok(Some(command.command_id)),
+        Ok(_) => Ok(Some(HostedControl::Pause(command.command_id))),
         Err(error) => Err(anyhow::anyhow!(error)).context("acknowledge hosted graph control"),
     }
+}
+
+pub(crate) fn mark_amendment_result(
+    workspace: &Path,
+    command_id: &str,
+    applied: bool,
+    error: Option<&str>,
+) -> Result<()> {
+    update_hosted_command(
+        workspace,
+        command_id,
+        if applied { "applied" } else { "failed" },
+        error,
+    )
+}
+
+fn update_hosted_command(
+    workspace: &Path,
+    command_id: &str,
+    status: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    let session = crate::auth::load_session()?;
+    let document = crate::project_file::load(workspace)?;
+    let endpoint = format!(
+        "{}/api/cli/projects/{}/control",
+        session.server.trim_end_matches('/'),
+        document.project.slug
+    );
+    let body = serde_json::json!({
+        "command_id": command_id,
+        "status": status,
+        "error": error,
+    })
+    .to_string();
+    ureq::post(&endpoint)
+        .set("Authorization", &format!("Bearer {}", session.access_token))
+        .set("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(3))
+        .send_string(&body)
+        .map(|_| ())
+        .map_err(anyhow::Error::new)
+        .context("update hosted graph command")
 }
 
 /// Report that the coordinator and worker process groups have been terminated.

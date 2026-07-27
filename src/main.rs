@@ -1,5 +1,7 @@
+mod amendments;
 mod auth;
 mod board;
+mod bridge;
 mod chain;
 mod checkpoint;
 mod cli;
@@ -10,6 +12,7 @@ mod decompose;
 mod evolve;
 mod execute;
 mod graph_store;
+mod handoff;
 mod harness;
 mod harness_evolution;
 mod ingest;
@@ -18,9 +21,9 @@ mod interactive;
 mod mobile;
 mod orchestrate;
 mod pipeline;
-mod projects;
 mod project_file;
 mod project_sync;
+mod projects;
 mod rlvr;
 mod router;
 mod run;
@@ -37,7 +40,7 @@ use std::process::ExitCode;
 use anyhow::Result;
 use clap::Parser;
 
-use crate::cli::{Cli, Command, GraphCommand};
+use crate::cli::{BridgeCommand, Cli, Command, GraphCommand};
 use crate::work_builder::IntentClassification;
 
 fn main() -> ExitCode {
@@ -193,6 +196,15 @@ fn run(cli: Cli) -> Result<()> {
         (None, Some(Command::Login(args))) => auth::run_login(&args),
         (None, Some(Command::Logout)) => auth::logout(),
         (None, Some(Command::Sync(args))) => project_sync::run(&args),
+        (None, Some(Command::Handoff(args))) => handoff::run(&args),
+        (None, Some(Command::Bridge(args))) => match args.command {
+            BridgeCommand::Serve { port } => {
+                bridge::serve(port, fractalwork.as_deref(), coordinate)
+            }
+            BridgeCommand::Install { port } => bridge::install(port),
+            BridgeCommand::Token => bridge::print_token(),
+            BridgeCommand::Status { port } => bridge::status(port),
+        },
         (None, Some(Command::Version)) => {
             println!("fractal {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -249,13 +261,7 @@ fn print_submit_plan(
         } else {
             let (browser_target, is_cloud_target) =
                 board::browser_target(project_url.as_deref(), port);
-            if let Err(error) = board::serve_graph(
-                &graph_hash,
-                port,
-                None,
-                is_cloud_target,
-                None,
-            ) {
+            if let Err(error) = board::serve_graph(&graph_hash, port, None, is_cloud_target, None) {
                 eprintln!("warning: could not serve the execution-graph viewer: {error:#}");
             }
             if is_cloud_target {

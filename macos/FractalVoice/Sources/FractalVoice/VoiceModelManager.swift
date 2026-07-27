@@ -67,8 +67,7 @@ final class VoiceModelManager: ObservableObject {
     }
 
     nonisolated static var modelRoot: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".fractal/models", isDirectory: true)
+        AppRuntime.modelRoot
     }
 
     nonisolated static var graniteDirectory: URL {

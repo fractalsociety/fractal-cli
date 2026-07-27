@@ -235,12 +235,15 @@ fn start_hosted_control_monitor(run_id: String) {
             if run.status != "running" {
                 break;
             }
-            match crate::project_sync::poll_pause_command(Path::new(&run.workspace)) {
-                Ok(Some(command_id)) => {
+            match crate::project_sync::poll_control_command(Path::new(&run.workspace)) {
+                Ok(Some(crate::project_sync::HostedControl::Pause(command_id))) => {
                     if let Err(error) = halt(&run, Some(&command_id)) {
                         eprintln!("  hosted pause note: {error:#}");
                     }
                     break;
+                }
+                Ok(Some(crate::project_sync::HostedControl::AmendmentQueued)) => {
+                    consecutive_errors = 0;
                 }
                 Ok(None) => consecutive_errors = 0,
                 Err(error) => {
@@ -252,6 +255,33 @@ fn start_hosted_control_monitor(run_id: String) {
             }
         }
     });
+}
+
+/// Queue a spoken or typed amendment against the one active build. The lead
+/// consumes it at the next dependency-safe boundary between execution waves.
+pub(crate) fn queue_active_amendment(task_ref: &str, instruction: &str) -> Result<()> {
+    let runs: Vec<_> = live_runs()?
+        .into_iter()
+        .filter(|run| run.status == "running" && process_alive(run.pid))
+        .collect();
+    if runs.is_empty() {
+        bail!("no Fractal build is currently running");
+    }
+    if runs.len() > 1 {
+        bail!("more than one Fractal build is running; add the branch from its project graph");
+    }
+    let command_id = format!("local-{}-{}", now_ms(), std::process::id());
+    crate::amendments::queue(
+        Path::new(&runs[0].workspace),
+        command_id,
+        task_ref,
+        instruction,
+        "voice",
+    )?;
+    println!(
+        "Accepted: task {task_ref} will receive a new planner branch between execution waves."
+    );
+    Ok(())
 }
 
 fn halt(original: &ActiveRun, hosted_command_id: Option<&str>) -> Result<()> {

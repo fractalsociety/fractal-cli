@@ -11,7 +11,10 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
     private var hotKey: GlobalHotKey?
     private var onboardingWindow: NSWindow?
     private var observations = Set<AnyCancellable>()
+    private var externalHandoffTimer: Timer?
     private var setupComplete = false
+    private var selectedVoiceMode: VoiceInputMode?
+    private var lastGlobalHotKeyActivation: TimeInterval = 0
 
     static func main() {
         if ProcessInfo.processInfo.environment["FRACTAL_VOICE_SELF_TEST"] == "1" {
@@ -45,21 +48,32 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         NSApp.setActivationPolicy(.accessory)
         configureStatusItem()
         setupComplete = UserDefaults.standard.bool(forKey: "completedOnboarding")
-        if setupComplete && coordinator.voiceReady {
-            installGlobalHotKey()
+        selectedVoiceMode = VoiceInputMode.selected()
+        if setupComplete, selectedVoiceMode == nil, coordinator.voiceReady {
+            VoiceInputMode.save(.builtIn)
+            selectedVoiceMode = .builtIn
+        }
+        if setupComplete,
+           let selectedVoiceMode,
+           selectedVoiceMode.isReady(localModelsReady: coordinator.voiceReady) {
+            activate(selectedVoiceMode)
         } else {
             setupComplete = false
             coordinator.reportSetupRequired()
         }
         NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
             .sink { [weak self] _ in
-                guard self?.setupComplete == true else { return }
+                guard
+                    self?.setupComplete == true,
+                    self?.selectedVoiceMode == .builtIn
+                else { return }
                 self?.installGlobalHotKey()
             }
             .store(in: &observations)
         coordinator.$state
             .sink { [weak self] state in self?.updateStatusIcon(state) }
             .store(in: &observations)
+        startExternalHandoffMonitoring()
 
         if !setupComplete {
             showOnboarding()
@@ -67,7 +81,64 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        externalHandoffTimer?.invalidate()
         coordinator.shutdown()
+    }
+
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        guard filenames.count == 1 else {
+            sender.reply(toOpenOrPrint: .failure)
+            return
+        }
+        let handled = handleExternalBuild(
+            at: URL(fileURLWithPath: filenames[0]),
+            reportFailure: true
+        )
+        sender.reply(toOpenOrPrint: handled ? .success : .failure)
+    }
+
+    private func startExternalHandoffMonitoring() {
+        externalHandoffTimer?.invalidate()
+        externalHandoffTimer = Timer.scheduledTimer(
+            withTimeInterval: 0.75,
+            repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.consumeNextQueuedExternalBuild()
+            }
+        }
+        consumeNextQueuedExternalBuild()
+    }
+
+    private func consumeNextQueuedExternalBuild() {
+        guard setupComplete, coordinator.canAcceptExternalBuild else { return }
+        guard let url = ExternalBuildHandoff.pendingURLs().first else { return }
+        _ = handleExternalBuild(at: url, reportFailure: true)
+    }
+
+    private func handleExternalBuild(at url: URL, reportFailure: Bool) -> Bool {
+        guard setupComplete else {
+            showOnboarding()
+            if reportFailure {
+                coordinator.reportExternalBuildFailure(
+                    ExternalBuildLaunchError.setupRequired.localizedDescription
+                )
+            }
+            return false
+        }
+        guard coordinator.canAcceptExternalBuild else {
+            return false
+        }
+        do {
+            let external = try ExternalBuildHandoff.consume(url)
+            try coordinator.startExternalBuild(external)
+            return true
+        } catch {
+            if reportFailure {
+                coordinator.reportExternalBuildFailure(error.localizedDescription)
+            }
+            return false
+        }
     }
 
     private func configureStatusItem() {
@@ -101,19 +172,30 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         menu.addItem(shortcut)
         menu.addItem(.separator())
 
-        let toggleTitle = coordinator.state == .recording ? "Stop Recording & Build" : "Start Recording"
-        let toggle = NSMenuItem(
-            title: toggleTitle,
-            action: #selector(toggleRecording),
-            keyEquivalent: " "
-        )
-        toggle.keyEquivalentModifierMask = [.option]
-        toggle.target = self
-        toggle.isEnabled = setupComplete
-            && ![.building, .preparing].contains(coordinator.state)
-        menu.addItem(toggle)
-        if setupComplete && !coordinator.shortcutReady {
-            menu.addItem(item("Retry ⌥Space Shortcut", #selector(retryShortcut)))
+        if selectedVoiceMode == .builtIn {
+            let toggleTitle = coordinator.state == .recording
+                ? "Stop Recording & Build"
+                : "Start Recording"
+            let toggle = NSMenuItem(
+                title: toggleTitle,
+                action: #selector(toggleRecording),
+                keyEquivalent: ""
+            )
+            toggle.target = self
+            toggle.isEnabled = setupComplete
+                && ![.building, .preparing].contains(coordinator.state)
+            menu.addItem(toggle)
+            if setupComplete && !coordinator.shortcutReady {
+                menu.addItem(item("Retry ⌥Space Shortcut", #selector(retryShortcut)))
+            }
+        } else if let selectedVoiceMode {
+            let voiceSource = NSMenuItem(
+                title: "Voice input: \(selectedVoiceMode.title)",
+                action: nil,
+                keyEquivalent: ""
+            )
+            voiceSource.isEnabled = false
+            menu.addItem(voiceSource)
         }
 
         menu.addItem(item("Show Welcome", #selector(showOnboarding)))
@@ -122,6 +204,8 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         }
         menu.addItem(item("Open Projects", #selector(openProjects)))
         menu.addItem(item("Open Activity Log", #selector(openLog)))
+        menu.addItem(item("Support", #selector(openSupport)))
+        menu.addItem(item("Privacy Policy", #selector(openPrivacyPolicy)))
         menu.addItem(.separator())
         if coordinator.state == .building {
             menu.addItem(item("Stop Current Build", #selector(stopCurrentBuild)))
@@ -150,7 +234,7 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         hotKey = nil
         do {
             hotKey = try GlobalHotKey { [weak self] in
-                self?.coordinator.toggleRecording()
+                self?.handleGlobalHotKey()
             }
             coordinator.reportShortcutReady()
         } catch {
@@ -159,6 +243,13 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
                     + " Quit the conflicting app, then choose Retry Shortcut from the Fractal menu."
             )
         }
+    }
+
+    private func handleGlobalHotKey() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastGlobalHotKeyActivation >= 0.35 else { return }
+        lastGlobalHotKeyActivation = now
+        coordinator.toggleRecording()
     }
 
     @objc func showOnboarding() {
@@ -171,7 +262,10 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         let view = OnboardingView(coordinator: coordinator) { [weak self] in
             UserDefaults.standard.set(true, forKey: "completedOnboarding")
             self?.setupComplete = true
-            self?.installGlobalHotKey()
+            self?.selectedVoiceMode = VoiceInputMode.selected()
+            if let selectedVoiceMode = self?.selectedVoiceMode {
+                self?.activate(selectedVoiceMode)
+            }
             self?.onboardingWindow?.close()
         }
         let window = NSWindow(
@@ -207,6 +301,14 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         coordinator.openLog()
     }
 
+    @objc private func openSupport() {
+        NSWorkspace.shared.open(URL(string: "https://fractalsociety.com/support")!)
+    }
+
+    @objc private func openPrivacyPolicy() {
+        NSWorkspace.shared.open(URL(string: "https://fractalsociety.com/privacy")!)
+    }
+
     @objc private func stopBuilds() {
         coordinator.stopAllBuilds()
     }
@@ -236,6 +338,27 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
             systemSymbolName: symbol,
             accessibilityDescription: state.label
         )
+    }
+
+    private func activate(_ mode: VoiceInputMode) {
+        selectedVoiceMode = mode
+        switch mode {
+        case .builtIn:
+            coordinator.activateBuiltInVoice()
+            installGlobalHotKey()
+            coordinator.requestMicrophonePermission()
+        case .chatGPTDesktop, .superwhisper:
+            hotKey = nil
+            coordinator.activateExternalVoice(mode)
+        }
+    }
+}
+
+private enum ExternalBuildLaunchError: LocalizedError {
+    case setupRequired
+
+    var errorDescription: String? {
+        "Complete Fractal Voice setup before accepting builds from another desktop app."
     }
 }
 

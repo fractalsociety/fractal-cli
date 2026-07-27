@@ -238,6 +238,25 @@ pub(crate) fn run_supervised(
     let mut midrun = 0u32;
     let min_hops = min_verify_hops();
     loop {
+        let previous_hash = hash.clone();
+        (graph, hash) = crate::amendments::apply_pending(graph, hash, workspace, &agents[0]);
+        if hash != previous_hash {
+            // A prior closeout is no longer final once the user adds new work.
+            completed.remove("lead_closeout");
+            let amended_nodes = all_node_ids(&graph);
+            completed.retain(|id| amended_nodes.contains(id));
+            crate::run_control::set_graph(&hash, board.unwrap_or_default());
+            if let Some(recorder) = recorder {
+                recorder.record(&hash, &completed, all_node_ids(&graph).len());
+            }
+            if let Some(url) = board {
+                if let Some(port) = crate::orchestrate::board_port(url) {
+                    if let Err(error) = crate::board::serve_graph(&hash, port, None, true, None) {
+                        eprintln!("  branch board follow note: {error:#}");
+                    }
+                }
+            }
+        }
         let frontier = execute::ready_frontier(&graph, &completed);
         if frontier.is_empty() {
             break;

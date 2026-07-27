@@ -16,7 +16,10 @@ final class NativeVoiceRecorder: @unchecked Sendable {
 
     init(endingSilenceDuration: Double = VoiceActivityDetector.defaultEndingSilenceDuration) {
         self.endingSilenceDuration = endingSilenceDuration
-        voiceActivity = VoiceActivityDetector(endingSilenceDuration: endingSilenceDuration)
+        voiceActivity = VoiceActivityDetector(
+            endingSilenceDuration: endingSilenceDuration,
+            calibrationDuration: 0.25
+        )
     }
 
     func start() throws {
@@ -40,7 +43,8 @@ final class NativeVoiceRecorder: @unchecked Sendable {
             recordingURL = url
             isRecording = true
             voiceActivity = VoiceActivityDetector(
-                endingSilenceDuration: endingSilenceDuration
+                endingSilenceDuration: endingSilenceDuration,
+                calibrationDuration: 0.25
             )
         }
         input.installTap(
@@ -113,15 +117,20 @@ final class NativeVoiceRecorder: @unchecked Sendable {
     func stop() throws -> URL {
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
-        return try lock.withLock {
+        let result = try lock.withLock {
             isRecording = false
             audioFile = nil
             guard let recordingURL else {
                 throw VoiceRecorderError.noRecording
             }
             self.recordingURL = nil
-            return recordingURL
+            return (recordingURL, voiceActivity.heardSpeech)
         }
+        guard result.1 else {
+            try? FileManager.default.removeItem(at: result.0)
+            throw VoiceRecorderError.noSpeech
+        }
+        return result.0
     }
 
     func close() {
@@ -153,14 +162,24 @@ struct VoiceActivityDetector {
     private var trailingSilenceDuration = 0.0
     private var ended = false
     private var speechReference: Float = 0
+    private var observedDuration = 0.0
+    private var noiseReference: Float = 0
     private let endingSilenceDuration: Double
+    private let calibrationDuration: Double
 
     static let speechThreshold: Float = 0.0035
-    static let minimumSpeechDuration = 0.04
+    // Require speech-like energy across more than one normal capture buffer.
+    // This prevents a click, notification sound, or brief room-noise spike from
+    // being sent to the speech model as though it were an utterance.
+    static let minimumSpeechDuration = 0.12
     static let defaultEndingSilenceDuration = 0.72
 
-    init(endingSilenceDuration: Double = Self.defaultEndingSilenceDuration) {
+    init(
+        endingSilenceDuration: Double = Self.defaultEndingSilenceDuration,
+        calibrationDuration: Double = 0
+    ) {
         self.endingSilenceDuration = endingSilenceDuration
+        self.calibrationDuration = calibrationDuration
     }
 
     mutating func observe(
@@ -173,10 +192,22 @@ struct VoiceActivityDetector {
         // an audio buffer. RMS remains the main signal so keyboard clicks do not
         // become utterances.
         let level = max(rms, (peak ?? rms) * 0.16)
+        observedDuration += duration
+        if observedDuration <= calibrationDuration {
+            noiseReference = noiseReference == 0
+                ? level
+                : min(noiseReference, level)
+            return nil
+        }
+        let adaptiveSpeechThreshold = max(
+            Self.speechThreshold,
+            noiseReference * 2.6
+        )
+        let adaptiveRMSFloor = max(0.0012, noiseReference * 1.45)
         let releaseThreshold = heardSpeech
             ? max(Self.speechThreshold * 0.72, speechReference * 0.22)
-            : Self.speechThreshold
-        if level >= releaseThreshold && rms >= 0.0012 {
+            : adaptiveSpeechThreshold
+        if level >= releaseThreshold && rms >= adaptiveRMSFloor {
             trailingSilenceDuration = 0
             speechReference = max(speechReference, level)
             if !heardSpeech {
@@ -197,6 +228,9 @@ struct VoiceActivityDetector {
             }
         } else {
             candidateSpeechDuration = 0
+            noiseReference = noiseReference == 0
+                ? level
+                : noiseReference * 0.96 + level * 0.04
         }
         return nil
     }
@@ -205,6 +239,7 @@ struct VoiceActivityDetector {
 private enum VoiceRecorderError: LocalizedError {
     case microphoneUnavailable
     case noRecording
+    case noSpeech
 
     var errorDescription: String? {
         switch self {
@@ -212,6 +247,8 @@ private enum VoiceRecorderError: LocalizedError {
             return "The microphone did not provide a usable audio format."
         case .noRecording:
             return "No voice recording was available to transcribe."
+        case .noSpeech:
+            return "No speech was detected. Please speak after the listening indicator appears."
         }
     }
 }

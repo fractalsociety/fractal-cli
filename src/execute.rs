@@ -324,11 +324,19 @@ pub(crate) fn detect_agents() -> Vec<String> {
             return chosen;
         }
     }
-    ["codex", "cursor", "claude", "hermes"]
+    let mut detected: Vec<String> = ["codex", "cursor", "claude", "hermes"]
         .into_iter()
         .filter(|kind| binary_on_path(agent_binary(kind)))
         .map(str::to_owned)
-        .collect()
+        .collect();
+    if let Ok(lead) = std::env::var("FRACTAL_LEAD_AGENT") {
+        let lead = lead.trim();
+        if let Some(index) = detected.iter().position(|agent| agent == lead) {
+            let selected = detected.remove(index);
+            detected.insert(0, selected);
+        }
+    }
+    detected
 }
 
 /// Result of executing one node.

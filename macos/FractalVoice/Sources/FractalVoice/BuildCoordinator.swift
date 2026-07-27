@@ -23,6 +23,7 @@ enum VoiceState: Equatable {
 
 private enum TranscriptionPurpose: Equatable {
     case request
+    case amendment
     case requestConfirmation
     case projectName
     case nameConfirmation
@@ -58,10 +59,11 @@ final class BuildCoordinator: ObservableObject {
     private var outputLineBuffer = ""
     private var hud: RecordingHUD?
     private var stopCommand: Process?
+    private var bridgeBuildTask: Task<Void, Never>?
     private var stopRequested = false
     private var restartRequested = false
     private var activeWorkspace: URL?
-    private let vocabularyEngine = VoiceVocabularyEngine()
+    private let vocabularyEngine = VoiceVocabularyEngine(homeURL: AppRuntime.homeURL)
     private let speaker = KokoroSpeaker()
     private var transcriptionPurpose: TranscriptionPurpose = .request
     private var dialogueStage: DialogueStage = .none
@@ -69,12 +71,20 @@ final class BuildCoordinator: ObservableObject {
     private var pendingRequestWasTyped = false
     private var pendingProjectName = ""
     private var dialogueGeneration = 0
+    private var transcriptRetryCount = 0
     private var recordingTimeout: Task<Void, Never>?
 
-    let projectsURL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("fractal-projects", isDirectory: true)
-    let logURL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Logs/FractalVoice.log")
+    let projectsURL = AppRuntime.projectsURL
+    let logURL = AppRuntime.logURL
+
+    var canAcceptExternalBuild: Bool {
+        process == nil
+            && transcriptionProcess == nil
+            && recorder == nil
+            && state != .preparing
+            && state != .recording
+            && state != .building
+    }
 
     init() {
         try? FileManager.default.createDirectory(
@@ -93,8 +103,26 @@ final class BuildCoordinator: ObservableObject {
         latestActivity = voiceReady
             ? "Press ⌥Space to speak"
             : "Voice models are downloading — open Welcome for progress"
+    }
+
+    func activateBuiltInVoice() {
+        refreshVoiceReadiness()
         if voiceReady {
             startGraniteServer()
+        }
+    }
+
+    func activateExternalVoice(_ mode: VoiceInputMode) {
+        graniteServerProcess?.terminate()
+        graniteServerProcess = nil
+        graniteServerBaseURL = nil
+        latestActivity = switch mode {
+        case .chatGPTDesktop:
+            "Ready for secure builds from ChatGPT Desktop"
+        case .superwhisper:
+            "Ready for commands from Superwhisper"
+        case .builtIn:
+            "Press ⌥Space to speak"
         }
     }
 
@@ -106,7 +134,7 @@ final class BuildCoordinator: ObservableObject {
         else {
             return
         }
-        let port = 18_371
+        let port = AppRuntime.graniteServerPort
         let server = Process()
         server.executableURL = executable
         server.arguments = [
@@ -149,6 +177,8 @@ final class BuildCoordinator: ObservableObject {
 
     func shutdown() {
         recordingTimeout?.cancel()
+        bridgeBuildTask?.cancel()
+        bridgeBuildTask = nil
         graniteServerBaseURL = nil
         if graniteServerProcess?.isRunning == true {
             graniteServerProcess?.terminate()
@@ -180,6 +210,18 @@ final class BuildCoordinator: ObservableObject {
         }
     }
 
+    func reportExternalBuildFailure(_ message: String) {
+        state = .failed(message)
+        latestActivity = message
+        if hud == nil {
+            hud = RecordingHUD(
+                onStop: { [weak self] in self?.stopCurrentBuild() },
+                onRestart: { [weak self] in self?.restartVoiceCommand() }
+            )
+        }
+        hud?.showFailure(message)
+    }
+
     func toggleRecording() {
         if state == .building, recorder == nil, transcriptionProcess == nil {
             switch dialogueStage {
@@ -193,6 +235,10 @@ final class BuildCoordinator: ObservableObject {
                 beginDialogueRecording(purpose: .nameConfirmation)
                 return
             default:
+                if process != nil || bridgeBuildTask != nil {
+                    beginAmendmentRecording()
+                    return
+                }
                 break
             }
         }
@@ -210,24 +256,22 @@ final class BuildCoordinator: ObservableObject {
         }
     }
 
+    private func beginAmendmentRecording() {
+        guard voiceReady else {
+            latestActivity = "Built-in voice assets are not ready"
+            return
+        }
+        let recorder = makeRecorder(for: .amendment)
+        configureCallbacks(for: recorder)
+        self.recorder = recorder
+        beginRecording(with: recorder, purpose: .amendment)
+    }
+
     func startRecording() {
         guard process == nil else { return }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .notDetermined:
-            state = .preparing
-            latestActivity = "Allow Microphone access to use Fractal Voice…"
-            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
-                Task { @MainActor in
-                    guard let self else { return }
-                    if granted {
-                        self.microphoneDenied = false
-                        self.state = .idle
-                        self.startRecording()
-                    } else {
-                        self.reportMicrophoneDenied()
-                    }
-                }
-            }
+            requestMicrophonePermission(startRecordingWhenGranted: true)
             return
         case .denied, .restricted:
             reportMicrophoneDenied()
@@ -252,6 +296,7 @@ final class BuildCoordinator: ObservableObject {
             pendingRequest = ""
             pendingRequestWasTyped = false
             pendingProjectName = ""
+            transcriptRetryCount = 0
             transcriptionPurpose = .request
         }
         state = .preparing
@@ -272,6 +317,84 @@ final class BuildCoordinator: ObservableObject {
         beginRecording(with: recorder, purpose: .request)
     }
 
+    func startExternalBuild(_ external: ExternalBuildRequest) throws {
+        guard canAcceptExternalBuild else {
+            throw ExternalBuildStartError.busy
+        }
+        guard Self.fractalExecutable() != nil else {
+            throw ExternalBuildStartError.cliMissing
+        }
+
+        cancelDialogueInput()
+        pendingRequest = external.request
+        pendingRequestWasTyped = true
+        pendingProjectName = external.projectName
+        stopRequested = false
+        restartRequested = false
+        state = .building
+        latestActivity = "External request received — starting \(external.projectName)…"
+        hud?.close()
+        hud = RecordingHUD(
+            onStop: { [weak self] in self?.stopCurrentBuild() },
+            onRestart: { [weak self] in self?.restartVoiceCommand() }
+        )
+        hud?.showBuilding(
+            summary: "External request received — starting \(external.projectName)…"
+        )
+        startBuild(
+            transcript: external.request,
+            projectName: external.projectName,
+            applyVoiceVocabulary: false
+        )
+    }
+
+    func requestMicrophonePermission(startRecordingWhenGranted: Bool = false) {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            microphoneDenied = false
+            if startRecordingWhenGranted {
+                startRecording()
+            }
+        case .denied, .restricted:
+            reportMicrophoneDenied()
+        case .notDetermined:
+            state = .preparing
+            latestActivity = "Fractal needs the microphone only to hear your spoken build request"
+            let explanation = NSAlert()
+            explanation.messageText = "Allow Microphone access?"
+            explanation.informativeText =
+                "Fractal Voice records only while the listening indicator is visible. "
+                + "Granite Speech transcribes the recording locally on this Mac; "
+                + "the microphone audio is not uploaded to a transcription service."
+            explanation.alertStyle = .informational
+            explanation.addButton(withTitle: "Continue")
+            explanation.addButton(withTitle: "Not Now")
+            guard explanation.runModal() == .alertFirstButtonReturn else {
+                state = .idle
+                latestActivity = "Microphone access was not requested — open the Fractal menu when you are ready"
+                return
+            }
+            latestActivity = "macOS will now ask for Microphone access…"
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                Task { @MainActor in
+                    guard let self else { return }
+                    if granted {
+                        self.microphoneDenied = false
+                        self.state = .idle
+                        self.latestActivity = "Microphone ready — press ⌥Space to speak"
+                        if startRecordingWhenGranted {
+                            self.startRecording()
+                        }
+                    } else {
+                        self.reportMicrophoneDenied()
+                    }
+                }
+            }
+        @unknown default:
+            reportMicrophoneDenied()
+        }
+    }
+
     private func beginRecording(
         with recorder: NativeVoiceRecorder,
         purpose: TranscriptionPurpose
@@ -284,6 +407,8 @@ final class BuildCoordinator: ObservableObject {
             switch purpose {
             case .request:
                 summary = "Tell Fractal what you want to build — listening stops when you finish"
+            case .amendment:
+                summary = "Add to the active build — for example, “add to task 1.2 a branch that adds export”"
             case .requestConfirmation, .nameConfirmation:
                 summary = "Just say yes or no — or use the buttons"
             case .projectName:
@@ -292,14 +417,17 @@ final class BuildCoordinator: ObservableObject {
             latestActivity = summary
             if purpose == .projectName {
                 hud?.showNaming(summary)
-            } else if purpose == .request {
+            } else if purpose == .request || purpose == .amendment {
                 hud?.showListening(summary: summary)
             }
             scheduleRecordingTimeout(for: recorder, purpose: purpose)
-            NSSound(named: "Tink")?.play()
         } catch {
-            state = .failed("Could not start microphone capture")
-            latestActivity = error.localizedDescription
+            if purpose == .amendment {
+                amendmentFailed(error)
+            } else {
+                state = .failed("Could not start microphone capture")
+                latestActivity = error.localizedDescription
+            }
         }
     }
 
@@ -339,6 +467,13 @@ final class BuildCoordinator: ObservableObject {
     }
 
     func stopAllBuilds() {
+        #if APP_STORE
+        Task.detached(priority: .userInitiated) {
+            try? LocalBridge.stop(project: nil, all: true)
+        }
+        latestActivity = "Stop requested for all Fractal builds"
+        return
+        #else
         guard let executable = Self.fractalExecutable() else { return }
         let stop = Process()
         stop.executableURL = executable
@@ -346,6 +481,7 @@ final class BuildCoordinator: ObservableObject {
         stop.environment = Self.processEnvironment()
         try? stop.run()
         latestActivity = "Stop requested for all Fractal builds"
+        #endif
     }
 
     func stopCurrentBuild() {
@@ -526,7 +662,11 @@ final class BuildCoordinator: ObservableObject {
             }
         } catch {
             try? FileManager.default.removeItem(at: audioURL)
-            recordingFailed(error)
+            if purpose == .amendment {
+                amendmentFailed(error)
+            } else {
+                recordingFailed(error)
+            }
         }
     }
 
@@ -538,6 +678,8 @@ final class BuildCoordinator: ObservableObject {
             return "Transcribe the exact project name. Preserve spelling, numbers, and technical terms. Return only the name."
         case .request:
             break
+        case .amendment:
+            return "Transcribe the exact command for changing the active execution graph. Preserve task numbers such as 0.1 and 2.3. Return only the spoken command."
         }
         let terms = vocabularyEngine.promptTerms(projectURL: Self.activeProjectURL())
         let keywords = terms.prefix(96).joined(separator: ", ")
@@ -571,14 +713,19 @@ final class BuildCoordinator: ObservableObject {
             return
         }
         guard exitCode == 0 else {
-            recordingFailed(VoiceAppError.graniteFailed(exitCode))
+            if purpose == .amendment {
+                amendmentFailed(VoiceAppError.graniteFailed(exitCode))
+            } else {
+                recordingFailed(VoiceAppError.graniteFailed(exitCode))
+            }
             return
         }
         let transcript = Self.cleanGraniteTranscript(output)
-        guard !transcript.isEmpty else {
-            recordingFailed(VoiceAppError.noSpeech)
+        guard !transcript.isEmpty, !Self.isLikelyGraniteHallucination(transcript) else {
+            retryAfterUnusableTranscript(purpose: purpose)
             return
         }
+        transcriptRetryCount = 0
         switch purpose {
         case .request:
             // Confirm the speech transcript exactly as heard. Vocabulary
@@ -587,6 +734,8 @@ final class BuildCoordinator: ObservableObject {
             pendingRequest = transcript
             pendingRequestWasTyped = false
             askToConfirmRequest()
+        case .amendment:
+            submitAmendment(transcript)
         case .requestConfirmation:
             handleSpokenConfirmation(transcript, forName: false)
         case .projectName:
@@ -599,6 +748,39 @@ final class BuildCoordinator: ObservableObject {
         case .nameConfirmation:
             handleSpokenConfirmation(transcript, forName: true)
         }
+    }
+
+    private func retryAfterUnusableTranscript(purpose: TranscriptionPurpose) {
+        transcriptRetryCount += 1
+        appendLog("[voice] rejected an empty or known hallucinated transcript\n")
+        guard transcriptRetryCount <= 2 else {
+            if purpose == .amendment {
+                amendmentFailed(VoiceAppError.noSpeech)
+            } else {
+                recordingFailed(VoiceAppError.noSpeech)
+            }
+            return
+        }
+        state = .building
+        latestActivity = "I didn’t catch usable speech — listening again…"
+        switch purpose {
+        case .request:
+            dialogueStage = .none
+            hud?.showListening(summary: latestActivity)
+        case .amendment:
+            hud?.showListening(summary: "I didn’t catch the graph change — please say it again")
+        case .requestConfirmation:
+            dialogueStage = .awaitingRequestAnswer
+            hud?.showQuestion(Self.requestQuestion(pendingRequest))
+        case .projectName:
+            dialogueStage = .awaitingProjectName
+            hud?.showNaming("I didn’t catch the name — please say it again")
+        case .nameConfirmation:
+            dialogueStage = .awaitingNameAnswer
+            hud?.showQuestion(Self.nameQuestion(pendingProjectName))
+        }
+        NSSound.beep()
+        beginDialogueRecording(purpose: purpose)
     }
 
     private func askToConfirmRequest() {
@@ -713,10 +895,84 @@ final class BuildCoordinator: ObservableObject {
         switch purpose {
         case .requestConfirmation, .nameConfirmation:
             endingSilence = 0.42
-        case .request, .projectName:
+        case .request, .projectName, .amendment:
             endingSilence = 0.62
         }
         return NativeVoiceRecorder(endingSilenceDuration: endingSilence)
+    }
+
+    private func submitAmendment(_ transcript: String) {
+        state = .building
+        latestActivity = "Sending graph change to the lead planner…"
+        hud?.showBuilding(summary: latestActivity)
+        #if APP_STORE
+        Task { [weak self] in
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try LocalBridge.amend(transcript)
+                }.value
+                guard let self else { return }
+                let message = result.output
+                    .split(separator: "\n")
+                    .last
+                    .map(String.init) ?? "Branch request accepted"
+                self.setActivity(message)
+            } catch {
+                self?.setActivity("Branch request was not accepted: \(error.localizedDescription)")
+            }
+        }
+        #else
+        guard let executable = Self.fractalExecutable() else {
+            setActivity("Fractal CLI is missing")
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let command = Process()
+            let stdin = Pipe()
+            let output = Pipe()
+            command.executableURL = executable
+            command.arguments = [
+                "ingest", "--source", "fractal-mac-app",
+                "--format", "text", "--stdin"
+            ]
+            command.environment = Self.processEnvironment()
+            command.standardInput = stdin
+            command.standardOutput = output
+            command.standardError = output
+            do {
+                try command.run()
+                stdin.fileHandleForWriting.write(Data(transcript.utf8))
+                try stdin.fileHandleForWriting.close()
+                command.waitUntilExit()
+                let message = String(
+                    decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                    as: UTF8.self
+                ).trimmingCharacters(in: .whitespacesAndNewlines)
+                Task { @MainActor in
+                    self?.setActivity(message.isEmpty ? "Branch request accepted" : message)
+                }
+            } catch {
+                Task { @MainActor in
+                    self?.setActivity("Branch request was not accepted: \(error.localizedDescription)")
+                }
+            }
+        }
+        #endif
+    }
+
+    private func amendmentFailed(_ error: Error) {
+        recordingTimeout?.cancel()
+        recordingTimeout = nil
+        transcriptionProcess = nil
+        recorder?.close()
+        recorder = nil
+        if let activeAudioURL {
+            try? FileManager.default.removeItem(at: activeAudioURL)
+        }
+        activeAudioURL = nil
+        state = .building
+        latestActivity = "Graph change was not accepted: \(error.localizedDescription)"
+        hud?.showBuilding(summary: latestActivity)
     }
 
     private func handleSpokenConfirmation(_ transcript: String, forName: Bool) {
@@ -873,6 +1129,19 @@ final class BuildCoordinator: ObservableObject {
             recordingFailed(VoiceAppError.noSpeech)
             return
         }
+        #if APP_STORE
+        startBridgeBuild(transcript: transcript, projectName: projectName)
+        if vocabularyResult?.appliedCorrections.isEmpty ?? true {
+            setActivity("Heard: “\(Self.compact(transcript, limit: 180))”")
+        } else {
+            appendLog(
+                "[voice] applied \(vocabularyResult?.appliedCorrections.count ?? 0) "
+                + "local vocabulary correction(s)\n"
+            )
+            setActivity("Understood: “\(Self.compact(transcript, limit: 180))”")
+        }
+        return
+        #else
         guard let executable = Self.fractalExecutable() else {
             recordingFailed(VoiceAppError.cliMissing)
             return
@@ -929,7 +1198,32 @@ final class BuildCoordinator: ObservableObject {
         } catch {
             recordingFailed(error)
         }
+        #endif
     }
+
+    #if APP_STORE
+    private func startBridgeBuild(transcript: String, projectName: String) {
+        outputBuffer = ""
+        outputLineBuffer = ""
+        activeWorkspace = nil
+        bridgeBuildTask?.cancel()
+        bridgeBuildTask = Task { [weak self] in
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try LocalBridge.build(request: transcript, projectName: projectName)
+                }.value
+                guard !Task.isCancelled, let self else { return }
+                self.consume(result.output)
+                self.finished(exitCode: result.exitCode)
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+                self?.recordingFailed(error)
+            }
+        }
+    }
+    #endif
 
     private func recordingFailed(_ error: Error) {
         recordingTimeout?.cancel()
@@ -946,10 +1240,11 @@ final class BuildCoordinator: ObservableObject {
         activeAudioURL = nil
         recorder?.close()
         recorder = nil
-        hud?.close()
-        hud = nil
         state = .failed("Voice command stopped")
         latestActivity = error.localizedDescription
+        appendLog("[voice] command failed: \(error.localizedDescription)\n")
+        hud?.showFailure(error.localizedDescription)
+        notify(title: "Fractal Voice needs attention", body: latestActivity)
     }
 
     private func consume(_ text: String) {
@@ -1026,6 +1321,12 @@ final class BuildCoordinator: ObservableObject {
             transcribing.terminate()
             return
         }
+        #if APP_STORE
+        Task.detached(priority: .userInitiated) {
+            try? LocalBridge.stop(project: nil, all: false)
+        }
+        return
+        #else
         guard let running = process else {
             return
         }
@@ -1062,6 +1363,7 @@ final class BuildCoordinator: ObservableObject {
         } catch {
             running.terminate()
         }
+        #endif
     }
 
     private func finishRequestedStopBeforeBuild() {
@@ -1090,6 +1392,7 @@ final class BuildCoordinator: ObservableObject {
     private func finished(exitCode: Int32) {
         process = nil
         stopCommand = nil
+        bridgeBuildTask = nil
         if stopRequested {
             let restart = restartRequested
             stopRequested = false
@@ -1216,6 +1519,29 @@ final class BuildCoordinator: ObservableObject {
             ))
     }
 
+    nonisolated static func isLikelyGraniteHallucination(_ transcript: String) -> Bool {
+        let normalized = transcript
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        let known: Set<String> = [
+            "thanks for watching",
+            "thank you for watching",
+            "thanks for listening",
+            "thank you for listening",
+            "please subscribe",
+            "like and subscribe",
+            "subtitles by",
+            "all right",
+            "alright",
+            "the end",
+            "music",
+            "applause",
+        ]
+        return normalized.isEmpty || known.contains(normalized)
+    }
+
     nonisolated static func graniteTranscriptionArguments(
         audioURL: URL,
         prompt: String,
@@ -1249,8 +1575,40 @@ final class BuildCoordinator: ObservableObject {
     }
 
     private func notify(title: String, body: String) {
+        Task { @MainActor [weak self] in
+            guard self != nil else { return }
+            let center = UNUserNotificationCenter.current()
+            let settings = await center.notificationSettings()
+            switch settings.authorizationStatus {
+            case .notDetermined:
+                let explanation = NSAlert()
+                explanation.messageText = "Allow build notifications?"
+                explanation.informativeText =
+                    "Fractal uses notifications only to tell you when a build finishes "
+                    + "or needs attention while its window is in the background. "
+                    + "Notifications never expose credentials or grant access to your files."
+                explanation.alertStyle = .informational
+                explanation.addButton(withTitle: "Continue")
+                explanation.addButton(withTitle: "Not Now")
+                guard explanation.runModal() == .alertFirstButtonReturn else { return }
+                guard (try? await center.requestAuthorization(options: [.alert, .sound])) == true
+                else { return }
+                Self.deliverNotification(title: title, body: body)
+            case .authorized, .provisional, .ephemeral:
+                Self.deliverNotification(title: title, body: body)
+            case .denied:
+                return
+            @unknown default:
+                return
+            }
+        }
+    }
+
+    nonisolated private static func deliverNotification(
+        title: String,
+        body: String
+    ) {
         let center = UNUserNotificationCenter.current()
-        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
@@ -1351,7 +1709,7 @@ final class BuildCoordinator: ObservableObject {
 
     nonisolated static func processEnvironment() -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let home = AppRuntime.homeURL.path
         let additions = [
             "\(home)/.cargo/bin",
             "\(home)/.local/bin",
@@ -1362,6 +1720,17 @@ final class BuildCoordinator: ObservableObject {
         ]
         environment["PATH"] = additions.joined(separator: ":")
         environment["HOME"] = home
+        environment["FRACTAL_PROJECTS_DIR"] = AppRuntime.projectsURL.path
+        let lead = UserDefaults.standard.string(forKey: "selectedLeadAgent")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let lead, ["codex", "cursor", "claude", "hermes"].contains(lead) {
+            environment["FRACTAL_LEAD_AGENT"] = lead
+        }
+        if AppRuntime.isAppStoreEdition {
+            environment["FRACTAL_HOME"] = AppRuntime.applicationSupportURL
+                .appendingPathComponent("CLI", isDirectory: true)
+                .path
+        }
         return environment
     }
 
@@ -1395,6 +1764,20 @@ private enum VoiceAppError: LocalizedError {
         case .graniteMissing: return "The bundled Granite Speech engine is missing."
         case .graniteFailed(let code):
             return "Granite Speech could not transcribe this recording (exit \(code))."
+        }
+    }
+}
+
+enum ExternalBuildStartError: LocalizedError {
+    case busy
+    case cliMissing
+
+    var errorDescription: String? {
+        switch self {
+        case .busy:
+            return "Fractal Voice is already recording or building another project."
+        case .cliMissing:
+            return "The bundled Fractal CLI is unavailable."
         }
     }
 }

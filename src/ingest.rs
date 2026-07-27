@@ -161,6 +161,16 @@ fn process_event(event: InputEvent, options: EventOptions<'_>) -> Result<()> {
         );
     }
 
+    // Mid-build graph amendments are intercepted before ordinary intent
+    // execution so a spoken addition never starts a second project.
+    if let Some((task_ref, instruction)) = parse_graph_amendment(&event.content) {
+        println!(
+            "Normalized {} {} input · graph amendment",
+            event.source, event.modality
+        );
+        return crate::run_control::queue_active_amendment(&task_ref, &instruction);
+    }
+
     // Control phrases are intercepted before ordinary intent execution. This is
     // deliberately narrow: a stop/status request must not become a new build.
     if let Some(control) = parse_run_control(&event.content) {
@@ -275,6 +285,54 @@ enum VoiceRunControl {
     StopAll,
     StopProject(String),
     StatusRunning,
+}
+
+fn parse_graph_amendment(input: &str) -> Option<(String, String)> {
+    let lower = input.to_ascii_lowercase();
+    if !lower.contains("add") || !lower.contains("branch") {
+        return None;
+    }
+    let task_start = lower.find("task")? + "task".len();
+    let after_task = input.get(task_start..)?.trim_start();
+    let task_ref = after_task
+        .split_whitespace()
+        .next()?
+        .trim_matches(|character: char| !character.is_ascii_digit() && character != '.')
+        .to_owned();
+    let (wave, position) = task_ref.split_once('.')?;
+    if wave.is_empty()
+        || position.is_empty()
+        || !wave.bytes().all(|byte| byte.is_ascii_digit())
+        || !position.bytes().all(|byte| byte.is_ascii_digit())
+        || position == "0"
+    {
+        return None;
+    }
+    let task_ref_offset = after_task.find(&task_ref)? + task_ref.len();
+    let remainder = after_task.get(task_ref_offset..)?.trim();
+    let remainder_lower = remainder.to_ascii_lowercase();
+    let branch_offset = remainder_lower.find("branch")? + "branch".len();
+    let mut instruction = remainder.get(branch_offset..)?.trim();
+    for prefix in [
+        "and this branch will add",
+        "this branch will add",
+        "that will add",
+        "which will add",
+        "will add",
+        "to add",
+        "add",
+    ] {
+        if instruction.to_ascii_lowercase().starts_with(prefix) {
+            instruction = instruction.get(prefix.len()..)?.trim();
+            break;
+        }
+    }
+    let instruction = instruction
+        .trim_matches(|character: char| {
+            character.is_ascii_punctuation() || character.is_whitespace()
+        })
+        .to_owned();
+    (!instruction.is_empty()).then_some((task_ref, instruction))
 }
 
 fn parse_run_control(input: &str) -> Option<VoiceRunControl> {
@@ -680,6 +738,17 @@ mod tests {
             Some(VoiceRunControl::StatusRunning)
         );
         assert_eq!(parse_run_control("build a stop watch"), None);
+    }
+
+    #[test]
+    fn recognizes_mid_build_task_branch_commands() {
+        assert_eq!(
+            parse_graph_amendment(
+                "Add to task 0.1 another branch and this branch will add CSV export features."
+            ),
+            Some(("0.1".to_owned(), "CSV export features".to_owned()))
+        );
+        assert_eq!(parse_graph_amendment("build a branching puzzle"), None);
     }
 
     #[test]

@@ -181,3 +181,21 @@ checksum manifests, and third-party license notice. From the menu bar you can re
 inspect activity, open generated projects, or stop all running Fractal builds.
 Finalized text is sent over stdin to the managed-project ingest boundary; it is
 never interpolated into a command line.
+
+### ChatGPT Desktop and other external apps
+
+Sandboxed desktop apps can start the same managed build without using Fractal's
+interactive trust flow or the deprecated local bridge:
+
+```sh
+fractal handoff --name 'Hello World' <<'FRACTAL_REQUEST'
+Build a very simple Hello World app.
+FRACTAL_REQUEST
+```
+
+The request is written to an owner-only, short-lived `.fractalbuild` file in the
+per-user temporary directory and delivered to Fractal Voice through macOS
+LaunchServices. The native app validates the file, deletes it after one read,
+creates the named managed project, and starts the normal PRD, execution-graph,
+agent checkout, verification, GitHub, and Fractal Society pipeline. Request text
+is never placed in a URL or shell argument.

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct OnboardingView: View {
@@ -5,23 +6,35 @@ struct OnboardingView: View {
     let finish: () -> Void
     @StateObject private var readiness = SetupReadiness()
     @StateObject private var voiceModels = VoiceModelManager()
+    @AppStorage(VoiceInputMode.defaultsKey) private var voiceInputModeRaw = ""
+    @AppStorage("selectedLeadAgent") private var selectedLeadAgent = "codex"
     @State private var page = 0
+    @State private var bridgeToken = ""
+    @State private var showKeychainExplanation = false
 
-    private let pageCount = 7
+    private var pageCount: Int { AppRuntime.isAppStoreEdition ? 8 : 7 }
+    private var readinessPageIndex: Int { AppRuntime.isAppStoreEdition ? 5 : 4 }
+    private var accountPageIndex: Int { AppRuntime.isAppStoreEdition ? 2 : 1 }
+    private var selectedPlannerReady: Bool {
+        readiness.snapshot.agents.first(where: { $0.id == selectedLeadAgent })?.authenticated == true
+    }
+    private var selectedVoiceMode: VoiceInputMode? {
+        VoiceInputMode(rawValue: voiceInputModeRaw)
+    }
+    private var voiceModeReady: Bool {
+        selectedVoiceMode?.isReady(localModelsReady: coordinator.voiceReady) == true
+    }
+    private var pageBlocksAdvancement: Bool {
+        (page == 0 && selectedVoiceMode == nil)
+            || (page == readinessPageIndex && (!readiness.isReady || !selectedPlannerReady))
+            || (AppRuntime.isAppStoreEdition
+                && page == 1
+                && !readiness.snapshot.fractalCLIInstalled)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            Group {
-                switch page {
-                case 0: voiceModelPage
-                case 1: accountPage
-                case 2: agentPage
-                case 3: githubPage
-                case 4: readinessPage
-                case 5: shortcutPage
-                default: buildPage
-                }
-            }
+            currentPage
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             Divider()
@@ -38,16 +51,18 @@ struct OnboardingView: View {
                     Button("Back") { page -= 1 }
                 }
                 if page < pageCount - 1 {
-                    Button(page == 4 && !readiness.isReady ? "Complete setup to continue" : "Next") {
+                    Button(
+                        pageBlocksAdvancement ? "Complete setup to continue" : "Next"
+                    ) {
                         page += 1
                     }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(page == 4 && !readiness.isReady)
-                } else if readiness.isReady && coordinator.voiceReady {
-                    Button("Start using Fractal Voice", action: finish)
+                    .disabled(pageBlocksAdvancement)
+                } else if readiness.isReady && voiceModeReady {
+                    Button(finishButtonTitle, action: finish)
                         .keyboardShortcut(.defaultAction)
                 } else {
-                    Button(readiness.isReady ? "Loading offline voice engine…" : "Setup required") {}
+                    Button(finalBlockedTitle) {}
                         .disabled(true)
                 }
             }
@@ -63,69 +78,279 @@ struct OnboardingView: View {
         )
         .task {
             readiness.refresh()
-            voiceModels.startIfNeeded()
+            if selectedVoiceMode == .builtIn {
+                voiceModels.startIfNeeded()
+            }
         }
         .onChange(of: page) { _, newPage in
-            if newPage == 1 || newPage == 4 || newPage == pageCount - 1 {
+            if newPage == accountPageIndex
+                || newPage == readinessPageIndex
+                || newPage == pageCount - 1 {
                 readiness.refresh()
             }
         }
         .onChange(of: voiceModels.isReady) { _, ready in
-            if ready {
-                coordinator.refreshVoiceReadiness()
+            if ready, selectedVoiceMode == .builtIn {
+                coordinator.activateBuiltInVoice()
+            }
+        }
+        .onChange(of: voiceInputModeRaw) { _, _ in
+            configureSelectedVoiceMode()
+        }
+    }
+
+    @ViewBuilder
+    private var currentPage: some View {
+        if AppRuntime.isAppStoreEdition {
+            switch page {
+            case 0: voiceChoicePage
+            case 1: bridgePage
+            case 2: accountPage
+            case 3: agentPage
+            case 4: githubPage
+            case 5: readinessPage
+            case 6: shortcutPage
+            default: buildPage
+            }
+        } else {
+            switch page {
+            case 0: voiceChoicePage
+            case 1: accountPage
+            case 2: agentPage
+            case 3: githubPage
+            case 4: readinessPage
+            case 5: shortcutPage
+            default: buildPage
             }
         }
     }
 
-    private var voiceModelPage: some View {
+    private var bridgePage: some View {
         VStack(alignment: .leading, spacing: 22) {
-            Label("Install your private voice engine", systemImage: "waveform.badge.magnifyingglass")
+            Label("Connect the sandboxed app to Fractal CLI", systemImage: "cable.connector")
                 .font(.system(size: 31, weight: .bold, design: .rounded))
-            Text("Fractal Voice is a small app download. On first launch it installs about 2.5 GB of verified speech models so your recordings and spoken confirmations stay on this Mac.")
+            Text("The App Store edition never receives unrestricted access to your coding agents, Git credentials, or home folder. A local authenticated bridge asks your installed Fractal CLI to perform builds outside the app sandbox.")
                 .font(.title3)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             explanation(
+                icon: "terminal",
+                title: "1. Install the local bridge",
+                detail: "Open Terminal and run: fractal bridge install"
+            )
+            explanation(
+                icon: "key.fill",
+                title: "2. Copy the pairing token",
+                detail: "The command prints a local pairing token. It is stored only on this Mac and should be treated like a local password."
+            )
+            explanation(
                 icon: "lock.shield",
-                title: "Private after installation",
-                detail: "Granite Speech transcribes locally and Kokoro speaks locally. Your microphone audio is not uploaded to a transcription service."
-            )
-            explanation(
-                icon: "externaldrive",
-                title: "Downloaded once",
-                detail: "Models are stored in ~/.fractal/models and reused by future app updates. Downloads resume if the connection is interrupted."
-            )
-            explanation(
-                icon: "slider.horizontal.3",
-                title: "Provider-ready",
-                detail: "Fractal saves a versioned voice-engine configuration. Future releases can offer another local model, a model you choose, or an API provider."
+                title: "Why Fractal asks for Keychain access",
+                detail: "Fractal saves only this local bridge pairing token in Apple Keychain so another app cannot read it from a settings file. The token authenticates requests to Fractal CLI on 127.0.0.1. Fractal does not read your Apple, GitHub, or coding-agent passwords."
             )
 
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 9) {
+                Text("Pairing token").font(.headline)
                 HStack {
-                    Text(voiceModelStatus).font(.headline)
-                    Spacer()
-                    Text(voiceModelProgress).font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                    SecureField("Paste the token from Terminal", text: $bridgeToken)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { showKeychainExplanation = true }
+                    Button {
+                        pasteBridgeToken()
+                    } label: {
+                        Label("Paste token", systemImage: "doc.on.clipboard")
+                    }
+                    .help("Paste the entire Fractal bridge token from the clipboard")
                 }
-                ProgressView(value: voiceModels.progress)
-                    .progressViewStyle(.linear)
-                Text(voiceModels.currentFile)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if case .failed(let message) = voiceModels.state {
-                    Text(message).font(.callout).foregroundStyle(.red)
-                    Button("Retry download") { voiceModels.retry() }
+                HStack {
+                    Button("Save securely and check bridge") {
+                        showKeychainExplanation = true
+                    }
+                    .disabled(bridgeToken.trimmingCharacters(in: .whitespacesAndNewlines).count < 48)
+                    if readiness.snapshot.fractalCLIInstalled {
+                        Label("Bridge connected", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    }
+                    Spacer()
+                    if !bridgeToken.isEmpty {
+                        Text("\(bridgeToken.trimmingCharacters(in: .whitespacesAndNewlines).count) characters")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if let message = readiness.bridgeMessage {
+                    Text(message).font(.caption).foregroundStyle(.secondary)
                 }
             }
             .padding(16)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
 
-            Text("You can continue account setup while the download finishes. Voice building unlocks only after every file passes its SHA-256 security check.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+            Link(
+                "Open setup and troubleshooting",
+                destination: URL(string: "https://fractalsociety.com/support")!
+            )
         }
         .padding(44)
+        .alert("Allow secure Keychain storage?", isPresented: $showKeychainExplanation) {
+            Button("Not now", role: .cancel) {}
+            Button("Continue") {
+                readiness.pairBridge(token: bridgeToken)
+            }
+        } message: {
+            Text("Fractal Voice will store only the local bridge pairing token in Apple Keychain. It uses the token to prove that build requests sent to Fractal CLI on this Mac are authorized. The token is not uploaded and this does not give Fractal access to your other passwords.")
+        }
+    }
+
+    private func pasteBridgeToken() {
+        guard let clipboard = NSPasteboard.general.string(forType: .string) else {
+            readiness.reportBridgeMessage("The clipboard does not contain text.")
+            return
+        }
+        let token = clipboard.trimmingCharacters(in: .whitespacesAndNewlines)
+        bridgeToken = token
+        showKeychainExplanation = true
+    }
+
+    private var voiceChoicePage: some View {
+        VStack(alignment: .leading, spacing: 15) {
+            Label("Choose how you want to speak to Fractal", systemImage: "waveform")
+                .font(.system(size: 31, weight: .bold, design: .rounded))
+            Text("ChatGPT Desktop and Superwhisper use their existing voice systems and do not download Fractal’s offline models. You can change this choice later from Show Welcome.")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            voiceOption(
+                .chatGPTDesktop,
+                icon: "message.fill",
+                detail: "Use ChatGPT’s conversational voice. It hands your confirmed request and project name to this app."
+            )
+            voiceOption(
+                .superwhisper,
+                icon: "waveform.badge.mic",
+                detail: "Use your Superwhisper shortcut and Fractal Command mode through the configured Macrowhisper action."
+            )
+            voiceOption(
+                .builtIn,
+                icon: "lock.shield.fill",
+                detail: "Private Option–Space conversation using Granite Speech and Kokoro locally. Downloads about 2.5 GB once."
+            )
+
+            if let selectedVoiceMode {
+                VStack(alignment: .leading, spacing: 8) {
+                    switch selectedVoiceMode {
+                    case .chatGPTDesktop:
+                        Text("What to say in ChatGPT Desktop").font(.headline)
+                        Text("“Use Fractal to build [describe the project]. Name the project [your project name].”")
+                            .font(.system(.callout, design: .rounded).weight(.medium))
+                            .textSelection(.enabled)
+                        Text("Keep Fractal Voice running in the menu bar. ChatGPT will use the secure native handoff; no local voice-model download is needed.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    case .superwhisper:
+                        Text("What to say in Superwhisper").font(.headline)
+                        Text("“Build [describe the project] and call it [your project name].”")
+                            .font(.system(.callout, design: .rounded).weight(.medium))
+                            .textSelection(.enabled)
+                        Text("Select your Fractal Command mode and make sure Macrowhisper’s completed-transcript action is configured. Fractal does not download its local voice models for this option.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    case .builtIn:
+                        HStack {
+                            Text(voiceModelStatus).font(.headline)
+                            Spacer()
+                            Text(voiceModelProgress)
+                                .font(.callout.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        ProgressView(value: voiceModels.progress)
+                            .progressViewStyle(.linear)
+                        Text(voiceModels.currentFile)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if case .failed(let message) = voiceModels.state {
+                            Text(message).font(.callout).foregroundStyle(.red)
+                            Button("Retry download") { voiceModels.retry() }
+                        }
+                    }
+                }
+                .padding(13)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 13))
+            }
+        }
+        .padding(36)
+    }
+
+    private func voiceOption(
+        _ mode: VoiceInputMode,
+        icon: String,
+        detail: String
+    ) -> some View {
+        Button {
+            VoiceInputMode.save(mode)
+            voiceInputModeRaw = mode.rawValue
+        } label: {
+            HStack(spacing: 13) {
+                Image(systemName: icon)
+                    .font(.title2)
+                    .frame(width: 34)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(mode.title).font(.headline)
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.leading)
+                }
+                Spacer()
+                Image(systemName: selectedVoiceMode == mode
+                    ? "checkmark.circle.fill"
+                    : "circle")
+                    .foregroundStyle(selectedVoiceMode == mode ? .green : .secondary)
+            }
+            .padding(11)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(
+            selectedVoiceMode == mode ? Color.indigo.opacity(0.12) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 13)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 13)
+                .stroke(
+                    selectedVoiceMode == mode
+                        ? Color.indigo.opacity(0.7)
+                        : Color.secondary.opacity(0.22)
+                )
+        )
+    }
+
+    private func configureSelectedVoiceMode() {
+        guard let selectedVoiceMode else { return }
+        if selectedVoiceMode == .builtIn {
+            voiceModels.startIfNeeded()
+            if voiceModels.isReady {
+                coordinator.activateBuiltInVoice()
+            }
+        } else {
+            coordinator.activateExternalVoice(selectedVoiceMode)
+        }
+    }
+
+    private var finishButtonTitle: String {
+        switch selectedVoiceMode {
+        case .chatGPTDesktop: return "Start with ChatGPT Desktop"
+        case .superwhisper: return "Start with Superwhisper"
+        case .builtIn: return "Start using built-in voice"
+        case nil: return "Choose a voice option"
+        }
+    }
+
+    private var finalBlockedTitle: String {
+        if !readiness.isReady { return "Setup required" }
+        if selectedVoiceMode == nil { return "Choose a voice option" }
+        return "Loading offline voice engine…"
     }
 
     private var voiceModelStatus: String {
@@ -210,6 +435,26 @@ struct OnboardingView: View {
                 .font(.title3)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 14) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Main planner").font(.headline)
+                    Text("Choose your smartest available agent. It designs the PRD, architecture, task graph, and reviews mid-build changes.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Picker("Main planner", selection: $selectedLeadAgent) {
+                    ForEach(readiness.snapshot.agents) { agent in
+                        Text("\(agent.name)\(agent.authenticated ? " — Ready" : " — setup required")")
+                            .tag(agent.id)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 170)
+            }
+            .padding(12)
+            .background(Color.indigo.opacity(0.1), in: RoundedRectangle(cornerRadius: 13))
 
             ForEach(SetupReadiness.agentTemplates) { agent in
                 HStack(spacing: 14) {
@@ -300,6 +545,15 @@ struct OnboardingView: View {
                 .font(.title3)
                 .foregroundStyle(.secondary)
 
+            if !selectedPlannerReady {
+                Label(
+                    "Your selected main planner must be installed and signed in.",
+                    systemImage: "brain.head.profile"
+                )
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.orange)
+            }
+
             VStack(spacing: 0) {
                 ForEach(readiness.snapshot.agents) { agent in
                     statusRow(
@@ -356,38 +610,69 @@ struct OnboardingView: View {
     }
 
     private var shortcutPage: some View {
-        VStack(spacing: 21) {
-            Image(systemName: "waveform.circle.fill")
-                .font(.system(size: 62))
-                .foregroundStyle(.indigo)
-            Text("Your microphone shortcut")
-                .font(.system(size: 32, weight: .bold, design: .rounded))
-            Text("Press these two keys together from anywhere on your Mac.")
-                .font(.title3)
-                .foregroundStyle(.secondary)
+        Group {
+            switch selectedVoiceMode {
+            case .chatGPTDesktop:
+                externalVoiceInstructionPage(
+                    icon: "message.fill",
+                    title: "Build through ChatGPT Desktop voice",
+                    steps: [
+                        "Keep Fractal Voice running in your menu bar.",
+                        "Open ChatGPT Desktop and start a voice conversation.",
+                        "Say: “Use Fractal to build a personal expense tracker. Name the project Pocket Ledger.”",
+                        "ChatGPT confirms the details and sends the named build through Fractal’s secure handoff.",
+                    ],
+                    footer: "If ChatGPT reports “Queued,” the request was accepted. Fractal Voice will pick it up automatically."
+                )
+            case .superwhisper:
+                externalVoiceInstructionPage(
+                    icon: "waveform.badge.mic",
+                    title: "Build through Superwhisper",
+                    steps: [
+                        "Open Superwhisper and select your Fractal Command mode.",
+                        "Make sure Macrowhisper sends completed transcripts to your Fractal action.",
+                        "Use your Superwhisper shortcut and say: “Build a personal expense tracker and call it Pocket Ledger.”",
+                        "Stop recording normally; the completed transcript enters Fractal’s build workflow.",
+                    ],
+                    footer: "Superwhisper handles transcription, so Fractal’s 2.5 GB offline voice download is not required."
+                )
+            case .builtIn:
+                VStack(spacing: 21) {
+                    Image(systemName: "waveform.circle.fill")
+                        .font(.system(size: 62))
+                        .foregroundStyle(.indigo)
+                    Text("Your microphone shortcut")
+                        .font(.system(size: 32, weight: .bold, design: .rounded))
+                    Text("Press these two keys together from anywhere on your Mac.")
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
 
-            HStack(spacing: 16) {
-                keycap(symbol: "⌥", label: "option", width: 126)
-                Text("+").font(.system(size: 30, weight: .light))
-                keycap(symbol: "—", label: "space", width: 230)
-            }
-            .padding(.vertical, 8)
+                    HStack(spacing: 16) {
+                        keycap(symbol: "⌥", label: "option", width: 126)
+                        Text("+").font(.system(size: 30, weight: .light))
+                        keycap(symbol: "—", label: "space", width: 230)
+                    }
+                    .padding(.vertical, 8)
 
-            VStack(spacing: 7) {
-                Text("Press ⌥Space → speak → pause naturally")
-                    .font(.headline)
-                Text("Fractal keeps the microphone active through the confirmation conversation, then starts the build after your final “yes.”")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                Text("The global shortcut does not require Accessibility permission. macOS asks for Microphone permission on your first recording.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
+                    VStack(spacing: 7) {
+                        Text("Press ⌥Space → speak → pause naturally")
+                            .font(.headline)
+                        Text("Fractal keeps the microphone active through the confirmation conversation, then starts the build after your final “yes.”")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                        Text("The shortcut does not require Accessibility permission. macOS asks for Microphone permission on your first recording.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .frame(maxWidth: 580)
+                }
+                .padding(42)
+            case nil:
+                Text("Return to the first page and choose a voice option.")
             }
-            .frame(maxWidth: 580)
         }
-        .padding(42)
     }
 
     private var buildPage: some View {
@@ -397,24 +682,83 @@ struct OnboardingView: View {
             example("Build a personal expense tracker for iPhone.")
             example("Create a dashboard that monitors my local API.")
             example("Make a simple multiplayer drawing game for the web.")
-            flow("1", "Speak or type", "Describe the platform, main features, and what done looks like.")
-            flow("2", "Confirm", "Fractal confirms spoken input; exact typed input advances when you press Enter.")
+            flow("1", "Describe and name it", finalBuildInputDescription)
+            flow("2", "Hand off", finalBuildHandoffDescription)
             flow("3", "Watch", "The live execution graph opens and shows each agent’s progress.")
 
             Label(
-                coordinator.voiceReady
-                    ? "Offline Granite speech and Kokoro voice engines are ready."
-                    : voiceModels.isReady
-                        ? coordinator.latestActivity
-                        : "Voice models are still installing — return to the first page for progress.",
-                systemImage: coordinator.voiceReady ? "checkmark.seal.fill" : "arrow.down.circle.fill"
+                finalVoiceStatus,
+                systemImage: voiceModeReady ? "checkmark.seal.fill" : "arrow.down.circle.fill"
             )
             .font(.callout.weight(.medium))
-            .foregroundStyle(coordinator.voiceReady ? .green : .indigo)
+            .foregroundStyle(voiceModeReady ? .green : .indigo)
             .padding(12)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
         }
         .padding(46)
+    }
+
+    private func externalVoiceInstructionPage(
+        icon: String,
+        title: String,
+        steps: [String],
+        footer: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Label(title, systemImage: icon)
+                .font(.system(size: 31, weight: .bold, design: .rounded))
+            ForEach(Array(steps.enumerated()), id: \.offset) { index, step in
+                flow(String(index + 1), index == 2 ? "What to say" : "Step \(index + 1)", step)
+            }
+            Text(footer)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .padding(14)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 13))
+            Button("Choose a different voice option") { page = 0 }
+        }
+        .padding(46)
+    }
+
+    private var finalBuildInputDescription: String {
+        switch selectedVoiceMode {
+        case .chatGPTDesktop:
+            return "Tell ChatGPT what to build and the exact project name in the same voice conversation."
+        case .superwhisper:
+            return "Speak the build description and project name in your Fractal Command mode."
+        case .builtIn:
+            return "Press ⌥Space, describe the project, and answer Fractal’s confirmation questions."
+        case nil:
+            return "Choose a voice option first."
+        }
+    }
+
+    private var finalBuildHandoffDescription: String {
+        switch selectedVoiceMode {
+        case .chatGPTDesktop:
+            return "ChatGPT calls `fractal handoff`; Fractal Voice receives sent or securely queued requests."
+        case .superwhisper:
+            return "Macrowhisper passes the completed transcript into Fractal."
+        case .builtIn:
+            return "Fractal starts after you confirm the request and project name."
+        case nil:
+            return "Voice setup is incomplete."
+        }
+    }
+
+    private var finalVoiceStatus: String {
+        switch selectedVoiceMode {
+        case .chatGPTDesktop:
+            return "ChatGPT Desktop handoff is ready. No Fractal voice models were downloaded."
+        case .superwhisper:
+            return "Superwhisper mode is selected. No Fractal voice models were downloaded."
+        case .builtIn:
+            return coordinator.voiceReady
+                ? "Offline Granite speech and Kokoro voice engines are ready."
+                : "Voice models are still installing — return to the first page for progress."
+        case nil:
+            return "Choose a voice option on the first page."
+        }
     }
 
     private func statusRow(

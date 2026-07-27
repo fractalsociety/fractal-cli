@@ -83,11 +83,7 @@ pub(crate) fn path(workspace: &Path) -> PathBuf {
 /// Pin the user-confirmed name for a managed voice project. Every later
 /// planning/execution persist reads this record, so lead request text cannot
 /// replace the dashboard title or hosted URL slug.
-pub(crate) fn configure_managed_identity(
-    workspace: &Path,
-    name: &str,
-    prompt: &str,
-) -> Result<()> {
+pub(crate) fn configure_managed_identity(workspace: &Path, name: &str, prompt: &str) -> Result<()> {
     let title = clean_title(name, workspace);
     let slug = slug_from(&title);
     let identity = ManagedProjectIdentity {

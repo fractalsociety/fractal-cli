@@ -11,10 +11,8 @@ final class FractalVoiceTests: XCTestCase {
 
     func testVoiceActivityEndsAfterSpeechFollowedByNaturalSilence() {
         var detector = VoiceActivityDetector()
-        XCTAssertEqual(
-            detector.observe(rms: 0.03, duration: 0.08),
-            .speechStarted
-        )
+        XCTAssertNil(detector.observe(rms: 0.03, duration: 0.08))
+        XCTAssertEqual(detector.observe(rms: 0.03, duration: 0.08), .speechStarted)
         for _ in 0..<7 {
             XCTAssertNil(detector.observe(rms: 0.001, duration: 0.1))
         }
@@ -26,6 +24,7 @@ final class FractalVoiceTests: XCTestCase {
 
     func testVoiceActivityRecognizesAQuietShortYesFromItsPeak() {
         var detector = VoiceActivityDetector()
+        XCTAssertNil(detector.observe(rms: 0.002, peak: 0.04, duration: 0.08))
         XCTAssertEqual(
             detector.observe(rms: 0.002, peak: 0.04, duration: 0.08),
             .speechStarted
@@ -43,10 +42,8 @@ final class FractalVoiceTests: XCTestCase {
 
     func testShortAnswerVoiceActivityUsesAQuickerNaturalPause() {
         var detector = VoiceActivityDetector(endingSilenceDuration: 0.42)
-        XCTAssertEqual(
-            detector.observe(rms: 0.02, duration: 0.08),
-            .speechStarted
-        )
+        XCTAssertNil(detector.observe(rms: 0.02, duration: 0.08))
+        XCTAssertEqual(detector.observe(rms: 0.02, duration: 0.08), .speechStarted)
         for _ in 0..<4 {
             XCTAssertNil(detector.observe(rms: 0.0008, duration: 0.1))
         }
@@ -62,6 +59,19 @@ final class FractalVoiceTests: XCTestCase {
             XCTAssertNil(detector.observe(rms: 0.002, duration: 0.1))
         }
         XCTAssertFalse(detector.heardSpeech)
+    }
+
+    func testVoiceActivityCalibrationIgnoresStartupToneAndLearnsRoomNoise() {
+        var detector = VoiceActivityDetector(calibrationDuration: 0.25)
+        XCTAssertNil(detector.observe(rms: 0.02, peak: 0.08, duration: 0.1))
+        XCTAssertNil(detector.observe(rms: 0.003, peak: 0.01, duration: 0.1))
+        XCTAssertNil(detector.observe(rms: 0.003, peak: 0.01, duration: 0.1))
+        XCTAssertFalse(detector.heardSpeech)
+        XCTAssertNil(detector.observe(rms: 0.03, peak: 0.12, duration: 0.08))
+        XCTAssertEqual(
+            detector.observe(rms: 0.03, peak: 0.12, duration: 0.08),
+            .speechStarted
+        )
     }
 
     func testProcessPathIncludesAgentInstallLocations() {
@@ -166,15 +176,45 @@ final class FractalVoiceTests: XCTestCase {
         XCTAssertNil(configuration.apiProvider)
     }
 
+    func testExternalVoiceChoicesDoNotRequireLocalModelDownload() {
+        XCTAssertFalse(VoiceInputMode.chatGPTDesktop.requiresLocalModels)
+        XCTAssertFalse(VoiceInputMode.superwhisper.requiresLocalModels)
+        XCTAssertTrue(VoiceInputMode.chatGPTDesktop.isReady(localModelsReady: false))
+        XCTAssertTrue(VoiceInputMode.superwhisper.isReady(localModelsReady: false))
+    }
+
+    func testBuiltInVoiceRequiresDownloadedModels() {
+        XCTAssertTrue(VoiceInputMode.builtIn.requiresLocalModels)
+        XCTAssertFalse(VoiceInputMode.builtIn.isReady(localModelsReady: false))
+        XCTAssertTrue(VoiceInputMode.builtIn.isReady(localModelsReady: true))
+    }
+
+    func testVoiceInputChoicePersistsWithoutStartingDownloads() throws {
+        let suite = "FractalVoiceTests.InputMode.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        XCTAssertNil(VoiceInputMode.selected(in: defaults))
+        VoiceInputMode.save(.chatGPTDesktop, in: defaults)
+        XCTAssertEqual(VoiceInputMode.selected(in: defaults), .chatGPTDesktop)
+    }
+
     func testDownloadedVoiceModelsLiveOutsideTheApplicationBundle() {
+        let expectedRoot = AppRuntime.isAppStoreEdition
+            ? "/Fractal Voice/Models"
+            : "/.fractal/models"
+        XCTAssertTrue(VoiceModelManager.modelRoot.path.hasSuffix(expectedRoot))
+        XCTAssertFalse(
+            VoiceModelManager.modelRoot.path.hasPrefix(Bundle.main.bundlePath)
+        )
         XCTAssertTrue(
             VoiceModelManager.graniteDirectory.path.hasSuffix(
-                "/.fractal/models/granite-speech-4.1-2b-q4"
+                "\(expectedRoot)/granite-speech-4.1-2b-q4"
             )
         )
         XCTAssertTrue(
             VoiceModelManager.kokoroDirectory.path.hasSuffix(
-                "/.fractal/models/kokoro-82m-bf16"
+                "\(expectedRoot)/kokoro-82m-bf16"
             )
         )
     }
@@ -251,6 +291,18 @@ final class FractalVoiceTests: XCTestCase {
         XCTAssertEqual(
             BuildCoordinator.cleanGraniteTranscript(output),
             "Build Sources/M3.11.swift with Codex and Cursor."
+        )
+    }
+
+    func testGraniteRejectsCommonSilenceHallucinations() {
+        XCTAssertTrue(BuildCoordinator.isLikelyGraniteHallucination("Thanks for watching."))
+        XCTAssertTrue(BuildCoordinator.isLikelyGraniteHallucination("THANK YOU FOR WATCHING!"))
+        XCTAssertTrue(BuildCoordinator.isLikelyGraniteHallucination("[Music]"))
+        XCTAssertTrue(BuildCoordinator.isLikelyGraniteHallucination("All right."))
+        XCTAssertFalse(
+            BuildCoordinator.isLikelyGraniteHallucination(
+                "Build a video player with playback controls."
+            )
         )
     }
 
@@ -376,6 +428,88 @@ final class FractalVoiceTests: XCTestCase {
             hud.summaryForTesting,
             "Is this what you want me to build?"
         )
+    }
+
+    @MainActor
+    func testVoiceHudCanBeMovedAndMinimizedToTheDock() {
+        let hud = RecordingHUD(onStop: {}, onRestart: {})
+        defer { hud.close() }
+
+        XCTAssertTrue(hud.isMovableForTesting)
+        XCTAssertTrue(hud.isMiniaturizableForTesting)
+    }
+
+    func testExternalDesktopHandoffIsPrivateFreshAndSingleUse() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "fractal-handoff-\(UUID().uuidString).fractalbuild"
+        )
+        let payload: [String: Any] = [
+            "schema": "fractal.external_build.v1",
+            "request": "Build a very simple Hello World app.",
+            "project_name": "Hello World",
+            "created_at_ms": UInt64(Date().timeIntervalSince1970 * 1_000),
+        ]
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: url.path,
+            contents: try JSONSerialization.data(withJSONObject: payload),
+            attributes: [.posixPermissions: 0o600]
+        ))
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let handoff = try ExternalBuildHandoff.consume(url)
+
+        XCTAssertEqual(handoff.request, "Build a very simple Hello World app.")
+        XCTAssertEqual(handoff.projectName, "Hello World")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testExternalDesktopHandoffRejectsExpiredRequests() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "fractal-expired-\(UUID().uuidString).fractalbuild"
+        )
+        let payload: [String: Any] = [
+            "schema": "fractal.external_build.v1",
+            "request": "Build an expired app.",
+            "project_name": "Expired",
+            "created_at_ms": 1,
+        ]
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: url.path,
+            contents: try JSONSerialization.data(withJSONObject: payload),
+            attributes: [.posixPermissions: 0o600]
+        ))
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        XCTAssertThrowsError(try ExternalBuildHandoff.consume(url))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testExternalDesktopQueueDiscoversOnlyExpectedRegularFiles() throws {
+        let directory = temporaryDirectory()
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let expected = directory.appendingPathComponent(
+            "fractal-build-123-abc.fractalbuild"
+        )
+        let unrelated = directory.appendingPathComponent(
+            "other-build.fractalbuild"
+        )
+        let wrongExtension = directory.appendingPathComponent(
+            "fractal-build-123-abc.json"
+        )
+        for url in [expected, unrelated, wrongExtension] {
+            XCTAssertTrue(FileManager.default.createFile(
+                atPath: url.path,
+                contents: Data("{}".utf8),
+                attributes: [.posixPermissions: 0o600]
+            ))
+        }
+
+        let discovered = ExternalBuildHandoff.pendingURLs(in: directory)
+        XCTAssertEqual(discovered.count, 1)
+        XCTAssertEqual(discovered.first?.lastPathComponent, expected.lastPathComponent)
     }
 
     func testBuiltInVocabularyCorrectsFractalProductTerms() {

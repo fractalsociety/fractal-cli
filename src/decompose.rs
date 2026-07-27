@@ -134,7 +134,10 @@ pub(crate) fn commit_planning_preview(
     lead_agent: &str,
 ) -> Result<String> {
     let source_name = detect_prd_file(request, workspace)
-        .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
         .unwrap_or_else(|| "user request".to_owned());
     let harness = planning_preview_harness(&source_name, lead_agent);
     let work = build_work_value(&format!(
@@ -143,8 +146,7 @@ pub(crate) fn commit_planning_preview(
     let target_id = "darwin-arm64";
     let graph = crate::compile::recompile(&work, &harness, target_id)
         .context("compile the planning preview graph")?;
-    let record =
-        graph_store::commit_graph(&graph).context("commit the planning preview graph")?;
+    let record = graph_store::commit_graph(&graph).context("commit the planning preview graph")?;
     if let Some(hash) = graph.get("graph_hash").and_then(Value::as_str) {
         graph_store::persist_source(hash, &harness, &work, target_id).ok();
     }

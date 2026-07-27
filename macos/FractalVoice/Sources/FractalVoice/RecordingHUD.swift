@@ -5,6 +5,7 @@ import SwiftUI
 final class RecordingHUD {
     private let window: NSPanel
     private let model: HUDModel
+    private var hasPositionedWindow = false
 
     init(
         onStop: @escaping () -> Void,
@@ -25,26 +26,38 @@ final class RecordingHUD {
             onManualName: onManualName
         )
         let content = RecordingHUDView(model: model)
-        window = InputPanel(
+        let panel = InputPanel(
             contentRect: NSRect(x: 0, y: 0, width: 590, height: 230),
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
+        window = panel
         window.level = .floating
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = true
+        window.title = "Fractal Voice"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        window.isMovable = true
+        window.isMovableByWindowBackground = true
+        window.isReleasedWhenClosed = false
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        window.becomesKeyOnlyIfNeeded = true
         window.contentView = NSHostingView(rootView: content)
+        window.standardWindowButton(.closeButton)?.isHidden = true
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        window.standardWindowButton(.zoomButton)?.isHidden = true
+        model.onMinimize = { [weak panel] in
+            panel?.miniaturize(nil)
+        }
     }
 
     func showPreparing() {
         model.phase = .preparing
         model.summary = "Starting Granite Speech and Kokoro locally…"
-        position()
-        window.orderFrontRegardless()
+        showWindow(activate: true)
     }
 
     func showListening(summary: String = "Press ⌥Space again to stop") {
@@ -57,9 +70,7 @@ final class RecordingHUD {
         model.phase = .manualRequest
         model.summary = "Type exactly what you want Fractal to build."
         model.manualText = ""
-        position()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        showWindow(activate: true)
         focusManualInput()
     }
 
@@ -76,8 +87,7 @@ final class RecordingHUD {
     func showQuestion(_ question: String) {
         model.phase = .question
         model.summary = question
-        position()
-        window.orderFrontRegardless()
+        showWindow()
     }
 
     func showNaming(_ summary: String) {
@@ -87,8 +97,7 @@ final class RecordingHUD {
         if !wasNaming {
             model.manualText = ""
         }
-        position()
-        window.makeKeyAndOrderFront(nil)
+        showWindow(activate: true)
         focusManualInput()
     }
 
@@ -97,6 +106,12 @@ final class RecordingHUD {
         model.summary = restarting
             ? "Pausing this attempt, then reopening the microphone…"
             : "Preserving completed graph waves and releasing active agents…"
+    }
+
+    func showFailure(_ message: String) {
+        model.phase = .failure
+        model.summary = message
+        showWindow()
     }
 
     func updateBuilding(summary: String) {
@@ -109,6 +124,9 @@ final class RecordingHUD {
 
     func close() {
         window.close()
+        if !NSApp.windows.contains(where: { $0.isVisible && $0 !== window }) {
+            NSApp.setActivationPolicy(.accessory)
+        }
     }
 
     var isShowingBuildProgressForTesting: Bool {
@@ -127,18 +145,39 @@ final class RecordingHUD {
         model.phase == .manualRequest
     }
 
+    var isMovableForTesting: Bool {
+        window.isMovable && window.isMovableByWindowBackground
+    }
+
+    var isMiniaturizableForTesting: Bool {
+        window.styleMask.contains(.miniaturizable)
+    }
+
     func submitManualTextForTesting(_ text: String) {
         model.manualText = text
         model.submitManual()
     }
 
-    private func position() {
+    private func showWindow(activate: Bool = false) {
+        NSApp.setActivationPolicy(.regular)
+        positionOnce()
+        if activate {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            window.orderFrontRegardless()
+        }
+    }
+
+    private func positionOnce() {
+        guard !hasPositionedWindow else { return }
         guard let screen = NSScreen.main else { return }
         let frame = screen.visibleFrame
         window.setFrameOrigin(NSPoint(
             x: frame.midX - window.frame.width / 2,
             y: frame.minY + 36
         ))
+        hasPositionedWindow = true
     }
 
     private func focusManualInput() {
@@ -176,6 +215,7 @@ private final class HUDModel: ObservableObject {
     let onTypeInstead: () -> Void
     let onManualRequest: (String) -> Void
     let onManualName: (String) -> Void
+    var onMinimize: () -> Void = {}
     @Published var manualText = ""
 
     init(
@@ -216,6 +256,7 @@ private enum HUDPhase: Equatable {
     case naming
     case building
     case stopping
+    case failure
 }
 
 private struct RecordingHUDView: View {
@@ -224,7 +265,16 @@ private struct RecordingHUDView: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            AnyView(statusHeader)
+            HStack(alignment: .top, spacing: 8) {
+                AnyView(statusHeader)
+                Button(action: model.onMinimize) {
+                    Image(systemName: "minus")
+                        .frame(width: 20, height: 20)
+                }
+                .buttonStyle(.borderless)
+                .help("Minimize Fractal Voice to the Dock")
+                .accessibilityLabel("Minimize Fractal Voice")
+            }
             AnyView(controls)
         }
         .padding(.horizontal, 20)
@@ -336,11 +386,25 @@ private struct RecordingHUDView: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
+        } else if model.phase == .failure {
+            HStack {
+                Button(action: model.onRestart) {
+                    Label("Restart voice", systemImage: "arrow.counterclockwise")
+                }
+                .buttonStyle(.borderedProminent)
+                Spacer()
+                Text("Fractal Voice is still running")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
         }
     }
 
     private var accent: Color {
-        model.phase == .listening ? .red : model.phase == .stopping ? .orange : .indigo
+        if model.phase == .listening || model.phase == .failure {
+            return .red
+        }
+        return model.phase == .stopping ? .orange : .indigo
     }
 
     private var icon: String {
@@ -353,6 +417,7 @@ private struct RecordingHUDView: View {
         case .naming: return "character.cursor.ibeam"
         case .building: return "hammer.fill"
         case .stopping: return "stop.circle.fill"
+        case .failure: return "exclamationmark.triangle.fill"
         }
     }
 
@@ -366,6 +431,7 @@ private struct RecordingHUDView: View {
         case .naming: return "Name your project"
         case .building: return "Fractal is building"
         case .stopping: return "Stopping safely"
+        case .failure: return "Voice command needs attention"
         }
     }
 }
