@@ -148,10 +148,12 @@ fractal invite \
   --message 'Please help with task 2.1 and spare compute for the test wave.'
 ```
 
-After the user explicitly says to send that invitation, repeat the same command
-with `--yes`. Fractal Society creates a secure seven-day invitation and sends
-it through the configured production mail service. Report success only when
-Fractal prints `Invitation email sent successfully`.
+The preview opens in the project's Fractal Society Share dialog. The user may
+confirm and send it there. If the user instead explicitly tells this agent to
+send that exact invitation, repeat the same command with `--yes`. Fractal
+Society creates a secure seven-day invitation and sends it through the
+configured production mail service. Report success only when Fractal prints
+`Invitation email sent successfully`.
 
 Preview a public X help request:
 
@@ -166,8 +168,9 @@ fractal share-x \
 
 Use `fractal connect-x` when the account is not connected; it transfers the
 existing CLI login into the browser with a short-lived, single-use handoff, then
-opens X authorization. Read the generated post back to the user. Only after
-they explicitly approve that exact public post, repeat `fractal share-x` with
+opens X authorization. The post preview opens in the project's Fractal Society
+Share dialog. The user may confirm it there. If the user instead explicitly
+approves that exact public post to this agent, repeat `fractal share-x` with
 `--yes`. Report success only when Fractal returns the final X post URL. Do not
 post arbitrary agent-authored content, silently change the tagged handle, reuse
 an old confirmation, or treat voice transcription alone as confirmation.

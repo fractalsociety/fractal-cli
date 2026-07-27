@@ -36,6 +36,37 @@ struct BrowserHandoffResponse {
     error: Option<String>,
 }
 
+fn open_share_preview(
+    session: &crate::auth::StoredSession,
+    server: &str,
+    body: serde_json::Value,
+) -> Result<()> {
+    let endpoint = format!(
+        "{}/api/fractal/share-previews",
+        server.trim_end_matches('/')
+    );
+    let (status, response) = request("POST", &endpoint, &session.access_token, &body)?;
+    let result: BrowserHandoffResponse =
+        serde_json::from_str(&response).context("decode share preview handoff")?;
+    if !(200..300).contains(&status) {
+        bail!(
+            "{}",
+            result
+                .error
+                .unwrap_or_else(|| format!("share preview failed with HTTP {status}"))
+        );
+    }
+    let url = result
+        .browser_url
+        .context("Fractal Society returned no share preview URL")?;
+    Command::new("open")
+        .arg(&url)
+        .status()
+        .context("open share preview in browser")?;
+    println!("Opened the secure share preview on Fractal Society.");
+    Ok(())
+}
+
 fn segment(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.as_bytes() {
@@ -114,14 +145,26 @@ pub(crate) fn invite(args: &InviteArgs) -> Result<()> {
     println!("  Recipient: {email}");
     println!("  Permission: {}", args.role.as_str());
     println!("  Help requested: {help}");
-    if !args.yes {
-        bail!("email not sent; after the user explicitly confirms, repeat with `--yes`");
-    }
     let (session, server) = session_and_server(args.server.as_deref())?;
     let username = session
         .username
         .as_deref()
         .context("Fractal Society username missing; run `fractal login` again")?;
+    if !args.yes {
+        open_share_preview(
+            &session,
+            &server,
+            serde_json::json!({
+                "kind": "email",
+                "owner": username,
+                "project": args.project,
+                "email": email,
+                "role": args.role.as_str(),
+                "help_requested": help,
+            }),
+        )?;
+        bail!("email not sent; after the user explicitly confirms, repeat with `--yes`");
+    }
     let endpoint = endpoint(&server, username, &args.project, "invitations");
     let (status, response) = request(
         "POST",
@@ -178,6 +221,17 @@ pub(crate) fn share_x(args: &ShareXArgs) -> Result<()> {
         .context("Fractal Society returned no X post preview")?;
     println!("X post preview:\n\n{text}\n");
     if !args.yes {
+        open_share_preview(
+            &session,
+            &server,
+            serde_json::json!({
+                "kind": "x",
+                "owner": username,
+                "project": args.project,
+                "handle": args.handle,
+                "help_requested": help,
+            }),
+        )?;
         bail!("X post not published; after the user explicitly confirms this preview, repeat with `--yes`");
     }
     let (status, response) = request(
