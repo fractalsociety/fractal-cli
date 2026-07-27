@@ -221,6 +221,7 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
             menu.addItem(item("Open Microphone Settings", #selector(openMicrophoneSettings)))
         }
         menu.addItem(item("Open Projects", #selector(openProjects)))
+        menu.addItem(item("Change Project Location…", #selector(showProjectLocation)))
         menu.addItem(item("Open Activity Log", #selector(openLog)))
         menu.addItem(item("Support", #selector(openSupport)))
         menu.addItem(item("Privacy Policy", #selector(openPrivacyPolicy)))
@@ -271,13 +272,27 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
     }
 
     @objc func showOnboarding() {
+        presentOnboarding(initialPage: 0)
+    }
+
+    @objc private func showProjectLocation() {
+        if onboardingWindow != nil {
+            onboardingWindow?.close()
+        }
+        presentOnboarding(initialPage: AppRuntime.isAppStoreEdition ? 5 : 4)
+    }
+
+    private func presentOnboarding(initialPage: Int) {
         if let onboardingWindow {
             onboardingWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
         NSApp.setActivationPolicy(.regular)
-        let view = OnboardingView(coordinator: coordinator) { [weak self] in
+        let view = OnboardingView(
+            coordinator: coordinator,
+            initialPage: initialPage
+        ) { [weak self] in
             UserDefaults.standard.set(true, forKey: "completedOnboarding")
             self?.setupComplete = true
             self?.selectedVoiceMode = VoiceInputMode.selected()

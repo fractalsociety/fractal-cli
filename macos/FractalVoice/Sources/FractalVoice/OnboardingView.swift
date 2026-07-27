@@ -8,12 +8,24 @@ struct OnboardingView: View {
     @StateObject private var voiceModels = VoiceModelManager()
     @AppStorage(VoiceInputMode.defaultsKey) private var voiceInputModeRaw = ""
     @AppStorage("selectedLeadAgent") private var selectedLeadAgent = "codex"
-    @State private var page = 0
+    @State private var page: Int
     @State private var bridgeToken = ""
     @State private var showKeychainExplanation = false
+    @State private var projectsDirectoryPath = AppRuntime.projectsURL.path
+    @State private var projectsDirectoryMessage = ""
 
-    private var pageCount: Int { AppRuntime.isAppStoreEdition ? 8 : 7 }
-    private var readinessPageIndex: Int { AppRuntime.isAppStoreEdition ? 5 : 4 }
+    init(
+        coordinator: BuildCoordinator,
+        initialPage: Int = 0,
+        finish: @escaping () -> Void
+    ) {
+        self.coordinator = coordinator
+        self.finish = finish
+        _page = State(initialValue: initialPage)
+    }
+
+    private var pageCount: Int { AppRuntime.isAppStoreEdition ? 9 : 8 }
+    private var readinessPageIndex: Int { AppRuntime.isAppStoreEdition ? 6 : 5 }
     private var accountPageIndex: Int { AppRuntime.isAppStoreEdition ? 2 : 1 }
     private var selectedPlannerReady: Bool {
         readiness.snapshot.agents.first(where: { $0.id == selectedLeadAgent })?.authenticated == true
@@ -108,8 +120,9 @@ struct OnboardingView: View {
             case 2: accountPage
             case 3: agentPage
             case 4: githubPage
-            case 5: readinessPage
-            case 6: shortcutPage
+            case 5: projectsDirectoryPage
+            case 6: readinessPage
+            case 7: shortcutPage
             default: buildPage
             }
         } else {
@@ -118,8 +131,9 @@ struct OnboardingView: View {
             case 1: accountPage
             case 2: agentPage
             case 3: githubPage
-            case 4: readinessPage
-            case 5: shortcutPage
+            case 4: projectsDirectoryPage
+            case 5: readinessPage
+            case 6: shortcutPage
             default: buildPage
             }
         }
@@ -526,6 +540,93 @@ struct OnboardingView: View {
                 .foregroundStyle(.secondary)
         }
         .padding(48)
+    }
+
+    private var projectsDirectoryPage: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            Label("Choose where Fractal saves projects", systemImage: "folder.badge.gearshape")
+                .font(.system(size: 31, weight: .bold, design: .rounded))
+            Text("Every voice or desktop build gets its own folder here. Fractal keeps the source code, Git repository, and portable execution graph together.")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Current project location").font(.headline)
+                Text(projectsDirectoryPath)
+                    .font(.system(.body, design: .monospaced))
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 9))
+                HStack {
+                    Button {
+                        chooseProjectsDirectory()
+                    } label: {
+                        Label("Choose a different folder…", systemImage: "folder")
+                    }
+                    Button("Use default") {
+                        useDefaultProjectsDirectory()
+                    }
+                    Spacer()
+                    Button("Open folder") {
+                        coordinator.openProjects()
+                    }
+                }
+                if !projectsDirectoryMessage.isEmpty {
+                    Text(projectsDirectoryMessage)
+                        .font(.caption)
+                        .foregroundStyle(
+                            projectsDirectoryMessage.hasPrefix("Could not") ? .red : .secondary
+                        )
+                }
+            }
+            .padding(16)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+
+            explanation(
+                icon: "doc.text.fill",
+                title: "Global agent instructions are included",
+                detail: "Fractal creates AGENTS.md in this folder so ChatGPT Desktop, Codex, and other compatible agents can discover how to hand builds to the Fractal orchestrator."
+            )
+            explanation(
+                icon: "folder.fill.badge.plus",
+                title: "Each project remains self-contained",
+                detail: "A project-level AGENTS.md and .fractal folder are also created inside every new project. Changing this setting affects new builds; existing projects are not moved or deleted."
+            )
+        }
+        .padding(44)
+    }
+
+    private func chooseProjectsDirectory() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose the Fractal projects folder"
+        panel.prompt = "Use This Folder"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = AppRuntime.projectsURL
+        guard panel.runModal() == .OK, let selected = panel.url else { return }
+        do {
+            try AppRuntime.configureProjectsURL(selected)
+            projectsDirectoryPath = AppRuntime.projectsURL.path
+            projectsDirectoryMessage = "New projects will be saved here. AGENTS.md is ready."
+        } catch {
+            projectsDirectoryMessage = "Could not use this folder: \(error.localizedDescription)"
+        }
+    }
+
+    private func useDefaultProjectsDirectory() {
+        do {
+            try AppRuntime.useDefaultProjectsURL()
+            projectsDirectoryPath = AppRuntime.projectsURL.path
+            projectsDirectoryMessage = "Restored the default project location."
+        } catch {
+            projectsDirectoryMessage = "Could not restore the default: \(error.localizedDescription)"
+        }
     }
 
     private var readinessPage: some View {

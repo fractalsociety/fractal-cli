@@ -515,6 +515,7 @@ pub(crate) fn prepare_managed_voice_workspace(name: &str, prompt: &str) -> Resul
     let root = root
         .canonicalize()
         .with_context(|| format!("resolve managed project root {}", root.display()))?;
+    install_managed_agent_instructions(&root)?;
 
     let slug = managed_project_slug(name);
     let suffix = std::time::SystemTime::now()
@@ -960,5 +961,25 @@ mod tests {
         assert!(instructions.contains("FRACTAL_WORKER"));
         assert!(instructions.contains(".fractal/project.fractal"));
         std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn managed_project_root_receives_global_agent_instructions() {
+        let root = std::env::temp_dir().join(format!(
+            "fractal-global-agent-instructions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+
+        install_managed_agent_instructions(&root).unwrap();
+        let instructions = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+
+        assert!(instructions.contains("Fractal owns orchestration"));
+        assert!(instructions.contains("fractal handoff"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

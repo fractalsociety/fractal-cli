@@ -81,6 +81,61 @@ final class FractalVoiceTests: XCTestCase {
         XCTAssertTrue(path.contains("/opt/homebrew/bin"))
     }
 
+    func testProjectLocationDefaultsAndPersistsAChosenFolder() throws {
+        let suite = "FractalVoiceTests.ProjectsDirectory.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fractal-project-location-\(UUID().uuidString)")
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        XCTAssertEqual(
+            AppRuntime.projectsURL(in: defaults).standardizedFileURL,
+            AppRuntime.defaultProjectsURL.standardizedFileURL
+        )
+        try AppRuntime.configureProjectsURL(
+            root,
+            defaults: defaults,
+            agentInstructions: "# Fractal Agent Operating Contract\n"
+        )
+        XCTAssertEqual(
+            AppRuntime.projectsURL(in: defaults).standardizedFileURL,
+            root.standardizedFileURL
+        )
+    }
+
+    func testGlobalAgentInstructionsAreCreatedWithoutOverwritingUserChanges() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fractal-global-agents-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try AppRuntime.installGlobalAgentInstructions(
+            at: root,
+            contents: "# Fractal Agent Operating Contract\n"
+        )
+        let destination = root.appendingPathComponent("AGENTS.md")
+        XCTAssertEqual(
+            try String(contentsOf: destination, encoding: .utf8),
+            "# Fractal Agent Operating Contract\n"
+        )
+
+        try "user customization".write(
+            to: destination,
+            atomically: true,
+            encoding: .utf8
+        )
+        try AppRuntime.installGlobalAgentInstructions(
+            at: root,
+            contents: "replacement"
+        )
+        XCTAssertEqual(
+            try String(contentsOf: destination, encoding: .utf8),
+            "user customization"
+        )
+    }
+
     func testSetupRequiresOneAuthenticatedAgentAndGitHub() {
         var agents = SetupReadiness.agentTemplates
         agents[0].installed = true

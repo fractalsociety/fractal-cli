@@ -74,7 +74,7 @@ final class BuildCoordinator: ObservableObject {
     private var transcriptRetryCount = 0
     private var recordingTimeout: Task<Void, Never>?
 
-    let projectsURL = AppRuntime.projectsURL
+    var projectsURL: URL { AppRuntime.projectsURL }
     let logURL = AppRuntime.logURL
 
     var canAcceptExternalBuild: Bool {
@@ -87,10 +87,7 @@ final class BuildCoordinator: ObservableObject {
     }
 
     init() {
-        try? FileManager.default.createDirectory(
-            at: projectsURL,
-            withIntermediateDirectories: true
-        )
+        try? AppRuntime.prepareProjectsDirectory()
         try? vocabularyEngine.installPersonalTemplateIfNeeded()
         refreshVoiceReadiness()
     }
