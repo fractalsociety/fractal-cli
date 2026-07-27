@@ -255,11 +255,11 @@ struct OnboardingView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     switch selectedVoiceMode {
                     case .chatGPTDesktop:
-                        Text("What to say in ChatGPT Desktop").font(.headline)
-                        Text("“Use Fractal to build [describe the project]. Name the project [your project name].”")
+                        Text("What to say in ChatGPT Desktop or Codex voice").font(.headline)
+                        Text(desktopVoiceInstruction)
                             .font(.system(.callout, design: .rounded).weight(.medium))
                             .textSelection(.enabled)
-                        Text("Keep Fractal Voice running in the menu bar. ChatGPT will use the secure native handoff; no local voice-model download is needed.")
+                        Text("This directs the desktop agent to load Fractal’s operating contract before it uses the secure native handoff. Keep Fractal Voice running in the menu bar.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     case .superwhisper:
@@ -716,14 +716,14 @@ struct OnboardingView: View {
             case .chatGPTDesktop:
                 externalVoiceInstructionPage(
                     icon: "message.fill",
-                    title: "Build through ChatGPT Desktop voice",
+                    title: "Build through ChatGPT Desktop or Codex voice",
                     steps: [
                         "Keep Fractal Voice running in your menu bar.",
                         "Open ChatGPT Desktop and start a voice conversation.",
-                        "Say: “Use Fractal to build a personal expense tracker. Name the project Pocket Ledger.”",
+                        "Say: \(desktopVoiceExample)",
                         "ChatGPT confirms the details and sends the named build through Fractal’s secure handoff.",
                     ],
-                    footer: "If ChatGPT reports “Queued,” the request was accepted. Fractal Voice will pick it up automatically."
+                    footer: "The instruction file tells the desktop agent to use `fractal handoff`, not the deprecated bridge. If it reports “Queued,” Fractal Voice will pick up the accepted request automatically."
                 )
             case .superwhisper:
                 externalVoiceInstructionPage(
@@ -832,6 +832,18 @@ struct OnboardingView: View {
         case nil:
             return "Choose a voice option first."
         }
+    }
+
+    private var desktopAgentInstructionsPath: String {
+        AppRuntime.projectsURL.appendingPathComponent("AGENTS.md").path
+    }
+
+    private var desktopVoiceInstruction: String {
+        "“First read \(desktopAgentInstructionsPath) and follow its External desktop app instructions. Then use Fractal to build [describe the project]. Name the project [your project name].”"
+    }
+
+    private var desktopVoiceExample: String {
+        "“First read \(desktopAgentInstructionsPath) and follow its External desktop app instructions. Then use Fractal to build a personal expense tracker. Name the project Pocket Ledger.”"
     }
 
     private var finalBuildHandoffDescription: String {
