@@ -93,6 +93,16 @@ for resource_bundle in "$XCODE_PRODUCTS"/*.bundle; do
     && cp -R "$resource_bundle" "$CONTENTS/Resources/"
 done
 
+# Release builds from Swift packages can retain local object-file paths in their
+# symbol tables even when compiler path remapping is enabled. Strip those
+# non-runtime symbols before signing so distributed bundles do not disclose the
+# build machine's home directory.
+while IFS= read -r -d '' binary; do
+  if file "$binary" | grep -q 'Mach-O'; then
+    strip -S -x "$binary"
+  fi
+done < <(find "$CONTENTS" -type f -print0)
+
 SIGNING_IDENTITY="${FRACTAL_CODESIGN_IDENTITY:--}"
 DEFAULT_MAIN_ENTITLEMENTS="$PACKAGE/DeveloperID.entitlements"
 MAIN_ENTITLEMENTS="${FRACTAL_CODESIGN_MAIN_ENTITLEMENTS:-$DEFAULT_MAIN_ENTITLEMENTS}"
