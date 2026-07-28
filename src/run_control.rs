@@ -384,11 +384,12 @@ fn halt(original: &ActiveRun, hosted_command_id: Option<&str>) -> Result<()> {
     for (node, agent) in &run.active_nodes {
         crate::project_file::transition(workspace, node, "release", agent, agent).ok();
     }
-    crate::project_file::set_execution_phase(workspace, "halted").ok();
 
     // Stop the coordinator first so a terminated planner cannot be mistaken for
     // an ordinary failure and trigger fallback planning while cancellation is
     // already in progress. Worker groups are independently terminated next.
+    // The graph is finalized only after termination: otherwise the coordinator
+    // can race the pause request and write `executing` over `halted`.
     signal_process(run.pid, libc::SIGTERM);
     for group in &run.worker_groups {
         signal_group(*group, libc::SIGTERM);
@@ -400,13 +401,40 @@ fn halt(original: &ActiveRun, hosted_command_id: Option<&str>) -> Result<()> {
     if process_alive(run.pid) && is_fractal_process(run.pid) {
         signal_process(run.pid, libc::SIGKILL);
     }
+    wait_for_process_exit(run.pid, Duration::from_secs(2));
+    finalize_halted_graph(workspace)?;
     if let Some(command_id) = hosted_command_id {
         if let Err(error) = crate::project_sync::mark_pause_agents_stopped(workspace, command_id) {
             eprintln!("  hosted pause progress note: {error:#}");
         }
     }
-    if let Err(error) = crate::project_sync::sync_runtime_halt_now(workspace) {
-        eprintln!("  halted graph sync note: {error:#}");
+    crate::project_sync::sync_runtime_halt_now(workspace).context(
+        "agents stopped locally, but the halted dashboard graph could not be synchronized",
+    )?;
+    Ok(())
+}
+
+fn wait_for_process_exit(pid: u32, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while process_alive(pid) && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn finalize_halted_graph(workspace: &Path) -> Result<()> {
+    if !crate::project_file::path(workspace).exists() {
+        return Ok(());
+    }
+    crate::project_file::release_stale_assignments(workspace)?;
+    // release_stale_assignments only changes the phase when a checkout exists.
+    // Always write the terminal phase so an idle or planning graph cannot remain
+    // visually running after its coordinator has stopped.
+    crate::project_file::set_execution_phase(workspace, "halted")?;
+    let phase = crate::project_file::load(workspace)?
+        .execution
+        .map(|execution| execution.phase);
+    if phase.as_deref() != Some("halted") {
+        bail!("halted graph verification failed");
     }
     Ok(())
 }
@@ -506,15 +534,11 @@ fn halt_persisted_workspace(workspace: &Path, sync_runtime: bool) -> Result<()> 
         )?;
         fs::remove_file(run_path(&state.run_id)).ok();
     }
-    if crate::project_file::path(workspace).exists()
-        && !crate::project_file::release_stale_assignments(workspace)?
-    {
-        crate::project_file::set_execution_phase(workspace, "halted")?;
-    }
+    finalize_halted_graph(workspace)?;
     if sync_runtime {
-        if let Err(error) = crate::project_sync::sync_runtime_halt_now(workspace) {
-            eprintln!("  halted graph sync note: {error:#}");
-        }
+        crate::project_sync::sync_runtime_halt_now(workspace).context(
+            "agents stopped locally, but the halted dashboard graph could not be synchronized",
+        )?;
     }
     Ok(())
 }
@@ -1021,6 +1045,35 @@ mod tests {
         assert_eq!(execution.phase, "halted");
         assert_eq!(execution.assignments["build"].state, "released");
         assert_eq!(read_project_run_state(&root).unwrap().status, "halted");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn halted_runtime_finalization_overrides_a_late_executing_write() {
+        let root = std::env::temp_dir().join(format!(
+            "fractal-halt-finalization-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut graph = serde_json::json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [{
+                "id": "build",
+                "capability": "code.generate",
+                "instruction": "Build it."
+            }],
+            "edges": []
+        });
+        graph["graph_hash"] =
+            serde_json::Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::project_file::persist(&root, &graph, "Dog").unwrap();
+        crate::project_file::set_execution_phase(&root, "executing").unwrap();
+
+        finalize_halted_graph(&root).unwrap();
+
+        let execution = crate::project_file::load(&root).unwrap().execution.unwrap();
+        assert_eq!(execution.phase, "halted");
         fs::remove_dir_all(root).ok();
     }
 
