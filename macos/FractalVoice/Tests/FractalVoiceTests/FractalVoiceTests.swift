@@ -611,6 +611,28 @@ final class FractalVoiceTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
+    func testExternalXShareHandoffAcceptsLegacyPlusEncodedSpaces() throws {
+        let url = URL(fileURLWithPath: "/tmp").appendingPathComponent(
+            "fractal-x-share-\(UUID().uuidString).fractalxshare"
+        )
+        let preview = "Building Coffee 2 with Fractal Society"
+        let payload: [String: Any] = [
+            "schema": "fractal.external_x_share.v1",
+            "intent_url": "https://x.com/intent/tweet?text=Building+Coffee+2+with+Fractal+Society",
+            "preview": preview,
+            "created_at_ms": UInt64(Date().timeIntervalSince1970 * 1_000),
+        ]
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: url.path,
+            contents: try JSONSerialization.data(withJSONObject: payload),
+            attributes: [.posixPermissions: 0o600]
+        ))
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        XCTAssertEqual(try ExternalXShareHandoff.consume(url).preview, preview)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
     func testWebsiteVisibilityHandoffAcceptsOnlyFractalSocietyCommands() throws {
         let handoff = try WebsiteVisibilityHandoff(url: URL(
             string: "fractalvoice://visibility?project=coffee5&target=private&server=https%3A%2F%2Ffractalsociety.com"

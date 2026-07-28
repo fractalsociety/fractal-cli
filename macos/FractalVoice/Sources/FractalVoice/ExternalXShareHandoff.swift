@@ -100,6 +100,13 @@ enum ExternalXShareHandoff {
         }
 
         let preview = envelope.preview.trimmingCharacters(in: .whitespacesAndNewlines)
+        let encodedText = URLComponents(
+            string: envelope.intentURL
+        )?.percentEncodedQuery?.dropFirst("text=".count)
+        let decodedText = encodedText
+            .map(String.init)?
+            .replacingOccurrences(of: "+", with: "%20")
+            .removingPercentEncoding
         guard
             !preview.isEmpty,
             preview.count <= 280,
@@ -109,9 +116,9 @@ enum ExternalXShareHandoff {
             components.host?.lowercased() == "x.com",
             components.path == "/intent/tweet",
             components.fragment == nil,
-            components.queryItems?.count == 1,
-            components.queryItems?.first?.name == "text",
-            components.queryItems?.first?.value == preview
+            components.percentEncodedQuery?.hasPrefix("text=") == true,
+            components.percentEncodedQuery?.contains("&") == false,
+            decodedText == preview
         else {
             throw ExternalXShareError.invalidRequest
         }
