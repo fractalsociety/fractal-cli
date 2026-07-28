@@ -215,15 +215,24 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         let resultURL = url.deletingPathExtension().appendingPathExtension("result")
         do {
             let request = try ExternalXShareHandoff.consume(url)
-            guard openXComposer(request.intentURL) else {
-                throw ExternalXShareError.invalidRequest
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard let self else { return }
+                let opened = self.openXComposer(request.intentURL)
+                let message = opened
+                    ? "Opened the approved X composer. Review the post and choose Post."
+                    : ExternalXShareError.invalidRequest.localizedDescription
+                self.writeXShareResult(
+                    to: resultURL,
+                    success: opened,
+                    message: message
+                )
+                if opened {
+                    self.coordinator.reportExternalShareOpened()
+                } else if reportFailure {
+                    self.coordinator.reportExternalBuildFailure(message)
+                }
             }
-            writeXShareResult(
-                to: resultURL,
-                success: true,
-                message: "Opened the approved X composer. Review the post and choose Post."
-            )
-            coordinator.reportExternalShareOpened()
             return true
         } catch {
             writeXShareResult(
