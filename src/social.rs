@@ -242,6 +242,13 @@ pub(crate) fn share_x(args: &ShareXArgs) -> Result<()> {
         .preview
         .context("Fractal Society returned no X post preview")?;
     println!("X post preview:\n\n{text}\n");
+    if args.preview_only {
+        println!("X_PREVIEW_READY");
+        println!(
+            "Nothing opened or posted. Ask for explicit approval, then repeat the identical command with `--yes` instead of `--preview-only`."
+        );
+        return Ok(());
+    }
     if !args.yes {
         open_share_preview(
             &session,

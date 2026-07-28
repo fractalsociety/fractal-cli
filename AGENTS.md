@@ -155,31 +155,42 @@ Society creates a secure seven-day invitation and sends it through the
 configured production mail service. Report success only when Fractal prints
 `Invitation email sent successfully`.
 
-Preview a public X help request:
+For ChatGPT Desktop and every other external voice agent, use the fast preview
+path:
 
 ```sh
 fractal share-x \
   --project 'coffee-2' \
   --handle '@helper' \
-  --message 'Please help with task 2.1 and spare agent compute for tests.'
+  --message 'Please help with task 2.1 and spare agent compute for tests.' \
+  --preview-only
 ```
 
-The post preview opens in the project's Fractal Society Share dialog. No X API
-connection, developer token, or posting credit is required. If the user
-explicitly approves that exact public post to this agent, repeat
-`fractal share-x` with `--yes`. Fractal retrieves the trusted X Web Intent URL,
-writes it to an owner-only, short-lived `.fractalxshare` handoff, and sends it
-to Fractal Voice. If the desktop sandbox cannot launch the app, Fractal Voice
-consumes the queued request while it is running. The app validates that the URL
-is exactly an `https://x.com/intent/tweet` composer whose text matches the
-approved preview, then opens X with the post filled in.
+`--preview-only` prints the exact server-generated post and `X_PREVIEW_READY`,
+then exits successfully. It must not open the Fractal Society preview page.
+Read that exact preview to the user and ask one concise yes-or-no question. Do
+not run any preliminary command, do not retry the preview, and do not say the
+preview screen failed to open.
 
-Treat `Sent X composer request` or `Queued X composer request` as successful
-delivery to Fractal Voice, not as proof that the post was published. Tell the
-user to review the prefilled post and choose Post in X. Do not call
-`fractal connect-x`; it is not needed for this flow. Do not post arbitrary
-agent-authored content, silently change the tagged handle, reuse an old
-confirmation, or treat voice transcription alone as confirmation.
+After an explicit yes, immediately repeat the identical project, handle, and
+message with `--yes` replacing `--preview-only`. Do not reread `AGENTS.md` and
+do not recreate the preview:
+
+```sh
+fractal share-x \
+  --project 'coffee-2' \
+  --handle '@helper' \
+  --message 'Please help with task 2.1 and spare agent compute for tests.' \
+  --yes
+```
+
+Fractal sends the trusted `https://x.com/intent/tweet` URL through a private
+handoff to Fractal Voice, which opens the free prefilled X composer. Report
+success only after Fractal prints `Opened the approved X composer`. The user
+still chooses Post. Never call `fractal connect-x`, never open
+`/api/providers/x/*`, never use OAuth or an X API token, and never use the bare
+`fractal share-x` command from an external desktop agent. Do not change the
+approved text or infer approval from the original request.
 
 ## Operate an existing graph
 

@@ -173,6 +173,9 @@ pub(crate) struct ShareXArgs {
     /// Send the displayed preview to Fractal Voice, which opens X's composer.
     #[arg(long)]
     pub(crate) yes: bool,
+    /// Print the exact post without opening the website preview (for desktop agents).
+    #[arg(long, conflicts_with = "yes")]
+    pub(crate) preview_only: bool,
     /// Fractal Society origin (defaults to the saved login server).
     #[arg(long, value_name = "URL")]
     pub(crate) server: Option<String>,
@@ -1136,6 +1139,25 @@ mod tests {
                 yes: true,
                 ..
             })) if handle == "@helper"
+        ));
+
+        let fast_preview = Cli::try_parse_from([
+            "fractal",
+            "share-x",
+            "--project",
+            "coffee-2",
+            "--handle",
+            "@helper",
+            "--preview-only",
+        ])
+        .unwrap();
+        assert!(matches!(
+            fast_preview.command,
+            Some(Command::ShareX(ShareXArgs {
+                preview_only: true,
+                yes: false,
+                ..
+            }))
         ));
 
         let connect =
