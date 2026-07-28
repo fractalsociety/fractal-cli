@@ -14,9 +14,15 @@ LLAMA_SERVER="${FRACTAL_LLAMA_SERVER:-$DEFAULT_LLAMA_SERVER}"
 LLAMA_SERVER_DEST="$CONTENTS/Resources/Granite/bin/llama-server"
 XCODE_PRODUCTS="$PACKAGE/.xcode-build/Build/Products/Release"
 SWIFT_CONDITIONS="${FRACTAL_SWIFT_CONDITIONS:-}"
+PUBLIC_BUILD_ROOT="${FRACTAL_PUBLIC_BUILD_ROOT:-/opt/fractal-build}"
+RUST_PATH_REMAP="--remap-path-prefix=$HOME=$PUBLIC_BUILD_ROOT"
+C_PATH_REMAP="-ffile-prefix-map=$HOME=$PUBLIC_BUILD_ROOT -fdebug-prefix-map=$HOME=$PUBLIC_BUILD_ROOT -fmacro-prefix-map=$HOME=$PUBLIC_BUILD_ROOT"
+SWIFT_PATH_REMAP="-debug-prefix-map $HOME=$PUBLIC_BUILD_ROOT"
 
 cd "$ROOT"
-cargo build --release
+FRACTAL_BUILD_SOURCE_ROOT="$PUBLIC_BUILD_ROOT/fractal-cli" \
+  RUSTFLAGS="${RUSTFLAGS:-} $RUST_PATH_REMAP" \
+  cargo build --release
 "$ROOT/scripts/build-macos-icon.sh"
 
 cd "$PACKAGE"
@@ -27,6 +33,9 @@ xcode_args=(
   -derivedDataPath .xcode-build \
   build \
   CODE_SIGNING_ALLOWED=NO \
+  "OTHER_CFLAGS=$C_PATH_REMAP" \
+  "OTHER_CPLUSPLUSFLAGS=$C_PATH_REMAP" \
+  "OTHER_SWIFT_FLAGS=$SWIFT_PATH_REMAP" \
   -quiet
 )
 if [[ -n "$SWIFT_CONDITIONS" ]]; then

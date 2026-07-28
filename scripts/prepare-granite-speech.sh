@@ -6,6 +6,8 @@ CACHE_ROOT="${FRACTAL_GRANITE_CACHE_DIR:-$HOME/.fractal/models/granite-speech-4.
 LLAMA_ROOT="${FRACTAL_LLAMA_SOURCE_DIR:-$HOME/.cache/fractal-build/llama.cpp}"
 LLAMA_COMMIT="42fc243060709331ff9b158a9ed2cbe37219ae83"
 MODEL_REPO="https://huggingface.co/ibm-granite/granite-speech-4.1-2b-GGUF/resolve/8267dad2adc84209b0efd2702ec68a98356125eb"
+PUBLIC_BUILD_ROOT="${FRACTAL_PUBLIC_BUILD_ROOT:-/opt/fractal-build}"
+PATH_REMAP="-ffile-prefix-map=$HOME=$PUBLIC_BUILD_ROOT -fdebug-prefix-map=$HOME=$PUBLIC_BUILD_ROOT -fmacro-prefix-map=$HOME=$PUBLIC_BUILD_ROOT"
 
 mkdir -p "$CACHE_ROOT" "$(dirname "$LLAMA_ROOT")"
 
@@ -38,6 +40,8 @@ cmake \
   -S "$LLAMA_ROOT" \
   -B "$LLAMA_ROOT/build-fractal" \
   -DCMAKE_BUILD_TYPE=Release \
+  "-DCMAKE_C_FLAGS=$PATH_REMAP" \
+  "-DCMAKE_CXX_FLAGS=$PATH_REMAP" \
   -DBUILD_SHARED_LIBS=OFF \
   -DLLAMA_CURL=OFF \
   -DLLAMA_OPENSSL=OFF \

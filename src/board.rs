@@ -375,7 +375,10 @@ fn resolve_exec_graph_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
 
     // The standalone repository owns its viewer. Keep the parent-directory
     // fallback for binaries built from the historical Fractalmaster layout.
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Release builds provide a remapped, non-personal source root. Development
+    // builds resolve from the repository working directory instead of embedding
+    // the builder's absolute home-directory path in the distributed binary.
+    let manifest = Path::new(option_env!("FRACTAL_BUILD_SOURCE_ROOT").unwrap_or("."));
     let standalone = manifest.join("execution-graph");
     if standalone.join("server.py").is_file() {
         return Ok(standalone);
