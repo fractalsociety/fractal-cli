@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIST="${FRACTAL_DIST_DIR:-$ROOT/dist}"
 APP="$DIST/Fractal Voice.app"
 ARCHIVE="$DIST/FractalVoice-macOS.zip"
+DMG="$DIST/FractalVoice-macOS.dmg"
 PROFILE="${FRACTAL_NOTARY_PROFILE:-fractal-notarytool}"
 IDENTITY="${FRACTAL_CODESIGN_IDENTITY:-}"
 
@@ -69,4 +70,24 @@ rm -f "$ARCHIVE"
 )
 
 shasum -a 256 "$ARCHIVE"
+FRACTAL_DIST_DIR="$DIST" "$ROOT/scripts/build-macos-dmg.sh"
+
+DMG_NOTARY_RESULT="$(
+  xcrun notarytool submit "$DMG" \
+  --keychain-profile "$PROFILE" \
+  --wait \
+  --output-format json
+)"
+echo "$DMG_NOTARY_RESULT"
+if [[ "$DMG_NOTARY_RESULT" != *'"status":"Accepted"'* \
+   && "$DMG_NOTARY_RESULT" != *'"status": "Accepted"'* ]]; then
+  echo "Apple did not accept the DMG notarization submission." >&2
+  exit 1
+fi
+
+xcrun stapler staple "$DMG"
+xcrun stapler validate "$DMG"
+spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG"
+shasum -a 256 "$DMG"
 echo "$ARCHIVE"
+echo "$DMG"

@@ -14,6 +14,8 @@
     <string>Fractal Voice</string>
     <key>CFBundleDisplayName</key>
     <string>Fractal Voice</string>
+    <key>CFBundleIconFile</key>
+    <string>FractalVoice.icns</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
 	<key>CFBundleDocumentTypes</key>
@@ -23,6 +25,8 @@
             <string>Fractal Build Request</string>
             <key>CFBundleTypeRole</key>
             <string>Editor</string>
+            <key>CFBundleTypeIconFile</key>
+            <string>FractalVoice.icns</string>
             <key>LSHandlerRank</key>
             <string>Owner</string>
             <key>LSItemContentTypes</key>
@@ -35,6 +39,8 @@
             <string>Fractal X Share Request</string>
             <key>CFBundleTypeRole</key>
             <string>Viewer</string>
+            <key>CFBundleTypeIconFile</key>
+            <string>FractalVoice.icns</string>
             <key>LSHandlerRank</key>
             <string>Owner</string>
             <key>LSItemContentTypes</key>
@@ -100,13 +106,13 @@
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.developer-tools</string>
     <key>CFBundleShortVersionString</key>
-	<string>0.9.1</string>
+	<string>0.9.2</string>
     <key>CFBundleVersion</key>
-	<string>24</string>
+	<string>25</string>
     <key>LSMinimumSystemVersion</key>
     <string>15.0</string>
     <key>LSUIElement</key>
-    <true/>
+    <false/>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>

@@ -750,6 +750,29 @@ final class FractalVoiceTests: XCTestCase {
         XCTAssertEqual(decoded.schema, VoiceVocabularyFile.schema)
     }
 
+    func testLegacyOnboardingFlagDoesNotSkipCurrentOnboarding() throws {
+        let suiteName = "FractalVoiceTests.Onboarding.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(true, forKey: "completedOnboarding")
+
+        XCTAssertFalse(OnboardingProgress.isComplete(defaults: defaults))
+    }
+
+    func testCurrentOnboardingCompletionIsRemembered() throws {
+        let suiteName = "FractalVoiceTests.Onboarding.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        OnboardingProgress.markComplete(defaults: defaults)
+
+        XCTAssertTrue(OnboardingProgress.isComplete(defaults: defaults))
+        XCTAssertEqual(
+            defaults.integer(forKey: OnboardingProgress.schemaVersionKey),
+            OnboardingProgress.currentSchemaVersion
+        )
+    }
+
     private func temporaryDirectory() -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

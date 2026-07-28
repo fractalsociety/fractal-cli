@@ -17,6 +17,7 @@ SWIFT_CONDITIONS="${FRACTAL_SWIFT_CONDITIONS:-}"
 
 cd "$ROOT"
 cargo build --release
+"$ROOT/scripts/build-macos-icon.sh"
 
 cd "$PACKAGE"
 xcode_args=(
@@ -45,6 +46,7 @@ cp "$XCODE_PRODUCTS/FractalVoice" "$CONTENTS/MacOS/FractalVoice"
 cp "$ROOT/target/release/fractal" "$CONTENTS/Resources/fractal"
 cp "$ROOT/AGENTS.md" "$CONTENTS/Resources/AGENTS.md"
 cp "$PACKAGE/Info.plist" "$CONTENTS/Info.plist"
+cp "$PACKAGE/Resources/FractalVoice.icns" "$CONTENTS/Resources/FractalVoice.icns"
 cp "$PACKAGE/PrivacyInfo.xcprivacy" "$CONTENTS/Resources/PrivacyInfo.xcprivacy"
 cp "$PACKAGE/THIRD_PARTY_NOTICES.txt" "$CONTENTS/Resources/THIRD_PARTY_NOTICES.txt"
 if [[ -n "${FRACTAL_EMBEDDED_PROVISIONING_PROFILE:-}" ]]; then

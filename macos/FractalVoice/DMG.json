@@ -1,0 +1,32 @@
+{
+  "title": "Fractal Voice",
+  "icon": "FractalVoice.icns",
+  "background": "DMGBackground.png",
+  "icon-size": 112,
+  "window": {
+    "position": {
+      "x": 200,
+      "y": 120
+    },
+    "size": {
+      "width": 660,
+      "height": 420
+    }
+  },
+  "format": "UDZO",
+  "filesystem": "HFS+",
+  "contents": [
+    {
+      "x": 165,
+      "y": 220,
+      "type": "file",
+      "path": "Fractal Voice.app"
+    },
+    {
+      "x": 495,
+      "y": 220,
+      "type": "link",
+      "path": "/Applications"
+    }
+  ]
+}

@@ -45,9 +45,9 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+        NSApp.setActivationPolicy(.regular)
         configureStatusItem()
-        setupComplete = UserDefaults.standard.bool(forKey: "completedOnboarding")
+        setupComplete = OnboardingProgress.isComplete()
         selectedVoiceMode = VoiceInputMode.selected()
         if setupComplete, selectedVoiceMode == nil, coordinator.voiceReady {
             VoiceInputMode.save(.builtIn)
@@ -76,8 +76,20 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         startExternalHandoffMonitoring()
 
         if !setupComplete {
+            DispatchQueue.main.async { [weak self] in
+                self?.showOnboarding()
+            }
+        }
+    }
+
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        if !flag {
             showOnboarding()
         }
+        return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -440,7 +452,7 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
             coordinator: coordinator,
             initialPage: initialPage
         ) { [weak self] in
-            UserDefaults.standard.set(true, forKey: "completedOnboarding")
+            OnboardingProgress.markComplete()
             self?.setupComplete = true
             self?.selectedVoiceMode = VoiceInputMode.selected()
             if let selectedVoiceMode = self?.selectedVoiceMode {
@@ -456,17 +468,18 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         )
         window.title = "Welcome to Fractal Voice"
         window.center()
+        window.collectionBehavior.insert(.moveToActiveSpace)
         window.contentView = NSHostingView(rootView: view)
         window.isReleasedWhenClosed = false
         window.delegate = self
         onboardingWindow = window
-        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+        window.makeKey()
         NSApp.activate(ignoringOtherApps: true)
     }
 
     func windowWillClose(_ notification: Notification) {
         onboardingWindow = nil
-        NSApp.setActivationPolicy(.accessory)
     }
 
     @objc private func openProjects() {

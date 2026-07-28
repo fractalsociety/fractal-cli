@@ -124,9 +124,6 @@ final class RecordingHUD {
 
     func close() {
         window.close()
-        if !NSApp.windows.contains(where: { $0.isVisible && $0 !== window }) {
-            NSApp.setActivationPolicy(.accessory)
-        }
     }
 
     var isShowingBuildProgressForTesting: Bool {
@@ -159,7 +156,6 @@ final class RecordingHUD {
     }
 
     private func showWindow(activate: Bool = false) {
-        NSApp.setActivationPolicy(.regular)
         positionOnce()
         if activate {
             window.makeKeyAndOrderFront(nil)
