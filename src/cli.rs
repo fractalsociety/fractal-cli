@@ -92,7 +92,7 @@ pub(crate) enum Command {
     Invite(InviteArgs),
     /// Ask an X user for help through Fractal Voice and X's prefilled composer.
     ShareX(ShareXArgs),
-    /// Legacy X connection flow; not required for composer-based sharing.
+    /// Deprecated no-op: X OAuth is disabled; use `share-x`.
     ConnectX(ConnectXArgs),
     /// Preview or confirm a project and GitHub repository visibility change.
     Visibility(VisibilityArgs),
@@ -180,13 +180,13 @@ pub(crate) struct ShareXArgs {
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct ConnectXArgs {
-    /// Return to this project slug after X authorization.
+    /// Ignored legacy project option.
     #[arg(long, value_name = "SLUG")]
     pub(crate) project: Option<String>,
-    /// Fractal Society origin (defaults to the saved login server).
+    /// Ignored legacy server option.
     #[arg(long, value_name = "URL")]
     pub(crate) server: Option<String>,
-    /// Print the secure URL instead of opening the browser.
+    /// Ignored legacy option.
     #[arg(long)]
     pub(crate) no_open: bool,
 }

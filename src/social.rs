@@ -331,48 +331,12 @@ fn run_open(arguments: &[&str], path: &Path) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-pub(crate) fn connect_x(args: &ConnectXArgs) -> Result<()> {
-    let (session, server) = session_and_server(args.server.as_deref())?;
-    let username = session
-        .username
-        .as_deref()
-        .context("Fractal Society username missing; run `fractal login` again")?;
-    let next = args
-        .project
-        .as_deref()
-        .map(|project| format!("/@{}/{}", segment(username), segment(project)))
-        .unwrap_or_else(|| "/account/projects".to_owned());
-    let redirect_path = format!("/api/providers/x/authorize?next={}", segment(&next));
-    let endpoint = format!(
-        "{}/api/fractal/auth/browser-handoff",
-        server.trim_end_matches('/')
+pub(crate) fn connect_x(_args: &ConnectXArgs) -> Result<()> {
+    println!("X OAuth is disabled and is not required.");
+    println!(
+        "Use `fractal share-x --project PROJECT --handle @PERSON --message TEXT`; \
+         Fractal Voice will open X's free prefilled composer after confirmation."
     );
-    let (status, response) = request(
-        "POST",
-        &endpoint,
-        &session.access_token,
-        &serde_json::json!({ "redirect_path": redirect_path }),
-    )?;
-    let result: BrowserHandoffResponse =
-        serde_json::from_str(&response).context("decode browser handoff response")?;
-    if !(200..300).contains(&status) {
-        bail!(
-            "{}",
-            result
-                .error
-                .unwrap_or_else(|| format!("browser handoff failed with HTTP {status}"))
-        );
-    }
-    let url = result
-        .browser_url
-        .context("Fractal Society returned no browser connection URL")?;
-    println!("Authorize X for Fractal Society:\n  {url}");
-    if !args.no_open {
-        Command::new("open")
-            .arg(&url)
-            .status()
-            .context("open X authorization in browser")?;
-    }
     Ok(())
 }
 
