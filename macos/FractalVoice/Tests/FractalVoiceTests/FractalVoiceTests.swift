@@ -539,6 +539,30 @@ final class FractalVoiceTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
+    func testExternalVisibilityHandoffIsPrivateFreshAndSingleUse() throws {
+        let url = URL(fileURLWithPath: "/tmp").appendingPathComponent(
+            "fractal-visibility-\(UUID().uuidString).fractalvisibility"
+        )
+        let payload: [String: Any] = [
+            "schema": "fractal.external_visibility.v1",
+            "workspace": "/Users/example/fractal-projects/racket",
+            "target": "public",
+            "created_at_ms": UInt64(Date().timeIntervalSince1970 * 1_000),
+        ]
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: url.path,
+            contents: try JSONSerialization.data(withJSONObject: payload),
+            attributes: [.posixPermissions: 0o600]
+        ))
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let handoff = try ExternalVisibilityHandoff.consume(url)
+
+        XCTAssertEqual(handoff.workspace, "/Users/example/fractal-projects/racket")
+        XCTAssertEqual(handoff.target, "public")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
     func testExternalDesktopQueueDiscoversOnlyExpectedRegularFiles() throws {
         let directory = temporaryDirectory()
         try FileManager.default.createDirectory(

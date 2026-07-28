@@ -1,8 +1,14 @@
 use std::ffi::OsString;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::cli::VisibilityArgs;
 
@@ -30,23 +36,151 @@ pub(crate) fn run(args: &VisibilityArgs) -> Result<()> {
         );
     }
 
-    let previous_local = document.project.visibility;
-    let previous_github = github_visibility(&workspace, &repository)?;
-    if previous_github != target {
-        edit_github_visibility(&workspace, &repository, target)?;
+    match apply_visibility(
+        &workspace,
+        &repository,
+        target,
+        &document.project.visibility,
+    ) {
+        Ok(()) => {
+            println!("Visibility updated: project graph and GitHub repository are now {target}.");
+            Ok(())
+        }
+        Err(error) if std::env::var_os("FRACTAL_VISIBILITY_RECEIVER").is_some() => Err(error),
+        Err(error) => {
+            let handoff = queue_visibility(&workspace, target)?;
+            let launched = launch_fractal_voice(&handoff.path);
+            eprintln!("Direct GitHub access was unavailable: {error:#}");
+            if launched {
+                if let Some(result) = wait_for_visibility_result(&handoff.result_path)? {
+                    if result.success {
+                        println!("{message}", message = result.message);
+                        return Ok(());
+                    }
+                    bail!("{}", result.message);
+                }
+            }
+            println!(
+                "{} confirmed visibility change for Fractal Voice. The app will update GitHub and Fractal Society.",
+                if launched { "Sent" } else { "Queued" }
+            );
+            Ok(())
+        }
     }
-    if let Err(error) = crate::project_file::set_visibility(&workspace, target)
-        .and_then(|_| crate::project_sync::publish_visibility(&workspace))
+}
+
+fn apply_visibility(
+    workspace: &Path,
+    repository: &str,
+    target: &str,
+    previous_local: &str,
+) -> Result<()> {
+    let previous_github = github_visibility(workspace, repository)?;
+    if previous_github != target {
+        edit_github_visibility(workspace, repository, target)?;
+    }
+    if let Err(error) = crate::project_file::set_visibility(workspace, target)
+        .and_then(|_| crate::project_sync::publish_visibility(workspace))
     {
-        let _ = crate::project_file::set_visibility(&workspace, &previous_local);
+        let _ = crate::project_file::set_visibility(workspace, previous_local);
         if previous_github != target {
-            let _ = edit_github_visibility(&workspace, &repository, &previous_github);
+            let _ = edit_github_visibility(workspace, repository, &previous_github);
         }
         return Err(error)
             .context("visibility synchronization failed; prior visibility was restored");
     }
-    println!("Visibility updated: project graph and GitHub repository are now {target}.");
     Ok(())
+}
+
+#[derive(Serialize)]
+struct VisibilityHandoff<'a> {
+    schema: &'static str,
+    workspace: &'a str,
+    target: &'a str,
+    created_at_ms: u128,
+}
+
+struct QueuedVisibility {
+    path: PathBuf,
+    result_path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct VisibilityResult {
+    success: bool,
+    message: String,
+}
+
+fn queue_visibility(workspace: &Path, target: &str) -> Result<QueuedVisibility> {
+    let workspace = workspace
+        .canonicalize()
+        .context("resolve visibility project workspace")?;
+    let workspace = workspace
+        .to_str()
+        .context("visibility project path must be UTF-8")?;
+    let created_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_millis();
+    let envelope = VisibilityHandoff {
+        schema: "fractal.external_visibility.v1",
+        workspace,
+        target,
+        created_at_ms,
+    };
+    let bytes = serde_json::to_vec(&envelope)?;
+    let mut seed = Sha256::new();
+    seed.update(&bytes);
+    seed.update(std::process::id().to_le_bytes());
+    let nonce: String = seed
+        .finalize()
+        .iter()
+        .take(12)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let path = PathBuf::from("/tmp").join(format!(
+        "fractal-visibility-{}-{nonce}.fractalvisibility",
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("create secure visibility handoff {}", path.display()))?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    let result_path = path.with_extension("result");
+    Ok(QueuedVisibility { path, result_path })
+}
+
+fn wait_for_visibility_result(path: &Path) -> Result<Option<VisibilityResult>> {
+    for _ in 0..80 {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                std::fs::remove_file(path).ok();
+                return serde_json::from_slice(&bytes)
+                    .context("decode Fractal Voice visibility result")
+                    .map(Some);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(None)
+}
+
+fn launch_fractal_voice(path: &Path) -> bool {
+    Command::new("/usr/bin/open")
+        .args(["-a", "/Applications/Fractal Voice.app"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn resolve_workspace(project: &str) -> Result<PathBuf> {
@@ -223,5 +357,22 @@ mod tests {
 
         let selected = github_cli_path_from(Some(OsString::from("/custom/gh")), |_| false);
         assert_eq!(selected, PathBuf::from("/custom/gh"));
+    }
+
+    #[test]
+    fn visibility_handoff_is_private_and_contains_only_confirmed_target() {
+        let root =
+            std::env::temp_dir().join(format!("fractal-visibility-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let handoff = queue_visibility(&root, "public").unwrap();
+        let metadata = std::fs::metadata(&handoff.path).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&handoff.path).unwrap()).unwrap();
+        assert_eq!(value["schema"], "fractal.external_visibility.v1");
+        assert_eq!(value["target"], "public");
+        std::fs::remove_file(handoff.path).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

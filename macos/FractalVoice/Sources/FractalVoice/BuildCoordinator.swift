@@ -359,6 +359,83 @@ final class BuildCoordinator: ObservableObject {
         )
     }
 
+    func applyExternalVisibility(_ request: ExternalVisibilityRequest, resultURL: URL) {
+        guard let executable = Self.fractalExecutable() else {
+            let message = ExternalBuildStartError.cliMissing.localizedDescription
+            reportExternalBuildFailure(message)
+            Self.writeVisibilityResult(to: resultURL, success: false, message: message)
+            return
+        }
+        latestActivity = "Updating \(request.target) visibility through GitHub…"
+        let task = Process()
+        let output = Pipe()
+        task.executableURL = executable
+        task.arguments = [
+            "visibility",
+            "--project", request.workspace,
+            "--\(request.target)",
+            "--yes",
+        ]
+        var environment = Self.processEnvironment()
+        environment["FRACTAL_VISIBILITY_RECEIVER"] = "1"
+        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        task.environment = environment
+        task.standardOutput = output
+        task.standardError = output
+        task.terminationHandler = { [weak self] finished in
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            let message = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            Task { @MainActor in
+                if finished.terminationStatus == 0 {
+                    let success =
+                        "Visibility updated: project graph and GitHub repository are now "
+                        + "\(request.target)."
+                    self?.latestActivity = success
+                    Self.writeVisibilityResult(
+                        to: resultURL,
+                        success: true,
+                        message: success
+                    )
+                } else {
+                    let failure = message.isEmpty
+                        ? "GitHub visibility update failed."
+                        : message
+                    self?.reportExternalBuildFailure(failure)
+                    Self.writeVisibilityResult(
+                        to: resultURL,
+                        success: false,
+                        message: failure
+                    )
+                }
+            }
+        }
+        do {
+            try task.run()
+        } catch {
+            reportExternalBuildFailure(error.localizedDescription)
+            Self.writeVisibilityResult(
+                to: resultURL,
+                success: false,
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    nonisolated private static func writeVisibilityResult(
+        to url: URL,
+        success: Bool,
+        message: String
+    ) {
+        let payload: [String: Any] = ["success": success, "message": message]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        FileManager.default.createFile(
+            atPath: url.path,
+            contents: data,
+            attributes: [.posixPermissions: 0o600]
+        )
+    }
+
     func startWebsiteTask(token: String, server: URL, action: String) throws {
         guard canAcceptExternalBuild else {
             throw ExternalBuildStartError.busy

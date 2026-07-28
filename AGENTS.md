@@ -264,7 +264,11 @@ Making a repository public exposes its files and Git history, so do not bypass
 the warning. Report completion only after Fractal says both the project graph
 and GitHub repository have the requested visibility. Any GitHub CLI, network,
 authentication, or synchronization error means the change failed and must be
-reported as failed. The website offers the same guarded toggle on the execution
+reported as failed. If Fractal says the confirmed change was `Sent` or `Queued`
+for Fractal Voice, explain that the trusted native app is completing it; do not
+call it complete until Fractal Voice reports “Visibility updated.” This handoff
+exists because desktop-agent sandboxes may not be allowed to use the user's
+GitHub credential. The website offers the same guarded toggle on the execution
 graph and project settings page.
 
 If `.fractal/project.fractal` exists but no build is running, inspect

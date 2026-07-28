@@ -145,10 +145,25 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
             repeats: true
         ) { [weak self] _ in
             Task { @MainActor in
+                self?.consumeNextQueuedVisibility()
                 self?.consumeNextQueuedExternalBuild()
             }
         }
+        consumeNextQueuedVisibility()
         consumeNextQueuedExternalBuild()
+    }
+
+    private func consumeNextQueuedVisibility() {
+        guard setupComplete, let url = ExternalVisibilityHandoff.pendingURLs().first else {
+            return
+        }
+        do {
+            let resultURL = url.deletingPathExtension().appendingPathExtension("result")
+            let request = try ExternalVisibilityHandoff.consume(url)
+            coordinator.applyExternalVisibility(request, resultURL: resultURL)
+        } catch {
+            coordinator.reportExternalBuildFailure(error.localizedDescription)
+        }
     }
 
     private func consumeNextQueuedExternalBuild() {
