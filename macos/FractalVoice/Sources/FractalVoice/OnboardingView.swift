@@ -721,17 +721,7 @@ struct OnboardingView: View {
         Group {
             switch selectedVoiceMode {
             case .chatGPTDesktop:
-                externalVoiceInstructionPage(
-                    icon: "message.fill",
-                    title: "Build through ChatGPT Desktop or Codex voice",
-                    steps: [
-                        "Keep Fractal Voice running in your menu bar.",
-                        "Open ChatGPT Desktop and start a voice conversation.",
-                        "Say: \(desktopVoiceExample)",
-                        "ChatGPT confirms the details and sends the named build through Fractal’s secure handoff.",
-                    ],
-                    footer: "The instruction file tells the desktop agent to use `fractal handoff`, not the deprecated bridge. If it reports “Queued,” Fractal Voice will pick up the accepted request automatically."
-                )
+                chatGPTSetupPage
             case .superwhisper:
                 externalVoiceInstructionPage(
                     icon: "waveform.badge.mic",
@@ -817,9 +807,47 @@ struct OnboardingView: View {
 
     private var chatGPTFinalPage: some View {
         ScrollView {
+            VStack(alignment: .leading, spacing: 19) {
+                Label("What you can ask Fractal by voice", systemImage: "sparkles")
+                    .font(.system(size: 29, weight: .bold, design: .rounded))
+
+                voiceExample(
+                    icon: "hammer.fill",
+                    title: "Build and name a project",
+                    example: "“Build a personal expense tracker and call it Pocket Ledger.”"
+                )
+                voiceExample(
+                    icon: "pause.circle.fill",
+                    title: "Pause a named project",
+                    example: "“Pause the Pocket Ledger project.”"
+                )
+                voiceExample(
+                    icon: "person.crop.circle.badge.plus",
+                    title: "Share or invite help",
+                    example: "“Invite alex@example.com to help with Pocket Ledger.”"
+                )
+                voiceExample(
+                    icon: "list.number",
+                    title: "Understand the execution graph",
+                    example: "“Explain task 2.4 on Pocket Ledger.”"
+                )
+
+                Label(ChatGPTOnboarding.voiceLimitTip, systemImage: "lightbulb.fill")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.indigo)
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.indigo.opacity(0.09), in: RoundedRectangle(cornerRadius: 13))
+            }
+            .padding(36)
+        }
+    }
+
+    private var chatGPTSetupPage: some View {
+        ScrollView {
             VStack(alignment: .leading, spacing: 17) {
                 HStack {
-                    Label("Start with ChatGPT Desktop voice", systemImage: "message.fill")
+                    Label("Set up ChatGPT Desktop voice", systemImage: "message.fill")
                         .font(.system(size: 29, weight: .bold, design: .rounded))
                     Spacer()
                     Link("Download ChatGPT for macOS", destination: ChatGPTOnboarding.downloadURL)
@@ -830,7 +858,7 @@ struct OnboardingView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Open ChatGPT, sign in, then click this voice button")
                             .font(.headline)
-                        Text("The white waveform button starts voice mode. Keep Fractal Voice running in your menu bar so it can receive secure build and sharing handoffs.")
+                        Text("The white waveform button starts voice mode. Keep Fractal Voice running in your menu bar so it can receive secure handoffs.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
@@ -841,9 +869,9 @@ struct OnboardingView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Label("Choose how commands are approved", systemImage: "lock.shield")
                         .font(.headline)
-                    Text("Hands-free: open ChatGPT Settings → General → Permissions, enable Full access, then select Full access beneath the composer. This lets ChatGPT access files and run networked commands without asking, so use it only when you trust the task.")
+                    Text("Hands-free: open ChatGPT Settings → General → Permissions, enable Full access, then select Full access beneath the composer. Use it only when you trust the task.")
                         .font(.callout)
-                    Text("Manual review: leave Ask for approval selected. ChatGPT pauses before external commands, so check back and approve each request yourself.")
+                    Text("Manual review: leave Ask for approval selected, then approve external commands when ChatGPT pauses.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     Link("Read OpenAI’s permission guide", destination: ChatGPTOnboarding.permissionsURL)
@@ -853,25 +881,14 @@ struct OnboardingView: View {
                 .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
 
                 VStack(alignment: .leading, spacing: 7) {
-                    Text("Say this once at the start of the voice conversation")
+                    Text("Say this once at the start of your conversation")
                         .font(.headline)
                     Text(desktopVoiceBootstrapInstruction)
                         .font(.system(.callout, design: .rounded).weight(.medium))
                         .textSelection(.enabled)
-                    Text("This points the agent to the Fractal-owned project folder in your user directory and teaches it the supported handoff commands.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
                 .padding(14)
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
-
-                Text("What you can ask by voice").font(.headline)
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 9) {
-                    voiceCapability("hammer.fill", "Build and name a project")
-                    voiceCapability("pause.circle.fill", "Pause a named project")
-                    voiceCapability("person.crop.circle.badge.plus", "Share or invite project help")
-                    voiceCapability("list.number", "Explain any execution-graph task")
-                }
             }
             .padding(36)
         }
@@ -898,12 +915,20 @@ struct OnboardingView: View {
         }
     }
 
-    private func voiceCapability(_ icon: String, _ title: String) -> some View {
-        Label(title, systemImage: icon)
-            .font(.callout.weight(.medium))
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.indigo.opacity(0.08), in: RoundedRectangle(cornerRadius: 11))
+    private func voiceExample(icon: String, title: String, example: String) -> some View {
+        HStack(alignment: .top, spacing: 13) {
+            Image(systemName: icon)
+                .font(.title3)
+                .foregroundStyle(.indigo)
+                .frame(width: 28)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.headline)
+                Text(example).font(.callout).foregroundStyle(.secondary)
+            }
+        }
+        .padding(13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 13))
     }
 
     private func externalVoiceInstructionPage(
@@ -951,10 +976,6 @@ struct OnboardingView: View {
 
     private var desktopVoiceInstruction: String {
         "\(desktopVoiceBootstrapInstruction) Then say: “Use Fractal to build [describe the project]. Name the project [your project name].”"
-    }
-
-    private var desktopVoiceExample: String {
-        "“First read \(desktopAgentInstructionsPath) and follow its External desktop app instructions. Then use Fractal to build a personal expense tracker. Name the project Pocket Ledger.”"
     }
 
     private var finalBuildHandoffDescription: String {
@@ -1090,4 +1111,5 @@ enum ChatGPTOnboarding {
     static var voiceIconURL: URL? {
         Bundle.module.url(forResource: "ChatGPTVoiceIcon", withExtension: "png")
     }
+    static let voiceLimitTip = "Tip: If you run out of ChatGPT voice time, open Show Welcome and switch to Superwhisper or Fractal’s built-in local voice models."
 }

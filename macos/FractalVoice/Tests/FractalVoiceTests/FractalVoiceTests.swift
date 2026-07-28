@@ -274,6 +274,8 @@ final class FractalVoiceTests: XCTestCase {
             "learn.chatgpt.com"
         )
         XCTAssertNotNil(ChatGPTOnboarding.voiceIconURL)
+        XCTAssertTrue(ChatGPTOnboarding.voiceLimitTip.contains("Superwhisper"))
+        XCTAssertTrue(ChatGPTOnboarding.voiceLimitTip.contains("local voice models"))
     }
 
     func testBuiltInVoiceRequiresDownloadedModels() {
