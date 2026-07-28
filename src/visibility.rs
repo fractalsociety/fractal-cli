@@ -80,7 +80,7 @@ fn apply_visibility(
         edit_github_visibility(workspace, repository, target)?;
     }
     if let Err(error) = crate::project_file::set_visibility(workspace, target)
-        .and_then(|_| crate::project_sync::publish_visibility(workspace))
+        .and_then(|_| publish_visibility_with_retry(workspace))
     {
         let _ = crate::project_file::set_visibility(workspace, previous_local);
         if previous_github != target {
@@ -90,6 +90,22 @@ fn apply_visibility(
             .context("visibility synchronization failed; prior visibility was restored");
     }
     Ok(())
+}
+
+fn publish_visibility_with_retry(workspace: &Path) -> Result<()> {
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match crate::project_sync::publish_visibility(workspace) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+    }
+    Err(last_error.expect("visibility publication attempted at least once"))
 }
 
 #[derive(Serialize)]
@@ -191,25 +207,94 @@ fn resolve_workspace(project: &str) -> Result<PathBuf> {
     if let Ok(current) = std::env::current_dir() {
         if crate::project_file::load(&current)
             .ok()
-            .is_some_and(|document| document.project.slug == project)
+            .is_some_and(|document| {
+                project_identity_matches(
+                    project,
+                    &document.project.slug,
+                    &document.project.title,
+                    current
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(""),
+                )
+            })
         {
             return Ok(current);
         }
     }
-    crate::projects::list()
+    let matches: Vec<_> = crate::projects::list()
         .into_iter()
-        .find_map(|entry| {
+        .filter_map(|entry| {
             let workspace = PathBuf::from(&entry.workspace);
             crate::project_file::load(&workspace)
                 .ok()
                 .filter(|document| {
-                    document.project.slug == project
-                        || entry.label.eq_ignore_ascii_case(project)
-                        || entry.workspace == project
+                    entry.workspace.eq_ignore_ascii_case(project)
+                        || project_identity_matches(
+                            project,
+                            &document.project.slug,
+                            &document.project.title,
+                            &entry.label,
+                        )
                 })
                 .map(|_| workspace)
         })
-        .with_context(|| format!("project `{project}` was not found; run `fractal projects`"))
+        .collect();
+    match matches.as_slice() {
+        [workspace] => Ok(workspace.clone()),
+        [] => bail!("project `{project}` was not found; run `fractal projects`"),
+        _ => bail!(
+            "project name `{project}` matches multiple projects; use the exact workspace path from `fractal projects`"
+        ),
+    }
+}
+
+fn project_identity_matches(project: &str, slug: &str, title: &str, label: &str) -> bool {
+    let needles = project_keys(project);
+    [slug, title, label].into_iter().any(|candidate| {
+        let candidates = project_keys(candidate);
+        needles.iter().any(|needle| candidates.contains(needle))
+    })
+}
+
+fn project_keys(value: &str) -> Vec<String> {
+    let mut words: Vec<String> = value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| word.to_ascii_lowercase())
+        .collect();
+    let mut keys = vec![words.join("")];
+    if words.first().is_some_and(|word| word == "the") {
+        words.remove(0);
+    }
+    if words
+        .last()
+        .is_some_and(|word| matches!(word.as_str(), "app" | "build" | "project"))
+    {
+        words.pop();
+    }
+    for word in &mut words {
+        *word = match word.as_str() {
+            "zero" => "0",
+            "one" => "1",
+            "two" => "2",
+            "three" => "3",
+            "four" => "4",
+            "five" => "5",
+            "six" => "6",
+            "seven" => "7",
+            "eight" => "8",
+            "nine" => "9",
+            "ten" => "10",
+            _ => continue,
+        }
+        .to_owned();
+    }
+    let conversational = words.join("");
+    if !conversational.is_empty() && !keys.contains(&conversational) {
+        keys.push(conversational);
+    }
+    keys
 }
 
 fn github_repository(workspace: &Path) -> Result<String> {
@@ -374,5 +459,21 @@ mod tests {
         assert_eq!(value["target"], "public");
         std::fs::remove_file(handoff.path).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn visibility_project_lookup_accepts_title_and_spoken_number() {
+        assert!(project_identity_matches(
+            "Coffee Five app",
+            "coffee5",
+            "Coffee5",
+            "coffee5-1785198755992"
+        ));
+        assert!(!project_identity_matches(
+            "Coffee Three",
+            "coffee5",
+            "Coffee5",
+            "coffee5-1785198755992"
+        ));
     }
 }

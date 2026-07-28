@@ -388,10 +388,20 @@ final class BuildCoordinator: ObservableObject {
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             Task { @MainActor in
                 if finished.terminationStatus == 0 {
-                    let success =
+                    let projectURL = message
+                        .split(separator: "\n")
+                        .map(String.init)
+                        .first(where: { $0.hasPrefix("Project URL: ") })?
+                        .replacingOccurrences(of: "Project URL: ", with: "")
+                    let success = [
+                        projectURL.map { "Project URL: \($0)" },
                         "Visibility updated: project graph and GitHub repository are now "
-                        + "\(request.target)."
+                            + "\(request.target).",
+                    ].compactMap { $0 }.joined(separator: "\n")
                     self?.latestActivity = success
+                    if let projectURL, let url = URL(string: projectURL) {
+                        NSWorkspace.shared.open(url)
+                    }
                     Self.writeVisibilityResult(
                         to: resultURL,
                         success: true,
