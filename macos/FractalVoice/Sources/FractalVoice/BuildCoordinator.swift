@@ -360,10 +360,23 @@ final class BuildCoordinator: ObservableObject {
     }
 
     func applyExternalVisibility(_ request: ExternalVisibilityRequest, resultURL: URL) {
+        applyVisibility(request, resultURL: resultURL)
+    }
+
+    func applyWebsiteVisibility(project: String, target: String) {
+        applyVisibility(
+            ExternalVisibilityRequest(workspace: project, target: target),
+            resultURL: nil
+        )
+    }
+
+    private func applyVisibility(_ request: ExternalVisibilityRequest, resultURL: URL?) {
         guard let executable = Self.fractalExecutable() else {
             let message = ExternalBuildStartError.cliMissing.localizedDescription
             reportExternalBuildFailure(message)
-            Self.writeVisibilityResult(to: resultURL, success: false, message: message)
+            if let resultURL {
+                Self.writeVisibilityResult(to: resultURL, success: false, message: message)
+            }
             return
         }
         latestActivity = "Updating \(request.target) visibility through GitHub…"
@@ -402,21 +415,25 @@ final class BuildCoordinator: ObservableObject {
                     if let projectURL, let url = URL(string: projectURL) {
                         NSWorkspace.shared.open(url)
                     }
-                    Self.writeVisibilityResult(
-                        to: resultURL,
-                        success: true,
-                        message: success
-                    )
+                    if let resultURL {
+                        Self.writeVisibilityResult(
+                            to: resultURL,
+                            success: true,
+                            message: success
+                        )
+                    }
                 } else {
                     let failure = message.isEmpty
                         ? "GitHub visibility update failed."
                         : message
                     self?.reportExternalBuildFailure(failure)
-                    Self.writeVisibilityResult(
-                        to: resultURL,
-                        success: false,
-                        message: failure
-                    )
+                    if let resultURL {
+                        Self.writeVisibilityResult(
+                            to: resultURL,
+                            success: false,
+                            message: failure
+                        )
+                    }
                 }
             }
         }
@@ -424,11 +441,13 @@ final class BuildCoordinator: ObservableObject {
             try task.run()
         } catch {
             reportExternalBuildFailure(error.localizedDescription)
-            Self.writeVisibilityResult(
-                to: resultURL,
-                success: false,
-                message: error.localizedDescription
-            )
+            if let resultURL {
+                Self.writeVisibilityResult(
+                    to: resultURL,
+                    success: false,
+                    message: error.localizedDescription
+                )
+            }
         }
     }
 

@@ -123,6 +123,27 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
     func application(_ application: NSApplication, open urls: [URL]) {
         guard urls.count == 1 else { return }
         do {
+            if urls[0].host?.lowercased() == "visibility" {
+                let handoff = try WebsiteVisibilityHandoff(url: urls[0])
+                guard setupComplete else {
+                    showOnboarding()
+                    throw WebsiteTaskHandoffError.setupRequired
+                }
+                let alert = NSAlert()
+                alert.messageText = "Make \(handoff.project) \(handoff.target)?"
+                alert.informativeText =
+                    "Fractal Voice will use your authenticated GitHub CLI to make the "
+                    + "repository and Fractal Society graph \(handoff.target)."
+                alert.alertStyle = handoff.target == "public" ? .warning : .informational
+                alert.addButton(withTitle: "Yes, make \(handoff.target)")
+                alert.addButton(withTitle: "Cancel")
+                guard alert.runModal() == .alertFirstButtonReturn else { return }
+                coordinator.applyWebsiteVisibility(
+                    project: handoff.project,
+                    target: handoff.target
+                )
+                return
+            }
             let handoff = try WebsiteTaskHandoff(url: urls[0])
             guard setupComplete else {
                 showOnboarding()
@@ -448,6 +469,32 @@ private struct WebsiteTaskHandoff {
         self.token = token
         self.server = server
         self.action = url.host!.lowercased()
+    }
+}
+
+struct WebsiteVisibilityHandoff {
+    let project: String
+    let target: String
+
+    init(url: URL) throws {
+        guard
+            url.scheme?.lowercased() == "fractalvoice",
+            url.host?.lowercased() == "visibility",
+            let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+            let project = components.queryItems?.first(where: { $0.name == "project" })?.value?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            !project.isEmpty,
+            project.count <= 100,
+            !project.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+            let target = components.queryItems?.first(where: { $0.name == "target" })?.value,
+            ["public", "private"].contains(target),
+            let server = components.queryItems?.first(where: { $0.name == "server" })?.value,
+            server == "https://fractalsociety.com"
+        else {
+            throw WebsiteTaskHandoffError.invalid
+        }
+        self.project = project
+        self.target = target
     }
 }
 

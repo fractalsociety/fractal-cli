@@ -563,6 +563,17 @@ final class FractalVoiceTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
+    func testWebsiteVisibilityHandoffAcceptsOnlyFractalSocietyCommands() throws {
+        let handoff = try WebsiteVisibilityHandoff(url: URL(
+            string: "fractalvoice://visibility?project=coffee5&target=private&server=https%3A%2F%2Ffractalsociety.com"
+        )!)
+        XCTAssertEqual(handoff.project, "coffee5")
+        XCTAssertEqual(handoff.target, "private")
+        XCTAssertThrowsError(try WebsiteVisibilityHandoff(url: URL(
+            string: "fractalvoice://visibility?project=coffee5&target=private&server=https%3A%2F%2Fevil.example"
+        )!))
+    }
+
     func testExternalDesktopQueueDiscoversOnlyExpectedRegularFiles() throws {
         let directory = temporaryDirectory()
         try FileManager.default.createDirectory(
