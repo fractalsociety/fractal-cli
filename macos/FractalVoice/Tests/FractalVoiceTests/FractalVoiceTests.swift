@@ -264,6 +264,18 @@ final class FractalVoiceTests: XCTestCase {
         XCTAssertTrue(VoiceInputMode.superwhisper.isReady(localModelsReady: false))
     }
 
+    func testChatGPTOnboardingUsesOfficialLinksAndIncludesVoiceIcon() {
+        XCTAssertEqual(
+            ChatGPTOnboarding.downloadURL.absoluteString,
+            "https://chatgpt.com/download/"
+        )
+        XCTAssertEqual(
+            ChatGPTOnboarding.permissionsURL.host,
+            "learn.chatgpt.com"
+        )
+        XCTAssertNotNil(ChatGPTOnboarding.voiceIconURL)
+    }
+
     func testBuiltInVoiceRequiresDownloadedModels() {
         XCTAssertTrue(VoiceInputMode.builtIn.requiresLocalModels)
         XCTAssertFalse(VoiceInputMode.builtIn.isReady(localModelsReady: false))

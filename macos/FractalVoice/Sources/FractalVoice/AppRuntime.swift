@@ -97,17 +97,14 @@ enum AppRuntime {
             at: root,
             withIntermediateDirectories: true
         )
-        let destination = root.appendingPathComponent("AGENTS.md")
-        guard !FileManager.default.fileExists(atPath: destination.path) else {
-            return
-        }
         guard
             let template = Bundle.main.resourceURL?.appendingPathComponent("AGENTS.md"),
             FileManager.default.fileExists(atPath: template.path)
         else {
             throw ProjectsDirectoryError.agentInstructionsMissing
         }
-        try FileManager.default.copyItem(at: template, to: destination)
+        let contents = try String(contentsOf: template, encoding: .utf8)
+        try installGlobalAgentInstructions(at: root, contents: contents)
     }
 
     static func installGlobalAgentInstructions(

@@ -255,7 +255,14 @@ struct OnboardingView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     switch selectedVoiceMode {
                     case .chatGPTDesktop:
-                        Text("What to say in ChatGPT Desktop or Codex voice").font(.headline)
+                        HStack {
+                            Text("What to say in ChatGPT Desktop or Codex voice").font(.headline)
+                            Spacer()
+                            Link(
+                                "Download ChatGPT",
+                                destination: ChatGPTOnboarding.downloadURL
+                            )
+                        }
                         Text(desktopVoiceInstruction)
                             .font(.system(.callout, design: .rounded).weight(.medium))
                             .textSelection(.enabled)
@@ -776,7 +783,16 @@ struct OnboardingView: View {
         }
     }
 
+    @ViewBuilder
     private var buildPage: some View {
+        if selectedVoiceMode == .chatGPTDesktop {
+            chatGPTFinalPage
+        } else {
+            standardBuildPage
+        }
+    }
+
+    private var standardBuildPage: some View {
         VStack(alignment: .leading, spacing: 21) {
             Label("Build your first project", systemImage: "sparkles")
                 .font(.system(size: 31, weight: .bold, design: .rounded))
@@ -797,6 +813,97 @@ struct OnboardingView: View {
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
         }
         .padding(46)
+    }
+
+    private var chatGPTFinalPage: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 17) {
+                HStack {
+                    Label("Start with ChatGPT Desktop voice", systemImage: "message.fill")
+                        .font(.system(size: 29, weight: .bold, design: .rounded))
+                    Spacer()
+                    Link("Download ChatGPT for macOS", destination: ChatGPTOnboarding.downloadURL)
+                }
+
+                HStack(alignment: .top, spacing: 20) {
+                    chatGPTVoiceIcon
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Open ChatGPT, sign in, then click this voice button")
+                            .font(.headline)
+                        Text("The white waveform button starts voice mode. Keep Fractal Voice running in your menu bar so it can receive secure build and sharing handoffs.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(14)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("Choose how commands are approved", systemImage: "lock.shield")
+                        .font(.headline)
+                    Text("Hands-free: open ChatGPT Settings → General → Permissions, enable Full access, then select Full access beneath the composer. This lets ChatGPT access files and run networked commands without asking, so use it only when you trust the task.")
+                        .font(.callout)
+                    Text("Manual review: leave Ask for approval selected. ChatGPT pauses before external commands, so check back and approve each request yourself.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Link("Read OpenAI’s permission guide", destination: ChatGPTOnboarding.permissionsURL)
+                        .font(.caption)
+                }
+                .padding(14)
+                .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Say this once at the start of the voice conversation")
+                        .font(.headline)
+                    Text(desktopVoiceBootstrapInstruction)
+                        .font(.system(.callout, design: .rounded).weight(.medium))
+                        .textSelection(.enabled)
+                    Text("This points the agent to the Fractal-owned project folder in your user directory and teaches it the supported handoff commands.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(14)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+
+                Text("What you can ask by voice").font(.headline)
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 9) {
+                    voiceCapability("hammer.fill", "Build and name a project")
+                    voiceCapability("pause.circle.fill", "Pause a named project")
+                    voiceCapability("person.crop.circle.badge.plus", "Share or invite project help")
+                    voiceCapability("list.number", "Explain any execution-graph task")
+                }
+            }
+            .padding(36)
+        }
+    }
+
+    @ViewBuilder
+    private var chatGPTVoiceIcon: some View {
+        if let imageURL = ChatGPTOnboarding.voiceIconURL,
+           let image = NSImage(contentsOf: imageURL) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 82, height: 82)
+                .clipShape(RoundedRectangle(cornerRadius: 18))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18)
+                        .stroke(Color.secondary.opacity(0.25))
+                )
+                .accessibilityLabel("ChatGPT voice mode waveform button")
+        } else {
+            Image(systemName: "waveform.circle.fill")
+                .font(.system(size: 72))
+                .accessibilityLabel("ChatGPT voice mode waveform button")
+        }
+    }
+
+    private func voiceCapability(_ icon: String, _ title: String) -> some View {
+        Label(title, systemImage: icon)
+            .font(.callout.weight(.medium))
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.indigo.opacity(0.08), in: RoundedRectangle(cornerRadius: 11))
     }
 
     private func externalVoiceInstructionPage(
@@ -838,8 +945,12 @@ struct OnboardingView: View {
         AppRuntime.projectsURL.appendingPathComponent("AGENTS.md").path
     }
 
+    private var desktopVoiceBootstrapInstruction: String {
+        "“Look in my user folder for the Fractal projects folder at \(AppRuntime.projectsURL.path). Read \(desktopAgentInstructionsPath) and follow its External desktop app instructions for every Fractal request.”"
+    }
+
     private var desktopVoiceInstruction: String {
-        "“First read \(desktopAgentInstructionsPath) and follow its External desktop app instructions. Then use Fractal to build [describe the project]. Name the project [your project name].”"
+        "\(desktopVoiceBootstrapInstruction) Then say: “Use Fractal to build [describe the project]. Name the project [your project name].”"
     }
 
     private var desktopVoiceExample: String {
@@ -968,5 +1079,15 @@ struct OnboardingView: View {
         case "claude": return "brain"
         default: return "bolt.horizontal.circle"
         }
+    }
+}
+
+enum ChatGPTOnboarding {
+    static let downloadURL = URL(string: "https://chatgpt.com/download/")!
+    static let permissionsURL = URL(
+        string: "https://learn.chatgpt.com/docs/permission-modes#enable-modes"
+    )!
+    static var voiceIconURL: URL? {
+        Bundle.module.url(forResource: "ChatGPTVoiceIcon", withExtension: "png")
     }
 }

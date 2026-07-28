@@ -22,7 +22,10 @@ let package = Package(
                 .product(name: "KokoroSwift", package: "KokoroStack"),
                 .product(name: "MLX", package: "mlx-swift")
             ],
-            path: "Sources/FractalVoice"
+            path: "Sources/FractalVoice",
+            resources: [
+                .copy("Resources/ChatGPTVoiceIcon.png")
+            ]
         ),
         .testTarget(
             name: "FractalVoiceTests",

@@ -260,6 +260,20 @@ failure. Never tell the user a named build cannot be paused merely because
 the user explicitly asks to pause every running build, and never kill agent or
 terminal processes directly.
 
+### Explain a numbered execution-graph task
+
+When the user asks what a visible task such as `2.4` means, run
+`fractal projects` to resolve the named project and read its
+`.fractal/project.fractal` file without changing it. Match the visible number
+against `graph.nodes[].execution.task_number`, then explain the node title,
+instruction, dependencies, parallel or sequential wave, assigned agent and
+current state in plain language. If more than one project could match, ask for
+the project name instead of guessing.
+
+Reading the portable graph for an explanation is allowed; editing it is not.
+If the user asks to add or change work, use the graph-amendment ingest command
+described above and report success only after Fractal prints `Accepted`.
+
 ### Change project and repository visibility
 
 ChatGPT Desktop and other external agents can preview a synchronized Fractal
