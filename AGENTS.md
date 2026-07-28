@@ -226,25 +226,24 @@ Fractal build stopped.
 
 ### Pause one project from an external desktop agent
 
-When the user asks ChatGPT Desktop, Codex Desktop, or another external agent to
-pause a specific project, first identify its exact running name and then pause
-only that project:
+When the user names a project to pause, call the pause command immediately with
+that spoken name, then verify status:
 
 ```sh
-fractal status --running
-fractal pause --project 'EXACT_PROJECT_NAME'
+fractal pause --project 'USER_SPOKEN_PROJECT_NAME'
 fractal status --running
 ```
 
-If the first status command lists exactly one active build and it is the build
-the user described, prefer `fractal pause` with no `--project` argument. Fractal
-will select that sole active run, avoiding transcription differences such as
-“Coffee Five” versus `coffee5`. If multiple builds are active, copy the absolute
-workspace path from status and pass that as `--project`.
+Do not use `fractal status --running` as a gate before issuing the named pause.
+The coordinator may have died while the website or app still shows planning or
+executing. In that case the live registry is intentionally empty, but
+`fractal pause --project NAME` resolves the durable managed project, releases
+stale checkouts, marks its graph halted, and synchronizes the website.
 
-Copy the exact running name or absolute path from the first status command into
-the pause command. A conversational graph title such as “Racket app” is also
-accepted, but the printed running identifier is preferred.
+If the user says only “pause the build” with no name, run
+`fractal status --running`. If exactly one live build is listed, use
+`fractal pause` with no argument. If multiple builds are listed, copy the
+absolute workspace path and pass it through `--project`.
 
 `fractal pause` is a visible alias for `fractal stop`. It halts the selected
 coordinator and its workers while preserving completed graph waves so the
@@ -253,12 +252,13 @@ or absolute workspace path. If a short name is ambiguous, use the absolute path
 printed by `fractal status --running`.
 
 Report success only after Fractal prints `Stopped PROJECT` and the final status
-no longer lists that project. If it prints `Already paused`, the requested
-project was safely halted before this command and should be reported as already
-paused—not as a failure. Never substitute `--all` unless the user explicitly
-asks to pause every running build. Do not kill agent or terminal processes
-directly. If the first status command lists the requested project, do not claim
-the registry failed to recognize its managed Fractal Voice process.
+no longer lists that project as live or stalled. `Stopped PROJECT` may also mean
+Fractal successfully reconciled a dead coordinator that left the online graph
+stuck. If it prints `Already paused`, report it as already paused—not as a
+failure. Never tell the user a named build cannot be paused merely because
+`status --running` found no live coordinator. Never substitute `--all` unless
+the user explicitly asks to pause every running build, and never kill agent or
+terminal processes directly.
 
 ### Change project and repository visibility
 

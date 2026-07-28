@@ -33,13 +33,13 @@ struct ActiveRun {
     active_nodes: BTreeMap<String, String>,
 }
 
-#[derive(Serialize)]
-struct ProjectRunState<'a> {
-    schema: &'static str,
-    run_id: &'a str,
-    status: &'a str,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ProjectRunState {
+    schema: String,
+    run_id: String,
+    status: String,
     pid: u32,
-    graph_hash: &'a Option<String>,
+    graph_hash: Option<String>,
     updated_at_ms: u64,
 }
 
@@ -209,6 +209,13 @@ pub(crate) fn stop(args: &StopArgs) -> Result<()> {
                         println!("Already finished: {name} ({workspace})");
                         println!("No agents are running.");
                     }
+                    "planning" | "executing" => {
+                        halt_persisted_workspace(Path::new(&workspace), true)?;
+                        println!("Stopped {name} ({workspace})");
+                        println!(
+                            "The stale coordinator state was reconciled; completed graph waves remain resumable."
+                        );
+                    }
                     _ => {
                         println!("Not running: {name} ({workspace})");
                         println!(
@@ -241,7 +248,18 @@ pub(crate) fn stop(args: &StopArgs) -> Result<()> {
 pub(crate) fn status(args: &StatusArgs) -> Result<()> {
     let runs = live_runs()?;
     if runs.is_empty() {
-        println!("No Fractal builds are running.");
+        let stalled = stalled_projects();
+        if stalled.is_empty() {
+            println!("No Fractal builds are running.");
+        } else {
+            println!("No live Fractal coordinators are running.");
+            println!("Stalled Fractal projects awaiting pause reconciliation:");
+            for (name, phase, workspace) in stalled {
+                println!("  {name:<28} state {phase}");
+                println!("    {workspace}");
+            }
+            println!("Run `fractal pause --project NAME` to halt and synchronize one.");
+        }
         return Ok(());
     }
     if args.running {
@@ -438,21 +456,98 @@ fn persisted_project_status(project: &str) -> Option<(String, String, String)> {
         .filter_map(|entry| {
             let workspace = PathBuf::from(&entry.workspace);
             workspace_matches_project(&workspace, &entry.label, &needle).then(|| {
-                let document = crate::project_file::load(&workspace).ok()?;
-                let phase = document
-                    .execution
-                    .as_ref()
-                    .map(|execution| execution.phase.clone())
-                    .unwrap_or_else(|| "pending".to_owned());
-                Some((
-                    document.project.title,
-                    phase,
-                    workspace.to_string_lossy().into_owned(),
-                ))
+                let (name, phase) = persisted_project_details(&workspace)?;
+                Some((name, phase, workspace.to_string_lossy().into_owned()))
             })?
         })
         .collect();
     (matches.len() == 1).then(|| matches[0].clone())
+}
+
+fn stalled_projects() -> Vec<(String, String, String)> {
+    let mut projects: Vec<_> = crate::projects::list()
+        .into_iter()
+        .filter_map(|entry| {
+            let workspace = PathBuf::from(&entry.workspace);
+            let (name, phase) = persisted_project_details(&workspace)?;
+            if !matches!(phase.as_str(), "planning" | "executing") {
+                return None;
+            }
+            let state = read_project_run_state(&workspace)?;
+            if state.status != "running"
+                || (process_alive(state.pid) && process_workspace_matches(state.pid, &workspace))
+            {
+                return None;
+            }
+            Some((name, phase, workspace.to_string_lossy().into_owned()))
+        })
+        .collect();
+    projects.sort_by(|left, right| left.0.cmp(&right.0));
+    projects
+}
+
+fn halt_persisted_workspace(workspace: &Path, sync_runtime: bool) -> Result<()> {
+    if let Some(mut state) = read_project_run_state(workspace) {
+        if state.status == "running"
+            && process_alive(state.pid)
+            && process_workspace_matches(state.pid, workspace)
+        {
+            signal_process(state.pid, libc::SIGTERM);
+            thread::sleep(Duration::from_millis(250));
+            if process_alive(state.pid) && is_fractal_process(state.pid) {
+                signal_process(state.pid, libc::SIGKILL);
+            }
+        }
+        state.status = "halted".to_owned();
+        state.updated_at_ms = now_ms();
+        atomic_write(
+            &workspace.join(".fractal").join("run-state.json"),
+            &serde_json::to_vec_pretty(&state)?,
+        )?;
+        fs::remove_file(run_path(&state.run_id)).ok();
+    }
+    if crate::project_file::path(workspace).exists()
+        && !crate::project_file::release_stale_assignments(workspace)?
+    {
+        crate::project_file::set_execution_phase(workspace, "halted")?;
+    }
+    if sync_runtime {
+        if let Err(error) = crate::project_sync::sync_runtime_halt_now(workspace) {
+            eprintln!("  halted graph sync note: {error:#}");
+        }
+    }
+    Ok(())
+}
+
+fn read_project_run_state(workspace: &Path) -> Option<ProjectRunState> {
+    fs::read(workspace.join(".fractal").join("run-state.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+}
+
+fn persisted_project_details(workspace: &Path) -> Option<(String, String)> {
+    if let Ok(document) = crate::project_file::load(workspace) {
+        let phase = document
+            .execution
+            .map(|execution| execution.phase)
+            .unwrap_or_else(|| "pending".to_owned());
+        return Some((document.project.title, phase));
+    }
+    let identity = read_managed_project_identity(workspace)?;
+    let state = read_project_run_state(workspace)?;
+    let phase = match state.status.as_str() {
+        "running" => "planning",
+        "halted" | "interrupted" => "halted",
+        "completed" => "completed",
+        _ => return None,
+    };
+    Some((
+        identity
+            .get("title")
+            .and_then(serde_json::Value::as_str)?
+            .to_owned(),
+        phase.to_owned(),
+    ))
 }
 
 fn workspace_matches_project(workspace: &Path, label: &str, needle: &str) -> bool {
@@ -489,7 +584,7 @@ fn run_matches_project(run: &ActiveRun, needle: &str) -> bool {
 }
 
 fn project_identity_aliases(workspace: &Path) -> Vec<String> {
-    fs::read(workspace.join(".fractal").join("project.fractal"))
+    let mut aliases: Vec<String> = fs::read(workspace.join(".fractal").join("project.fractal"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|document| document.get("project").cloned())
@@ -499,7 +594,21 @@ fn project_identity_aliases(workspace: &Path) -> Vec<String> {
                 .filter_map(|field| project.get(field)?.as_str().map(str::to_owned))
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if let Some(identity) = read_managed_project_identity(workspace) {
+        aliases.extend(
+            ["slug", "title"]
+                .into_iter()
+                .filter_map(|field| identity.get(field)?.as_str().map(str::to_owned)),
+        );
+    }
+    aliases
+}
+
+fn read_managed_project_identity(workspace: &Path) -> Option<serde_json::Value> {
+    fs::read(workspace.join(".fractal").join("managed-project.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
 }
 
 fn project_keys(value: &str) -> Vec<String> {
@@ -622,11 +731,11 @@ fn write_project_state(run: &ActiveRun) -> Result<()> {
     let directory = Path::new(&run.workspace).join(".fractal");
     fs::create_dir_all(&directory)?;
     let state = ProjectRunState {
-        schema: "fractal.run_state.v1",
-        run_id: &run.run_id,
-        status: &run.status,
+        schema: "fractal.run_state.v1".to_owned(),
+        run_id: run.run_id.clone(),
+        status: run.status.clone(),
         pid: run.pid,
-        graph_hash: &run.graph_hash,
+        graph_hash: run.graph_hash.clone(),
         updated_at_ms: run.updated_at_ms,
     };
     atomic_write(
@@ -702,6 +811,32 @@ fn is_fractal_process(pid: u32) -> bool {
                 .file_name()
                 .is_some_and(|name| name.to_string_lossy().starts_with("fractal"))
         })
+}
+
+fn process_workspace_matches(pid: u32, workspace: &Path) -> bool {
+    let expected = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    #[cfg(target_os = "linux")]
+    if fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .and_then(|path| path.canonicalize().ok())
+        .is_some_and(|path| path == expected)
+    {
+        return true;
+    }
+    std::process::Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
+        })
+        .and_then(|path| path.canonicalize().ok())
+        .is_some_and(|path| path == expected)
 }
 
 #[cfg(test)]
@@ -835,6 +970,99 @@ mod tests {
             "coffee5-1785198755992",
             "coffee five app"
         ));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn stale_planning_run_is_halted_and_checkouts_are_released() {
+        let root = std::env::temp_dir().join(format!(
+            "fractal-stale-planning-run-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        crate::project_file::configure_managed_identity(
+            &root,
+            "Monkey",
+            "Build an app about a monkey.",
+        )
+        .unwrap();
+        let mut graph = serde_json::json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [{
+                "id": "build",
+                "capability": "code.generate",
+                "instruction": "Build it."
+            }],
+            "edges": []
+        });
+        graph["graph_hash"] =
+            serde_json::Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::project_file::persist(&root, &graph, "Monkey").unwrap();
+        crate::project_file::transition(&root, "build", "checkout", "codex", "Codex").unwrap();
+        let state = ProjectRunState {
+            schema: "fractal.run_state.v1".to_owned(),
+            run_id: "stale-run".to_owned(),
+            status: "running".to_owned(),
+            pid: u32::MAX,
+            graph_hash: None,
+            updated_at_ms: 1,
+        };
+        atomic_write(
+            &root.join(".fractal/run-state.json"),
+            &serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        halt_persisted_workspace(&root, false).unwrap();
+
+        let project = crate::project_file::load(&root).unwrap();
+        let execution = project.execution.unwrap();
+        assert_eq!(execution.phase, "halted");
+        assert_eq!(execution.assignments["build"].state, "released");
+        assert_eq!(read_project_run_state(&root).unwrap().status, "halted");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn named_pause_resolves_before_the_planning_graph_exists() {
+        let root = std::env::temp_dir().join(format!(
+            "fractal-early-planning-run-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        crate::project_file::configure_managed_identity(
+            &root,
+            "Monkey",
+            "Build an app about a monkey.",
+        )
+        .unwrap();
+        let state = ProjectRunState {
+            schema: "fractal.run_state.v1".to_owned(),
+            run_id: "early-run".to_owned(),
+            status: "running".to_owned(),
+            pid: u32::MAX,
+            graph_hash: None,
+            updated_at_ms: 1,
+        };
+        atomic_write(
+            &root.join(".fractal/run-state.json"),
+            &serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        assert!(workspace_matches_project(
+            &root,
+            "generated-folder",
+            "monkey"
+        ));
+        assert_eq!(
+            persisted_project_details(&root),
+            Some(("Monkey".to_owned(), "planning".to_owned()))
+        );
+        halt_persisted_workspace(&root, false).unwrap();
+        assert_eq!(read_project_run_state(&root).unwrap().status, "halted");
         fs::remove_dir_all(root).ok();
     }
 }

@@ -136,6 +136,32 @@ final class FractalVoiceTests: XCTestCase {
         )
     }
 
+    func testManagedGlobalAgentInstructionsRefreshToTheBundledContract() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fractal-refresh-agents-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        let destination = root.appendingPathComponent("AGENTS.md")
+        try "# Fractal Agent Operating Contract\nold instructions\n".write(
+            to: destination,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        try AppRuntime.installGlobalAgentInstructions(
+            at: root,
+            contents: "# Fractal Agent Operating Contract\nnew instructions\n"
+        )
+
+        XCTAssertEqual(
+            try String(contentsOf: destination, encoding: .utf8),
+            "# Fractal Agent Operating Contract\nnew instructions\n"
+        )
+    }
+
     func testSetupRequiresOneAuthenticatedAgentAndGitHub() {
         var agents = SetupReadiness.agentTemplates
         agents[0].installed = true

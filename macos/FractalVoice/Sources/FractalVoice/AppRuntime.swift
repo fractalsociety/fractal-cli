@@ -119,7 +119,16 @@ enum AppRuntime {
             withIntermediateDirectories: true
         )
         let destination = root.appendingPathComponent("AGENTS.md")
-        guard !FileManager.default.fileExists(atPath: destination.path) else {
+        if FileManager.default.fileExists(atPath: destination.path) {
+            let current = try String(contentsOf: destination, encoding: .utf8)
+            if current.hasPrefix("# Fractal Agent Operating Contract"),
+               current != contents {
+                try contents.write(
+                    to: destination,
+                    atomically: true,
+                    encoding: .utf8
+                )
+            }
             return
         }
         try contents.write(to: destination, atomically: true, encoding: .utf8)

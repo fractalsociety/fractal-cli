@@ -534,6 +534,9 @@ pub(crate) fn prepare_managed_voice_workspace(name: &str, prompt: &str) -> Resul
     install_managed_agent_instructions(&workspace)?;
     crate::project_file::configure_managed_identity(&workspace, name, prompt)?;
     persist_trust(&trust_store_path(), &workspace)?;
+    // Register immediately so desktop agents can resolve the spoken project
+    // name while the lead is still planning, before the full graph exists.
+    crate::projects::register(&workspace);
     println!("Created managed voice project: {}", workspace.display());
     Ok(workspace)
 }
@@ -541,6 +544,17 @@ pub(crate) fn prepare_managed_voice_workspace(name: &str, prompt: &str) -> Resul
 fn install_managed_agent_instructions(workspace: &Path) -> Result<()> {
     let destination = workspace.join("AGENTS.md");
     if destination.exists() {
+        let current = std::fs::read_to_string(&destination).unwrap_or_default();
+        if current.starts_with("# Fractal Agent Operating Contract")
+            && current != MANAGED_AGENT_INSTRUCTIONS
+        {
+            std::fs::write(&destination, MANAGED_AGENT_INSTRUCTIONS).with_context(|| {
+                format!(
+                    "refresh managed agent instructions {}",
+                    destination.display()
+                )
+            })?;
+        }
         return Ok(());
     }
     std::fs::write(&destination, MANAGED_AGENT_INSTRUCTIONS)
@@ -981,6 +995,36 @@ mod tests {
 
         assert!(instructions.contains("Fractal owns orchestration"));
         assert!(instructions.contains("fractal handoff"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_agent_contract_refreshes_without_overwriting_unmanaged_files() {
+        let root = std::env::temp_dir().join(format!(
+            "fractal-refresh-agent-instructions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let destination = root.join("AGENTS.md");
+        std::fs::write(
+            &destination,
+            "# Fractal Agent Operating Contract\nold instructions\n",
+        )
+        .unwrap();
+        install_managed_agent_instructions(&root).unwrap();
+        let refreshed = std::fs::read_to_string(&destination).unwrap();
+        assert!(refreshed.contains("Do not use `fractal status --running` as a gate"));
+
+        std::fs::write(&destination, "user instructions\n").unwrap();
+        install_managed_agent_instructions(&root).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "user instructions\n"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }
