@@ -374,17 +374,9 @@ fn halt(original: &ActiveRun, hosted_command_id: Option<&str>) -> Result<()> {
 fn select_runs(runs: Vec<ActiveRun>, project: Option<&str>) -> Result<Vec<ActiveRun>> {
     if let Some(project) = project {
         let needle = project.trim().to_ascii_lowercase();
-        let needle_key = project_key(&needle);
         let selected: Vec<_> = runs
             .into_iter()
-            .filter(|run| {
-                run.project.to_ascii_lowercase() == needle
-                    || run.workspace.to_ascii_lowercase() == needle
-                    || project_key(&run.project) == needle_key
-                    || Path::new(&run.workspace)
-                        .file_name()
-                        .is_some_and(|name| project_key(&name.to_string_lossy()) == needle_key)
-            })
+            .filter(|run| run_matches_project(run, &needle))
             .collect();
         if selected.is_empty() {
             bail!("no running Fractal project matches {project:?}");
@@ -415,6 +407,56 @@ fn select_runs(runs: Vec<ActiveRun>, project: Option<&str>) -> Result<Vec<Active
         return Ok(runs);
     }
     bail!("multiple builds are running; use `fractal stop --project NAME` or `fractal stop --all`")
+}
+
+fn run_matches_project(run: &ActiveRun, needle: &str) -> bool {
+    if run.workspace.to_ascii_lowercase() == needle {
+        return true;
+    }
+    let needle_keys = project_keys(needle);
+    let workspace = Path::new(&run.workspace);
+    let mut aliases = vec![run.project.clone()];
+    if let Some(name) = workspace.file_name() {
+        aliases.push(name.to_string_lossy().into_owned());
+    }
+    aliases.extend(project_identity_aliases(workspace));
+    aliases.into_iter().any(|alias| {
+        let alias_keys = project_keys(&alias);
+        needle_keys.iter().any(|key| alias_keys.contains(key))
+    })
+}
+
+fn project_identity_aliases(workspace: &Path) -> Vec<String> {
+    fs::read(workspace.join(".fractal").join("project.fractal"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|document| document.get("project").cloned())
+        .map(|project| {
+            ["slug", "title"]
+                .into_iter()
+                .filter_map(|field| project.get(field)?.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn project_keys(value: &str) -> Vec<String> {
+    let words: Vec<_> = value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let mut keys = vec![project_key(value)];
+    let trimmed = words.strip_prefix(&["the"]).unwrap_or(&words).to_vec();
+    let trimmed = trimmed
+        .strip_suffix(&["app"])
+        .or_else(|| trimmed.strip_suffix(&["build"]))
+        .or_else(|| trimmed.strip_suffix(&["project"]))
+        .unwrap_or(&trimmed);
+    let conversational = project_key(&trimmed.join(" "));
+    if !conversational.is_empty() && !keys.contains(&conversational) {
+        keys.push(conversational);
+    }
+    keys
 }
 
 fn project_key(value: &str) -> String {
@@ -646,5 +688,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(run[0].project, "expense-tracker");
+    }
+
+    #[test]
+    fn project_selection_accepts_graph_title_and_conversational_app_suffix() {
+        let root = std::env::temp_dir().join(format!(
+            "fractal-run-project-alias-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(root.join(".fractal")).unwrap();
+        fs::write(
+            root.join(".fractal/project.fractal"),
+            r#"{"project":{"slug":"racket","title":"Racket"}}"#,
+        )
+        .unwrap();
+        let run = ActiveRun {
+            schema: "fractal.active_run.v1".to_owned(),
+            run_id: "run".to_owned(),
+            pid: std::process::id(),
+            workspace: root.to_string_lossy().into_owned(),
+            project: "racket-1785197928063".to_owned(),
+            request: "build".to_owned(),
+            status: "running".to_owned(),
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            graph_hash: None,
+            board_url: None,
+            worker_groups: Vec::new(),
+            active_nodes: BTreeMap::new(),
+        };
+        assert_eq!(
+            select_runs(vec![run], Some("the Racket app"))
+                .unwrap()
+                .first()
+                .unwrap()
+                .project,
+            "racket-1785197928063"
+        );
+        fs::remove_dir_all(root).ok();
     }
 }

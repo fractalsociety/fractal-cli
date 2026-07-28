@@ -370,7 +370,7 @@ fn parse_run_control(input: &str) -> Option<VoiceRunControl> {
         .collect::<Vec<_>>()
         .join(" ");
     let lower = cleaned.to_ascii_lowercase();
-    let starts_stop = ["stop ", "halt ", "cancel ", "abort "]
+    let starts_stop = ["stop ", "pause ", "halt ", "cancel ", "abort "]
         .iter()
         .any(|prefix| lower.starts_with(prefix));
     if starts_stop
@@ -384,6 +384,7 @@ fn parse_run_control(input: &str) -> Option<VoiceRunControl> {
     if starts_stop {
         for marker in [
             "stop project ",
+            "pause project ",
             "halt project ",
             "cancel project ",
             "abort project ",
@@ -759,6 +760,10 @@ mod tests {
         assert_eq!(
             parse_run_control("stop project expense tracker"),
             Some(VoiceRunControl::StopProject("expense tracker".to_owned()))
+        );
+        assert_eq!(
+            parse_run_control("pause project Racket"),
+            Some(VoiceRunControl::StopProject("racket".to_owned()))
         );
         assert_eq!(
             parse_run_control("show running Fractal builds"),

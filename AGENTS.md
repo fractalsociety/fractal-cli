@@ -219,6 +219,10 @@ fractal pause --project 'EXACT_PROJECT_NAME'
 fractal status --running
 ```
 
+Copy the exact running name or absolute path from the first status command into
+the pause command. A conversational graph title such as “Racket app” is also
+accepted, but the printed running identifier is preferred.
+
 `fractal pause` is a visible alias for `fractal stop`. It halts the selected
 coordinator and its workers while preserving completed graph waves so the
 project remains resumable. The project name may be its folder name, graph slug,
@@ -228,7 +232,8 @@ printed by `fractal status --running`.
 Report success only after Fractal prints `Stopped PROJECT` and the final status
 no longer lists that project. Never substitute `--all` unless the user
 explicitly asks to pause every running build. Do not kill agent or terminal
-processes directly.
+processes directly. If the first status command lists the requested project,
+do not claim the registry failed to recognize its managed Fractal Voice process.
 
 ### Change project and repository visibility
 
