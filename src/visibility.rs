@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -115,7 +116,8 @@ fn safe_segment(value: &str) -> bool {
 }
 
 fn github_visibility(workspace: &Path, repository: &str) -> Result<String> {
-    let output = Command::new("gh")
+    let github_cli = github_cli_path();
+    let output = Command::new(&github_cli)
         .current_dir(workspace)
         .args([
             "repo",
@@ -127,9 +129,12 @@ fn github_visibility(workspace: &Path, repository: &str) -> Result<String> {
             ".visibility",
         ])
         .output()
-        .context(
-            "inspect GitHub repository visibility; install GitHub CLI and run `gh auth login`",
-        )?;
+        .with_context(|| {
+            format!(
+                "launch GitHub CLI at {}; install GitHub CLI, run `gh auth login`, or set FRACTAL_GH_BIN",
+                github_cli.display()
+            )
+        })?;
     if !output.status.success() {
         bail!(
             "inspect GitHub repository visibility: {}",
@@ -148,7 +153,8 @@ fn github_visibility(workspace: &Path, repository: &str) -> Result<String> {
 }
 
 fn edit_github_visibility(workspace: &Path, repository: &str, visibility: &str) -> Result<()> {
-    let status = Command::new("gh")
+    let github_cli = github_cli_path();
+    let output = Command::new(&github_cli)
         .current_dir(workspace)
         .args([
             "repo",
@@ -158,12 +164,39 @@ fn edit_github_visibility(workspace: &Path, repository: &str, visibility: &str) 
             visibility,
             "--accept-visibility-change-consequences",
         ])
-        .status()
-        .context("change GitHub repository visibility; run `gh auth login` first")?;
-    if !status.success() {
-        bail!("GitHub repository visibility update failed with {status}");
+        .output()
+        .with_context(|| {
+            format!(
+                "launch GitHub CLI at {}; install GitHub CLI, run `gh auth login`, or set FRACTAL_GH_BIN",
+                github_cli.display()
+            )
+        })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "GitHub repository visibility update failed: {}",
+            detail.trim()
+        );
     }
     Ok(())
+}
+
+fn github_cli_path() -> PathBuf {
+    github_cli_path_from(std::env::var_os("FRACTAL_GH_BIN"), |path| path.is_file())
+}
+
+fn github_cli_path_from(
+    override_path: Option<OsString>,
+    is_file: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    if let Some(path) = override_path.filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+    ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| is_file(path))
+        .unwrap_or_else(|| PathBuf::from("gh"))
 }
 
 #[cfg(test)]
@@ -181,5 +214,14 @@ mod tests {
             Some("owner/repo")
         );
         assert_eq!(canonical_repository("https://example.com/owner/repo"), None);
+    }
+
+    #[test]
+    fn discovers_github_cli_outside_restricted_desktop_path() {
+        let selected = github_cli_path_from(None, |path| path == Path::new("/opt/homebrew/bin/gh"));
+        assert_eq!(selected, PathBuf::from("/opt/homebrew/bin/gh"));
+
+        let selected = github_cli_path_from(Some(OsString::from("/custom/gh")), |_| false);
+        assert_eq!(selected, PathBuf::from("/custom/gh"));
     }
 }

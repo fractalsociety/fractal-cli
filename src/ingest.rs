@@ -161,6 +161,15 @@ fn process_event(event: InputEvent, options: EventOptions<'_>) -> Result<()> {
         );
     }
 
+    // Visibility changes must use the dedicated two-step command. Do not let a
+    // voice agent accidentally queue one as an ordinary graph amendment and
+    // then report the word "accepted" as if GitHub had changed.
+    if let Some(target) = parse_visibility_intent(&event.content) {
+        bail!(
+            "project visibility was not changed; use `fractal visibility --project 'EXACT_PROJECT_NAME' --{target}`, read the warning, and repeat it with `--yes` only after explicit confirmation"
+        );
+    }
+
     // Mid-build graph amendments are intercepted before ordinary intent
     // execution so a spoken addition never starts a second project.
     if let Some((task_ref, instruction)) = parse_graph_amendment(&event.content) {
@@ -333,6 +342,24 @@ fn parse_graph_amendment(input: &str) -> Option<(String, String)> {
         })
         .to_owned();
     (!instruction.is_empty()).then_some((task_ref, instruction))
+}
+
+fn parse_visibility_intent(input: &str) -> Option<&'static str> {
+    let lower = input.trim().to_ascii_lowercase();
+    let target = if lower.contains("public") {
+        "public"
+    } else if lower.contains("private") {
+        "private"
+    } else {
+        return None;
+    };
+    let action = ["make ", "set ", "change ", "toggle ", "switch "]
+        .iter()
+        .any(|word| lower.starts_with(word) || lower.contains(&format!(" {word}")));
+    let subject = ["project", "repository", "repo", "graph", "visibility"]
+        .iter()
+        .any(|word| lower.contains(word));
+    (action && subject).then_some(target)
 }
 
 fn parse_run_control(input: &str) -> Option<VoiceRunControl> {
@@ -749,6 +776,22 @@ mod tests {
             Some(("0.1".to_owned(), "CSV export features".to_owned()))
         );
         assert_eq!(parse_graph_amendment("build a branching puzzle"), None);
+    }
+
+    #[test]
+    fn visibility_requests_cannot_be_accepted_as_build_intent() {
+        assert_eq!(
+            parse_visibility_intent("Make project coffee-2 public"),
+            Some("public")
+        );
+        assert_eq!(
+            parse_visibility_intent("change the repository visibility to private"),
+            Some("private")
+        );
+        assert_eq!(
+            parse_visibility_intent("Build a public transit timetable"),
+            None
+        );
     }
 
     #[test]
