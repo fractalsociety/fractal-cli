@@ -27,4 +27,12 @@ sips -s format png "$PACKAGE/Resources/DMGBackground.svg" \
 
 rm -f "$OUTPUT"
 npx --yes appdmg@0.6.6 "$STAGING/DMG.json" "$OUTPUT"
+if [[ -n "${FRACTAL_CODESIGN_IDENTITY:-}" \
+   && "${FRACTAL_CODESIGN_IDENTITY}" != "-" ]]; then
+  codesign \
+    --force \
+    --timestamp \
+    --sign "$FRACTAL_CODESIGN_IDENTITY" \
+    "$OUTPUT"
+fi
 echo "$OUTPUT"

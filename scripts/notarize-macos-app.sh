@@ -70,7 +70,9 @@ rm -f "$ARCHIVE"
 )
 
 shasum -a 256 "$ARCHIVE"
-FRACTAL_DIST_DIR="$DIST" "$ROOT/scripts/build-macos-dmg.sh"
+FRACTAL_DIST_DIR="$DIST" \
+FRACTAL_CODESIGN_IDENTITY="$IDENTITY" \
+  "$ROOT/scripts/build-macos-dmg.sh"
 
 DMG_NOTARY_RESULT="$(
   xcrun notarytool submit "$DMG" \
