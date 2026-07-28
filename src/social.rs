@@ -39,6 +39,17 @@ struct ExternalXShareHandoff<'a> {
     created_at_ms: u128,
 }
 
+struct QueuedXShare {
+    path: PathBuf,
+    result_path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct XShareResult {
+    success: bool,
+    message: String,
+}
+
 #[derive(Deserialize)]
 struct BrowserHandoffResponse {
     #[serde(default)]
@@ -250,7 +261,14 @@ pub(crate) fn share_x(args: &ShareXArgs) -> Result<()> {
         .context("Fractal Society returned no X composer URL")?;
     validate_x_intent_url(&intent_url)?;
     let handoff = queue_x_share(&intent_url, &text)?;
-    let launched = launch_fractal_voice(&handoff);
+    let launched = launch_fractal_voice(&handoff.path);
+    if let Some(result) = wait_for_x_share_result(&handoff.result_path)? {
+        if result.success {
+            println!("{}", result.message);
+            return Ok(());
+        }
+        bail!("{}", result.message);
+    }
     println!(
         "{} X composer request to Fractal Voice. Review the prefilled post in X, then choose Post.",
         if launched { "Sent" } else { "Queued" }
@@ -275,7 +293,7 @@ fn validate_x_intent_url(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn queue_x_share(intent_url: &str, preview: &str) -> Result<PathBuf> {
+fn queue_x_share(intent_url: &str, preview: &str) -> Result<QueuedXShare> {
     let created_at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?
@@ -308,7 +326,26 @@ fn queue_x_share(intent_url: &str, preview: &str) -> Result<PathBuf> {
         .with_context(|| format!("create secure X share handoff {}", path.display()))?;
     file.write_all(&bytes)?;
     file.sync_all()?;
-    Ok(path)
+    let result_path = path.with_extension("result");
+    Ok(QueuedXShare { path, result_path })
+}
+
+fn wait_for_x_share_result(path: &Path) -> Result<Option<XShareResult>> {
+    for _ in 0..20 {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                std::fs::remove_file(path).ok();
+                return serde_json::from_slice(&bytes)
+                    .context("decode Fractal Voice X share result")
+                    .map(Some);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(None)
 }
 
 fn launch_fractal_voice(path: &Path) -> bool {
@@ -358,13 +395,26 @@ mod tests {
         assert!(validate_x_intent_url("https://evil.example/intent/tweet?text=no").is_err());
         assert!(validate_x_intent_url("https://x.com/intent/tweet?text=ok&url=bad").is_err());
 
-        let path = queue_x_share(intent, "Hello @buildfractal").unwrap();
-        let metadata = fs::metadata(&path).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let handoff = queue_x_share(intent, "Hello @buildfractal").unwrap();
+        let metadata = fs::metadata(&handoff.path).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&handoff.path).unwrap()).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         assert_eq!(value["schema"], "fractal.external_x_share.v1");
         assert_eq!(value["intent_url"], intent);
         assert_eq!(value["preview"], "Hello @buildfractal");
-        fs::remove_file(path).unwrap();
+        fs::remove_file(handoff.path).unwrap();
+
+        fs::write(
+            &handoff.result_path,
+            br#"{"success":true,"message":"Opened X composer"}"#,
+        )
+        .unwrap();
+        let result = wait_for_x_share_result(&handoff.result_path)
+            .unwrap()
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.message, "Opened X composer");
+        assert!(!handoff.result_path.exists());
     }
 }

@@ -212,19 +212,64 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
             }
             return false
         }
+        let resultURL = url.deletingPathExtension().appendingPathExtension("result")
         do {
             let request = try ExternalXShareHandoff.consume(url)
-            guard NSWorkspace.shared.open(request.intentURL) else {
+            guard openXComposer(request.intentURL) else {
                 throw ExternalXShareError.invalidRequest
             }
+            writeXShareResult(
+                to: resultURL,
+                success: true,
+                message: "Opened the approved X composer. Review the post and choose Post."
+            )
             coordinator.reportExternalShareOpened()
             return true
         } catch {
+            writeXShareResult(
+                to: resultURL,
+                success: false,
+                message: error.localizedDescription
+            )
             if reportFailure {
                 coordinator.reportExternalBuildFailure(error.localizedDescription)
             }
             return false
         }
+    }
+
+    private func openXComposer(_ url: URL) -> Bool {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        task.arguments = [url.absoluteString]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        do {
+            try task.run()
+            task.waitUntilExit()
+            return task.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    private func writeXShareResult(
+        to url: URL,
+        success: Bool,
+        message: String
+    ) {
+        guard let data = try? JSONSerialization.data(withJSONObject: [
+            "success": success,
+            "message": message,
+        ]) else {
+            return
+        }
+        try? FileManager.default.removeItem(at: url)
+        _ = FileManager.default.createFile(
+            atPath: url.path,
+            contents: data,
+            attributes: [.posixPermissions: 0o600]
+        )
     }
 
     private func handleExternalBuild(at url: URL, reportFailure: Bool) -> Bool {
