@@ -563,6 +563,54 @@ final class FractalVoiceTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
+    func testExternalXShareHandoffIsPrivateFreshAndRestrictedToXComposer() throws {
+        let url = URL(fileURLWithPath: "/tmp").appendingPathComponent(
+            "fractal-x-share-\(UUID().uuidString).fractalxshare"
+        )
+        let preview = "@helper @buildfractal Please help with task 2.4."
+        var components = URLComponents(string: "https://x.com/intent/tweet")!
+        components.queryItems = [URLQueryItem(name: "text", value: preview)]
+        let payload: [String: Any] = [
+            "schema": "fractal.external_x_share.v1",
+            "intent_url": components.url!.absoluteString,
+            "preview": preview,
+            "created_at_ms": UInt64(Date().timeIntervalSince1970 * 1_000),
+        ]
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: url.path,
+            contents: try JSONSerialization.data(withJSONObject: payload),
+            attributes: [.posixPermissions: 0o600]
+        ))
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let handoff = try ExternalXShareHandoff.consume(url)
+
+        XCTAssertEqual(handoff.preview, preview)
+        XCTAssertEqual(handoff.intentURL.host, "x.com")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testExternalXShareHandoffRejectsAnotherOrigin() throws {
+        let url = URL(fileURLWithPath: "/tmp").appendingPathComponent(
+            "fractal-x-share-\(UUID().uuidString).fractalxshare"
+        )
+        let payload: [String: Any] = [
+            "schema": "fractal.external_x_share.v1",
+            "intent_url": "https://evil.example/intent/tweet?text=Hello",
+            "preview": "Hello",
+            "created_at_ms": UInt64(Date().timeIntervalSince1970 * 1_000),
+        ]
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: url.path,
+            contents: try JSONSerialization.data(withJSONObject: payload),
+            attributes: [.posixPermissions: 0o600]
+        ))
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        XCTAssertThrowsError(try ExternalXShareHandoff.consume(url))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
     func testWebsiteVisibilityHandoffAcceptsOnlyFractalSocietyCommands() throws {
         let handoff = try WebsiteVisibilityHandoff(url: URL(
             string: "fractalvoice://visibility?project=coffee5&target=private&server=https%3A%2F%2Ffractalsociety.com"

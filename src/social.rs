@@ -1,8 +1,13 @@
-use std::process::Command;
-use std::time::Duration;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::cli::{ConnectXArgs, InviteArgs, ShareXArgs};
 
@@ -21,11 +26,17 @@ struct XResponse {
     #[serde(default)]
     preview: Option<String>,
     #[serde(default)]
-    post_url: Option<String>,
-    #[serde(default)]
-    connect_url: Option<String>,
+    intent_url: Option<String>,
     #[serde(default)]
     error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ExternalXShareHandoff<'a> {
+    schema: &'static str,
+    intent_url: &'a str,
+    preview: &'a str,
+    created_at_ms: u128,
 }
 
 #[derive(Deserialize)]
@@ -232,45 +243,92 @@ pub(crate) fn share_x(args: &ShareXArgs) -> Result<()> {
                 "help_requested": help,
             }),
         )?;
-        bail!("X post not published; after the user explicitly confirms this preview, repeat with `--yes`");
+        bail!("X composer not opened; after the user explicitly confirms this exact preview, repeat with `--yes`");
     }
-    let (status, response) = request(
-        "POST",
-        &endpoint,
-        &session.access_token,
-        &serde_json::json!({
-            "handle": args.handle,
-            "help_requested": help,
-            "confirm": true,
-        }),
-    )?;
-    let result: XResponse = serde_json::from_str(&response).context("decode X post result")?;
-    if status == 409 {
-        if let Some(connect_url) = result.connect_url {
-            let absolute = if connect_url.starts_with('/') {
-                format!("{server}{connect_url}")
-            } else {
-                connect_url
-            };
-            let _ = Command::new("open").arg(&absolute).status();
-            bail!(
-                "connect your X account in the opened browser, then repeat the confirmed command"
-            );
-        }
-    }
-    if !(200..300).contains(&status) {
-        bail!(
-            "{}",
-            result
-                .error
-                .unwrap_or_else(|| format!("X post failed with HTTP {status}"))
-        );
-    }
+    let intent_url = preview
+        .intent_url
+        .context("Fractal Society returned no X composer URL")?;
+    validate_x_intent_url(&intent_url)?;
+    let handoff = queue_x_share(&intent_url, &text)?;
+    let launched = launch_fractal_voice(&handoff);
     println!(
-        "Posted to X successfully: {}",
-        result.post_url.context("X returned no post URL")?
+        "{} X composer request to Fractal Voice. Review the prefilled post in X, then choose Post.",
+        if launched { "Sent" } else { "Queued" }
     );
     Ok(())
+}
+
+fn validate_x_intent_url(value: &str) -> Result<()> {
+    const PREFIX: &str = "https://x.com/intent/tweet?";
+    let query = value
+        .strip_prefix(PREFIX)
+        .context("Fractal Society returned an untrusted X composer URL")?;
+    if value.len() > 4_096
+        || value.chars().any(char::is_control)
+        || !query.starts_with("text=")
+        || query.contains('&')
+        || query.contains('#')
+        || query.len() <= "text=".len()
+    {
+        bail!("Fractal Society returned an invalid X composer URL");
+    }
+    Ok(())
+}
+
+fn queue_x_share(intent_url: &str, preview: &str) -> Result<PathBuf> {
+    let created_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_millis();
+    let envelope = ExternalXShareHandoff {
+        schema: "fractal.external_x_share.v1",
+        intent_url,
+        preview,
+        created_at_ms,
+    };
+    let bytes = serde_json::to_vec(&envelope).context("encode X share handoff")?;
+    let mut seed = Sha256::new();
+    seed.update(&bytes);
+    seed.update(std::process::id().to_le_bytes());
+    let nonce: String = seed
+        .finalize()
+        .iter()
+        .take(12)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let path = PathBuf::from("/tmp").join(format!(
+        "fractal-x-share-{}-{nonce}.fractalxshare",
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("create secure X share handoff {}", path.display()))?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(path)
+}
+
+fn launch_fractal_voice(path: &Path) -> bool {
+    const APP_PATH: &str = "/Applications/Fractal Voice.app";
+    const BUNDLE_ID: &str = "com.fractalsociety.voice";
+    if Path::new(APP_PATH).is_dir() && run_open(&["-a", APP_PATH], path) {
+        return true;
+    }
+    run_open(&["-b", BUNDLE_ID], path)
+}
+
+fn run_open(arguments: &[&str], path: &Path) -> bool {
+    Command::new("/usr/bin/open")
+        .args(arguments)
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 pub(crate) fn connect_x(args: &ConnectXArgs) -> Result<()> {
@@ -321,9 +379,28 @@ pub(crate) fn connect_x(args: &ConnectXArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn url_segments_encode_untrusted_values() {
         assert_eq!(segment("hello world/@x"), "hello%20world%2F%40x");
+    }
+
+    #[test]
+    fn x_share_handoff_is_private_and_accepts_only_x_composer_urls() {
+        let intent = "https://x.com/intent/tweet?text=Hello%20%40buildfractal";
+        validate_x_intent_url(intent).unwrap();
+        assert!(validate_x_intent_url("https://evil.example/intent/tweet?text=no").is_err());
+        assert!(validate_x_intent_url("https://x.com/intent/tweet?text=ok&url=bad").is_err());
+
+        let path = queue_x_share(intent, "Hello @buildfractal").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(value["schema"], "fractal.external_x_share.v1");
+        assert_eq!(value["intent_url"], intent);
+        assert_eq!(value["preview"], "Hello @buildfractal");
+        fs::remove_file(path).unwrap();
     }
 }

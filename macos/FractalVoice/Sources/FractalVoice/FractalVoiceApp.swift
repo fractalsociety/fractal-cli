@@ -113,10 +113,10 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
             sender.reply(toOpenOrPrint: .failure)
             return
         }
-        let handled = handleExternalBuild(
-            at: URL(fileURLWithPath: filenames[0]),
-            reportFailure: true
-        )
+        let url = URL(fileURLWithPath: filenames[0])
+        let handled = url.pathExtension == "fractalxshare"
+            ? handleExternalXShare(at: url, reportFailure: true)
+            : handleExternalBuild(at: url, reportFailure: true)
         sender.reply(toOpenOrPrint: handled ? .success : .failure)
     }
 
@@ -167,10 +167,12 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         ) { [weak self] _ in
             Task { @MainActor in
                 self?.consumeNextQueuedVisibility()
+                self?.consumeNextQueuedXShare()
                 self?.consumeNextQueuedExternalBuild()
             }
         }
         consumeNextQueuedVisibility()
+        consumeNextQueuedXShare()
         consumeNextQueuedExternalBuild()
     }
 
@@ -191,6 +193,38 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         guard setupComplete, coordinator.canAcceptExternalBuild else { return }
         guard let url = ExternalBuildHandoff.pendingURLs().first else { return }
         _ = handleExternalBuild(at: url, reportFailure: true)
+    }
+
+    private func consumeNextQueuedXShare() {
+        guard setupComplete, let url = ExternalXShareHandoff.pendingURLs().first else {
+            return
+        }
+        _ = handleExternalXShare(at: url, reportFailure: true)
+    }
+
+    private func handleExternalXShare(at url: URL, reportFailure: Bool) -> Bool {
+        guard setupComplete else {
+            showOnboarding()
+            if reportFailure {
+                coordinator.reportExternalBuildFailure(
+                    ExternalBuildLaunchError.setupRequired.localizedDescription
+                )
+            }
+            return false
+        }
+        do {
+            let request = try ExternalXShareHandoff.consume(url)
+            guard NSWorkspace.shared.open(request.intentURL) else {
+                throw ExternalXShareError.invalidRequest
+            }
+            coordinator.reportExternalShareOpened()
+            return true
+        } catch {
+            if reportFailure {
+                coordinator.reportExternalBuildFailure(error.localizedDescription)
+            }
+            return false
+        }
     }
 
     private func handleExternalBuild(at url: URL, reportFailure: Bool) -> Bool {

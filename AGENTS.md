@@ -158,22 +158,28 @@ configured production mail service. Report success only when Fractal prints
 Preview a public X help request:
 
 ```sh
-fractal connect-x --project 'coffee-2'
-
 fractal share-x \
   --project 'coffee-2' \
   --handle '@helper' \
   --message 'Please help with task 2.1 and spare agent compute for tests.'
 ```
 
-Use `fractal connect-x` when the account is not connected; it transfers the
-existing CLI login into the browser with a short-lived, single-use handoff, then
-opens X authorization. The post preview opens in the project's Fractal Society
-Share dialog. The user may confirm it there. If the user instead explicitly
-approves that exact public post to this agent, repeat `fractal share-x` with
-`--yes`. Report success only when Fractal returns the final X post URL. Do not
-post arbitrary agent-authored content, silently change the tagged handle, reuse
-an old confirmation, or treat voice transcription alone as confirmation.
+The post preview opens in the project's Fractal Society Share dialog. No X API
+connection, developer token, or posting credit is required. If the user
+explicitly approves that exact public post to this agent, repeat
+`fractal share-x` with `--yes`. Fractal retrieves the trusted X Web Intent URL,
+writes it to an owner-only, short-lived `.fractalxshare` handoff, and sends it
+to Fractal Voice. If the desktop sandbox cannot launch the app, Fractal Voice
+consumes the queued request while it is running. The app validates that the URL
+is exactly an `https://x.com/intent/tweet` composer whose text matches the
+approved preview, then opens X with the post filled in.
+
+Treat `Sent X composer request` or `Queued X composer request` as successful
+delivery to Fractal Voice, not as proof that the post was published. Tell the
+user to review the prefilled post and choose Post in X. Do not call
+`fractal connect-x`; it is not needed for this flow. Do not post arbitrary
+agent-authored content, silently change the tagged handle, reuse an old
+confirmation, or treat voice transcription alone as confirmation.
 
 ## Operate an existing graph
 

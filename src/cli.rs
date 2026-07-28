@@ -90,9 +90,9 @@ pub(crate) enum Command {
     Contribute(ContributeArgs),
     /// Email a secure project invitation after explicit confirmation.
     Invite(InviteArgs),
-    /// Ask an X user for project help after preview and explicit confirmation.
+    /// Ask an X user for help through Fractal Voice and X's prefilled composer.
     ShareX(ShareXArgs),
-    /// Connect the signed-in Fractal Society account to X in the browser.
+    /// Legacy X connection flow; not required for composer-based sharing.
     ConnectX(ConnectXArgs),
     /// Preview or confirm a project and GitHub repository visibility change.
     Visibility(VisibilityArgs),
@@ -170,7 +170,7 @@ pub(crate) struct ShareXArgs {
     /// Plain-language description of the help or compute requested.
     #[arg(long = "message", visible_alias = "help-request", value_name = "TEXT")]
     pub(crate) message: Option<String>,
-    /// Publish the displayed preview to X.
+    /// Send the displayed preview to Fractal Voice, which opens X's composer.
     #[arg(long)]
     pub(crate) yes: bool,
     /// Fractal Society origin (defaults to the saved login server).

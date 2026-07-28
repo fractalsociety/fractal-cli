@@ -233,6 +233,11 @@ final class BuildCoordinator: ObservableObject {
         hud?.showFailure(message)
     }
 
+    func reportExternalShareOpened() {
+        state = .idle
+        latestActivity = "X composer opened with the approved Fractal help request"
+    }
+
     func toggleRecording() {
         if state == .building, recorder == nil, transcriptionProcess == nil {
             switch dialogueStage {

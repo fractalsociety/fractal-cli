@@ -30,6 +30,18 @@
                 <string>com.fractalsociety.build-request</string>
 	            </array>
 	        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Fractal X Share Request</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.fractalsociety.x-share-request</string>
+            </array>
+        </dict>
 	    </array>
 	    <key>CFBundleURLTypes</key>
 	    <array>
@@ -65,13 +77,32 @@
                 <string>application/vnd.fractalsociety.build-request+json</string>
             </dict>
         </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.fractalsociety.x-share-request</string>
+            <key>UTTypeDescription</key>
+            <string>Fractal X Share Request</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.data</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>fractalxshare</string>
+                </array>
+                <key>public.mime-type</key>
+                <string>application/vnd.fractalsociety.x-share-request+json</string>
+            </dict>
+        </dict>
     </array>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.developer-tools</string>
     <key>CFBundleShortVersionString</key>
-	<string>0.9.0</string>
+	<string>0.9.1</string>
     <key>CFBundleVersion</key>
-	<string>23</string>
+	<string>24</string>
     <key>LSMinimumSystemVersion</key>
     <string>15.0</string>
     <key>LSUIElement</key>
