@@ -198,6 +198,28 @@ pub(crate) fn terminate_worker(pid: u32) {
 pub(crate) fn stop(args: &StopArgs) -> Result<()> {
     let mut runs = live_runs()?;
     if runs.is_empty() {
+        if let Some(project) = args.project.as_deref() {
+            if let Some((name, phase, workspace)) = persisted_project_status(project) {
+                match phase.as_str() {
+                    "halted" => {
+                        println!("Already paused: {name} ({workspace})");
+                        println!("No agents are running; completed graph waves remain resumable.");
+                    }
+                    "completed" => {
+                        println!("Already finished: {name} ({workspace})");
+                        println!("No agents are running.");
+                    }
+                    _ => {
+                        println!("Not running: {name} ({workspace})");
+                        println!(
+                            "The saved graph phase is {phase}; no coordinator or workers need to be stopped."
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            bail!("no running or registered Fractal project matches {project:?}");
+        }
         println!("No Fractal builds are running.");
         return Ok(());
     }
@@ -409,6 +431,46 @@ fn select_runs(runs: Vec<ActiveRun>, project: Option<&str>) -> Result<Vec<Active
     bail!("multiple builds are running; use `fractal stop --project NAME` or `fractal stop --all`")
 }
 
+fn persisted_project_status(project: &str) -> Option<(String, String, String)> {
+    let needle = project.trim().to_ascii_lowercase();
+    let matches: Vec<_> = crate::projects::list()
+        .into_iter()
+        .filter_map(|entry| {
+            let workspace = PathBuf::from(&entry.workspace);
+            workspace_matches_project(&workspace, &entry.label, &needle).then(|| {
+                let document = crate::project_file::load(&workspace).ok()?;
+                let phase = document
+                    .execution
+                    .as_ref()
+                    .map(|execution| execution.phase.clone())
+                    .unwrap_or_else(|| "pending".to_owned());
+                Some((
+                    document.project.title,
+                    phase,
+                    workspace.to_string_lossy().into_owned(),
+                ))
+            })?
+        })
+        .collect();
+    (matches.len() == 1).then(|| matches[0].clone())
+}
+
+fn workspace_matches_project(workspace: &Path, label: &str, needle: &str) -> bool {
+    if workspace.to_string_lossy().to_ascii_lowercase() == needle {
+        return true;
+    }
+    let needle_keys = project_keys(needle);
+    let mut aliases = vec![label.to_owned()];
+    if let Some(name) = workspace.file_name() {
+        aliases.push(name.to_string_lossy().into_owned());
+    }
+    aliases.extend(project_identity_aliases(workspace));
+    aliases.into_iter().any(|alias| {
+        let alias_keys = project_keys(&alias);
+        needle_keys.iter().any(|key| alias_keys.contains(key))
+    })
+}
+
 fn run_matches_project(run: &ActiveRun, needle: &str) -> bool {
     if run.workspace.to_ascii_lowercase() == needle {
         return true;
@@ -441,22 +503,48 @@ fn project_identity_aliases(workspace: &Path) -> Vec<String> {
 }
 
 fn project_keys(value: &str) -> Vec<String> {
-    let words: Vec<_> = value
+    let mut words: Vec<String> = value
         .split(|character: char| !character.is_ascii_alphanumeric())
         .filter(|word| !word.is_empty())
+        .map(|word| word.to_ascii_lowercase())
         .collect();
     let mut keys = vec![project_key(value)];
-    let trimmed = words.strip_prefix(&["the"]).unwrap_or(&words).to_vec();
-    let trimmed = trimmed
-        .strip_suffix(&["app"])
-        .or_else(|| trimmed.strip_suffix(&["build"]))
-        .or_else(|| trimmed.strip_suffix(&["project"]))
-        .unwrap_or(&trimmed);
-    let conversational = project_key(&trimmed.join(" "));
+    if words.first().is_some_and(|word| word == "the") {
+        words.remove(0);
+    }
+    if words
+        .last()
+        .is_some_and(|word| matches!(word.as_str(), "app" | "build" | "project"))
+    {
+        words.pop();
+    }
+    for word in &mut words {
+        if let Some(number) = spoken_number(word) {
+            *word = number.to_owned();
+        }
+    }
+    let conversational = project_key(&words.join(" "));
     if !conversational.is_empty() && !keys.contains(&conversational) {
         keys.push(conversational);
     }
     keys
+}
+
+fn spoken_number(value: &str) -> Option<&'static str> {
+    Some(match value {
+        "zero" => "0",
+        "one" => "1",
+        "two" => "2",
+        "three" => "3",
+        "four" => "4",
+        "five" => "5",
+        "six" => "6",
+        "seven" => "7",
+        "eight" => "8",
+        "nine" => "9",
+        "ten" => "10",
+        _ => return None,
+    })
 }
 
 fn project_key(value: &str) -> String {
@@ -726,6 +814,27 @@ mod tests {
                 .project,
             "racket-1785197928063"
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn persisted_project_matching_accepts_graph_title_after_run_has_stopped() {
+        let root = std::env::temp_dir().join(format!(
+            "fractal-stopped-project-alias-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(root.join(".fractal")).unwrap();
+        fs::write(
+            root.join(".fractal/project.fractal"),
+            r#"{"project":{"slug":"coffee5","title":"Coffee5"}}"#,
+        )
+        .unwrap();
+        assert!(workspace_matches_project(
+            &root,
+            "coffee5-1785198755992",
+            "coffee five app"
+        ));
         fs::remove_dir_all(root).ok();
     }
 }

@@ -219,6 +219,12 @@ fractal pause --project 'EXACT_PROJECT_NAME'
 fractal status --running
 ```
 
+If the first status command lists exactly one active build and it is the build
+the user described, prefer `fractal pause` with no `--project` argument. Fractal
+will select that sole active run, avoiding transcription differences such as
+“Coffee Five” versus `coffee5`. If multiple builds are active, copy the absolute
+workspace path from status and pass that as `--project`.
+
 Copy the exact running name or absolute path from the first status command into
 the pause command. A conversational graph title such as “Racket app” is also
 accepted, but the printed running identifier is preferred.
@@ -230,10 +236,12 @@ or absolute workspace path. If a short name is ambiguous, use the absolute path
 printed by `fractal status --running`.
 
 Report success only after Fractal prints `Stopped PROJECT` and the final status
-no longer lists that project. Never substitute `--all` unless the user
-explicitly asks to pause every running build. Do not kill agent or terminal
-processes directly. If the first status command lists the requested project,
-do not claim the registry failed to recognize its managed Fractal Voice process.
+no longer lists that project. If it prints `Already paused`, the requested
+project was safely halted before this command and should be reported as already
+paused—not as a failure. Never substitute `--all` unless the user explicitly
+asks to pause every running build. Do not kill agent or terminal processes
+directly. If the first status command lists the requested project, do not claim
+the registry failed to recognize its managed Fractal Voice process.
 
 ### Change project and repository visibility
 
