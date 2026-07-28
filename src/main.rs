@@ -34,6 +34,7 @@ mod social;
 mod supervise;
 mod ui;
 mod verify;
+mod visibility;
 mod voice;
 mod work_builder;
 
@@ -205,6 +206,7 @@ fn run(cli: Cli) -> Result<()> {
         (None, Some(Command::Invite(args))) => social::invite(&args),
         (None, Some(Command::ShareX(args))) => social::share_x(&args),
         (None, Some(Command::ConnectX(args))) => social::connect_x(&args),
+        (None, Some(Command::Visibility(args))) => visibility::run(&args),
         (None, Some(Command::Bridge(args))) => match args.command {
             BridgeCommand::Serve { port } => {
                 bridge::serve(port, fractalwork.as_deref(), coordinate)

@@ -175,7 +175,7 @@ pub(crate) fn run(args: &SyncArgs) -> Result<()> {
             None
         }
     };
-    let response = upload(&workspace, repository.as_ref(), false)?;
+    let response = upload(&workspace, repository.as_ref(), false, false)?;
     println!("Project URL: {}", response.project_url);
     if let Some(repository) = repository {
         println!("GitHub graph: {}", repository.github_graph_url);
@@ -280,7 +280,7 @@ pub(crate) fn sync_runtime_now(workspace: &Path) -> Result<()> {
         None if crate::auth::load_session().is_err() => return Ok(()),
         None => {}
     }
-    upload(workspace, None, false).map(|_| ())
+    upload(workspace, None, false, false).map(|_| ())
 }
 
 /// Publish a halted graph ahead of queued routine transition uploads.
@@ -294,7 +294,7 @@ pub(crate) fn sync_runtime_halt_now(workspace: &Path) -> Result<()> {
         None if crate::auth::load_session().is_err() => return Ok(()),
         None => {}
     }
-    upload(workspace, None, true).map(|_| ())
+    upload(workspace, None, true, false).map(|_| ())
 }
 
 /// Poll the authenticated Fractal Society project for an owner-requested pause.
@@ -469,7 +469,7 @@ fn maybe_sync_with_options(workspace: &Path, publish_github: bool) -> Option<Str
     } else {
         None
     };
-    match upload(workspace, repository.as_ref(), false) {
+    match upload(workspace, repository.as_ref(), false, false) {
         Ok(response) => {
             println!("  ↗ Project URL: {}", response.project_url);
             if let Some(repository) = repository {
@@ -492,6 +492,7 @@ fn upload(
     workspace: &Path,
     repository: Option<&RepositoryLink>,
     priority: bool,
+    authoritative_local_visibility: bool,
 ) -> Result<SyncResponse> {
     let _permit = UPLOAD_SCHEDULER
         .get_or_init(UploadScheduler::default)
@@ -501,12 +502,33 @@ fn upload(
         crate::project_file::release_stale_assignments(workspace).ok();
     }
     let session = crate::auth::load_session()?;
-    let document = crate::project_file::load(workspace)?;
+    let mut document = crate::project_file::load(workspace)?;
     let endpoint = format!(
         "{}/api/cli/projects/{}",
         session.server.trim_end_matches('/'),
         document.project.slug
     );
+    let mut hosted_hash = None;
+    if !authoritative_local_visibility {
+        if let Ok(response) = ureq::get(&endpoint)
+            .set("Authorization", &format!("Bearer {}", session.access_token))
+            .timeout(std::time::Duration::from_secs(5))
+            .call()
+        {
+            let response_hash = response.header("ETag").and_then(parse_etag);
+            if let Ok(hosted) = serde_json::from_reader::<_, crate::project_file::FractalProject>(
+                response.into_reader(),
+            ) {
+                if hosted.graph_hash == document.graph_hash {
+                    hosted_hash = response_hash;
+                    if hosted.project.visibility != document.project.visibility {
+                        crate::project_file::set_visibility(workspace, &hosted.project.visibility)?;
+                        document = crate::project_file::load(workspace)?;
+                    }
+                }
+            }
+        }
+    }
     let mut body = serde_json::to_value(&document)?;
     if let Some(repository) = repository {
         let object = body
@@ -522,11 +544,13 @@ fn upload(
         );
     }
     let encoded = serde_json::to_string(&body)?;
-    let prior_hash = load_state(workspace)
-        .filter(|state| {
-            state.server == session.server && state.account == session.account_identity()
-        })
-        .map(|state| state.last_remote_hash);
+    let prior_hash = hosted_hash.or_else(|| {
+        load_state(workspace)
+            .filter(|state| {
+                state.server == session.server && state.account == session.account_identity()
+            })
+            .map(|state| state.last_remote_hash)
+    });
 
     let response = match put_project(
         &endpoint,
@@ -598,6 +622,15 @@ fn upload(
         },
     )?;
     Ok(result)
+}
+
+pub(crate) fn publish_visibility(workspace: &Path) -> Result<()> {
+    let repository = publish_local_github(workspace)?
+        .context("a GitHub origin is required to synchronize repository visibility")?;
+    let response = upload(workspace, Some(&repository), true, true)?;
+    println!("Project URL: {}", response.project_url);
+    println!("GitHub graph: {}", repository.github_graph_url);
+    Ok(())
 }
 
 fn is_safe_project_url(project_url: &str) -> bool {

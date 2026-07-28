@@ -230,6 +230,32 @@ no longer lists that project. Never substitute `--all` unless the user
 explicitly asks to pause every running build. Do not kill agent or terminal
 processes directly.
 
+### Change project and repository visibility
+
+ChatGPT Desktop and other external agents can preview a synchronized Fractal
+Society and GitHub visibility change:
+
+```sh
+fractal visibility --project 'EXACT_PROJECT_NAME' --public
+fractal visibility --project 'EXACT_PROJECT_NAME' --private
+```
+
+The first command is warning-only and must leave both systems unchanged. Read
+the warning to the user and wait for an explicit yes or no. A spoken “yes” or
+“no” applies only to the immediately preceding visibility preview for that
+exact project and target. On “no,” stop. On “yes,” repeat the identical command
+with `--yes`:
+
+```sh
+fractal visibility --project 'EXACT_PROJECT_NAME' --public --yes
+```
+
+Never infer approval from a request to inspect, share, or build a project.
+Making a repository public exposes its files and Git history, so do not bypass
+the warning. Report completion only after Fractal says both the project graph
+and GitHub repository have the requested visibility. The website offers the
+same guarded toggle on the execution graph and project settings page.
+
 If `.fractal/project.fractal` exists but no build is running, inspect
 `fractal projects` and resume the registered project. Do not manufacture
 checkout or completion entries. The current `fractal node` command is not a

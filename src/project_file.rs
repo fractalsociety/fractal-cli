@@ -155,7 +155,10 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
             slug,
             title,
             prompt: Some(prompt),
-            visibility: "private".to_owned(),
+            visibility: current
+                .as_ref()
+                .map(|document| document.project.visibility.clone())
+                .unwrap_or_else(|| "private".to_owned()),
         },
         graph_hash: graph_hash.to_owned(),
         graph: graph.clone(),
@@ -479,6 +482,17 @@ pub(crate) fn load(workspace: &Path) -> Result<FractalProject> {
     Ok(document)
 }
 
+pub(crate) fn set_visibility(workspace: &Path, visibility: &str) -> Result<()> {
+    if !matches!(visibility, "public" | "private" | "unlisted") {
+        bail!("unsupported project visibility `{visibility}`");
+    }
+    let _guard = project_file_lock();
+    let mut document = load(workspace)?;
+    document.project.visibility = visibility.to_owned();
+    document.updated_at = timestamp();
+    write_document(workspace, &document)
+}
+
 fn validate(document: &FractalProject) -> Result<()> {
     if document.schema != "fractal.project.v1"
         || document.graph_hash.is_empty()
@@ -745,6 +759,13 @@ mod tests {
         );
         let encoded = fs::read_to_string(stored)?;
         assert!(!encoded.contains(workspace.to_string_lossy().as_ref()));
+        set_visibility(&workspace, "public")?;
+        persist(&workspace, &graph, "Build an expense tracker")?;
+        assert_eq!(
+            load(&workspace)?.project.visibility,
+            "public",
+            "later graph updates must preserve an explicitly selected visibility"
+        );
         fs::remove_dir_all(workspace)?;
         Ok(())
     }

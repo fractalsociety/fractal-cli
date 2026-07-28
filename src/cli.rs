@@ -94,6 +94,8 @@ pub(crate) enum Command {
     ShareX(ShareXArgs),
     /// Connect the signed-in Fractal Society account to X in the browser.
     ConnectX(ConnectXArgs),
+    /// Preview or confirm a project and GitHub repository visibility change.
+    Visibility(VisibilityArgs),
     /// Deprecated compatibility bridge; external desktop apps should use `handoff`.
     Bridge(BridgeArgs),
     /// Print the Fractal CLI version.
@@ -187,6 +189,22 @@ pub(crate) struct ConnectXArgs {
     /// Print the secure URL instead of opening the browser.
     #[arg(long)]
     pub(crate) no_open: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct VisibilityArgs {
+    /// Project slug, folder name, or registered workspace path.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) project: String,
+    /// Make the Fractal Society graph and linked GitHub repository public.
+    #[arg(long, conflicts_with = "private", required_unless_present = "private")]
+    pub(crate) public: bool,
+    /// Make the Fractal Society graph and linked GitHub repository private.
+    #[arg(long, conflicts_with = "public", required_unless_present = "public")]
+    pub(crate) private: bool,
+    /// Confirm the warned visibility change.
+    #[arg(long)]
+    pub(crate) yes: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1129,6 +1147,39 @@ mod tests {
                 no_open: false,
                 ..
             })) if project == "coffee-2"
+        ));
+    }
+
+    #[test]
+    fn parses_guarded_project_visibility_commands() {
+        let preview =
+            Cli::try_parse_from(["fractal", "visibility", "--project", "coffee-2", "--public"])
+                .unwrap();
+        assert!(matches!(
+            preview.command,
+            Some(Command::Visibility(VisibilityArgs {
+                ref project,
+                public: true,
+                private: false,
+                yes: false,
+            })) if project == "coffee-2"
+        ));
+        let confirmed = Cli::try_parse_from([
+            "fractal",
+            "visibility",
+            "--project",
+            "coffee-2",
+            "--private",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            confirmed.command,
+            Some(Command::Visibility(VisibilityArgs {
+                private: true,
+                yes: true,
+                ..
+            }))
         ));
     }
 
