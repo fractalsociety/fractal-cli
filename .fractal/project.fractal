@@ -6,7 +6,7 @@
     "prompt": "Update the Fractal CLI and macOS Fractal Voice app, without Apple signing, notarization, or release submission, so portable .fractal execution graphs record compact, structurally meaningful learning data. Preserve backward compatibility wit",
     "visibility": "private"
   },
-  "graph_hash": "sha256:09bb59393349e2a2e8633e0ce13d2df000ca35c8a8adc2252288c4e749ecfe30",
+  "graph_hash": "sha256:573f1f253b42ac7065e941e4eb776bbbb5e7ccbec288ef1c398db5fbe2ba8ce4",
   "graph": {
     "compiler_version": "fractal-harnessc/0.1.0",
     "edges": [
@@ -49,6 +49,11 @@
         "condition": "success",
         "from": "define_learning_contract",
         "to": "integrate_portable_persistence"
+      },
+      {
+        "condition": "success",
+        "from": "define_learning_contract",
+        "to": "verify.define_learning_contract.harness"
       },
       {
         "condition": "success",
@@ -126,6 +131,8 @@
         "to": "audit_acceptance_and_scope"
       }
     ],
+    "evolution": 1,
+    "evolution_arm": "grow.verification",
     "execution_flow": {
       "schema": "fractal.execution_flow.v1",
       "waves": [
@@ -150,7 +157,8 @@
           "nodes": [
             "add_swift_graph_models",
             "enrich_graph_producers",
-            "integrate_portable_persistence"
+            "integrate_portable_persistence",
+            "verify.define_learning_contract.harness"
           ],
           "parallel_group": "wave-2",
           "wave": 2
@@ -203,9 +211,9 @@
         }
       ]
     },
-    "graph_hash": "sha256:09bb59393349e2a2e8633e0ce13d2df000ca35c8a8adc2252288c4e749ecfe30",
-    "graph_id": "fg_b65c138d7971435bd723bfdeb3e3ee96",
-    "harness_hash": "sha256:420114c6e7f371f0189111f287db1964b8e871fbd7e7e28be0585bee9c7befbb",
+    "graph_hash": "sha256:573f1f253b42ac7065e941e4eb776bbbb5e7ccbec288ef1c398db5fbe2ba8ce4",
+    "graph_id": "fg_a4a2b77c02116d6be7d3a86ed2b4a70e",
+    "harness_hash": "sha256:73f6ce785760fd33aac6efe76ce50e6fb9796ac367406c7ce4adcaeda604554a",
     "nodes": [
       {
         "budget": {
@@ -591,6 +599,33 @@
         "capability": "project.tests.execute",
         "execution": {
           "mode": "parallel",
+          "parallel_group": "wave-2",
+          "task_number": "2.4",
+          "wave": 2
+        },
+        "id": "verify.define_learning_contract.harness",
+        "instruction": "Re-run the acceptance suite against the produced artifact; fail if any test fails.",
+        "kind": "container",
+        "memory_scopes": [
+          "acceptance:spec",
+          "work:goal",
+          "workspace:root"
+        ],
+        "requires": [
+          "define_learning_contract.ready"
+        ],
+        "route_candidates": [
+          "apple-container://project-tests-execute-default"
+        ],
+        "sandbox_profile": "apple-container://local-work-v1"
+      },
+      {
+        "budget": {
+          "timeout_ms": 120000
+        },
+        "capability": "project.tests.execute",
+        "execution": {
+          "mode": "parallel",
           "parallel_group": "wave-5",
           "task_number": "5.1",
           "wave": 5
@@ -640,15 +675,59 @@
         "title": "Run the complete Rust quality gate"
       }
     ],
+    "parent_graph": "sha256:09bb59393349e2a2e8633e0ce13d2df000ca35c8a8adc2252288c4e749ecfe30",
     "schema": "fractal.execution_graph.v1",
     "target": "darwin-arm64",
-    "work_hash": "sha256:f5b1a2b4a84ccdb1ede76bb55225fdc6655354732c900cdda517dd10ce377e00"
+    "work_hash": "sha256:3f3cd1a955e6ccd688c0849c282aada8b2f943a92c036be727189a32c8899dbe"
   },
   "execution": {
     "schema": "fractal.execution_state.v1",
-    "phase": "executing",
-    "assignments": {},
-    "updated_at": "2026-07-29T10:01:21Z"
+    "phase": "halted",
+    "assignments": {
+      "add_swift_graph_models": {
+        "agent_id": "cursor",
+        "agent_label": "cursor",
+        "state": "released",
+        "checked_out_at": "2026-07-29T10:04:03Z",
+        "released_at": "2026-07-29T13:30:29Z"
+      },
+      "define_learning_contract": {
+        "agent_id": "cursor",
+        "agent_label": "cursor",
+        "state": "completed",
+        "checked_out_at": "2026-07-29T10:01:24Z",
+        "completed_at": "2026-07-29T10:04:02Z"
+      },
+      "enrich_graph_producers": {
+        "agent_id": "claude",
+        "agent_label": "claude",
+        "state": "released",
+        "checked_out_at": "2026-07-29T10:04:03Z",
+        "released_at": "2026-07-29T13:30:29Z"
+      },
+      "integrate_portable_persistence": {
+        "agent_id": "hermes",
+        "agent_label": "hermes",
+        "state": "released",
+        "checked_out_at": "2026-07-29T10:04:03Z",
+        "released_at": "2026-07-29T13:30:29Z"
+      },
+      "lead_plan": {
+        "agent_id": "codex",
+        "agent_label": "codex",
+        "state": "completed",
+        "checked_out_at": "2026-07-29T10:01:24Z",
+        "completed_at": "2026-07-29T10:01:24Z"
+      },
+      "verify.define_learning_contract.harness": {
+        "agent_id": "cursor",
+        "agent_label": "cursor",
+        "state": "completed",
+        "checked_out_at": "2026-07-29T10:04:03Z",
+        "completed_at": "2026-07-29T10:04:04Z"
+      }
+    },
+    "updated_at": "2026-07-29T13:30:29Z"
   },
-  "updated_at": "2026-07-29T10:01:21Z"
+  "updated_at": "2026-07-29T13:31:48Z"
 }
