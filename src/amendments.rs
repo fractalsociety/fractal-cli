@@ -10,6 +10,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::compile::{baseline_node_efficiency, node_efficiency_to_graph_value};
+use crate::efficiency::{validate_node_metadata, NodeEfficiencyMetadata};
+
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
@@ -44,6 +47,10 @@ struct PlannerTask {
     instruction: String,
     #[serde(default)]
     depends_on: Vec<String>,
+    /// Planning efficiency metadata; older planners may omit it and a
+    /// deterministic baseline is synthesized so every amended node exposes it.
+    #[serde(default)]
+    efficiency: Option<NodeEfficiencyMetadata>,
 }
 
 pub(crate) struct AppliedAmendment {
@@ -125,11 +132,39 @@ pub(crate) fn apply_pending(
         }
         match apply_one(&graph, &graph_hash, workspace, lead_agent, &request) {
             Ok(applied) => {
+                let created_nodes = applied
+                    .graph
+                    .get("nodes")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|node| node.get("id").and_then(Value::as_str))
+                    .filter(|id| {
+                        !graph
+                            .get("nodes")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .any(|node| node.get("id").and_then(Value::as_str) == Some(*id))
+                    })
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let graph_before_hash = graph_hash.clone();
                 graph = applied.graph;
                 graph_hash = applied.graph_hash;
                 if let Err(error) = crate::project_file::persist_evolved(workspace, &graph) {
                     eprintln!("  branch graph persist note: {error:#}");
                 } else {
+                    crate::project_file::record_graph_edit(
+                        workspace,
+                        &graph_before_hash,
+                        &request.action,
+                        (!request.task_ref.is_empty()).then_some(request.task_ref.as_str()),
+                        created_nodes,
+                        "human_amendment",
+                        &request.source,
+                    )
+                    .ok();
                     crate::project_sync::maybe_sync_runtime(workspace);
                 }
                 if request.command_id.starts_with("amend_") {
@@ -219,8 +254,15 @@ fn apply_one(
              `.fractal/fractal-amendment.json` as \
              {{\"tasks\":[{{\"id\":\"short_id\",\"title\":\"...\",\"capability\":\"code.generate\",\
              \"instruction\":\"concrete standalone implementation instruction with files and \
-             acceptance behavior\",\"depends_on\":[]}}]}}. Produce exactly one bounded task that \
-             can execute alongside the existing work in wave {wave}. Do not create a new feature \
+             acceptance behavior\",\"depends_on\":[],\"efficiency\":{{\
+             \"estimated_remaining_tokens\":12000,\"dependencies\":[],\
+             \"expected_artifact\":\"the concrete artifact produced\",\
+             \"files_or_systems_affected\":[\"path/to/file\"],\
+             \"verification_plan\":\"how the result is verified\",\"current_assumptions\":[],\
+             \"similarity_to_other_active_nodes\":{{}},\"confidence_still_useful\":0.9}}}}]}}. \
+             Produce exactly one bounded task that \
+             can execute alongside the existing work in wave {wave}. Scores and confidence live \
+             in 0..=1 and file references contain no whitespace. Do not create a new feature \
              branch and do not edit product files now.",
             wave = request.wave.unwrap_or_default(),
             instruction = request.instruction,
@@ -232,10 +274,17 @@ fn apply_one(
              {instruction}\n\nWrite only `.fractal/fractal-amendment.json`. It must be JSON shaped \
              as {{\"tasks\":[{{\"id\":\"short_id\",\"title\":\"...\",\
              \"capability\":\"code.generate\",\"instruction\":\"concrete standalone implementation \
-             instruction with files and acceptance behavior\",\"depends_on\":[\"anchor\"]}}]}}. \
+             instruction with files and acceptance behavior\",\"depends_on\":[\"anchor\"],\
+             \"efficiency\":{{\"estimated_remaining_tokens\":12000,\"dependencies\":[\"anchor\"],\
+             \"expected_artifact\":\"the concrete artifact produced\",\
+             \"files_or_systems_affected\":[\"path/to/file\"],\
+             \"verification_plan\":\"how the result is verified\",\"current_assumptions\":[],\
+             \"similarity_to_other_active_nodes\":{{}},\"confidence_still_useful\":0.9}}}}]}}. \
              Produce 2-8 bounded tasks forming a complete feature branch: implementation, any \
              supporting integration work, and a final project.tests.execute verification task. \
-             `depends_on` may use `anchor` or an earlier id in this new task list. Maximize \
+             `depends_on` may use `anchor` or an earlier id in this new task list; each task's \
+             `efficiency.dependencies` repeats its `depends_on`, scores and confidence live in \
+             0..=1, and file references contain no whitespace. Maximize \
              dependency-safe parallelism inside the branch. Do not edit product files now.",
             task_ref = request.task_ref,
             anchor = anchor.as_deref().unwrap_or_default(),
@@ -297,7 +346,8 @@ fn apply_one(
                 })
                 .collect::<Result<Vec<_>>>()?
         };
-        append_harness_task(&mut harness, &id, task, &dependencies)?;
+        let efficiency = resolve_task_efficiency(task, &dependencies, &id_map)?;
+        append_harness_task(&mut harness, &id, task, &dependencies, &efficiency)?;
         new_ids.push((task.id.clone(), id));
     }
     let sinks: Vec<String> = new_ids
@@ -457,11 +507,51 @@ fn record_amendment_metadata(
     Ok(())
 }
 
+/// Resolve the planning efficiency metadata an amended node will expose. The
+/// declared metadata (already range-validated) has its similarity peers remapped
+/// into the amendment's namespaced ids; a missing block gets a deterministic
+/// baseline. Either way the exposed `dependencies` are the node's ACTUAL
+/// resolved graph dependencies, so the compiler's consistency gate holds.
+fn resolve_task_efficiency(
+    task: &PlannerTask,
+    dependencies: &[String],
+    id_map: &BTreeMap<String, String>,
+) -> Result<NodeEfficiencyMetadata> {
+    let mut meta = match &task.efficiency {
+        Some(declared) => {
+            let mut meta = declared.clone();
+            meta.similarity_to_other_active_nodes = declared
+                .similarity_to_other_active_nodes
+                .iter()
+                .map(|(peer, score)| {
+                    (
+                        id_map.get(peer).cloned().unwrap_or_else(|| peer.clone()),
+                        *score,
+                    )
+                })
+                .collect();
+            meta
+        }
+        None => baseline_node_efficiency(
+            12_000,
+            Vec::new(),
+            task.title.trim(),
+            Vec::new(),
+            "Verified by the amendment's gating project.tests.execute task.",
+        ),
+    };
+    meta.dependencies = dependencies.to_vec();
+    validate_node_metadata(&meta)
+        .map_err(|error| anyhow!("amendment task `{}` efficiency metadata: {error}", task.id))?;
+    Ok(meta)
+}
+
 fn append_harness_task(
     harness: &mut Value,
     id: &str,
     task: &PlannerTask,
     dependencies: &[String],
+    efficiency: &NodeEfficiencyMetadata,
 ) -> Result<()> {
     let ready = |value: &str| format!("{value}.ready");
     let capability = normalize_capability(&task.capability);
@@ -478,6 +568,7 @@ fn append_harness_task(
         "produced_state": [ready(id)],
         "instruction": task.instruction.trim(),
         "budget": {"timeout_ms": if capability.ends_with("tests.execute") { 120_000 } else { 180_000 }},
+        "efficiency": node_efficiency_to_graph_value(efficiency),
     }));
     let edges = harness
         .get_mut("edges")
@@ -556,6 +647,19 @@ fn validate_tasks(tasks: &[PlannerTask], action: &str) -> Result<()> {
             .any(|dependency| dependency != "anchor" && !seen.contains(dependency))
         {
             bail!("amendment dependencies must reference anchor or an earlier new task");
+        }
+        if let Some(meta) = &task.efficiency {
+            validate_node_metadata(meta).map_err(|error| {
+                anyhow!("amendment task `{}` efficiency metadata: {error}", task.id)
+            })?;
+            if meta.dependencies.iter().any(|dependency| {
+                dependency != "anchor" && (dependency == &task.id || !seen.contains(dependency))
+            }) {
+                bail!(
+                    "amendment task `{}` efficiency dependencies must reference anchor or an earlier new task",
+                    task.id
+                );
+            }
         }
     }
     Ok(())
@@ -648,6 +752,121 @@ mod tests {
         assert_eq!(downstream, vec!["verify"]);
         assert!(resolve_wave_flow(&graph, 0).is_err());
         assert!(resolve_wave_flow(&graph, 9).is_err());
+    }
+
+    fn planner_task(
+        id: &str,
+        depends_on: Vec<String>,
+        efficiency: Option<NodeEfficiencyMetadata>,
+    ) -> PlannerTask {
+        PlannerTask {
+            id: id.to_owned(),
+            title: format!("{id} title"),
+            capability: "code.generate".to_owned(),
+            instruction: "do the work".to_owned(),
+            depends_on,
+            efficiency,
+        }
+    }
+
+    #[test]
+    fn declared_amendment_efficiency_is_range_and_reference_checked() {
+        let meta = baseline_node_efficiency(
+            5_000,
+            vec!["anchor".to_owned()],
+            "the new module",
+            vec![],
+            "verified by the branch tests task",
+        );
+        let tasks = vec![
+            planner_task("impl", vec!["anchor".to_owned()], Some(meta.clone())),
+            planner_task("verify", vec!["impl".to_owned()], None),
+        ];
+        validate_tasks(&tasks, "add_branch").expect("valid declared metadata");
+
+        let mut bad_range = meta.clone();
+        bad_range.confidence_still_useful = 2.0;
+        let tasks = vec![
+            planner_task("impl", vec!["anchor".to_owned()], Some(bad_range)),
+            planner_task("verify", vec!["impl".to_owned()], None),
+        ];
+        assert!(validate_tasks(&tasks, "add_branch")
+            .unwrap_err()
+            .to_string()
+            .contains("confidence_still_useful"));
+
+        let mut unknown_dependency = meta;
+        unknown_dependency.dependencies = vec!["ghost".to_owned()];
+        let tasks = vec![
+            planner_task("impl", vec!["anchor".to_owned()], Some(unknown_dependency)),
+            planner_task("verify", vec!["impl".to_owned()], None),
+        ];
+        assert!(validate_tasks(&tasks, "add_branch")
+            .unwrap_err()
+            .to_string()
+            .contains("efficiency dependencies"));
+    }
+
+    #[test]
+    fn resolved_amendment_efficiency_tracks_graph_dependencies_and_remaps_peers() {
+        let mut meta = baseline_node_efficiency(
+            5_000,
+            vec!["anchor".to_owned()],
+            "the new module",
+            vec![],
+            "verified by the branch tests task",
+        );
+        meta.similarity_to_other_active_nodes
+            .insert("other".to_owned(), 0.5);
+        let task = planner_task("impl", vec!["anchor".to_owned()], Some(meta));
+        let id_map = BTreeMap::from([
+            ("impl".to_owned(), "branch.cmd.impl".to_owned()),
+            ("other".to_owned(), "branch.cmd.other".to_owned()),
+        ]);
+        let resolved =
+            resolve_task_efficiency(&task, &["build".to_owned()], &id_map).expect("resolved");
+        assert_eq!(resolved.dependencies, vec!["build".to_owned()]);
+        assert_eq!(
+            resolved
+                .similarity_to_other_active_nodes
+                .get("branch.cmd.other"),
+            Some(&0.5)
+        );
+
+        // A legacy planner without the block gets a deterministic baseline.
+        let legacy = planner_task("impl", vec!["anchor".to_owned()], None);
+        let resolved =
+            resolve_task_efficiency(&legacy, &["build".to_owned()], &id_map).expect("baseline");
+        assert_eq!(resolved.dependencies, vec!["build".to_owned()]);
+        assert_eq!(resolved.expected_artifact, "impl title");
+        assert!((resolved.confidence_still_useful - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn appended_amendment_nodes_expose_efficiency_metadata() {
+        let mut harness = json!({"nodes": [], "edges": []});
+        let task = planner_task("impl", vec![], None);
+        let meta = resolve_task_efficiency(&task, &["build".to_owned()], &BTreeMap::new())
+            .expect("baseline metadata");
+        append_harness_task(
+            &mut harness,
+            "branch.cmd.impl",
+            &task,
+            &["build".to_owned()],
+            &meta,
+        )
+        .expect("append");
+        let node = &harness["nodes"][0];
+        assert_eq!(node["efficiency"]["dependencies"], json!(["build"]));
+        assert_eq!(
+            node["efficiency"]["estimated_remaining_tokens"],
+            json!(12_000)
+        );
+        assert_eq!(node["efficiency"]["confidence_still_useful"], json!("1"));
+        assert_eq!(
+            harness["edges"][0],
+            json!({"from": "build", "to": "branch.cmd.impl", "condition": "success"})
+        );
     }
 
     #[test]

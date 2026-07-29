@@ -42,33 +42,31 @@ mod receipt;
 mod tamper;
 
 pub use anchor::{
-    AnchorError, AnchorEvent, anchor_node_execution, anchor_promotion, anchor_route_decision,
-    anchor_verifier_verdict, commit_anchors, payload_hash, payload_hash_str,
+    anchor_node_execution, anchor_promotion, anchor_route_decision, anchor_verifier_verdict,
+    commit_anchors, payload_hash, payload_hash_str, AnchorError, AnchorEvent,
 };
 pub use boundary::{
-    BOUNDARY_ATTESTATION_SUBJECT, BoundaryAttestationError, IMMUTABLE_BOUNDARY_TARGETS,
     assert_boundary_attested, assert_mutation_outside_boundary, attest_boundary,
     boundary_commitment, chain_sits_inside_boundary, is_immutable_boundary_target,
+    BoundaryAttestationError, BOUNDARY_ATTESTATION_SUBJECT, IMMUTABLE_BOUNDARY_TARGETS,
 };
-pub use fold::{
-    FoldError, ScaleLevel, ScaleSpine, fold_child_into_parent, verify_child_anchored,
-};
+pub use fold::{fold_child_into_parent, verify_child_anchored, FoldError, ScaleLevel, ScaleSpine};
 pub use honesty::{
-    AcceptedClaim, Claim, ClaimKind, HonestyRejectReason, HonestyVerdict, accept_claim,
-    evaluate_claim,
+    accept_claim, evaluate_claim, AcceptedClaim, Claim, ClaimKind, HonestyRejectReason,
+    HonestyVerdict,
 };
-pub use ledger::{Block, ChainError, ScaleLedger, verify_blocks, GENESIS_PREV};
+pub use ledger::{verify_blocks, Block, ChainError, ScaleLedger, GENESIS_PREV};
 pub use lineage::{
-    DevelopmentAudit, DevelopmentalOp, DevelopmentalStep, LineageGraph, anchor_step,
-    audit_development, step_is_anchored,
+    anchor_step, audit_development, step_is_anchored, DevelopmentAudit, DevelopmentalOp,
+    DevelopmentalStep, LineageGraph,
 };
 pub use merkle::{keccak256, merkle_root, Hash256};
 pub use outcome::{
-    Consent, EvidenceEntry, ExportError, OutcomeField, SanitizedExport, Sensitivity,
-    replayable_evidence_root, sanitized_export, verify_replay,
+    replayable_evidence_root, sanitized_export, verify_replay, Consent, EvidenceEntry, ExportError,
+    OutcomeField, SanitizedExport, Sensitivity,
 };
 pub use receipt::{Receipt, ReceiptKind};
 pub use tamper::{
-    TamperFinding, TamperKind, assert_fold_untampered, detect_fold_tamper,
-    detect_local_block_tamper, latest_anchored_head, scan_spine_tamper,
+    assert_fold_untampered, detect_fold_tamper, detect_local_block_tamper, latest_anchored_head,
+    scan_spine_tamper, TamperFinding, TamperKind,
 };

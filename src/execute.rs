@@ -8,11 +8,19 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
+
+use crate::efficiency::{RepairAction, WasteType};
+use crate::efficiency_accounting::{self, EpisodeDraft, UpsertOutcome};
+use crate::efficiency_config::EfficiencyConfig;
+use crate::efficiency_detector::{self, NodeSnapshot, SnapshotState};
+use crate::efficiency_policy::{
+    self, ApprovalState, ImpactAssessment, PolicyDecision, PolicyRequest,
+};
 
 /// One node's execution record, for signed receipts + evidence roots.
 #[derive(Clone)]
@@ -483,7 +491,12 @@ fn validate_closeout(prd: &Value, closeout: &Value) -> Result<usize> {
 /// Best-effort report of a node transition to the live board so the dashboard
 /// turns yellow (checkout) then green (complete) as agents work.
 fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str, workspace: &Path) {
-    crate::run_control::node_transition(board, node, action, agent);
+    let board_action = if action.starts_with("failed_") {
+        "release"
+    } else {
+        action
+    };
+    crate::run_control::node_transition(board, node, board_action, agent);
     if let Err(error) = crate::project_file::transition(workspace, node, action, agent, agent) {
         eprintln!("  live graph state note: {error:#}");
     } else {
@@ -494,7 +507,7 @@ fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str, works
             "{}/api/tasks/{}/{}",
             base.trim_end_matches('/'),
             node,
-            action
+            board_action
         );
         let body = serde_json::json!({ "agent_id": agent, "agent_label": agent }).to_string();
         let _ = ureq::post(&url)
@@ -622,7 +635,10 @@ pub(crate) fn run_multi_agent(
                     std::thread::sleep(Duration::from_millis(mine.min(3) * 120));
                 }
                 // Atomically check out a ready, unclaimed node.
+                // The scheduler barrier serializes claims against efficiency
+                // boundary inspection so repairs never race checkout.
                 let claimed = {
+                    let _barrier = lock_scheduler();
                     let mut state = schedule.lock().expect("schedule lock");
                     if state.failed.is_some() || state.completed.len() == total {
                         break;
@@ -715,14 +731,24 @@ pub(crate) fn run_multi_agent(
                             }
                         } else {
                             state.failed = Some(id.clone());
-                            report_node(board, &id, "release", &agent, workspace);
+                            report_node(
+                                board,
+                                &id,
+                                if verified == Some(false) {
+                                    "failed_verification"
+                                } else {
+                                    "failed_execution"
+                                },
+                                &agent,
+                                workspace,
+                            );
                             println!("{clr}  [{agent}] ✗ {id}{suffix}");
                         }
                         ok
                     }
                     Err(error) => {
                         state.failed = Some(id.clone());
-                        report_node(board, &id, "release", &agent, workspace);
+                        report_node(board, &id, "failed_execution", &agent, workspace);
                         eprintln!("  [{agent}] ✗ {id}: {error:#}");
                         false
                     }
@@ -793,8 +819,20 @@ pub(crate) fn predecessor_map(graph: &Value) -> BTreeMap<String, Vec<String>> {
 /// The dependency-ready frontier: nodes not yet in `completed` whose predecessors
 /// are all complete, in the graph's node order. This is the mid-run supervisor's
 /// unit of work — one wave — after which morphogen triggers are evaluated.
+#[allow(dead_code)]
 pub(crate) fn ready_frontier(graph: &Value, completed: &BTreeSet<String>) -> Vec<Value> {
+    ready_frontier_filtered(graph, completed, None)
+}
+
+/// Ready frontier that also honors efficiency suppressions and one-wave delays.
+pub(crate) fn ready_frontier_filtered(
+    graph: &Value,
+    completed: &BTreeSet<String>,
+    runtime: Option<&EfficiencyRuntime>,
+) -> Vec<Value> {
     let preds = predecessor_map(graph);
+    let effective =
+        |id: &str| completed.contains(id) || runtime.is_some_and(|rt| rt.suppressed.contains(id));
     graph
         .get("nodes")
         .and_then(Value::as_array)
@@ -802,15 +840,562 @@ pub(crate) fn ready_frontier(graph: &Value, completed: &BTreeSet<String>) -> Vec
         .flatten()
         .filter(|node| {
             let id = node.get("id").and_then(Value::as_str).unwrap_or("");
-            !id.is_empty()
-                && !completed.contains(id)
-                && preds
-                    .get(id)
-                    .map(|list| list.iter().all(|pred| completed.contains(pred)))
-                    .unwrap_or(true)
+            if id.is_empty() || effective(id) {
+                return false;
+            }
+            if runtime.is_some_and(|rt| rt.deferred.contains(id)) {
+                return false;
+            }
+            preds
+                .get(id)
+                .map(|list| list.iter().all(|pred| effective(pred)))
+                .unwrap_or(true)
         })
         .cloned()
         .collect()
+}
+
+/// Shared barrier between efficiency boundary inspection and node checkout.
+fn scheduler_barrier() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Acquire the scheduler barrier (tests and checkout/boundary serialization).
+pub(crate) fn lock_scheduler() -> MutexGuard<'static, ()> {
+    scheduler_barrier()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Try to acquire the scheduler barrier without blocking (concurrency tests).
+#[allow(dead_code)]
+pub(crate) fn try_lock_scheduler() -> Option<MutexGuard<'static, ()>> {
+    scheduler_barrier().try_lock().ok()
+}
+
+/// Hash-safe runtime outcomes from efficiency repairs. Never rewrites committed
+/// graph bytes or `graph_hash`; cancelled work is suppressed from checkout.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EfficiencyRuntime {
+    pub(crate) suppressed: BTreeSet<String>,
+    pub(crate) deferred: BTreeSet<String>,
+    pub(crate) reassignments: BTreeMap<String, String>,
+    /// Monotonic token captured with each immutable snapshot for stale detection.
+    pub(crate) snapshot_epoch: u64,
+}
+
+/// Result of one between-wave efficiency boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BoundaryReport {
+    pub(crate) inspected: bool,
+    pub(crate) detections: usize,
+    pub(crate) episode_recorded: bool,
+    pub(crate) upsert: Option<UpsertOutcome>,
+    pub(crate) decision: Option<PolicyDecision>,
+    pub(crate) applied_action: Option<RepairAction>,
+    pub(crate) applied_nodes: Vec<String>,
+    pub(crate) stale_snapshot: bool,
+    pub(crate) graph_hash_unchanged: bool,
+}
+
+/// Run the deterministic efficiency hook under the scheduler barrier: snapshot
+/// active/queued nodes, detect waste, decide policy, record one idempotent
+/// episode, and apply only accepted/authorized hash-safe repairs. Revalidates
+/// readiness before mutation and refuses to proceed on a stale snapshot.
+pub(crate) fn run_efficiency_boundary(
+    graph: &Value,
+    graph_hash: &str,
+    completed: &BTreeSet<String>,
+    workspace: &Path,
+    config: &EfficiencyConfig,
+    runtime: &mut EfficiencyRuntime,
+) -> Result<BoundaryReport> {
+    run_efficiency_boundary_inner(
+        graph, graph_hash, completed, workspace, config, runtime, false,
+    )
+}
+
+/// When `simulate_stale` is true, the detected node is treated as completed after
+/// the snapshot (test injector) so apply revalidation refuses the mutation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_efficiency_boundary_inner(
+    graph: &Value,
+    graph_hash: &str,
+    completed: &BTreeSet<String>,
+    workspace: &Path,
+    config: &EfficiencyConfig,
+    runtime: &mut EfficiencyRuntime,
+    simulate_stale: bool,
+) -> Result<BoundaryReport> {
+    let _barrier = lock_scheduler();
+    let hash_before = graph
+        .get("graph_hash")
+        .and_then(Value::as_str)
+        .unwrap_or(graph_hash)
+        .to_owned();
+
+    // Clear one-wave delays from the previous boundary before snapshotting.
+    runtime.deferred.clear();
+    runtime.snapshot_epoch = runtime.snapshot_epoch.saturating_add(1);
+
+    let snapshots = snapshot_active_and_queued(graph, completed, runtime);
+    let detections = efficiency_detector::detect_waste(&snapshots);
+    if detections.is_empty() {
+        return Ok(BoundaryReport {
+            inspected: true,
+            detections: 0,
+            episode_recorded: false,
+            upsert: None,
+            decision: None,
+            applied_action: None,
+            applied_nodes: Vec::new(),
+            stale_snapshot: false,
+            graph_hash_unchanged: hash_before
+                == graph
+                    .get("graph_hash")
+                    .and_then(Value::as_str)
+                    .unwrap_or(graph_hash),
+        });
+    }
+
+    // One episode per boundary: highest-priority detection (detector order).
+    let detection = detections[0].clone();
+    let impact = assess_impact(graph, completed, runtime, &snapshots, &detection);
+    let approval = approval_state(config, detection.proposed_action);
+    let outcome = efficiency_policy::decide(&PolicyRequest {
+        mode: config.mode,
+        waste: detection.waste_type,
+        action: detection.proposed_action,
+        impact,
+        approval,
+        scoped_autonomy: config.high_impact_autonomy.clone(),
+    });
+
+    let accepted = matches!(
+        outcome.decision,
+        PolicyDecision::ApplyApproved | PolicyDecision::AutoApply
+    );
+    let human_override = approval == ApprovalState::Overridden;
+    let draft = EpisodeDraft {
+        waste_type: detection.waste_type,
+        detected_node: detection.detected_node.clone(),
+        affected_node_ids: detection.affected_node_ids.clone(),
+        proposed_action: detection.proposed_action,
+        accepted,
+        mode: config.mode,
+        estimated_tokens_avoided: detection.gross_avoidable_tokens,
+        estimation_basis: detection.estimation_basis.clone(),
+        confidence: detection.confidence,
+        realized_tokens_saved: None,
+        realization_basis: None,
+        actual_followup_result: Some(outcome.reason.to_owned()),
+        human_override,
+        actor: "fractal-efficiency".to_owned(),
+        evidence_refs: detection
+            .similarity_evidence
+            .iter()
+            .map(|evidence| {
+                format!(
+                    "sim:{}:{}:{:.2}",
+                    detection.detected_node, evidence.peer_node_id, evidence.score
+                )
+            })
+            .take(8)
+            .collect(),
+        config_hash: config.config_hash(),
+        detected_at: None,
+        resolved_at: accepted.then(crate::project_file::project_timestamp),
+    };
+
+    let upsert = match efficiency_accounting::record_episode(workspace, draft) {
+        Ok(outcome) => Some(outcome),
+        Err(error) => {
+            eprintln!("  efficiency episode note: {error:#}");
+            None
+        }
+    };
+
+    let mut applied_action = None;
+    let mut applied_nodes = Vec::new();
+    let mut stale_snapshot = false;
+
+    if accepted {
+        let mut live_completed = completed.clone();
+        if simulate_stale {
+            live_completed.insert(detection.detected_node.clone());
+        }
+        let live = snapshot_active_and_queued(graph, &live_completed, runtime);
+        let still_present = live.iter().any(|node| node.id == detection.detected_node)
+            && detection
+                .affected_node_ids
+                .iter()
+                .all(|id| live.iter().any(|node| node.id == *id) || live_completed.contains(id));
+        if !still_present {
+            stale_snapshot = true;
+        } else {
+            applied_nodes = apply_hash_safe_repair(
+                graph,
+                &live_completed,
+                runtime,
+                detection.proposed_action,
+                &detection,
+            );
+            if !applied_nodes.is_empty() || detection.proposed_action == RepairAction::SplitDrift {
+                applied_action = Some(detection.proposed_action);
+            }
+        }
+    }
+
+    let hash_after = graph
+        .get("graph_hash")
+        .and_then(Value::as_str)
+        .unwrap_or(graph_hash);
+    Ok(BoundaryReport {
+        inspected: true,
+        detections: detections.len(),
+        episode_recorded: upsert.is_some(),
+        upsert,
+        decision: Some(outcome.decision),
+        applied_action,
+        applied_nodes,
+        stale_snapshot,
+        graph_hash_unchanged: hash_before == hash_after,
+    })
+}
+
+/// Immutable active (next frontier) + queued (remaining) snapshot.
+pub(crate) fn snapshot_active_and_queued(
+    graph: &Value,
+    completed: &BTreeSet<String>,
+    runtime: &EfficiencyRuntime,
+) -> Vec<NodeSnapshot> {
+    let frontier_ids: BTreeSet<String> = ready_frontier_filtered(graph, completed, Some(runtime))
+        .iter()
+        .filter_map(|node| node.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| {
+            let id = node.get("id").and_then(Value::as_str)?;
+            if id.is_empty() || completed.contains(id) || runtime.suppressed.contains(id) {
+                return None;
+            }
+            let state = if frontier_ids.contains(id) {
+                SnapshotState::Active
+            } else {
+                SnapshotState::Queued
+            };
+            Some(node_to_snapshot(node, state))
+        })
+        .collect()
+}
+
+fn node_to_snapshot(node: &Value, state: SnapshotState) -> NodeSnapshot {
+    let id = node
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let title = node
+        .get("title")
+        .and_then(Value::as_str)
+        .or_else(|| node.get("id").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_owned();
+    let instruction = node
+        .get("instruction")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let efficiency = node.get("efficiency");
+    let meta =
+        efficiency.and_then(|raw| crate::compile::node_efficiency_from_graph_value(raw).ok());
+    let (
+        estimated_remaining_tokens,
+        dependencies,
+        expected_artifact,
+        files_or_systems_affected,
+        verification_plan,
+        current_assumptions,
+        similarity_to_other_active_nodes,
+        confidence_still_useful,
+    ) = match meta {
+        Some(meta) => (
+            meta.estimated_remaining_tokens,
+            meta.dependencies,
+            meta.expected_artifact,
+            meta.files_or_systems_affected,
+            meta.verification_plan,
+            meta.current_assumptions,
+            meta.similarity_to_other_active_nodes,
+            meta.confidence_still_useful,
+        ),
+        None => (
+            1_000,
+            Vec::new(),
+            title.clone(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            1.0,
+        ),
+    };
+    let verifies_node_ids = node
+        .get("verifies")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let verifies_node_ids = if verifies_node_ids.is_empty() {
+        efficiency
+            .and_then(|raw| raw.get("verifies_node_ids"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect()
+    } else {
+        verifies_node_ids
+    };
+    NodeSnapshot {
+        id,
+        state,
+        title,
+        instruction,
+        dependencies,
+        estimated_remaining_tokens,
+        expected_artifact,
+        files_or_systems_affected,
+        verification_plan,
+        current_assumptions,
+        similarity_to_other_active_nodes,
+        confidence_still_useful,
+        attempt_count: node
+            .get("attempt_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(1) as u32,
+        produced_artifacts: node
+            .get("produced_artifacts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect(),
+        referenced_artifacts: node
+            .get("referenced_artifacts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect(),
+        verifies_node_ids,
+    }
+}
+
+fn approval_state(config: &EfficiencyConfig, action: RepairAction) -> ApprovalState {
+    if config.overridden.contains(&action) {
+        ApprovalState::Overridden
+    } else if config.approved.contains(&action) {
+        ApprovalState::Granted
+    } else {
+        ApprovalState::NotRequested
+    }
+}
+
+fn assess_impact(
+    graph: &Value,
+    completed: &BTreeSet<String>,
+    runtime: &EfficiencyRuntime,
+    snapshots: &[NodeSnapshot],
+    detection: &efficiency_detector::EfficiencyDetection,
+) -> ImpactAssessment {
+    let exact_duplicate = match detection.waste_type {
+        WasteType::DuplicateTask | WasteType::DuplicateTest | WasteType::DuplicateResearch => {
+            let Some(detected) = snapshots
+                .iter()
+                .find(|node| node.id == detection.detected_node)
+            else {
+                return ImpactAssessment::default();
+            };
+            detection
+                .affected_node_ids
+                .iter()
+                .filter(|id| *id != &detection.detected_node)
+                .any(|peer| {
+                    snapshots.iter().any(|node| {
+                        node.id == *peer
+                            && node.title == detected.title
+                            && node.expected_artifact == detected.expected_artifact
+                    })
+                })
+        }
+        _ => false,
+    };
+    let critical = critical_path_nodes(graph, completed, runtime);
+    let on_critical_path = detection
+        .affected_node_ids
+        .iter()
+        .any(|id| critical.contains(id));
+    let active: BTreeSet<String> = snapshots
+        .iter()
+        .filter(|node| node.state == SnapshotState::Active)
+        .map(|node| node.id.clone())
+        .collect();
+    let succ = successor_map(graph);
+    let blocks_active_dependents = detection.affected_node_ids.iter().any(|id| {
+        succ.get(id)
+            .into_iter()
+            .flatten()
+            .any(|child| active.contains(child) && !runtime.suppressed.contains(child))
+    });
+    ImpactAssessment {
+        exact_duplicate,
+        on_critical_path,
+        blocks_active_dependents,
+    }
+}
+
+fn successor_map(graph: &Value) -> BTreeMap<String, Vec<String>> {
+    let mut succ: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for edge in graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let (Some(from), Some(to)) = (
+            edge.get("from").and_then(Value::as_str),
+            edge.get("to").and_then(Value::as_str),
+        ) {
+            succ.entry(from.to_owned()).or_default().push(to.to_owned());
+        }
+    }
+    succ
+}
+
+fn critical_path_nodes(
+    graph: &Value,
+    completed: &BTreeSet<String>,
+    runtime: &EfficiencyRuntime,
+) -> BTreeSet<String> {
+    let succ = successor_map(graph);
+    let mut depth: BTreeMap<String, usize> = BTreeMap::new();
+    let ids: Vec<String> = graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| node.get("id").and_then(Value::as_str).map(str::to_owned))
+        .filter(|id| !completed.contains(id) && !runtime.suppressed.contains(id))
+        .collect();
+    fn depth_of(
+        id: &str,
+        succ: &BTreeMap<String, Vec<String>>,
+        completed: &BTreeSet<String>,
+        suppressed: &BTreeSet<String>,
+        memo: &mut BTreeMap<String, usize>,
+    ) -> usize {
+        if let Some(value) = memo.get(id) {
+            return *value;
+        }
+        let child_depth = succ
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter(|child| !completed.contains(*child) && !suppressed.contains(*child))
+            .map(|child| 1 + depth_of(child, succ, completed, suppressed, memo))
+            .max()
+            .unwrap_or(0);
+        memo.insert(id.to_owned(), child_depth);
+        child_depth
+    }
+    for id in &ids {
+        depth_of(id, &succ, completed, &runtime.suppressed, &mut depth);
+    }
+    let max = depth.values().copied().max().unwrap_or(0);
+    depth
+        .into_iter()
+        .filter(|(_, value)| *value == max && max > 0)
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Apply a repair without rewriting committed graph JSON / `graph_hash`.
+fn apply_hash_safe_repair(
+    graph: &Value,
+    completed: &BTreeSet<String>,
+    runtime: &mut EfficiencyRuntime,
+    action: RepairAction,
+    detection: &efficiency_detector::EfficiencyDetection,
+) -> Vec<String> {
+    let mut touched = Vec::new();
+    let succ = successor_map(graph);
+    match action {
+        RepairAction::Cancel | RepairAction::Merge | RepairAction::ConsolidateVerifiers => {
+            // Keep the earliest affected node; suppress the detected duplicate /
+            // later consolidatable peers so checkout never claims them.
+            let keep = detection
+                .affected_node_ids
+                .iter()
+                .filter(|id| !completed.contains(*id))
+                .min()
+                .cloned();
+            for id in &detection.affected_node_ids {
+                if completed.contains(id) {
+                    continue;
+                }
+                if keep.as_ref() == Some(id) {
+                    continue;
+                }
+                if runtime.suppressed.insert(id.clone()) {
+                    touched.push(id.clone());
+                }
+            }
+            if touched.is_empty() && runtime.suppressed.insert(detection.detected_node.clone()) {
+                touched.push(detection.detected_node.clone());
+            }
+        }
+        RepairAction::DelayVerification => {
+            if runtime.deferred.insert(detection.detected_node.clone()) {
+                touched.push(detection.detected_node.clone());
+            }
+        }
+        RepairAction::StopDownstream => {
+            let mut stack = vec![detection.detected_node.clone()];
+            let mut seen = BTreeSet::new();
+            while let Some(current) = stack.pop() {
+                for child in succ.get(&current).into_iter().flatten() {
+                    if seen.insert(child.clone()) {
+                        if !completed.contains(child) && runtime.suppressed.insert(child.clone()) {
+                            touched.push(child.clone());
+                        }
+                        stack.push(child.clone());
+                    }
+                }
+            }
+        }
+        RepairAction::Reassign => {
+            let agent = "efficiency-reassigned".to_owned();
+            runtime
+                .reassignments
+                .insert(detection.detected_node.clone(), agent);
+            touched.push(detection.detected_node.clone());
+        }
+        RepairAction::SplitDrift => {
+            // Structure-changing split requires governed graph evolution (child
+            // hash). Hash-safe path: do not mutate the committed graph in place.
+            // Episode already records the authorized proposal.
+        }
+    }
+    touched.sort();
+    touched.dedup();
+    touched
 }
 
 /// Execute one node with one agent, timing it and reporting board transitions.
@@ -825,7 +1410,12 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
     let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
     let clr = crate::ui::CLEAR_LINE;
     println!("{clr}  [{agent}] ▸ {id} ({capability})");
-    report_node(board, &id, "checkout", agent, workspace);
+    // Serialize checkout with the efficiency boundary: never claim a node while
+    // inspection/repair holds the scheduler barrier.
+    {
+        let _barrier = lock_scheduler();
+        report_node(board, &id, "checkout", agent, workspace);
+    }
     let started = std::time::Instant::now();
     let result = run_node(node, agent, workspace);
     let latency_ms = started.elapsed().as_millis() as u64;
@@ -847,13 +1437,23 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
                 report_node(board, &id, "complete", agent, workspace);
                 println!("{clr}  [{agent}] ✓ {id}{suffix}");
             } else {
-                report_node(board, &id, "release", agent, workspace);
+                report_node(
+                    board,
+                    &id,
+                    if node_verified == Some(false) {
+                        "failed_verification"
+                    } else {
+                        "failed_execution"
+                    },
+                    agent,
+                    workspace,
+                );
                 println!("{clr}  [{agent}] ✗ {id}{suffix}");
             }
             ok
         }
         Err(error) => {
-            report_node(board, &id, "release", agent, workspace);
+            report_node(board, &id, "failed_execution", agent, workspace);
             eprintln!("  [{agent}] ✗ {id}: {error:#}");
             false
         }
@@ -873,12 +1473,26 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
 /// across the agent team, role-aware (the lead runs root/control nodes; workers
 /// run the coding/verify tasks; a solo agent runs everything). Returns one
 /// `NodeRun` per node. The mid-run supervisor calls this once per frontier.
+#[allow(dead_code)]
 pub(crate) fn run_wave(
     nodes: &[Value],
     graph: &Value,
     agents: &[String],
     workspace: &Path,
     board: Option<&str>,
+) -> Vec<NodeRun> {
+    run_wave_with_runtime(nodes, graph, agents, workspace, board, None)
+}
+
+/// Wave runner that honors efficiency reassignments without stealing in-flight
+/// checkouts (callers must already exclude suppressed/deferred nodes).
+pub(crate) fn run_wave_with_runtime(
+    nodes: &[Value],
+    graph: &Value,
+    agents: &[String],
+    workspace: &Path,
+    board: Option<&str>,
+    runtime: Option<&EfficiencyRuntime>,
 ) -> Vec<NodeRun> {
     let preds = predecessor_map(graph);
     let lead: &str = agents.first().map(String::as_str).unwrap_or("");
@@ -896,10 +1510,11 @@ pub(crate) fn run_wave(
             let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
             let is_root = preds.get(id).map(|p| p.is_empty()).unwrap_or(true);
             let is_control = capability.starts_with("control.");
-            // Role assignment mirrors the pull-queue: lead owns root + control,
-            // workers own the middle. Workers are handed out round-robin so a
-            // multi-node wave (e.g. implement ∥ author_tests) runs in parallel.
-            let agent: String = if !has_workers || is_root || is_control {
+            let agent: String = if let Some(reassigned) =
+                runtime.and_then(|rt| rt.reassignments.get(id)).cloned()
+            {
+                reassigned
+            } else if !has_workers || is_root || is_control {
                 lead.to_owned()
             } else {
                 let idx = next_worker.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -918,7 +1533,13 @@ pub(crate) fn run_wave(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::efficiency::EfficiencyMode;
+    use crate::efficiency_accounting::UpsertOutcome;
+    use crate::efficiency_policy::PolicyDecision;
     use serde_json::json;
+    use std::fs;
+    use std::sync::{Arc, Barrier};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn closeout_requires_evidence_for_every_acceptance_criterion() {
@@ -949,5 +1570,303 @@ mod tests {
             ]
         });
         assert!(validate_closeout(&prd, &incomplete).is_err());
+    }
+
+    fn temp_workspace() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "fractal-efficiency-boundary-{}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn efficiency_node(
+        id: &str,
+        title: &str,
+        tokens: u64,
+        artifact: &str,
+        similarity: BTreeMap<String, f64>,
+    ) -> Value {
+        let mut efficiency = crate::compile::baseline_efficiency_value(
+            tokens,
+            Vec::new(),
+            artifact,
+            vec![artifact.to_owned()],
+            "",
+        );
+        if let Some(object) = efficiency.as_object_mut() {
+            object.insert(
+                "similarity_to_other_active_nodes".to_owned(),
+                Value::Object(
+                    similarity
+                        .into_iter()
+                        .map(|(peer, score)| (peer, Value::String(score.to_string())))
+                        .collect(),
+                ),
+            );
+            object.insert(
+                "confidence_still_useful".to_owned(),
+                Value::String("0.9".to_owned()),
+            );
+        }
+        json!({
+            "id": id,
+            "title": title,
+            "capability": "code.generate",
+            "instruction": format!("build {title}"),
+            "efficiency": efficiency
+        })
+    }
+
+    fn duplicate_task_graph() -> (Value, String) {
+        let mut sim_b = BTreeMap::new();
+        sim_b.insert("task_a".to_owned(), 0.94);
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "eff-boundary",
+            "nodes": [
+                efficiency_node("task_a", "implement payments api", 8_000, "src/payments.rs", BTreeMap::new()),
+                efficiency_node("task_b", "implement payments api", 8_000, "src/payments.rs", sim_b),
+                {
+                    "id": "done",
+                    "title": "complete",
+                    "capability": "control.complete",
+                    "instruction": "close out",
+                    "efficiency": crate::compile::baseline_efficiency_value(
+                        100,
+                        vec!["task_a".to_owned(), "task_b".to_owned()],
+                        "closeout",
+                        Vec::new(),
+                        "manual"
+                    )
+                }
+            ],
+            "edges": [
+                {"from": "task_a", "to": "done"},
+                {"from": "task_b", "to": "done"}
+            ]
+        });
+        let hash = fractal_contracts::canonical_sha256(&graph).expect("hash");
+        graph["graph_hash"] = Value::String(hash.clone());
+        (graph, hash)
+    }
+
+    fn seed_workspace(workspace: &Path, graph: &Value) {
+        fs::create_dir_all(workspace).unwrap();
+        crate::project_file::persist(workspace, graph, "Efficiency Boundary").unwrap();
+    }
+
+    fn suggest_config() -> EfficiencyConfig {
+        EfficiencyConfig {
+            mode: EfficiencyMode::Suggest,
+            approved: Vec::new(),
+            overridden: Vec::new(),
+            high_impact_autonomy: Vec::new(),
+        }
+    }
+
+    fn auto_config() -> EfficiencyConfig {
+        EfficiencyConfig {
+            mode: EfficiencyMode::AutoOptimize,
+            approved: Vec::new(),
+            overridden: Vec::new(),
+            high_impact_autonomy: Vec::new(),
+        }
+    }
+
+    fn approved_cancel_config() -> EfficiencyConfig {
+        EfficiencyConfig {
+            mode: EfficiencyMode::Suggest,
+            approved: vec![RepairAction::Cancel],
+            overridden: Vec::new(),
+            high_impact_autonomy: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn efficiency_boundary_records_one_idempotent_episode_before_checkout() {
+        let workspace = temp_workspace();
+        let (graph, hash) = duplicate_task_graph();
+        seed_workspace(&workspace, &graph);
+        let completed = BTreeSet::new();
+        let mut runtime = EfficiencyRuntime::default();
+        let config = suggest_config();
+
+        let first =
+            run_efficiency_boundary(&graph, &hash, &completed, &workspace, &config, &mut runtime)
+                .unwrap();
+        assert!(first.inspected);
+        assert!(first.detections >= 1);
+        assert_eq!(first.decision, Some(PolicyDecision::Propose));
+        assert!(first.applied_action.is_none());
+        assert_eq!(first.upsert, Some(UpsertOutcome::Inserted));
+        assert!(first.graph_hash_unchanged);
+
+        let second =
+            run_efficiency_boundary(&graph, &hash, &completed, &workspace, &config, &mut runtime)
+                .unwrap();
+        assert!(matches!(
+            second.upsert,
+            Some(UpsertOutcome::IdempotentReplay) | Some(UpsertOutcome::Updated)
+        ));
+        let document = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(document.graph_hash, hash);
+        assert_eq!(document.efficiency.unwrap().episodes.len(), 1);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn approval_applies_cancel_without_changing_graph_hash() {
+        let workspace = temp_workspace();
+        let (graph, hash) = duplicate_task_graph();
+        let graph_bytes = serde_json::to_vec(&graph).unwrap();
+        seed_workspace(&workspace, &graph);
+        let completed = BTreeSet::new();
+        let mut runtime = EfficiencyRuntime::default();
+        let report = run_efficiency_boundary(
+            &graph,
+            &hash,
+            &completed,
+            &workspace,
+            &approved_cancel_config(),
+            &mut runtime,
+        )
+        .unwrap();
+        assert_eq!(report.decision, Some(PolicyDecision::ApplyApproved));
+        assert_eq!(report.applied_action, Some(RepairAction::Cancel));
+        assert!(!report.applied_nodes.is_empty());
+        assert!(report.graph_hash_unchanged);
+        assert_eq!(serde_json::to_vec(&graph).unwrap(), graph_bytes);
+        assert_eq!(graph["graph_hash"], hash);
+        let frontier = ready_frontier_filtered(&graph, &completed, Some(&runtime));
+        let ids: BTreeSet<_> = frontier
+            .iter()
+            .filter_map(|node| node.get("id").and_then(Value::as_str))
+            .collect();
+        assert!(!ids.contains("task_b") || !ids.contains("task_a"));
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn auto_optimize_cancels_exact_duplicate_hash_invariantly() {
+        let workspace = temp_workspace();
+        let (graph, hash) = duplicate_task_graph();
+        seed_workspace(&workspace, &graph);
+        let completed = BTreeSet::new();
+        let mut runtime = EfficiencyRuntime::default();
+        let report = run_efficiency_boundary(
+            &graph,
+            &hash,
+            &completed,
+            &workspace,
+            &auto_config(),
+            &mut runtime,
+        )
+        .unwrap();
+        assert!(matches!(
+            report.decision,
+            Some(PolicyDecision::AutoApply) | Some(PolicyDecision::Propose)
+        ));
+        assert!(report.graph_hash_unchanged);
+        assert_eq!(
+            crate::project_file::load(&workspace).unwrap().graph_hash,
+            hash
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn stale_snapshot_refuses_repair_mutation() {
+        let workspace = temp_workspace();
+        let (graph, hash) = duplicate_task_graph();
+        seed_workspace(&workspace, &graph);
+        let completed = BTreeSet::new();
+        let mut runtime = EfficiencyRuntime::default();
+        let report = run_efficiency_boundary_inner(
+            &graph,
+            &hash,
+            &completed,
+            &workspace,
+            &approved_cancel_config(),
+            &mut runtime,
+            true,
+        )
+        .unwrap();
+        assert!(report.stale_snapshot);
+        assert!(report.applied_nodes.is_empty());
+        assert!(runtime.suppressed.is_empty());
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn concurrency_barrier_blocks_checkout_during_boundary() {
+        let ready = Arc::new(Barrier::new(2));
+        let released = Arc::new(Barrier::new(2));
+        let ready2 = Arc::clone(&ready);
+        let released2 = Arc::clone(&released);
+        let holder = std::thread::spawn(move || {
+            let _guard = lock_scheduler();
+            ready2.wait();
+            released2.wait();
+        });
+        ready.wait();
+        assert!(
+            try_lock_scheduler().is_none(),
+            "checkout must not acquire the barrier while efficiency holds it"
+        );
+        released.wait();
+        holder.join().unwrap();
+        assert!(try_lock_scheduler().is_some());
+    }
+
+    #[test]
+    fn resume_boundary_is_idempotent_over_completed_seed() {
+        let workspace = temp_workspace();
+        let (graph, hash) = duplicate_task_graph();
+        seed_workspace(&workspace, &graph);
+        let mut completed = BTreeSet::new();
+        completed.insert("task_a".to_owned());
+        let mut runtime = EfficiencyRuntime::default();
+        let config = suggest_config();
+        let first =
+            run_efficiency_boundary(&graph, &hash, &completed, &workspace, &config, &mut runtime)
+                .unwrap();
+        assert!(first.inspected);
+        let episodes = crate::project_file::load(&workspace)
+            .unwrap()
+            .efficiency
+            .map(|data| data.episodes.len())
+            .unwrap_or(0);
+        let second =
+            run_efficiency_boundary(&graph, &hash, &completed, &workspace, &config, &mut runtime)
+                .unwrap();
+        assert!(second.inspected);
+        let episodes_after = crate::project_file::load(&workspace)
+            .unwrap()
+            .efficiency
+            .map(|data| data.episodes.len())
+            .unwrap_or(0);
+        assert_eq!(episodes, episodes_after);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn suppressed_nodes_do_not_enter_ready_frontier() {
+        let (graph, _) = duplicate_task_graph();
+        let completed = BTreeSet::new();
+        let mut runtime = EfficiencyRuntime::default();
+        runtime.suppressed.insert("task_b".to_owned());
+        let frontier = ready_frontier_filtered(&graph, &completed, Some(&runtime));
+        let ids: Vec<_> = frontier
+            .iter()
+            .filter_map(|node| node.get("id").and_then(Value::as_str))
+            .collect();
+        assert!(ids.contains(&"task_a"));
+        assert!(!ids.contains(&"task_b"));
     }
 }

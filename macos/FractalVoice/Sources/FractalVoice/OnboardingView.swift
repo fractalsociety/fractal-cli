@@ -593,6 +593,44 @@ struct OnboardingView: View {
             .padding(16)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
 
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Execution efficiency").font(.headline)
+                Text(EfficiencyControls.modeHelp)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel(EfficiencyControls.modeHelp)
+                Picker(
+                    "Efficiency mode",
+                    selection: Binding(
+                        get: { coordinator.efficiencyControls.mode },
+                        set: { coordinator.setEfficiencyMode($0) }
+                    )
+                ) {
+                    ForEach(ProjectGraphEfficiency.Mode.allCases, id: \.self) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .accessibilityHint(EfficiencyControls.modeHelp)
+                if let lifetime = coordinator.lifetimeEfficiencyPresentation() {
+                    Text("Lifetime \(lifetime.estimated)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help(EfficiencyControls.lifetimeEstimatedHelp)
+                        .accessibilityLabel("Lifetime \(lifetime.estimated)")
+                        .accessibilityHint(EfficiencyControls.lifetimeEstimatedHelp)
+                    Text("Lifetime \(lifetime.realized)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help(EfficiencyControls.lifetimeRealizedHelp)
+                        .accessibilityLabel("Lifetime \(lifetime.realized)")
+                        .accessibilityHint(EfficiencyControls.lifetimeRealizedHelp)
+                }
+            }
+            .padding(16)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+
             explanation(
                 icon: "doc.text.fill",
                 title: "Global agent instructions are included",

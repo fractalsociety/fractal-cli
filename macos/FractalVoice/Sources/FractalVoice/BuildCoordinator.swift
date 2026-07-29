@@ -38,6 +38,141 @@ private enum DialogueStage: Equatable {
     case awaitingNameAnswer
 }
 
+/// Governed efficiency preferences forwarded to Fractal CLI.
+/// Defaults match CLI suggest mode with no approvals or autonomy grants.
+struct EfficiencyControls: Equatable {
+    static let modeDefaultsKey = "FractalVoice.EfficiencyMode.v1"
+    static let approvedDefaultsKey = "FractalVoice.EfficiencyApproved.v1"
+    static let overriddenDefaultsKey = "FractalVoice.EfficiencyOverridden.v1"
+    static let highImpactDefaultsKey = "FractalVoice.EfficiencyHighImpact.v1"
+
+    /// High-impact actions that require named `--allow-high-impact` in auto-optimize.
+    static let highImpactActions: [ProjectGraphEfficiency.RepairAction] = [
+        .cancel, .stopDownstream, .reassign,
+    ]
+
+    static let lifetimeEstimatedHelp =
+        "Lifetime Estimated tokens avoided from detection confidence. "
+        + "This is a projection, not proven savings."
+    static let lifetimeRealizedHelp =
+        "Lifetime Realized tokens saved only when comparison evidence confirmed the outcome. "
+        + "Estimates are never counted as realized."
+    static let modeHelp =
+        "Observe records signals only. Suggest proposes interventions for approval. "
+        + "Auto-optimize may apply low-impact repairs; high-impact actions need named grants."
+
+    var mode: ProjectGraphEfficiency.Mode
+    var approved: [ProjectGraphEfficiency.RepairAction]
+    var overridden: [ProjectGraphEfficiency.RepairAction]
+    var highImpactAutonomy: [ProjectGraphEfficiency.RepairAction]
+
+    static let `default` = EfficiencyControls(
+        mode: .suggest,
+        approved: [],
+        overridden: [],
+        highImpactAutonomy: []
+    )
+
+    static func load(from defaults: UserDefaults = .standard) -> EfficiencyControls {
+        let mode = defaults.string(forKey: modeDefaultsKey)
+            .flatMap(ProjectGraphEfficiency.Mode.init(rawValue:)) ?? .suggest
+        return EfficiencyControls(
+            mode: mode,
+            approved: decodeActions(defaults.stringArray(forKey: approvedDefaultsKey)),
+            overridden: decodeActions(defaults.stringArray(forKey: overriddenDefaultsKey)),
+            highImpactAutonomy: decodeActions(defaults.stringArray(forKey: highImpactDefaultsKey))
+        ).sanitized()
+    }
+
+    func save(to defaults: UserDefaults = .standard) {
+        let clean = sanitized()
+        defaults.set(clean.mode.rawValue, forKey: Self.modeDefaultsKey)
+        defaults.set(clean.approved.map(\.rawValue), forKey: Self.approvedDefaultsKey)
+        defaults.set(clean.overridden.map(\.rawValue), forKey: Self.overriddenDefaultsKey)
+        defaults.set(
+            clean.highImpactAutonomy.map(\.rawValue),
+            forKey: Self.highImpactDefaultsKey
+        )
+    }
+
+    /// Drop contradictory or unsafe combinations before CLI forwarding.
+    func sanitized() -> EfficiencyControls {
+        var approved = Self.uniqueSorted(self.approved)
+        let overridden = Self.uniqueSorted(self.overridden)
+        approved.removeAll { overridden.contains($0) }
+        var highImpact = Self.uniqueSorted(self.highImpactAutonomy)
+            .filter { Self.highImpactActions.contains($0) }
+        highImpact.removeAll { overridden.contains($0) }
+
+        switch mode {
+        case .observe:
+            return EfficiencyControls(
+                mode: .observe,
+                approved: [],
+                overridden: [],
+                highImpactAutonomy: []
+            )
+        case .suggest:
+            return EfficiencyControls(
+                mode: .suggest,
+                approved: approved,
+                overridden: overridden,
+                highImpactAutonomy: []
+            )
+        case .autoOptimize:
+            return EfficiencyControls(
+                mode: .autoOptimize,
+                approved: approved,
+                overridden: overridden,
+                highImpactAutonomy: highImpact
+            )
+        }
+    }
+
+    /// CLI flags for `fractal efficiency` / `fractal run`. Default suggest with
+    /// no grants emits nothing so legacy ingest invocations stay unchanged.
+    var cliArguments: [String] {
+        let clean = sanitized()
+        let isLegacyDefault = clean.mode == .suggest
+            && clean.approved.isEmpty
+            && clean.overridden.isEmpty
+            && clean.highImpactAutonomy.isEmpty
+        if isLegacyDefault { return [] }
+
+        var arguments = ["--efficiency-mode", Self.cliModeValue(clean.mode)]
+        for action in clean.approved {
+            arguments += ["--approve-intervention", action.rawValue]
+        }
+        for action in clean.overridden {
+            arguments += ["--override-intervention", action.rawValue]
+        }
+        for action in clean.highImpactAutonomy {
+            arguments += ["--allow-high-impact", action.rawValue]
+        }
+        return arguments
+    }
+
+    static func cliModeValue(_ mode: ProjectGraphEfficiency.Mode) -> String {
+        switch mode {
+        case .observe: return "observe"
+        case .suggest: return "suggest"
+        case .autoOptimize: return "auto-optimize"
+        }
+    }
+
+    private static func decodeActions(_ raw: [String]?) -> [ProjectGraphEfficiency.RepairAction] {
+        uniqueSorted((raw ?? []).compactMap(ProjectGraphEfficiency.RepairAction.init(rawValue:)))
+    }
+
+    private static func uniqueSorted(
+        _ actions: [ProjectGraphEfficiency.RepairAction]
+    ) -> [ProjectGraphEfficiency.RepairAction] {
+        var seen = Set<ProjectGraphEfficiency.RepairAction>()
+        return actions.filter { seen.insert($0).inserted }
+            .sorted { $0.rawValue < $1.rawValue }
+    }
+}
+
 @MainActor
 final class BuildCoordinator: ObservableObject {
     @Published private(set) var state: VoiceState = .idle
@@ -46,6 +181,7 @@ final class BuildCoordinator: ObservableObject {
     @Published private(set) var shortcutReady = false
     @Published private(set) var shortcutStatus = "Registering ⌥Space…"
     @Published private(set) var microphoneDenied = false
+    @Published private(set) var efficiencyControls = EfficiencyControls.default
 
     private var process: Process?
     private var transcriptionProcess: Process?
@@ -94,7 +230,107 @@ final class BuildCoordinator: ObservableObject {
     init() {
         try? AppRuntime.prepareProjectsDirectory()
         try? vocabularyEngine.installPersonalTemplateIfNeeded()
+        efficiencyControls = EfficiencyControls.load()
         refreshVoiceReadiness()
+    }
+
+    func setEfficiencyMode(_ mode: ProjectGraphEfficiency.Mode) {
+        efficiencyControls.mode = mode
+        efficiencyControls = efficiencyControls.sanitized()
+        efficiencyControls.save()
+    }
+
+    func toggleApprovedIntervention(_ action: ProjectGraphEfficiency.RepairAction) {
+        if efficiencyControls.approved.contains(action) {
+            efficiencyControls.approved.removeAll { $0 == action }
+        } else {
+            efficiencyControls.approved.append(action)
+            efficiencyControls.overridden.removeAll { $0 == action }
+        }
+        efficiencyControls = efficiencyControls.sanitized()
+        efficiencyControls.save()
+    }
+
+    func toggleOverriddenIntervention(_ action: ProjectGraphEfficiency.RepairAction) {
+        if efficiencyControls.overridden.contains(action) {
+            efficiencyControls.overridden.removeAll { $0 == action }
+        } else {
+            efficiencyControls.overridden.append(action)
+            efficiencyControls.approved.removeAll { $0 == action }
+            efficiencyControls.highImpactAutonomy.removeAll { $0 == action }
+        }
+        efficiencyControls = efficiencyControls.sanitized()
+        efficiencyControls.save()
+    }
+
+    func toggleHighImpactAutonomy(_ action: ProjectGraphEfficiency.RepairAction) {
+        guard EfficiencyControls.highImpactActions.contains(action) else { return }
+        if efficiencyControls.highImpactAutonomy.contains(action) {
+            efficiencyControls.highImpactAutonomy.removeAll { $0 == action }
+        } else {
+            efficiencyControls.highImpactAutonomy.append(action)
+            efficiencyControls.overridden.removeAll { $0 == action }
+            setEfficiencyMode(.autoOptimize)
+            return
+        }
+        efficiencyControls = efficiencyControls.sanitized()
+        efficiencyControls.save()
+    }
+
+    /// Secondary lifetime labels from the active or most recent project file.
+    /// Absent or malformed efficiency data yields `nil` and never blocks builds.
+    func lifetimeEfficiencyPresentation() -> (
+        estimated: String,
+        confidenceAdjusted: String,
+        realized: String
+    )? {
+        guard let efficiency = loadLifetimeEfficiency() else { return nil }
+        return (
+            efficiency.lifetimeEstimatedLabel,
+            efficiency.lifetimeConfidenceAdjustedEstimatedLabel,
+            efficiency.lifetimeRealizedLabel
+        )
+    }
+
+    private func loadLifetimeEfficiency() -> ProjectGraphEfficiency? {
+        let candidates: [URL] = [
+            activeWorkspace?.appendingPathComponent(".fractal/project.fractal"),
+            Self.activeProjectURL()?.appendingPathComponent(".fractal/project.fractal"),
+            Self.mostRecentProjectFractalURL(),
+        ].compactMap { $0 }
+        for url in candidates {
+            if let efficiency = ProjectGraphEfficiency.load(from: url) {
+                return efficiency
+            }
+        }
+        return nil
+    }
+
+    /// Pure CLI argument builder used by builds and unit tests.
+    nonisolated static func efficiencyCLIArguments(
+        _ controls: EfficiencyControls
+    ) -> [String] {
+        controls.cliArguments
+    }
+
+    nonisolated private static func mostRecentProjectFractalURL() -> URL? {
+        let root = AppRuntime.projectsURL
+        guard let projects = try? FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+        return projects
+            .map { $0.appendingPathComponent(".fractal/project.fractal") }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+            .sorted { lhs, rhs in
+                let left = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey])
+                    .contentModificationDate) ?? .distantPast
+                let right = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey])
+                    .contentModificationDate) ?? .distantPast
+                return left > right
+            }
+            .first
     }
 
     func refreshVoiceReadiness() {
@@ -1108,8 +1344,8 @@ final class BuildCoordinator: ObservableObject {
             command.executableURL = executable
             command.arguments = [
                 "ingest", "--source", "fractal-mac-app",
-                "--format", "text", "--stdin"
-            ]
+                "--format", "text", "--stdin",
+            ] + Self.efficiencyCLIArguments(EfficiencyControls.load())
             command.environment = Self.processEnvironment()
             command.standardInput = stdin
             command.standardOutput = output
@@ -1332,8 +1568,8 @@ final class BuildCoordinator: ObservableObject {
             "--format", "text",
             "--stdin",
             "--managed-project",
-            "--project-name", projectName
-        ]
+            "--project-name", projectName,
+        ] + Self.efficiencyCLIArguments(efficiencyControls)
         task.environment = Self.processEnvironment()
         task.standardInput = stdin
         task.standardOutput = combinedOutput
@@ -1601,8 +1837,16 @@ final class BuildCoordinator: ObservableObject {
         hud = nil
         if exitCode == 0 {
             state = .idle
-            latestActivity = "Build finished — press ⌥Space for another project"
-            notify(title: "Fractal build finished", body: "Your project run completed.")
+            let projectFile = activeWorkspace?
+                .appendingPathComponent(".fractal/project.fractal")
+            let learningSummary = projectFile.flatMap {
+                ProjectGraphLearning.load(from: $0)
+            }?.outcome?.compactSummary
+            // Lifetime efficiency is secondary menu/detail only — never replace
+            // the learning summary or claim Estimated totals are Realized.
+            latestActivity = learningSummary.map { "Build finished — \($0)" }
+                ?? "Build finished — press ⌥Space for another project"
+            notify(title: "Fractal build finished", body: learningSummary ?? "Your project run completed.")
         } else {
             let detail = outputBuffer
                 .split(separator: "\n")

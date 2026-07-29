@@ -79,6 +79,7 @@ pub(crate) fn run(fractalwork_override: Option<&Path>, coordinate_flag: bool) ->
                     &completed,
                     Some(&completed),
                     false,
+                    None,
                 );
             } else {
                 crate::checkpoint::discard(&cp.key);
@@ -127,6 +128,7 @@ pub(crate) fn run(fractalwork_override: Option<&Path>, coordinate_flag: bool) ->
                     port,
                     &agents,
                     backend,
+                    None,
                 ) {
                     eprintln!("error: {error:#}");
                 }
@@ -424,6 +426,7 @@ pub(crate) fn execute_ingested(
     fractalwork_override: Option<&Path>,
     coordinate_flag: bool,
     port: u16,
+    efficiency: Option<&crate::efficiency_config::EfficiencyConfig>,
 ) -> Result<Option<crate::execute::RunOutcome>> {
     // Voice/typed control command: "resume project 3" continues that numbered
     // project regardless of the current folder, instead of starting a build.
@@ -477,6 +480,7 @@ pub(crate) fn execute_ingested(
             &completed,
             Some(&completed),
             false,
+            efficiency,
         ));
     }
 
@@ -487,6 +491,7 @@ pub(crate) fn execute_ingested(
         port,
         &agents,
         backend,
+        efficiency,
     )
 }
 
@@ -644,6 +649,7 @@ pub(crate) fn resume_project(
         &completed,
         Some(&completed),
         false,
+        None,
     ))
 }
 
@@ -654,6 +660,7 @@ fn execute_request(
     port: u16,
     agents: &[String],
     backend: Backend,
+    efficiency: Option<&crate::efficiency_config::EfficiencyConfig>,
 ) -> Result<Option<crate::execute::RunOutcome>> {
     let _run = crate::run_control::RunGuard::start_or_join(workspace, request, port)?;
     println!("\n→ Understanding: {request}");
@@ -732,6 +739,7 @@ fn execute_request(
                 &BTreeSet::new(),
                 None,
                 planning_browser_opened,
+                efficiency,
             )
         }
         None => {
@@ -757,6 +765,7 @@ fn drive_committed_graph(
     resume_completed: &BTreeSet<String>,
     board_preseed: Option<&BTreeSet<String>>,
     browser_already_open: bool,
+    efficiency: Option<&crate::efficiency_config::EfficiencyConfig>,
 ) -> Option<crate::execute::RunOutcome> {
     let _run = match crate::run_control::RunGuard::start_or_join(workspace, request, port) {
         Ok(run) => run,
@@ -874,16 +883,29 @@ fn drive_committed_graph(
     );
 
     let spinner = crate::ui::Spinner::start("working");
-    let outcome = crate::orchestrate::run_end_to_end(
-        hash,
-        workspace,
-        agents,
-        Some(&board_url),
-        backend,
-        &facts,
-        request,
-        resume_completed,
-    );
+    let outcome = match efficiency {
+        Some(efficiency) => crate::orchestrate::run_end_to_end_with_efficiency(
+            hash,
+            workspace,
+            agents,
+            Some(&board_url),
+            backend,
+            &facts,
+            request,
+            resume_completed,
+            Some(efficiency),
+        ),
+        None => crate::orchestrate::run_end_to_end(
+            hash,
+            workspace,
+            agents,
+            Some(&board_url),
+            backend,
+            &facts,
+            request,
+            resume_completed,
+        ),
+    };
     let elapsed = crate::ui::format_elapsed(spinner.stop());
     match outcome {
         Ok(outcome) => {

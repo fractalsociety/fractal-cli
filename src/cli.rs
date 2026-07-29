@@ -61,6 +61,8 @@ pub(crate) enum Command {
     Run(RunArgs),
     /// Run the graph morphogenesis loop (stub).
     Evolve(EvolveArgs),
+    /// Inspect or configure governed execution-efficiency controls.
+    Efficiency(EfficiencyArgs),
     /// Inspect or control one graph node (stub).
     Node(NodeArgs),
     /// Safely clear a fractal workspace/test folder (guarded + confirmed).
@@ -472,6 +474,10 @@ pub(crate) struct IngestArgs {
     /// Confirmed display name for a native managed project.
     #[arg(long, hide = true, requires = "managed_project", value_name = "NAME")]
     pub(crate) project_name: Option<String>,
+
+    /// Efficiency governance for the build started by this input event.
+    #[command(flatten)]
+    pub(crate) efficiency: IngestEfficiencyOpts,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -679,6 +685,118 @@ pub(crate) struct RunArgs {
     /// Print the Coordinate invocation without running it.
     #[arg(long)]
     pub(crate) dry_run: bool,
+
+    /// Efficiency governance for this run (observation and reporting only;
+    /// scheduler mutation is not wired yet).
+    #[command(flatten)]
+    pub(crate) efficiency: EfficiencyOpts,
+}
+
+/// Governed execution-efficiency operating mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub(crate) enum EfficiencyModeArg {
+    /// Record efficiency signals only; never propose or apply interventions.
+    Observe,
+    /// Propose interventions; every one requires explicit approval (default).
+    #[default]
+    Suggest,
+    /// Apply low-impact interventions autonomously; high-impact actions still
+    /// require per-action `--allow-high-impact` grants.
+    #[value(alias = "auto_optimize")]
+    AutoOptimize,
+}
+
+impl std::fmt::Display for EfficiencyModeArg {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Observe => "observe",
+            Self::Suggest => "suggest",
+            Self::AutoOptimize => "auto-optimize",
+        })
+    }
+}
+
+/// Repair actions addressable from the command line (contract names accepted
+/// as aliases, e.g. `delay_verification`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum InterventionArg {
+    Merge,
+    Cancel,
+    #[value(alias = "delay_verification")]
+    DelayVerification,
+    #[value(alias = "stop_downstream")]
+    StopDownstream,
+    Reassign,
+    #[value(alias = "consolidate_verifiers")]
+    ConsolidateVerifiers,
+    #[value(alias = "split_drift")]
+    SplitDrift,
+}
+
+/// Efficiency governance controls shared by `fractal efficiency` and
+/// `fractal run`.
+#[derive(Debug, Args)]
+pub(crate) struct EfficiencyOpts {
+    /// Efficiency operating mode.
+    #[arg(
+        long = "efficiency-mode",
+        visible_alias = "mode",
+        value_enum,
+        value_name = "MODE",
+        default_value_t = EfficiencyModeArg::Suggest
+    )]
+    pub(crate) efficiency_mode: EfficiencyModeArg,
+
+    /// Explicitly approve a proposed intervention (repeatable).
+    #[arg(long = "approve-intervention", value_enum, value_name = "ACTION")]
+    pub(crate) approve_intervention: Vec<InterventionArg>,
+
+    /// Explicitly override (decline) a proposed intervention (repeatable).
+    #[arg(long = "override-intervention", value_enum, value_name = "ACTION")]
+    pub(crate) override_intervention: Vec<InterventionArg>,
+
+    /// Grant scoped autonomy for one named high-impact action (repeatable;
+    /// valid only with `--efficiency-mode auto-optimize`).
+    #[arg(long = "allow-high-impact", value_enum, value_name = "ACTION")]
+    pub(crate) allow_high_impact: Vec<InterventionArg>,
+}
+
+/// Ingest efficiency controls omit the `--mode` shorthand because ingest
+/// already uses that flag for transcript normalization.
+#[derive(Debug, Args)]
+pub(crate) struct IngestEfficiencyOpts {
+    #[arg(
+        long = "efficiency-mode",
+        value_enum,
+        value_name = "MODE",
+        default_value_t = EfficiencyModeArg::Suggest
+    )]
+    pub(crate) efficiency_mode: EfficiencyModeArg,
+
+    #[arg(long = "approve-intervention", value_enum, value_name = "ACTION")]
+    pub(crate) approve_intervention: Vec<InterventionArg>,
+
+    #[arg(long = "override-intervention", value_enum, value_name = "ACTION")]
+    pub(crate) override_intervention: Vec<InterventionArg>,
+
+    #[arg(long = "allow-high-impact", value_enum, value_name = "ACTION")]
+    pub(crate) allow_high_impact: Vec<InterventionArg>,
+}
+
+/// Arguments accepted by `fractal efficiency`.
+#[derive(Debug, Args)]
+pub(crate) struct EfficiencyArgs {
+    #[command(flatten)]
+    pub(crate) controls: EfficiencyOpts,
+
+    /// Workspace whose recorded efficiency data should be summarized
+    /// (defaults to the current directory).
+    #[arg(long, value_name = "PATH")]
+    pub(crate) repo: Option<PathBuf>,
+
+    /// Print the resolved configuration and status as JSON.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 /// Arguments accepted by the morphogenesis evolve loop (P4.7).
@@ -1214,6 +1332,152 @@ mod tests {
                 ref project_name
             })) if project_name == "Hello World"
         ));
+    }
+
+    #[test]
+    fn efficiency_defaults_to_suggest_with_no_grants() {
+        let cli = Cli::try_parse_from(["fractal", "efficiency"]).unwrap();
+        let Some(Command::Efficiency(args)) = cli.command else {
+            panic!("expected efficiency command");
+        };
+        assert_eq!(args.controls.efficiency_mode, EfficiencyModeArg::Suggest);
+        assert!(args.controls.approve_intervention.is_empty());
+        assert!(args.controls.override_intervention.is_empty());
+        assert!(args.controls.allow_high_impact.is_empty());
+        assert!(args.repo.is_none());
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn parses_efficiency_modes_and_intervention_input() {
+        let cli = Cli::try_parse_from([
+            "fractal",
+            "efficiency",
+            "--mode",
+            "auto-optimize",
+            "--approve-intervention",
+            "merge",
+            "--approve-intervention",
+            "delay_verification",
+            "--override-intervention",
+            "split-drift",
+            "--allow-high-impact",
+            "cancel",
+            "--allow-high-impact",
+            "stop_downstream",
+            "--repo",
+            "/tmp/project",
+            "--json",
+        ])
+        .unwrap();
+        let Some(Command::Efficiency(args)) = cli.command else {
+            panic!("expected efficiency command");
+        };
+        assert_eq!(
+            args.controls.efficiency_mode,
+            EfficiencyModeArg::AutoOptimize
+        );
+        assert_eq!(
+            args.controls.approve_intervention,
+            vec![InterventionArg::Merge, InterventionArg::DelayVerification]
+        );
+        assert_eq!(
+            args.controls.override_intervention,
+            vec![InterventionArg::SplitDrift]
+        );
+        assert_eq!(
+            args.controls.allow_high_impact,
+            vec![InterventionArg::Cancel, InterventionArg::StopDownstream]
+        );
+        assert_eq!(args.repo, Some(PathBuf::from("/tmp/project")));
+        assert!(args.json);
+
+        // The contract-style underscore spelling of the mode is accepted too.
+        let observe =
+            Cli::try_parse_from(["fractal", "efficiency", "--efficiency-mode", "observe"]).unwrap();
+        assert!(matches!(
+            observe.command,
+            Some(Command::Efficiency(EfficiencyArgs {
+                controls: EfficiencyOpts {
+                    efficiency_mode: EfficiencyModeArg::Observe,
+                    ..
+                },
+                ..
+            }))
+        ));
+        let underscored =
+            Cli::try_parse_from(["fractal", "efficiency", "--mode", "auto_optimize"]).unwrap();
+        assert!(matches!(
+            underscored.command,
+            Some(Command::Efficiency(EfficiencyArgs {
+                controls: EfficiencyOpts {
+                    efficiency_mode: EfficiencyModeArg::AutoOptimize,
+                    ..
+                },
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_efficiency_values() {
+        assert!(Cli::try_parse_from(["fractal", "efficiency", "--mode", "autonomous"]).is_err());
+        assert!(Cli::try_parse_from([
+            "fractal",
+            "efficiency",
+            "--approve-intervention",
+            "rewrite"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn run_carries_flattened_efficiency_controls() {
+        let run = Cli::try_parse_from([
+            "fractal",
+            "run",
+            "--graph",
+            "sha256:0123",
+            "--efficiency-mode",
+            "observe",
+        ])
+        .unwrap();
+        let Some(Command::Run(args)) = run.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.efficiency.efficiency_mode, EfficiencyModeArg::Observe);
+        assert!(args.efficiency.allow_high_impact.is_empty());
+
+        let default_run = Cli::try_parse_from(["fractal", "run", "--work", "work-7"]).unwrap();
+        let Some(Command::Run(args)) = default_run.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.efficiency.efficiency_mode, EfficiencyModeArg::Suggest);
+    }
+
+    #[test]
+    fn ingest_carries_native_efficiency_controls() {
+        let ingest = Cli::try_parse_from([
+            "fractal",
+            "ingest",
+            "--stdin",
+            "--efficiency-mode",
+            "auto-optimize",
+            "--allow-high-impact",
+            "stop-downstream",
+        ])
+        .unwrap();
+        let Some(Command::Ingest(args)) = ingest.command else {
+            panic!("expected ingest command");
+        };
+        assert_eq!(
+            args.efficiency.efficiency_mode,
+            EfficiencyModeArg::AutoOptimize
+        );
+        assert_eq!(
+            args.efficiency.allow_high_impact,
+            vec![InterventionArg::StopDownstream]
+        );
     }
 
     #[test]

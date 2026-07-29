@@ -16,7 +16,9 @@ use fractal_chain::{
 use serde_json::{json, Value};
 
 fn parse_hash(value: &Value, field: &str) -> Result<Hash256, String> {
-    let text = value.as_str().ok_or_else(|| format!("{field} must be a string"))?;
+    let text = value
+        .as_str()
+        .ok_or_else(|| format!("{field} must be a string"))?;
     let text = text.strip_prefix("sha256:").unwrap_or(text);
     if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!("{field} must be 64 hex chars"));
@@ -39,7 +41,9 @@ fn hex(hash: &Hash256) -> String {
 
 fn run() -> Result<Value, String> {
     let mut raw = String::new();
-    std::io::stdin().read_to_string(&mut raw).map_err(|e| e.to_string())?;
+    std::io::stdin()
+        .read_to_string(&mut raw)
+        .map_err(|e| e.to_string())?;
     let input: Value = serde_json::from_str(&raw).map_err(|e| format!("invalid JSON: {e}"))?;
 
     let operation = match input["operation"].as_str() {
@@ -49,13 +53,19 @@ fn run() -> Result<Value, String> {
         _ => return Err("operation must be grow|repair|differentiate".into()),
     };
     let scale = input["scale"].as_str().ok_or("scale required")?;
-    let scale_level = fractal_chain::ScaleLevel::parse(scale)
-        .ok_or_else(|| format!("unknown scale: {scale}"))?;
+    let scale_level =
+        fractal_chain::ScaleLevel::parse(scale).ok_or_else(|| format!("unknown scale: {scale}"))?;
     let step = DevelopmentalStep {
         scale: scale_level,
-        subject: input["subject"].as_str().ok_or("subject required")?.to_owned(),
+        subject: input["subject"]
+            .as_str()
+            .ok_or("subject required")?
+            .to_owned(),
         operation,
-        step_id: input["step_id"].as_str().ok_or("step_id required")?.to_owned(),
+        step_id: input["step_id"]
+            .as_str()
+            .ok_or("step_id required")?
+            .to_owned(),
         motivating_outcome: parse_hash(&input["motivating"], "motivating")?,
         produced_outcome: parse_hash(&input["produced"], "produced")?,
     };
@@ -65,7 +75,9 @@ fn run() -> Result<Value, String> {
     seed[..scale.len().min(32)].copy_from_slice(&scale.as_bytes()[..scale.len().min(32)]);
     let mut ledger = ScaleLedger::new(scale, SigningKey::from_bytes(&seed));
     anchor_step(&mut ledger, &step, 1);
-    ledger.verify().map_err(|e| format!("ledger did not verify: {e}"))?;
+    ledger
+        .verify()
+        .map_err(|e| format!("ledger did not verify: {e}"))?;
     let anchored = step_is_anchored(&ledger, &step);
 
     Ok(json!({

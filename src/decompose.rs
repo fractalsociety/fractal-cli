@@ -19,6 +19,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::compile::{
+    baseline_efficiency_value, baseline_node_efficiency, node_efficiency_to_graph_value,
+};
+use crate::efficiency::{validate_node_metadata, NodeEfficiencyMetadata};
 use crate::graph_store;
 use crate::work_builder::{build_work_from_nl, NlWorkRequest};
 
@@ -36,6 +40,10 @@ const ALLOWED_CAPS: [&str; 6] = [
 /// Bounds so a runaway plan cannot produce an unusable graph.
 const MAX_TASKS: usize = 40;
 const MIN_TASKS: usize = 2;
+
+/// Remaining-token estimate assumed for a planned task when an older lead omits
+/// the efficiency block (legacy plans stay executable).
+const DEFAULT_TASK_TOKEN_ESTIMATE: u64 = 12_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct StructuredPrd {
@@ -92,6 +100,7 @@ struct Task {
     instruction: String,
     depends_on: Vec<String>,
     execution: TaskExecution,
+    efficiency: NodeEfficiencyMetadata,
     #[serde(skip)]
     declared_execution: Option<TaskExecution>,
 }
@@ -173,6 +182,13 @@ fn planning_preview_harness(source_name: &str, lead_agent: &str) -> Value {
                 "The lead is reading {source_name}, selecting architecture, defining acceptance criteria, and decomposing the execution graph."
             ),
             "budget": {"timeout_ms": 900_000},
+            "efficiency": baseline_efficiency_value(
+                4_000,
+                vec![],
+                "fractal-plan.json",
+                vec!["fractal-plan.json".to_owned()],
+                "The plan is validated and compiled into the full execution graph.",
+            ),
         }],
         "edges": [],
     })
@@ -358,10 +374,21 @@ fn planning_prompt(source_text: &str, source_name: &str) -> String {
                \"mode\": \"parallel|sequential\",\n\
                \"wave\": 1,\n\
                \"parallel_group\": \"wave-1 (required for parallel; omit for sequential)\"\n\
+             }},\n\
+             \"efficiency\": {{\n\
+               \"estimated_remaining_tokens\": 12000,\n\
+               \"dependencies\": [\"same ids as depends_on\"],\n\
+               \"expected_artifact\": \"the concrete artifact this task produces\",\n\
+               \"files_or_systems_affected\": [\"path/to/file\"],\n\
+               \"verification_plan\": \"how this task's result is verified\",\n\
+               \"current_assumptions\": [\"assumption this task relies on\"],\n\
+               \"similarity_to_other_active_nodes\": {{\"other_task_id\": 0.2}},\n\
+               \"confidence_still_useful\": 0.95\n\
              }}\n\
            }}]\n\
          }}\n\n\
          Rules: {min}-{max} tasks; ids unique; `depends_on` must reference earlier task ids only and form a DAG (no cycles); \
+         every task MUST include the `efficiency` block: `dependencies` repeats its `depends_on`, `similarity_to_other_active_nodes` scores overlap with other task ids in 0..=1 (empty object when none overlap), `confidence_still_useful` is in 0..=1, and file references contain no whitespace or credentials; \
          every task MUST label its dependency-ready execution wave and whether it runs `parallel` (two or more tasks become ready in that same wave) or `sequential` (it is the only task in its wave); \
          roots are wave 1, every other task is wave 1 + the maximum wave of its dependencies, and all parallel tasks in wave N use `parallel_group`: `wave-N`; \
          every `instruction` must be concrete and standalone (name the files to create/edit and what they must contain/do); \
@@ -443,6 +470,7 @@ fn parse_and_validate(raw: &str) -> Result<PlannedProject> {
             })
             .unwrap_or_default();
         let declared_execution = parse_execution_declaration(item, &id)?;
+        let efficiency = task_efficiency(item, &id, &title, &depends_on)?;
         tasks.push(Task {
             id,
             title,
@@ -454,6 +482,7 @@ fn parse_and_validate(raw: &str) -> Result<PlannedProject> {
                 wave: 0,
                 parallel_group: None,
             },
+            efficiency,
             declared_execution,
         });
     }
@@ -478,6 +507,22 @@ fn parse_and_validate(raw: &str) -> Result<PlannedProject> {
             }
             if !ids.contains(dependency) {
                 bail!("task `{}` depends on unknown task `{dependency}`", task.id);
+            }
+        }
+        for dependency in &task.efficiency.dependencies {
+            if !task.depends_on.contains(dependency) {
+                bail!(
+                    "task `{}` efficiency dependency `{dependency}` is not one of its depends_on",
+                    task.id
+                );
+            }
+        }
+        for peer in task.efficiency.similarity_to_other_active_nodes.keys() {
+            if peer == &task.id || !ids.contains(peer) {
+                bail!(
+                    "task `{}` efficiency similarity peer `{peer}` must name another planned task",
+                    task.id
+                );
             }
         }
     }
@@ -525,6 +570,33 @@ fn parse_execution_declaration(item: &Value, id: &str) -> Result<Option<TaskExec
         wave,
         parallel_group,
     }))
+}
+
+/// Decode and range-validate a task's planning efficiency metadata. A plan from
+/// an older lead that omits the block gets a deterministic baseline so every
+/// newly planned node still exposes the required fields.
+fn task_efficiency(
+    item: &Value,
+    id: &str,
+    title: &str,
+    depends_on: &[String],
+) -> Result<NodeEfficiencyMetadata> {
+    match item.get("efficiency") {
+        Some(raw) => {
+            let meta: NodeEfficiencyMetadata = serde_json::from_value(raw.clone())
+                .with_context(|| format!("task `{id}` efficiency metadata is malformed"))?;
+            validate_node_metadata(&meta)
+                .map_err(|error| anyhow!("task `{id}` efficiency metadata: {error}"))?;
+            Ok(meta)
+        }
+        None => Ok(baseline_node_efficiency(
+            DEFAULT_TASK_TOKEN_ESTIMATE,
+            depends_on.to_vec(),
+            if title.trim().is_empty() { id } else { title },
+            Vec::new(),
+            "The plan's gating tests task verifies the acceptance criteria.",
+        )),
+    }
 }
 
 fn assign_and_validate_execution_waves(tasks: &mut [Task]) -> Result<()> {
@@ -655,6 +727,13 @@ fn build_harness_genome(tasks: &[Task], prd_name: &str) -> Value {
         "produced_state": [ready("lead_plan")],
         "instruction": "The lead-authored .fractal/lead-prd.json and validated task DAG are ready.",
         "budget": {"timeout_ms": 5_000},
+        "efficiency": baseline_efficiency_value(
+            500,
+            vec![],
+            ".fractal/lead-prd.json",
+            vec![".fractal/lead-prd.json".to_owned()],
+            "The task DAG was validated (acyclic, capabilities, gating tests) before compilation.",
+        ),
     })];
     let mut edges = Vec::new();
 
@@ -670,6 +749,11 @@ fn build_harness_genome(tasks: &[Task], prd_name: &str) -> Value {
         } else {
             180_000
         };
+        // Expose the planning metadata with the node's ACTUAL graph
+        // dependencies (roots hang off the durable lead_plan node), so the
+        // compiler's dependency-consistency gate always holds.
+        let mut efficiency = task.efficiency.clone();
+        efficiency.dependencies = dependencies.clone();
         nodes.push(json!({
             "id": task.id,
             "title": task.title,
@@ -679,6 +763,7 @@ fn build_harness_genome(tasks: &[Task], prd_name: &str) -> Value {
             "produced_state": [ready(&task.id)],
             "instruction": task.instruction,
             "budget": {"timeout_ms": budget},
+            "efficiency": node_efficiency_to_graph_value(&efficiency),
         }));
         for dep in &dependencies {
             edges.push(json!({"from": dep, "to": task.id, "condition": "success"}));
@@ -707,6 +792,13 @@ fn build_harness_genome(tasks: &[Task], prd_name: &str) -> Value {
         "produced_state": ["outcome_verified"],
         "instruction": "Review the finished implementation against .fractal/lead-prd.json. Inspect the changes and verification evidence, run any final checks needed, then write .fractal/closeout.json with schema fractal.closeout.v1, status approved, a non-empty summary, an acceptance array containing every PRD acceptance id with passed=true and concrete evidence, and a risks array. Do not approve if any criterion is unsupported.",
         "budget": {"timeout_ms": 180_000},
+        "efficiency": baseline_efficiency_value(
+            8_000,
+            sinks.iter().map(|task| task.id.clone()).collect(),
+            ".fractal/closeout.json",
+            vec![".fractal/closeout.json".to_owned()],
+            "Approval requires every PRD acceptance criterion evidenced as passed.",
+        ),
     }));
 
     json!({
@@ -927,6 +1019,135 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("gating tests"));
+    }
+
+    #[test]
+    fn planned_tasks_expose_efficiency_metadata_with_defaults() {
+        // Legacy plan shape (no efficiency block) still parses; every task and
+        // synthesized node exposes the required planning metadata.
+        let raw = valid_plan(
+            r#"[
+          {"id": "core", "title": "core", "capability": "code.generate", "instruction": "write core.py", "depends_on": []},
+          {"id": "tests", "title": "tests", "capability": "python.tests.execute", "instruction": "run pytest", "depends_on": ["core"]}
+        ]"#,
+        );
+        let planned = parse_and_validate(&raw).expect("legacy plan");
+        let core = &planned.tasks[0];
+        assert_eq!(
+            core.efficiency.estimated_remaining_tokens,
+            DEFAULT_TASK_TOKEN_ESTIMATE
+        );
+        assert_eq!(core.efficiency.expected_artifact, "core");
+        assert!((core.efficiency.confidence_still_useful - 1.0).abs() < f64::EPSILON);
+        assert_eq!(planned.tasks[1].efficiency.dependencies, vec!["core"]);
+
+        let genome = build_harness_genome(&planned.tasks, "X.md");
+        let nodes = genome["nodes"].as_array().unwrap();
+        assert!(nodes.iter().all(|node| node.get("efficiency").is_some()));
+        let node = |id: &str| nodes.iter().find(|node| node["id"] == id).unwrap();
+        // Roots hang off the durable lead_plan node, and the metadata says so.
+        assert_eq!(
+            node("core")["efficiency"]["dependencies"],
+            json!(["lead_plan"])
+        );
+        assert_eq!(node("tests")["efficiency"]["dependencies"], json!(["core"]));
+        assert_eq!(
+            node("tests")["efficiency"]["confidence_still_useful"],
+            json!("1")
+        );
+        assert_eq!(
+            node("lead_closeout")["efficiency"]["dependencies"],
+            json!(["tests"])
+        );
+    }
+
+    #[test]
+    fn declared_efficiency_metadata_is_validated_and_preserved() {
+        let with_efficiency = |efficiency: &str| {
+            valid_plan(&format!(
+                r#"[
+          {{"id":"core","capability":"code.generate","instruction":"write core.py","depends_on":[],
+            "efficiency":{efficiency}}},
+          {{"id":"tests","capability":"project.tests.execute","instruction":"run pytest","depends_on":["core"]}}
+        ]"#
+            ))
+        };
+        let good = with_efficiency(
+            r#"{"estimated_remaining_tokens":9000,"dependencies":[],"expected_artifact":"core.py",
+                "files_or_systems_affected":["core.py"],"verification_plan":"pytest passes",
+                "current_assumptions":["python3 available"],
+                "similarity_to_other_active_nodes":{"tests":0.25},"confidence_still_useful":0.8}"#,
+        );
+        let planned = parse_and_validate(&good).expect("declared metadata");
+        let core = planned.tasks.iter().find(|task| task.id == "core").unwrap();
+        assert_eq!(core.efficiency.estimated_remaining_tokens, 9_000);
+        assert_eq!(
+            core.efficiency
+                .similarity_to_other_active_nodes
+                .get("tests"),
+            Some(&0.25)
+        );
+        assert!((core.efficiency.confidence_still_useful - 0.8).abs() < f64::EPSILON);
+
+        let bad_range = with_efficiency(
+            r#"{"estimated_remaining_tokens":9000,"dependencies":[],"expected_artifact":"core.py",
+                "files_or_systems_affected":[],"verification_plan":"pytest passes",
+                "current_assumptions":[],"similarity_to_other_active_nodes":{},
+                "confidence_still_useful":1.5}"#,
+        );
+        assert!(parse_and_validate(&bad_range)
+            .unwrap_err()
+            .to_string()
+            .contains("confidence_still_useful"));
+
+        let bad_peer = with_efficiency(
+            r#"{"estimated_remaining_tokens":9000,"dependencies":[],"expected_artifact":"core.py",
+                "files_or_systems_affected":[],"verification_plan":"pytest passes",
+                "current_assumptions":[],"similarity_to_other_active_nodes":{"ghost":0.2},
+                "confidence_still_useful":0.8}"#,
+        );
+        assert!(parse_and_validate(&bad_peer)
+            .unwrap_err()
+            .to_string()
+            .contains("similarity peer"));
+
+        let bad_dependency = with_efficiency(
+            r#"{"estimated_remaining_tokens":9000,"dependencies":["tests"],"expected_artifact":"core.py",
+                "files_or_systems_affected":[],"verification_plan":"pytest passes",
+                "current_assumptions":[],"similarity_to_other_active_nodes":{},
+                "confidence_still_useful":0.8}"#,
+        );
+        assert!(parse_and_validate(&bad_dependency)
+            .unwrap_err()
+            .to_string()
+            .contains("efficiency dependency"));
+    }
+
+    #[test]
+    fn decomposed_genome_compiles_with_efficiency_metadata_on_every_node() {
+        let raw = valid_plan(
+            r#"[
+          {"id": "core", "capability": "code.generate", "instruction": "write core.py", "depends_on": []},
+          {"id": "tests", "capability": "python.tests.execute", "instruction": "run pytest", "depends_on": ["core"]}
+        ]"#,
+        );
+        let planned = parse_and_validate(&raw).expect("plan");
+        let genome = build_harness_genome(&planned.tasks, "X.md");
+        let work = build_work_value("Execute the plan").expect("work");
+        let graph = crate::compile::recompile(&work, &genome, "darwin-arm64")
+            .expect("decomposed genome compiles");
+        crate::graph_store::verify_graph_document(&graph).expect("valid graph hash");
+        for id in ["lead_plan", "core", "tests", "lead_closeout"] {
+            let node = graph["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["id"] == id)
+                .unwrap_or_else(|| panic!("missing node {id}"));
+            let decoded = crate::compile::node_efficiency_from_graph_value(&node["efficiency"])
+                .unwrap_or_else(|error| panic!("node {id}: {error}"));
+            validate_node_metadata(&decoded).unwrap_or_else(|error| panic!("node {id}: {error}"));
+        }
     }
 
     #[test]

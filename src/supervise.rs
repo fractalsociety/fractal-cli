@@ -202,7 +202,7 @@ fn detail_for(built: bool, verified: Option<bool>, failed: &Option<String>) -> S
 }
 
 /// Drive the graph wave by wave, firing proactive morphogens between waves.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn run_supervised(
     graph: Value,
     graph_hash: &str,
@@ -214,8 +214,45 @@ pub(crate) fn run_supervised(
     resume_completed: &BTreeSet<String>,
     recorder: Option<&crate::checkpoint::Recorder>,
 ) -> Result<Supervised> {
+    run_supervised_with_efficiency(
+        graph,
+        graph_hash,
+        graph_id,
+        workspace,
+        agents,
+        board,
+        ledger,
+        resume_completed,
+        recorder,
+        None,
+    )
+}
+
+/// Supervised wave runner with optional efficiency governance. When `efficiency`
+/// is `None`, suggest-mode defaults are used (record/propose only).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_supervised_with_efficiency(
+    graph: Value,
+    graph_hash: &str,
+    graph_id: &str,
+    workspace: &Path,
+    agents: &[String],
+    board: Option<&str>,
+    ledger: &RunLedger,
+    resume_completed: &BTreeSet<String>,
+    recorder: Option<&crate::checkpoint::Recorder>,
+    efficiency: Option<&crate::efficiency_config::EfficiencyConfig>,
+) -> Result<Supervised> {
+    let default_efficiency = crate::efficiency_config::EfficiencyConfig {
+        mode: crate::efficiency::EfficiencyMode::Suggest,
+        approved: Vec::new(),
+        overridden: Vec::new(),
+        high_impact_autonomy: Vec::new(),
+    };
+    let efficiency = efficiency.unwrap_or(&default_efficiency);
     let mut graph = graph;
     let mut hash = graph_hash.to_owned();
+    let mut runtime = execute::EfficiencyRuntime::default();
 
     // Resume: seed the completed set (only nodes still present in the graph) so the
     // ready frontier skips them and execution continues from where it stopped.
@@ -237,6 +274,9 @@ pub(crate) fn run_supervised(
     let mut grown: BTreeSet<String> = BTreeSet::new();
     let mut midrun = 0u32;
     let min_hops = min_verify_hops();
+    // Efficiency runs after a frontier completes (or on resume before the next
+    // checkout), never concurrently with checkout.
+    let mut between_waves = !completed.is_empty();
     loop {
         let previous_hash = hash.clone();
         (graph, hash) = crate::amendments::apply_pending(graph, hash, workspace, &agents[0]);
@@ -245,6 +285,8 @@ pub(crate) fn run_supervised(
             completed.remove("lead_closeout");
             let amended_nodes = all_node_ids(&graph);
             completed.retain(|id| amended_nodes.contains(id));
+            runtime.suppressed.retain(|id| amended_nodes.contains(id));
+            runtime.deferred.retain(|id| amended_nodes.contains(id));
             crate::run_control::set_graph(&hash, board.unwrap_or_default());
             if let Some(recorder) = recorder {
                 recorder.record(&hash, &completed, all_node_ids(&graph).len());
@@ -257,12 +299,48 @@ pub(crate) fn run_supervised(
                 }
             }
         }
-        let frontier = execute::ready_frontier(&graph, &completed);
+
+        if between_waves {
+            match execute::run_efficiency_boundary(
+                &graph,
+                &hash,
+                &completed,
+                workspace,
+                efficiency,
+                &mut runtime,
+            ) {
+                Ok(report) if report.inspected => {
+                    if report.detections > 0 {
+                        println!(
+                            "  ✧ efficiency boundary: {} detection(s) · decision={:?} · recorded={} · applied={:?}",
+                            report.detections,
+                            report.decision,
+                            report.episode_recorded,
+                            report.applied_action
+                        );
+                    }
+                    if report.stale_snapshot {
+                        eprintln!("  efficiency boundary note: stale snapshot — repair skipped");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("  efficiency boundary note: {error:#}"),
+            }
+        }
+
+        let frontier = execute::ready_frontier_filtered(&graph, &completed, Some(&runtime));
         if frontier.is_empty() {
             break;
         }
 
-        let runs = execute::run_wave(&frontier, &graph, agents, workspace, board);
+        let runs = execute::run_wave_with_runtime(
+            &frontier,
+            &graph,
+            agents,
+            workspace,
+            board,
+            Some(&runtime),
+        );
 
         for run in &runs {
             if execute::is_build(&capability_of(&graph, &run.node)) && run.ok {
@@ -283,12 +361,13 @@ pub(crate) fn run_supervised(
         if let Some(recorder) = recorder {
             recorder.record(&hash, &completed, all_node_ids(&graph).len());
         }
+        between_waves = true;
 
         if failed.is_some() {
             break; // the caller's failure-evolution loop takes over from here.
         }
-        if completed.len() >= all_node_ids(&graph).len() {
-            break; // whole graph done.
+        if completed.len() + runtime.suppressed.len() >= all_node_ids(&graph).len() {
+            break; // whole graph done (including efficiency-suppressed nodes).
         }
 
         // ── Mid-run morphogenesis: read this wave's progress signals ──

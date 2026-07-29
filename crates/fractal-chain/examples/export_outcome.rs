@@ -81,7 +81,11 @@ fn run() -> Result<Value, String> {
         let sensitivity = match field["sensitivity"].as_str() {
             Some("public") => Sensitivity::Public,
             Some("private") => Sensitivity::Private,
-            _ => return Err(format!("fields[{index}].sensitivity must be public|private")),
+            _ => {
+                return Err(format!(
+                    "fields[{index}].sensitivity must be public|private"
+                ))
+            }
         };
         fields.push(OutcomeField {
             key: key.to_owned(),
@@ -100,8 +104,8 @@ fn run() -> Result<Value, String> {
     let replay_ok = verify_replay(&entries, evidence_root);
 
     // Consent-gated, sanitized export (fail-closed inside the crate).
-    let export = sanitized_export(&entries, &fields, &consent)
-        .map_err(|e| format!("export denied: {e}"))?;
+    let export =
+        sanitized_export(&entries, &fields, &consent).map_err(|e| format!("export denied: {e}"))?;
 
     Ok(json!({
         "replay_ok": replay_ok,
