@@ -385,6 +385,9 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         menu.addItem(item("Support", #selector(openSupport)))
         menu.addItem(item("Privacy Policy", #selector(openPrivacyPolicy)))
         menu.addItem(.separator())
+        addEfficiencyControls(to: menu)
+        addLifetimeEfficiencySummary(to: menu)
+        menu.addItem(.separator())
         if coordinator.state == .building {
             menu.addItem(item("Stop Current Build", #selector(stopCurrentBuild)))
             menu.addItem(item("Restart Voice Command", #selector(restartVoiceCommand)))
@@ -394,10 +397,172 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         menu.addItem(item("Quit Fractal Voice", #selector(quit), key: "q"))
     }
 
+    private func addEfficiencyControls(to menu: NSMenu) {
+        let controls = coordinator.efficiencyControls
+        let modeRoot = NSMenuItem(
+            title: "Efficiency: \(controls.mode.displayName)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        modeRoot.toolTip = EfficiencyControls.modeHelp
+        let modeMenu = NSMenu()
+        for mode in ProjectGraphEfficiency.Mode.allCases {
+            let entry = NSMenuItem(
+                title: mode.displayName,
+                action: #selector(selectEfficiencyMode(_:)),
+                keyEquivalent: ""
+            )
+            entry.target = self
+            entry.representedObject = mode.rawValue
+            entry.state = controls.mode == mode ? .on : .off
+            entry.toolTip = EfficiencyControls.modeHelp
+            modeMenu.addItem(entry)
+        }
+        modeRoot.submenu = modeMenu
+        menu.addItem(modeRoot)
+
+        let approveRoot = NSMenuItem(
+            title: "Approve Interventions",
+            action: nil,
+            keyEquivalent: ""
+        )
+        approveRoot.isEnabled = controls.mode != .observe
+        approveRoot.toolTip = "Explicitly approve a proposed repair for the next Fractal run."
+        let approveMenu = NSMenu()
+        for action in ProjectGraphEfficiency.RepairAction.allCases {
+            let entry = NSMenuItem(
+                title: action.displayName,
+                action: #selector(toggleApprovedIntervention(_:)),
+                keyEquivalent: ""
+            )
+            entry.target = self
+            entry.representedObject = action.rawValue
+            entry.state = controls.approved.contains(action) ? .on : .off
+            entry.isEnabled = controls.mode != .observe
+            approveMenu.addItem(entry)
+        }
+        approveRoot.submenu = approveMenu
+        menu.addItem(approveRoot)
+
+        let overrideRoot = NSMenuItem(
+            title: "Override Interventions",
+            action: nil,
+            keyEquivalent: ""
+        )
+        overrideRoot.isEnabled = controls.mode != .observe
+        overrideRoot.toolTip = "Decline a proposed repair for the next Fractal run."
+        let overrideMenu = NSMenu()
+        for action in ProjectGraphEfficiency.RepairAction.allCases {
+            let entry = NSMenuItem(
+                title: action.displayName,
+                action: #selector(toggleOverriddenIntervention(_:)),
+                keyEquivalent: ""
+            )
+            entry.target = self
+            entry.representedObject = action.rawValue
+            entry.state = controls.overridden.contains(action) ? .on : .off
+            entry.isEnabled = controls.mode != .observe
+            overrideMenu.addItem(entry)
+        }
+        overrideRoot.submenu = overrideMenu
+        menu.addItem(overrideRoot)
+
+        let autonomyRoot = NSMenuItem(
+            title: "Scoped High-Impact Autonomy",
+            action: nil,
+            keyEquivalent: ""
+        )
+        autonomyRoot.isEnabled = controls.mode == .autoOptimize
+        autonomyRoot.toolTip =
+            "Grant auto-optimize permission for one named high-impact action. "
+            + "Requires Auto-optimize mode."
+        let autonomyMenu = NSMenu()
+        for action in EfficiencyControls.highImpactActions {
+            let entry = NSMenuItem(
+                title: action.displayName,
+                action: #selector(toggleHighImpactAutonomy(_:)),
+                keyEquivalent: ""
+            )
+            entry.target = self
+            entry.representedObject = action.rawValue
+            entry.state = controls.highImpactAutonomy.contains(action) ? .on : .off
+            entry.isEnabled = controls.mode == .autoOptimize
+            autonomyMenu.addItem(entry)
+        }
+        autonomyRoot.submenu = autonomyMenu
+        menu.addItem(autonomyRoot)
+    }
+
+    private func addLifetimeEfficiencySummary(to menu: NSMenu) {
+        guard let lifetime = coordinator.lifetimeEfficiencyPresentation() else {
+            let absent = NSMenuItem(
+                title: "Lifetime efficiency unavailable",
+                action: nil,
+                keyEquivalent: ""
+            )
+            absent.isEnabled = false
+            absent.toolTip =
+                "No fractal.efficiency.v1 lifetime totals yet. Builds still run normally."
+            menu.addItem(absent)
+            return
+        }
+
+        let estimated = NSMenuItem(
+            title: "Lifetime \(lifetime.estimated)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        estimated.isEnabled = false
+        estimated.toolTip = EfficiencyControls.lifetimeEstimatedHelp
+        menu.addItem(estimated)
+
+        let confidence = NSMenuItem(
+            title: "Lifetime \(lifetime.confidenceAdjusted)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        confidence.isEnabled = false
+        confidence.toolTip = EfficiencyControls.lifetimeEstimatedHelp
+        menu.addItem(confidence)
+
+        let realized = NSMenuItem(
+            title: "Lifetime \(lifetime.realized)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        realized.isEnabled = false
+        realized.toolTip = EfficiencyControls.lifetimeRealizedHelp
+        menu.addItem(realized)
+    }
+
     private func item(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
         item.target = self
         return item
+    }
+
+    @objc private func selectEfficiencyMode(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let mode = ProjectGraphEfficiency.Mode(rawValue: raw) else { return }
+        coordinator.setEfficiencyMode(mode)
+    }
+
+    @objc private func toggleApprovedIntervention(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let action = ProjectGraphEfficiency.RepairAction(rawValue: raw) else { return }
+        coordinator.toggleApprovedIntervention(action)
+    }
+
+    @objc private func toggleOverriddenIntervention(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let action = ProjectGraphEfficiency.RepairAction(rawValue: raw) else { return }
+        coordinator.toggleOverriddenIntervention(action)
+    }
+
+    @objc private func toggleHighImpactAutonomy(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let action = ProjectGraphEfficiency.RepairAction(rawValue: raw) else { return }
+        coordinator.toggleHighImpactAutonomy(action)
     }
 
     @objc private func toggleRecording() {

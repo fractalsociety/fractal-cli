@@ -91,7 +91,12 @@ mod tests {
     use super::*;
 
     fn sample() -> Receipt {
-        Receipt::new(ReceiptKind::EvidenceRoot, "graph:abc#node:patch", [9u8; 32], 1_700)
+        Receipt::new(
+            ReceiptKind::EvidenceRoot,
+            "graph:abc#node:patch",
+            [9u8; 32],
+            1_700,
+        )
     }
 
     #[test]

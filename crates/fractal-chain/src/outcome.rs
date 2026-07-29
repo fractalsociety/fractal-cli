@@ -141,8 +141,7 @@ pub fn sanitized_export(
         }
     }
 
-    let export_commitment =
-        export_commitment(&evidence_root, &public_fields, &consent.scope);
+    let export_commitment = export_commitment(&evidence_root, &public_fields, &consent.scope);
     Ok(SanitizedExport {
         evidence_root,
         public_fields,

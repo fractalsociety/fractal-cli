@@ -95,6 +95,33 @@ pub(crate) fn run_end_to_end(
     request: &str,
     resume_completed: &std::collections::BTreeSet<String>,
 ) -> Result<execute::RunOutcome> {
+    run_end_to_end_with_efficiency(
+        graph_hash,
+        workspace,
+        agents,
+        board,
+        backend,
+        facts,
+        request,
+        resume_completed,
+        None,
+    )
+}
+
+/// End-to-end run with explicit efficiency governance threaded from CLI/native
+/// controls. `None` selects the product default (suggest mode).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_end_to_end_with_efficiency(
+    graph_hash: &str,
+    workspace: &Path,
+    agents: &[String],
+    board: Option<&str>,
+    backend: Backend,
+    facts: &crate::router::RunFacts,
+    request: &str,
+    resume_completed: &std::collections::BTreeSet<String>,
+    efficiency: Option<&crate::efficiency_config::EfficiencyConfig>,
+) -> Result<execute::RunOutcome> {
     let mut graph = graph_store::load_graph(graph_hash)?;
     let mut current_hash = graph_hash.to_owned();
     let graph_id = graph
@@ -125,7 +152,7 @@ pub(crate) fn run_end_to_end(
             // fires proactive governed morphogens between waves (adapting the graph
             // continuously), returning the possibly-evolved graph to continue from.
             Backend::InProcess if crate::supervise::enabled() => {
-                let supervised = crate::supervise::run_supervised(
+                let supervised = crate::supervise::run_supervised_with_efficiency(
                     graph.clone(),
                     &current_hash,
                     &graph_id,
@@ -135,12 +162,35 @@ pub(crate) fn run_end_to_end(
                     &ledger,
                     &run_completed,
                     Some(&recorder),
+                    efficiency,
                 )?;
                 graph = supervised.graph;
                 current_hash = supervised.hash;
                 supervised.outcome
             }
             Backend::InProcess => {
+                // Non-supervised whole-graph path: still run one efficiency
+                // boundary before checkout so resume/inspect stays consistent.
+                let default_efficiency = crate::efficiency_config::EfficiencyConfig {
+                    mode: crate::efficiency::EfficiencyMode::Suggest,
+                    approved: Vec::new(),
+                    overridden: Vec::new(),
+                    high_impact_autonomy: Vec::new(),
+                };
+                let efficiency = efficiency.unwrap_or(&default_efficiency);
+                let mut runtime = execute::EfficiencyRuntime::default();
+                if !run_completed.is_empty() {
+                    if let Err(error) = execute::run_efficiency_boundary(
+                        &graph,
+                        &current_hash,
+                        &run_completed,
+                        workspace,
+                        efficiency,
+                        &mut runtime,
+                    ) {
+                        eprintln!("  efficiency boundary note: {error:#}");
+                    }
+                }
                 execute::run_multi_agent(&graph, workspace, agents, board, &run_completed)?
             }
             Backend::Coordinate => crate::coordinate::run_via_coordinate(

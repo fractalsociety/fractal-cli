@@ -1,0 +1,305 @@
+{
+  "prd": {
+    "schema": "fractal.prd.v1",
+    "title": "Portable Execution-Graph Learning Records for Fractal CLI and Fractal Voice",
+    "summary": "Extend the Rust Fractal CLI and native macOS Fractal Voice app so every portable .fractal/project.fractal execution graph carries compact, structurally meaningful, backward-compatible node learning records, graph-edit decisions, and aggregate completion outcomes, while large evidence remains externally referenced.",
+    "architecture": {
+      "approach": "Add a versioned, strongly typed learning-data layer to the existing fractal.execution_graph.v1 and fractal.project.v1 documents. Keep graph topology authoritative, mirror dependency IDs into normalized node learning records, and centralize defaulting, controlled-value validation, lifecycle mutation, event recording, external-reference hygiene, and deterministic graph-outcome aggregation in Rust. Existing graph construction, execution, evolution/amendment, persistence, and sync paths call this layer at their current boundaries. The Swift app uses tolerant Codable projections for the same additive fields so older and newer project files both decode and display safely.",
+      "rationale": "An additive typed layer preserves current graph hashes, topology, and old-file readability while preventing producers from inventing incompatible values. Central lifecycle and aggregation APIs make timestamps, attempts, verification, costs, artifact lineage, human intervention, and final metrics consistent across local execution, resume, cancellation, graph evolution, and cloud sync. Compact evidence IDs avoid graph bloat and sensitive transcript capture, while deterministic derivation makes the learning data testable rather than speculative.",
+      "components": [
+        {
+          "name": "Learning Data Contract",
+          "responsibility": "Own controlled enums and serializable node records, graph-edit events, graph outcomes, external evidence/artifact references, backward-compatible defaults, normalization, and validation.",
+          "technology": "Rust, serde, serde_json, RFC 3339 timestamps, SHA-256 graph hashes"
+        },
+        {
+          "name": "Graph Producers and Lifecycle Recorder",
+          "responsibility": "Initialize structural metadata and update attempts, timing, executor identity, controlled outcomes/failures, verification evidence, artifacts, consumers, intervention, costs, and notes at every runtime transition.",
+          "technology": "Existing Rust modules compile.rs, decompose.rs, project_file.rs, execute.rs, orchestrate.rs, supervise.rs, run_control.rs, and checkpoint.rs"
+        },
+        {
+          "name": "Graph Edit Decision Journal",
+          "responsibility": "Record compact split, reroute, cancel, and dependency-edit decisions with before-hash, trigger, actor, affected nodes, timestamp, and eventual effect.",
+          "technology": "Existing Rust amendment and governed-evolution paths using append-only typed JSON events"
+        },
+        {
+          "name": "Outcome Aggregator",
+          "responsibility": "Derive graph-level success, acceptance results, durations, concurrency, cost, retry/reopen/dead-node/intervention counts, verification coverage, and early-stop or unnecessary-expansion flags from recorded facts.",
+          "technology": "Deterministic Rust graph analysis over topology and lifecycle records"
+        },
+        {
+          "name": "Portable Persistence and Sync Boundary",
+          "responsibility": "Migrate/default old documents on read, validate and atomically persist enriched documents, preserve unknown compatible data, reject oversized or forbidden embedded content, and upload the exact validated portable representation.",
+          "technology": "Rust serde, atomic file writes, existing graph_store and project_sync modules"
+        },
+        {
+          "name": "Fractal Voice Graph Projection",
+          "responsibility": "Tolerantly decode and present enriched project graph status without requiring new fields in legacy files.",
+          "technology": "Swift Codable, SwiftUI, XCTest via Swift Package Manager"
+        }
+      ]
+    },
+    "acceptance_criteria": [
+      {
+        "id": "AC-1",
+        "criterion": "A newly compiled graph gives every node a stable ID and type, objective, normalized dependency IDs, created/ready/start/finish timestamps as applicable, executor identity fields, attempt count, controlled outcome and failure code, verification record, produced and consumed artifact references, human-intervention record, estimated and actual cost, and optional bounded notes.",
+        "verification": "Run focused Rust producer and lifecycle tests with cargo test compile project_file execute orchestrate supervise; fixtures must assert exact serialized fields and timestamp/attempt transitions."
+      },
+      {
+        "id": "AC-2",
+        "criterion": "Only the seven requested outcomes and twelve requested failure codes are accepted; incompatible state combinations such as verified_success with failed verification, a failure code on verified_success, finished outcomes without finished_at, or consumed artifact IDs that were never produced are rejected.",
+        "verification": "Run Rust contract table tests that deserialize every allowed value and reject unknown values and invalid cross-field combinations via cargo test learning_data."
+      },
+      {
+        "id": "AC-3",
+        "criterion": "Existing fractal.project.v1 files and fractal.execution_graph.v1 graphs that omit all learning fields still load, receive deterministic safe defaults or nulls, persist, reload, and retain their original graph topology and identity without data loss.",
+        "verification": "Run legacy-fixture migration and JSON serialization round-trip tests in project_file and graph_store with cargo test project_file graph_store."
+      },
+      {
+        "id": "AC-4",
+        "criterion": "Checkout, retry, execution failure, verification failure, success, cancellation, stale-release/resume, artifact production and consumption, and human completion each update attempts, timestamps, executor metadata, controlled outcome/failure, verification evidence, intervention, and costs consistently and atomically.",
+        "verification": "Run lifecycle scenario tests covering every named transition with cargo test execute project_file run_control checkpoint and assert monotonic timestamps, attempt increments, preserved prior facts, and controlled terminal states."
+      },
+      {
+        "id": "AC-5",
+        "criterion": "Human split, reroute, cancel, and dependency edits, plus autonomous graph evolution, append compact decision events containing graph_before_hash, controlled action with target and created_nodes, trigger, actor, timestamp, and eventual_effect fields success and rework_reduced.",
+        "verification": "Run amendment/evolution event tests with cargo test amendments harness_evolution supervise; verify before-hash correctness, action payloads, event ordering, and later eventual-effect updates."
+      },
+      {
+        "id": "AC-6",
+        "criterion": "When a graph reaches a terminal project state, it records final_verified_success, per-acceptance passed/failed status, total and critical-path duration, total agent time, maximum parallelism, total cost, retries, reopened nodes, dead or unused nodes, human intervention count, verification coverage, stopped-too-early, and expanded-unnecessarily from recorded facts.",
+        "verification": "Run deterministic aggregation tests over sequential, parallel, retried, reopened, dead-node, failed-verification, cancelled, and human-completed fixtures with cargo test learning_data project_file."
+      },
+      {
+        "id": "AC-7",
+        "criterion": "Graph files contain only compact IDs and bounded notes for evidence, logs, and artifacts; chain-of-thought, generated-token streams, huge terminal transcripts, speculative metrics, arbitrary self-ratings, secrets, and oversized inline payloads are rejected or omitted.",
+        "verification": "Run validator boundary tests with forbidden keys and oversized strings/arrays using cargo test project_file graph_store, and inspect representative serialized fixtures to confirm only evidence_refs and artifact IDs are stored."
+      },
+      {
+        "id": "AC-8",
+        "criterion": "Local persistence, evolved-child persistence, resume/checkpoint recovery, graph validation/hash verification, and Fractal Society sync all preserve and transmit the same enriched learning records without silently dropping fields.",
+        "verification": "Run persistence/evolution/sync fixture tests with cargo test project_file graph_store project_sync checkpoint harness_evolution and compare canonical pre/post boundary JSON."
+      },
+      {
+        "id": "AC-9",
+        "criterion": "Fractal Voice decodes both legacy and enriched project.fractal fixtures and displays the available node outcome, attempt, verification, and graph completion summary without crashing or treating missing additive fields as corruption.",
+        "verification": "Run swift test --package-path macos/FractalVoice and assert XCTest coverage for legacy, fully enriched, partially populated, and unknown-forward-compatible fixtures."
+      },
+      {
+        "id": "AC-10",
+        "criterion": "The repository passes formatting, the complete Rust test suite, warning-free Clippy, and the native Swift test suite, with no generated dist release bundle changed and no signing, notarization, packaging, or Apple submission invoked.",
+        "verification": "Run cargo fmt --all -- --check; cargo test --no-fail-fast; cargo clippy --all-targets -- -D warnings; swift test --package-path macos/FractalVoice; then verify git diff --name-only contains no path beginning with dist- or generated release bundle."
+      }
+    ],
+    "non_goals": [
+      "Apple code signing, notarization, App Store submission, release upload, DMG/ZIP generation, or modification of any generated dist release bundle.",
+      "Embedding large logs, artifact bodies, terminal transcripts, prompts, chain-of-thought, token-by-token model output, or binary evidence in project.fractal.",
+      "Adding speculative quality scores, arbitrary model self-evaluations, or metrics that cannot be derived from recorded lifecycle and topology facts.",
+      "Replacing the existing execution graph schema, scheduler, graph hash, project identity, Fractal Society protocol, or external artifact/log storage systems.",
+      "Building a training pipeline or changing model-selection policy; this work only records compact trustworthy learning data.",
+      "Reconstructing precise historical timing, executor, verification, or cost facts that are absent from legacy graphs."
+    ]
+  },
+  "tasks": [
+    {
+      "id": "define_learning_contract",
+      "title": "Define the versioned learning-data contract",
+      "capability": "code.generate",
+      "instruction": "Create src/learning_data.rs and register it from src/main.rs. Define serde types and controlled enums for all requested node fields, the exact seven outcomes, exact twelve failure codes, verification type/passed/evidence_refs, compact artifact IDs, consumed_by, human_intervention, executor agent/model/version-or-config-hash, costs, graph-edit actions/events, eventual_effect, acceptance results, and graph outcomes. Implement bounded notes/reference validation, forbidden large-content and chain-of-thought-style key rejection, RFC 3339 timestamp helpers, dependency normalization from graph edges, and backward-compatible serde defaults that never fabricate unknown historical facts. Add exhaustive unit tests in src/learning_data.rs for allowed enum round trips, unknown controlled values, cross-field invariants, bounds, and legacy defaulting. Do not edit project persistence, runtime producers, Swift files, or any dist-* path.",
+      "depends_on": [],
+      "execution": {
+        "mode": "sequential",
+        "wave": 1
+      }
+    },
+    {
+      "id": "integrate_portable_persistence",
+      "title": "Integrate migration and validation into portable persistence",
+      "capability": "code.edit",
+      "instruction": "Edit src/project_file.rs and src/graph_store.rs to load old fractal.project.v1 and fractal.execution_graph.v1 documents with missing learning data, normalize them through src/learning_data.rs, validate enriched node/event/outcome records, and atomically serialize them without losing topology, identity, unknown forward-compatible fields, or graph-hash integrity. Add central mutation APIs for node-ready, checkout/start, finish, release/reopen, verification result, artifact produced/consumed, human intervention, estimated/actual cost, graph-edit event append/update, and terminal graph outcome storage; make APIs enforce monotonic timestamps and controlled state combinations. Preserve parent-to-child execution attribution and local-board backfill. Add legacy fixture, enriched round-trip, invalid-record, secret/oversized-content, and evolved-child preservation tests in these modules. Do not edit execution callers, compiler producers, sync code, Swift files, or dist-* paths.",
+      "depends_on": [
+        "define_learning_contract"
+      ],
+      "execution": {
+        "mode": "parallel",
+        "wave": 2,
+        "parallel_group": "wave-2"
+      }
+    },
+    {
+      "id": "enrich_graph_producers",
+      "title": "Populate structural learning fields in every graph producer",
+      "capability": "code.edit",
+      "instruction": "Edit src/compile.rs, src/decompose.rs, and src/work_builder.rs so planning previews, normal compiled DAGs, fallback graphs, and lead-generated task graphs initialize every node with stable ID/type, objective, normalized dependency IDs, created_at, ready_at when root-ready, executor configuration metadata when known, attempt_count zero, estimated_cost when actually available, empty verification/artifact/consumption/intervention collections, and absent historical/terminal facts rather than invented values. Ensure stable IDs survive serialization and graph recompilation, and dependency mirrors exactly match incoming edges. Update the existing module tests to cover preview, sequential, parallel, verification, and closeout nodes. Do not edit runtime lifecycle, persistence, amendment/evolution, Swift, sync, or dist-* files.",
+      "depends_on": [
+        "define_learning_contract"
+      ],
+      "execution": {
+        "mode": "parallel",
+        "wave": 2,
+        "parallel_group": "wave-2"
+      }
+    },
+    {
+      "id": "add_swift_graph_models",
+      "title": "Add tolerant Swift graph learning models",
+      "capability": "code.generate",
+      "instruction": "Create macos/FractalVoice/Sources/FractalVoice/ProjectGraphLearning.swift containing additive Codable projections for fractal.project.v1, enriched graph nodes, executor, verification, artifact references, human intervention, controlled outcomes/failure codes, graph-edit events, and graph outcome summaries. Make every new learning field optional or safely defaulted so legacy and partially enriched project.fractal files decode; retain raw unknown controlled strings for forward-compatible display rather than crashing. Provide pure formatting helpers for concise node outcome/attempt/verification text and graph completion summaries. Do not edit BuildCoordinator.swift, views, tests, Rust files, Package.swift, generated resources, or dist-* paths.",
+      "depends_on": [
+        "define_learning_contract"
+      ],
+      "execution": {
+        "mode": "parallel",
+        "wave": 2,
+        "parallel_group": "wave-2"
+      }
+    },
+    {
+      "id": "record_runtime_lifecycle",
+      "title": "Record complete node lifecycle facts",
+      "capability": "code.edit",
+      "instruction": "Edit src/execute.rs, src/orchestrate.rs, src/run_control.rs, and src/checkpoint.rs to call the central project_file learning mutation APIs at dependency readiness, checkout/start, success, execution error, verification failure, timeout, retry/reopen, cancellation/stale release, resume, and human completion. Record executor agent/model/version-or-config-hash from real agent configuration, increment attempt_count only for actual starts, attach controlled outcomes/failure codes, verification type/passed/compact evidence_refs, actual elapsed agent time and actual cost only when measured, and artifact production/consumption IDs where runtime facts exist. Map errors deterministically to requested failure codes without arbitrary self-evaluation; preserve previous attempts on retry. Extend module tests for retries, tool failure, timeout, failed verification, cancellation, stale release/resume, artifact lineage, human intervention, and monotonic timestamps. Do not edit graph-edit producers, persistence schema, sync, Swift, or dist-* files.",
+      "depends_on": [
+        "integrate_portable_persistence",
+        "enrich_graph_producers"
+      ],
+      "execution": {
+        "mode": "parallel",
+        "wave": 3,
+        "parallel_group": "wave-3"
+      }
+    },
+    {
+      "id": "record_graph_edit_events",
+      "title": "Record graph-edit decision events",
+      "capability": "code.edit",
+      "instruction": "Edit src/amendments.rs, src/harness_evolution.rs, and src/supervise.rs so every accepted human split, reroute, cancel, dependency edit, and autonomous grow/repair/differentiate graph mutation appends a compact learning event through project_file APIs. Capture the verified graph_before_hash before mutation; controlled action type with target and created_nodes; bounded trigger; actor identity; timestamp; and eventual_effect success/rework_reduced, initially unknown where necessary and updated when downstream evidence arrives. Ensure rejected/no-op edits do not claim success, child graph hashes remain valid, and created/cancelled/superseded nodes get appropriate structural and controlled outcome fields. Add tests for all four human-edit forms, autonomous edits, event ordering, before-hash accuracy, eventual-effect update, and no-op rejection. Do not edit runtime lifecycle files, persistence schema, Swift, sync, or dist-* files.",
+      "depends_on": [
+        "integrate_portable_persistence",
+        "enrich_graph_producers"
+      ],
+      "execution": {
+        "mode": "parallel",
+        "wave": 3,
+        "parallel_group": "wave-3"
+      }
+    },
+    {
+      "id": "preserve_sync_boundaries",
+      "title": "Preserve learning data across validation and sync boundaries",
+      "capability": "code.edit",
+      "instruction": "Edit src/project_sync.rs and src/projects.rs to ensure project discovery, runtime coalesced uploads, one-shot uploads, conflict handling, and remote-hash state always read the validated current project.fractal and preserve its complete enriched graph, events, and outcomes. Add boundary tests using legacy and enriched local fixtures plus mocked upload payloads, asserting canonical learning fields are neither stripped nor rewritten and invalid/oversized data is refused before upload. Keep local persistence fail-soft with respect to network errors and do not alter authentication, visibility behavior, remote APIs, GitHub publication semantics, or any dist-* path.",
+      "depends_on": [
+        "integrate_portable_persistence"
+      ],
+      "execution": {
+        "mode": "parallel",
+        "wave": 3,
+        "parallel_group": "wave-3"
+      }
+    },
+    {
+      "id": "display_learning_in_voice",
+      "title": "Read and display enriched graphs in Fractal Voice",
+      "capability": "code.edit",
+      "instruction": "Edit macos/FractalVoice/Sources/FractalVoice/BuildCoordinator.swift and the smallest relevant existing SwiftUI status surface, preferably macos/FractalVoice/Sources/FractalVoice/RecordingHUD.swift, to load the active workspace .fractal/project.fractal through ProjectGraphLearning.swift and display concise available node outcome, attempt, verification, and final graph summary information. Missing learning fields in legacy files, partially written files, and unknown future controlled strings must degrade to existing status text without a crash or false failure. Keep file reads off latency-sensitive audio paths and preserve current voice/build state behavior. Do not edit Swift tests, Rust, Package.swift, generated resources, signing settings, or dist-* paths.",
+      "depends_on": [
+        "integrate_portable_persistence",
+        "add_swift_graph_models"
+      ],
+      "execution": {
+        "mode": "parallel",
+        "wave": 3,
+        "parallel_group": "wave-3"
+      }
+    },
+    {
+      "id": "aggregate_graph_outcomes",
+      "title": "Derive and persist terminal graph outcomes",
+      "capability": "code.edit",
+      "instruction": "Edit src/learning_data.rs and src/project_file.rs to implement deterministic terminal aggregation and invoke it exactly when a project becomes completed, cancelled/halted terminal, or human-completed. Derive final_verified_success; every PRD acceptance criterion passed/failed with compact evidence IDs; wall-clock total duration; DAG critical-path duration using recorded node intervals; summed agent time; observed maximum overlapping executions; summed measured total cost; retry and reopened-node counts; dead/unused nodes; human-intervention count; verification coverage with an explicit denominator; and evidence-based stopped-too-early and expanded-unnecessarily booleans. Represent unknown inputs explicitly and never estimate missing historical facts. Recompute safely after an event eventual_effect update without double counting. Add deterministic fixtures for sequential, parallel, retry, reopen, dead-node, failed-verification, cancellation, superseded expansion, and human-completed graphs. Do not edit callers outside project_file.rs, sync, Swift, or dist-* files.",
+      "depends_on": [
+        "record_runtime_lifecycle",
+        "record_graph_edit_events"
+      ],
+      "execution": {
+        "mode": "parallel",
+        "wave": 4,
+        "parallel_group": "wave-4"
+      }
+    },
+    {
+      "id": "add_cross_boundary_rust_tests",
+      "title": "Add cross-boundary Rust regression coverage",
+      "capability": "code.edit",
+      "instruction": "Extend the existing #[cfg(test)] suites in src/compile.rs, src/execute.rs, src/amendments.rs, src/harness_evolution.rs, src/project_sync.rs, and src/graph_store.rs with end-to-end fixtures that compile a graph, persist it, execute success/failure/retry/verification/artifact-consumption/human-intervention paths, apply graph edits, serialize/reload it, and inspect the sync payload. Assert every AC-1 through AC-8 field and invariant, including exact controlled values, legacy migration, round-trip preservation, compact reference-only evidence, and graph hash validity. Keep tests deterministic with injected/fixed timestamps and no live network, model, agent, or cloud dependency. Do not edit src/learning_data.rs, src/project_file.rs, Swift files, production behavior, or dist-* paths.",
+      "depends_on": [
+        "record_runtime_lifecycle",
+        "record_graph_edit_events",
+        "preserve_sync_boundaries"
+      ],
+      "execution": {
+        "mode": "parallel",
+        "wave": 4,
+        "parallel_group": "wave-4"
+      }
+    },
+    {
+      "id": "add_native_swift_tests",
+      "title": "Add native Swift compatibility and display tests",
+      "capability": "code.edit",
+      "instruction": "Edit macos/FractalVoice/Tests/FractalVoiceTests/FractalVoiceTests.swift to add temporary project.fractal fixtures for a legacy graph with no learning fields, a fully enriched graph containing all controlled records and a graph outcome, a partially populated graph, and a graph with unknown future controlled strings. Test Codable parsing, fallback behavior, concise node and graph formatting, BuildCoordinator active-project loading, and the relevant HUD/status presentation without starting a real build. Assert no crash and no false corruption status for missing additive data. Do not edit production Swift, Rust, Package.swift, generated resources, signing settings, or dist-* paths.",
+      "depends_on": [
+        "display_learning_in_voice"
+      ],
+      "execution": {
+        "mode": "parallel",
+        "wave": 4,
+        "parallel_group": "wave-4"
+      }
+    },
+    {
+      "id": "verify_rust_repository",
+      "title": "Run the complete Rust quality gate",
+      "capability": "project.tests.execute",
+      "instruction": "From /workspace/fractal-cli run cargo fmt --all -- --check, cargo test --no-fail-fast, and cargo clippy --all-targets -- -D warnings. Also run focused tests for learning_data, project_file, graph_store, compile, execute, orchestrate, run_control, checkpoint, amendments, harness_evolution, supervise, project_sync, and projects if the full-suite output does not make their evidence individually clear. Fix only Rust source or Rust test defects caused by this feature, rerun every failed gate, and record exact passing commands in the task result. Do not weaken tests, access live services, modify Swift or any dist-* path, or perform release/signing work.",
+      "depends_on": [
+        "aggregate_graph_outcomes",
+        "add_cross_boundary_rust_tests"
+      ],
+      "execution": {
+        "mode": "parallel",
+        "wave": 5,
+        "parallel_group": "wave-5"
+      }
+    },
+    {
+      "id": "verify_native_swift",
+      "title": "Run the native Fractal Voice quality gate",
+      "capability": "project.tests.execute",
+      "instruction": "From /workspace/fractal-cli run swift test --package-path macos/FractalVoice. Fix only Swift source or XCTest defects caused by the enriched graph decoding/display work and rerun until the complete package suite passes. Confirm tests cover legacy, enriched, partial, and forward-compatible fixtures and report the exact passing command. Do not alter Package.swift dependency versions, generated resources, signing/notarization settings, Rust files, or any dist-* path; do not build a release app, archive, DMG, or ZIP.",
+      "depends_on": [
+        "add_native_swift_tests"
+      ],
+      "execution": {
+        "mode": "parallel",
+        "wave": 5,
+        "parallel_group": "wave-5"
+      }
+    },
+    {
+      "id": "audit_acceptance_and_scope",
+      "title": "Audit acceptance evidence and excluded release scope",
+      "capability": "content.analyze",
+      "instruction": "Review the final workspace changes and test evidence against every acceptance criterion in fractal-plan.json. Inspect git diff --name-only and git diff --stat to prove no generated dist-* release bundle, signing/notarization setting, archive, DMG, ZIP, or Apple submission path changed. Inspect representative newly compiled, migrated legacy, lifecycle-failed/retried, graph-edited, and completed graph fixtures to confirm compact external references, all controlled values, aggregation fields, and absence of chain-of-thought, huge transcripts, speculative metrics, arbitrary self-evaluations, secrets, or inline artifacts. Report criterion-by-criterion evidence and any residual risk; do not modify files, commit, push, sign, package, notarize, or submit.",
+      "depends_on": [
+        "verify_rust_repository",
+        "verify_native_swift"
+      ],
+      "execution": {
+        "mode": "sequential",
+        "wave": 6
+      }
+    }
+  ]
+}

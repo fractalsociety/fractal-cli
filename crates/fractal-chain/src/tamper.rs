@@ -6,7 +6,7 @@
 //! receipt — so [`detect_fold_tamper`] / [`scan_spine_tamper`] report a mismatch
 //! detectable at the parent without trusting the child.
 
-use crate::fold::{FoldError, ScaleLevel, ScaleSpine, verify_child_anchored};
+use crate::fold::{verify_child_anchored, FoldError, ScaleLevel, ScaleSpine};
 use crate::ledger::{verify_blocks, Block, ChainError, ScaleLedger};
 use crate::merkle::Hash256;
 use crate::receipt::ReceiptKind;
@@ -61,9 +61,7 @@ pub fn latest_anchored_head(parent: &ScaleLedger, child_scale: &str) -> Option<H
         .blocks()
         .iter()
         .flat_map(|block| block.receipts.iter())
-        .filter(|receipt| {
-            receipt.kind == ReceiptKind::Lineage && receipt.subject == child_scale
-        })
+        .filter(|receipt| receipt.kind == ReceiptKind::Lineage && receipt.subject == child_scale)
         .map(|receipt| receipt.payload_hash)
         .next_back()
 }
@@ -76,10 +74,7 @@ pub fn latest_anchored_head(parent: &ScaleLedger, child_scale: &str) -> Option<H
 /// # Errors
 ///
 /// Returns [`TamperFinding`] describing the first detected mismatch.
-pub fn detect_fold_tamper(
-    parent: &ScaleLedger,
-    child: &ScaleLedger,
-) -> Result<(), TamperFinding> {
+pub fn detect_fold_tamper(parent: &ScaleLedger, child: &ScaleLedger) -> Result<(), TamperFinding> {
     let child_scale = ScaleLevel::parse(child.scale()).ok_or(TamperFinding {
         child_scale: ScaleLevel::Node,
         parent_scale: ScaleLevel::Graph,
@@ -163,12 +158,14 @@ pub fn detect_local_block_tamper(blocks: &[Block]) -> Result<(), ChainError> {
 /// # Errors
 ///
 /// Returns [`TamperFinding`] when the edge is broken.
-pub fn assert_fold_untampered(parent: &ScaleLedger, child: &ScaleLedger) -> Result<(), TamperFinding> {
+pub fn assert_fold_untampered(
+    parent: &ScaleLedger,
+    child: &ScaleLedger,
+) -> Result<(), TamperFinding> {
     match verify_child_anchored(parent, child) {
         Ok(()) => Ok(()),
         Err(FoldError::ChildInvalid(error)) => {
-            let child_scale =
-                ScaleLevel::parse(child.scale()).unwrap_or(ScaleLevel::Node);
+            let child_scale = ScaleLevel::parse(child.scale()).unwrap_or(ScaleLevel::Node);
             let parent_scale = child_scale.parent().unwrap_or(ScaleLevel::Graph);
             Err(TamperFinding {
                 child_scale,
@@ -177,8 +174,7 @@ pub fn assert_fold_untampered(parent: &ScaleLedger, child: &ScaleLedger) -> Resu
             })
         }
         Err(FoldError::ParentInvalid(error)) => {
-            let child_scale =
-                ScaleLevel::parse(child.scale()).unwrap_or(ScaleLevel::Node);
+            let child_scale = ScaleLevel::parse(child.scale()).unwrap_or(ScaleLevel::Node);
             let parent_scale = child_scale.parent().unwrap_or(ScaleLevel::Graph);
             Err(TamperFinding {
                 child_scale,
@@ -281,9 +277,6 @@ mod tests {
         let findings = scan_spine_tamper(&spine);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].child_scale, ScaleLevel::Node);
-        assert!(matches!(
-            findings[0].kind,
-            TamperKind::HeadMismatch { .. }
-        ));
+        assert!(matches!(findings[0].kind, TamperKind::HeadMismatch { .. }));
     }
 }

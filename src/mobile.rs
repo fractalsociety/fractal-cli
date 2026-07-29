@@ -50,6 +50,7 @@ pub(crate) fn run_ios(
         fractalwork_override,
         coordinate,
         DEFAULT_GRAPH_PORT,
+        None,
     )?;
 
     // Only launch a COMPLETE, non-failed build — never an unfinished app. A run
@@ -152,6 +153,7 @@ pub(crate) fn run_mobile(
         fractalwork_override,
         coordinate,
         DEFAULT_GRAPH_PORT,
+        None,
     )?;
 
     // Never launch an unfinished build (see run_ios).

@@ -185,7 +185,10 @@ pub fn evaluate_claim(ledger: &ScaleLedger, claim: &Claim) -> HonestyVerdict {
 /// # Errors
 ///
 /// Returns [`HonestyRejectReason`] when the claim is not chain-backed.
-pub fn accept_claim(ledger: &ScaleLedger, claim: &Claim) -> Result<AcceptedClaim, HonestyRejectReason> {
+pub fn accept_claim(
+    ledger: &ScaleLedger,
+    claim: &Claim,
+) -> Result<AcceptedClaim, HonestyRejectReason> {
     match evaluate_claim(ledger, claim) {
         HonestyVerdict::Accepted(accepted) => Ok(accepted),
         HonestyVerdict::Rejected(reason) => Err(reason),
@@ -251,7 +254,10 @@ mod tests {
             payload_hash_str("verdict:i-swear"),
         );
         let err = accept_claim(&chain, &fake).expect_err("mismatch");
-        assert!(matches!(err, HonestyRejectReason::EvidenceHashMismatch { .. }));
+        assert!(matches!(
+            err,
+            HonestyRejectReason::EvidenceHashMismatch { .. }
+        ));
 
         // No receipt for this subject.
         let missing = Claim::new(ClaimKind::NodePassed, "node:other", real);

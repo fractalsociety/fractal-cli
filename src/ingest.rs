@@ -68,6 +68,13 @@ pub(crate) fn run(
     fractalwork_override: Option<&Path>,
     coordinate: bool,
 ) -> Result<()> {
+    let controls = crate::cli::EfficiencyOpts {
+        efficiency_mode: args.efficiency.efficiency_mode,
+        approve_intervention: args.efficiency.approve_intervention.clone(),
+        override_intervention: args.efficiency.override_intervention.clone(),
+        allow_high_impact: args.efficiency.allow_high_impact.clone(),
+    };
+    let efficiency = crate::efficiency_config::resolve(&controls)?;
     let event = read_event(args)?;
     if args.managed_project && !managed_project_source_allowed(&event.source) {
         bail!("managed project ingest is reserved for the native Fractal Voice app");
@@ -83,6 +90,7 @@ pub(crate) fn run(
             port: args.port,
             fractalwork_override,
             coordinate,
+            efficiency: Some(&efficiency),
         },
     )
 }
@@ -126,6 +134,7 @@ pub(crate) fn run_voice_transcript(
             port: args.port,
             fractalwork_override,
             coordinate,
+            efficiency: None,
         },
     )
 }
@@ -139,6 +148,7 @@ struct EventOptions<'a> {
     port: u16,
     fractalwork_override: Option<&'a Path>,
     coordinate: bool,
+    efficiency: Option<&'a crate::efficiency_config::EfficiencyConfig>,
 }
 
 fn process_event(event: InputEvent, options: EventOptions<'_>) -> Result<()> {
@@ -276,6 +286,7 @@ fn process_event(event: InputEvent, options: EventOptions<'_>) -> Result<()> {
         options.fractalwork_override,
         options.coordinate,
         options.port,
+        options.efficiency,
     )
     .map(|_| ())
 }

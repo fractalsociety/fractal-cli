@@ -19,6 +19,11 @@ pub(crate) struct FractalProject {
     pub(crate) graph: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) execution: Option<ExecutionState>,
+    #[serde(default)]
+    pub(crate) learning: crate::learning_data::LearningData,
+    /// Optional efficiency ledger stored beside execution and learning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) efficiency: Option<crate::efficiency::EfficiencyData>,
     pub(crate) updated_at: String,
 }
 
@@ -149,6 +154,13 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
                 updated_at: now.clone(),
             })
         });
+    let learning = current
+        .as_ref()
+        .map(|document| merge_learning(&document.learning, graph, &now))
+        .unwrap_or_else(|| learning_from_graph(graph, &now));
+    let efficiency = current
+        .as_ref()
+        .and_then(|document| document.efficiency.clone());
     let document = FractalProject {
         schema: "fractal.project.v1".to_owned(),
         project: ProjectIdentity {
@@ -163,6 +175,8 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
         graph_hash: graph_hash.to_owned(),
         graph: graph.clone(),
         execution,
+        learning,
+        efficiency,
         updated_at: now,
     };
     let destination = path(workspace);
@@ -297,6 +311,21 @@ pub(crate) fn transition(
                     released_at: None,
                 },
             );
+            if let Some(record) = document.learning.nodes.get_mut(node) {
+                if record.outcome.take().is_some() {
+                    record.reopen_count += 1;
+                    record.finished_at = None;
+                    record.failure_code = None;
+                    record.verification = None;
+                }
+                record.started_at = Some(now.clone());
+                record.attempt_count += 1;
+                record.executor = Some(crate::learning_data::Executor {
+                    agent: Some(agent_label.to_owned()),
+                    model: std::env::var("FRACTAL_MODEL").ok(),
+                    version: option_env!("CARGO_PKG_VERSION").map(str::to_owned),
+                });
+            }
         }
         "complete" => {
             let checked_out_at = execution
@@ -315,8 +344,24 @@ pub(crate) fn transition(
                     released_at: None,
                 },
             );
+            if let Some(record) = document.learning.nodes.get_mut(node) {
+                let is_verifier = record.node_type == "verification";
+                record.finished_at = Some(now.clone());
+                record.outcome = Some(if is_verifier {
+                    crate::learning_data::NodeOutcome::VerifiedSuccess
+                } else {
+                    crate::learning_data::NodeOutcome::UnverifiedSuccess
+                });
+                if is_verifier {
+                    record.verification = Some(crate::learning_data::Verification {
+                        kind: Some("automated".to_owned()),
+                        passed: Some(true),
+                        evidence_refs: Vec::new(),
+                    });
+                }
+            }
         }
-        "release" => {
+        "release" | "failed_execution" | "failed_verification" => {
             let checked_out_at = execution
                 .assignments
                 .get(node)
@@ -333,6 +378,28 @@ pub(crate) fn transition(
                     released_at: Some(now.clone()),
                 },
             );
+            if action != "release" {
+                if let Some(record) = document.learning.nodes.get_mut(node) {
+                    record.finished_at = Some(now.clone());
+                    record.outcome = Some(if action == "failed_verification" {
+                        crate::learning_data::NodeOutcome::FailedVerification
+                    } else {
+                        crate::learning_data::NodeOutcome::FailedExecution
+                    });
+                    record.failure_code = Some(if action == "failed_verification" {
+                        crate::learning_data::FailureCode::WeakVerifier
+                    } else {
+                        crate::learning_data::FailureCode::ToolFailure
+                    });
+                    if action == "failed_verification" {
+                        record.verification = Some(crate::learning_data::Verification {
+                            kind: Some("automated".to_owned()),
+                            passed: Some(false),
+                            evidence_refs: Vec::new(),
+                        });
+                    }
+                }
+            }
         }
         other => bail!("unsupported execution transition `{other}`"),
     }
@@ -348,6 +415,7 @@ pub(crate) fn transition(
         .count();
     if node_count > 0 && completed == node_count {
         execution.phase = "completed".to_owned();
+        document.learning.outcome = Some(crate::learning_data::aggregate(&document.learning));
     }
     execution.updated_at = now.clone();
     document.updated_at = now;
@@ -437,6 +505,52 @@ pub(crate) fn set_execution_phase(workspace: &Path, phase: &str) -> Result<()> {
     write_document(workspace, &document)
 }
 
+pub(crate) fn record_graph_edit(
+    workspace: &Path,
+    graph_before_hash: &str,
+    action: &str,
+    target: Option<&str>,
+    created_nodes: Vec<String>,
+    trigger: &str,
+    actor: &str,
+) -> Result<()> {
+    if !matches!(
+        action,
+        "split_node"
+            | "reroute_node"
+            | "cancel_node"
+            | "add_dependency"
+            | "remove_dependency"
+            | "add_branch"
+            | "add_wave_task"
+            | "evolve_graph"
+    ) {
+        bail!("unsupported graph edit action `{action}`");
+    }
+    let _guard = project_file_lock();
+    let mut document = load(workspace)?;
+    document
+        .learning
+        .graph_edits
+        .push(crate::learning_data::GraphEditEvent {
+            graph_before_hash: graph_before_hash.to_owned(),
+            action: crate::learning_data::GraphEditAction {
+                kind: action.to_owned(),
+                target: target.map(str::to_owned),
+                created_nodes,
+            },
+            trigger: trigger.chars().take(240).collect(),
+            actor: actor.chars().take(120).collect(),
+            timestamp: timestamp(),
+            eventual_effect: crate::learning_data::EventualEffect::default(),
+        });
+    if let Some(record) = target.and_then(|id| document.learning.nodes.get_mut(id)) {
+        record.human_intervention = true;
+    }
+    document.updated_at = timestamp();
+    write_document(workspace, &document)
+}
+
 pub(crate) fn update_planning_progress(
     workspace: &Path,
     message: &str,
@@ -474,10 +588,13 @@ pub(crate) fn update_planning_progress(
 
 pub(crate) fn load(workspace: &Path) -> Result<FractalProject> {
     let path = path(workspace);
-    let document: FractalProject = serde_json::from_slice(
+    let mut document: FractalProject = serde_json::from_slice(
         &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
     )
     .with_context(|| format!("decode {}", path.display()))?;
+    if document.learning.nodes.is_empty() {
+        document.learning = learning_from_graph(&document.graph, &document.updated_at);
+    }
     validate(&document)?;
     Ok(document)
 }
@@ -505,6 +622,16 @@ fn validate(document: &FractalProject) -> Result<()> {
     crate::graph_store::verify_graph_document(&document.graph)
         .context("embedded execution graph hash is invalid")?;
     reject_secret_fields(&document.graph)?;
+    crate::learning_data::validate(&document.learning)
+        .map_err(|error| anyhow::anyhow!("invalid fractal.learning.v1 document: {error}"))?;
+    if let Some(efficiency) = &document.efficiency {
+        crate::efficiency::validate(efficiency)
+            .map_err(|error| anyhow::anyhow!("invalid fractal.efficiency.v1 document: {error}"))?;
+        let encoded = serde_json::to_value(efficiency)
+            .map_err(|error| anyhow::anyhow!("encode fractal.efficiency.v1: {error}"))?;
+        reject_secret_fields(&encoded)
+            .context("efficiency envelope contains forbidden credential-shaped fields")?;
+    }
     if let Some(execution) = &document.execution {
         if execution.schema != "fractal.execution_state.v1"
             || !matches!(
@@ -551,6 +678,89 @@ fn validate(document: &FractalProject) -> Result<()> {
     Ok(())
 }
 
+fn learning_from_graph(graph: &Value, now: &str) -> crate::learning_data::LearningData {
+    let mut learning = crate::learning_data::LearningData::default();
+    let mut dependencies: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for edge in graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let (Some(from), Some(to)) = (
+            edge.get("from").and_then(Value::as_str),
+            edge.get("to").and_then(Value::as_str),
+        ) {
+            dependencies
+                .entry(to.to_owned())
+                .or_default()
+                .push(from.to_owned());
+        }
+    }
+    for node in graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = node.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let capability = node
+            .get("capability")
+            .and_then(Value::as_str)
+            .unwrap_or("implementation");
+        let depends_on = dependencies.remove(id).unwrap_or_default();
+        let node_type = if capability.starts_with("project.tests") || capability.contains("verify")
+        {
+            "verification"
+        } else if capability.starts_with("control.") {
+            "control"
+        } else {
+            "implementation"
+        };
+        let objective = node
+            .get("title")
+            .or_else(|| node.get("instruction"))
+            .and_then(Value::as_str)
+            .unwrap_or(id)
+            .chars()
+            .take(1_000)
+            .collect();
+        learning.nodes.insert(
+            id.to_owned(),
+            crate::learning_data::NodeRecord {
+                node_id: id.to_owned(),
+                node_type: node_type.to_owned(),
+                objective,
+                ready_at: depends_on.is_empty().then(|| now.to_owned()),
+                depends_on,
+                created_at: Some(now.to_owned()),
+                ..crate::learning_data::NodeRecord::default()
+            },
+        );
+    }
+    learning
+}
+
+fn merge_learning(
+    current: &crate::learning_data::LearningData,
+    graph: &Value,
+    now: &str,
+) -> crate::learning_data::LearningData {
+    let mut merged = learning_from_graph(graph, now);
+    for (id, record) in &mut merged.nodes {
+        if let Some(previous) = current.nodes.get(id) {
+            let depends_on = record.depends_on.clone();
+            *record = previous.clone();
+            record.depends_on = depends_on;
+        }
+    }
+    merged.graph_edits = current.graph_edits.clone();
+    merged.outcome = current.outcome.clone();
+    merged
+}
+
 fn is_planning_preview(graph: &Value) -> bool {
     let nodes = graph.get("nodes").and_then(Value::as_array);
     nodes.is_some_and(|nodes| {
@@ -565,6 +775,24 @@ fn write_document(workspace: &Path, document: &FractalProject) -> Result<()> {
     let directory = destination.parent().expect("project file has parent");
     fs::create_dir_all(directory).with_context(|| format!("create {}", directory.display()))?;
     atomic_write(&destination, &serde_json::to_vec_pretty(document)?)
+}
+
+/// Atomically load, mutate, validate, and rewrite the portable project file under
+/// the shared project-file lock. Used by efficiency accounting and similar append
+/// paths that must not race execution/learning updates.
+pub(crate) fn mutate_document(
+    workspace: &Path,
+    update: impl FnOnce(&mut FractalProject) -> Result<()>,
+) -> Result<()> {
+    let _guard = project_file_lock();
+    let mut document = load(workspace)?;
+    update(&mut document)?;
+    document.updated_at = timestamp();
+    write_document(workspace, &document)
+}
+
+pub(crate) fn project_timestamp() -> String {
+    timestamp()
 }
 
 fn project_file_lock() -> std::sync::MutexGuard<'static, ()> {

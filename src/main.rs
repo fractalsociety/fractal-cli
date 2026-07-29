@@ -10,6 +10,11 @@ mod contribute;
 mod coordinate;
 mod dataevol;
 mod decompose;
+mod efficiency;
+mod efficiency_accounting;
+mod efficiency_config;
+mod efficiency_detector;
+mod efficiency_policy;
 mod evolve;
 mod execute;
 mod graph_store;
@@ -19,6 +24,7 @@ mod harness_evolution;
 mod ingest;
 mod intent;
 mod interactive;
+mod learning_data;
 mod mobile;
 mod orchestrate;
 mod pipeline;
@@ -119,21 +125,31 @@ fn run(cli: Cli) -> Result<()> {
             GraphCommand::Status(args) => board::status(&args.url, args.json),
             GraphCommand::Show(args) => graph_store::show(&args.graph_hash, args.json),
         },
-        (None, Some(Command::Run(args))) if args.local => run_local(&args),
-        (None, Some(Command::Run(args))) => match args.graph.as_deref() {
-            Some(graph_hash) => run::run_graph(
-                graph_hash,
-                args.db.as_deref(),
-                args.squad_bin.as_deref(),
-                args.watch,
-                args.dry_run,
-            ),
-            None => {
-                pipeline::print_run_stub(args.work.as_deref());
-                Ok(())
+        (None, Some(Command::Run(args))) if args.local => {
+            let efficiency = efficiency_config::resolve(&args.efficiency)?;
+            run_local(&args, &efficiency)
+        }
+        (None, Some(Command::Run(args))) => {
+            let efficiency = efficiency_config::resolve(&args.efficiency)?;
+            match args.graph.as_deref() {
+                Some(graph_hash) => {
+                    println!("{}", efficiency_config::banner(&efficiency));
+                    run::run_graph(
+                        graph_hash,
+                        args.db.as_deref(),
+                        args.squad_bin.as_deref(),
+                        args.watch,
+                        args.dry_run,
+                    )
+                }
+                None => {
+                    pipeline::print_run_stub(args.work.as_deref());
+                    Ok(())
+                }
             }
-        },
+        }
         (None, Some(Command::Evolve(args))) => evolve::run_evolve(&args),
+        (None, Some(Command::Efficiency(args))) => efficiency_config::run(&args),
         (None, Some(Command::Node(args))) => {
             pipeline::print_node_stub(&args.id, args.show, args.retry, args.cancel);
             Ok(())
@@ -293,8 +309,13 @@ fn print_submit_plan(
 }
 
 /// Execute a committed or file-based graph in-process with the local agent team,
-/// serving a live board that turns green as nodes complete.
-fn run_local(args: &crate::cli::RunArgs) -> Result<()> {
+/// serving a live board that turns green as nodes complete. The efficiency
+/// configuration is threaded in explicitly (no global mutable state); it is
+/// surfaced here but does not yet mutate scheduling.
+fn run_local(
+    args: &crate::cli::RunArgs,
+    efficiency: &efficiency_config::EfficiencyConfig,
+) -> Result<()> {
     let (graph, graph_file): (serde_json::Value, std::path::PathBuf) =
         if let Some(file) = &args.graph_file {
             (serde_json::from_slice(&std::fs::read(file)?)?, file.clone())
@@ -319,6 +340,7 @@ fn run_local(args: &crate::cli::RunArgs) -> Result<()> {
     }
     std::thread::sleep(std::time::Duration::from_millis(1500));
 
+    println!("{}", efficiency_config::banner(efficiency));
     println!(
         "Running graph with agent team: {} in {}",
         agents.join(", "),
@@ -355,5 +377,37 @@ mod tests {
     fn dispatches_version() {
         let cli = Cli::try_parse_from(["fractal", "version"]).unwrap();
         assert!(run(cli).is_ok());
+    }
+
+    #[test]
+    fn dispatches_efficiency_status_with_defaults() {
+        let cli = Cli::try_parse_from(["fractal", "efficiency"]).unwrap();
+        assert!(run(cli).is_ok());
+    }
+
+    #[test]
+    fn rejects_contradictory_efficiency_configuration() {
+        let cli = Cli::try_parse_from([
+            "fractal",
+            "efficiency",
+            "--mode",
+            "observe",
+            "--approve-intervention",
+            "merge",
+        ])
+        .unwrap();
+        let error = run(cli).unwrap_err();
+        assert!(error.to_string().contains("contradictory"));
+
+        let unsafe_run = Cli::try_parse_from([
+            "fractal",
+            "run",
+            "--work",
+            "work-7",
+            "--allow-high-impact",
+            "cancel",
+        ])
+        .unwrap();
+        assert!(run(unsafe_run).is_err());
     }
 }

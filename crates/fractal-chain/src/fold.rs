@@ -141,11 +141,10 @@ pub fn fold_child_into_parent<'a>(
     child: &ScaleLedger,
     timestamp_ms: u64,
 ) -> Result<&'a Block, FoldError> {
-    let child_level =
-        ScaleLevel::parse(child.scale()).ok_or_else(|| FoldError::ScaleMismatch {
-            child: child.scale().to_owned(),
-            parent: parent.scale().to_owned(),
-        })?;
+    let child_level = ScaleLevel::parse(child.scale()).ok_or_else(|| FoldError::ScaleMismatch {
+        child: child.scale().to_owned(),
+        parent: parent.scale().to_owned(),
+    })?;
     let expected_parent = child_level.parent().ok_or_else(|| FoldError::NoParent {
         scale: child.scale().to_owned(),
     })?;
@@ -383,10 +382,7 @@ mod tests {
         verify_child_anchored(&parent, &child).expect("anchored");
         assert_eq!(parent.blocks()[0].receipts[0].payload_hash, child.head());
         assert_eq!(parent.blocks()[0].receipts[0].subject, "node");
-        assert_eq!(
-            parent.blocks()[0].receipts[0].kind,
-            ReceiptKind::Lineage
-        );
+        assert_eq!(parent.blocks()[0].receipts[0].kind, ReceiptKind::Lineage);
     }
 
     #[test]
@@ -437,7 +433,13 @@ mod tests {
 
         // Each parent block contains the child's head at fold time.
         assert_eq!(
-            spine.ledger(ScaleLevel::Graph).blocks().last().unwrap().receipts[0].payload_hash,
+            spine
+                .ledger(ScaleLevel::Graph)
+                .blocks()
+                .last()
+                .unwrap()
+                .receipts[0]
+                .payload_hash,
             // Note: after fold_all, node head is unchanged (node not mutated).
             spine.ledger(ScaleLevel::Node).head()
         );

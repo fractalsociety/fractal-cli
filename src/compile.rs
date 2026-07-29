@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
 
+use crate::efficiency::{validate_node_metadata, NodeEfficiencyMetadata, MAX_BASIS_BYTES};
 use crate::harness::HarnessSelection;
 
 const CODE_HARNESS_FIXTURE: &str = include_str!(
@@ -46,6 +47,111 @@ fn goal_is_greenfield_build(goal: &str) -> bool {
     let goal = goal.to_ascii_lowercase();
     const REPAIR: [&str; 6] = ["fix", "repair", "bug", "regression", "debug", "failing"];
     !REPAIR.iter().any(|word| goal.contains(word))
+}
+
+/// Baseline planning metadata for nodes Fractal synthesizes itself. Planner
+/// tasks declare their own metadata; legacy harnesses without any stay valid.
+pub(crate) fn baseline_node_efficiency(
+    estimated_remaining_tokens: u64,
+    dependencies: Vec<String>,
+    expected_artifact: &str,
+    files_or_systems_affected: Vec<String>,
+    verification_plan: &str,
+) -> NodeEfficiencyMetadata {
+    NodeEfficiencyMetadata {
+        estimated_remaining_tokens,
+        dependencies,
+        expected_artifact: bounded_basis(expected_artifact),
+        files_or_systems_affected,
+        verification_plan: bounded_basis(verification_plan),
+        current_assumptions: Vec::new(),
+        similarity_to_other_active_nodes: BTreeMap::new(),
+        confidence_still_useful: 1.0,
+    }
+}
+
+/// Baseline metadata already encoded for direct embedding in a harness node.
+pub(crate) fn baseline_efficiency_value(
+    estimated_remaining_tokens: u64,
+    dependencies: Vec<String>,
+    expected_artifact: &str,
+    files_or_systems_affected: Vec<String>,
+    verification_plan: &str,
+) -> Value {
+    node_efficiency_to_graph_value(&baseline_node_efficiency(
+        estimated_remaining_tokens,
+        dependencies,
+        expected_artifact,
+        files_or_systems_affected,
+        verification_plan,
+    ))
+}
+
+/// Encode planning metadata for embedding in canonically hashed documents.
+/// `fractal-cjson-v1` rejects floating-point numbers, so the two unit-interval
+/// fields travel as decimal strings; field names and everything else match
+/// `NodeEfficiencyMetadata` exactly. The caller passes validated metadata.
+pub(crate) fn node_efficiency_to_graph_value(meta: &NodeEfficiencyMetadata) -> Value {
+    let mut value = serde_json::to_value(meta).expect("encode node efficiency metadata");
+    value["confidence_still_useful"] = Value::String(meta.confidence_still_useful.to_string());
+    value["similarity_to_other_active_nodes"] = Value::Object(
+        meta.similarity_to_other_active_nodes
+            .iter()
+            .map(|(peer, score)| (peer.clone(), Value::String(score.to_string())))
+            .collect(),
+    );
+    value
+}
+
+/// Decode node planning metadata, accepting the canonical string form for the
+/// unit-interval fields as well as plain JSON numbers.
+pub(crate) fn node_efficiency_from_graph_value(raw: &Value) -> Result<NodeEfficiencyMetadata> {
+    let mut value = raw.clone();
+    if let Some(text) = value
+        .get("confidence_still_useful")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    {
+        value["confidence_still_useful"] = parse_unit_number(&text, "confidence_still_useful")?;
+    }
+    if let Some(scores) = value
+        .get("similarity_to_other_active_nodes")
+        .and_then(Value::as_object)
+        .cloned()
+    {
+        let mut converted = Map::new();
+        for (peer, score) in scores {
+            let score = match score {
+                Value::String(text) => {
+                    parse_unit_number(&text, "similarity_to_other_active_nodes")?
+                }
+                other => other,
+            };
+            converted.insert(peer, score);
+        }
+        value["similarity_to_other_active_nodes"] = Value::Object(converted);
+    }
+    serde_json::from_value(value)
+        .map_err(|error| anyhow!("efficiency metadata is malformed: {error}"))
+}
+
+fn parse_unit_number(text: &str, field: &str) -> Result<Value> {
+    let parsed: f64 = text
+        .parse()
+        .map_err(|_| anyhow!("{field} must be a decimal number, got `{text}`"))?;
+    serde_json::Number::from_f64(parsed)
+        .map(Value::Number)
+        .ok_or_else(|| anyhow!("{field} must be a finite number, got `{text}`"))
+}
+
+/// Clamp free text to the efficiency contract's basis size bound.
+fn bounded_basis(text: &str) -> String {
+    let text = text.trim();
+    let mut cut = text.len().min(MAX_BASIS_BYTES);
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text[..cut].to_owned()
 }
 
 /// A task-faithful greenfield build harness. The `implement` node produces the
@@ -93,7 +199,14 @@ fn build_harness(selection: &HarnessSelection, goal: &str, success_criteria: &[S
                 "preconditions": [],
                 "produced_state": ["plan_ready"],
                 "instruction": plan,
-                "budget": {"timeout_ms": 60_000}
+                "budget": {"timeout_ms": 60_000},
+                "efficiency": baseline_efficiency_value(
+                    6_000,
+                    vec![],
+                    "INTERFACE.md",
+                    vec!["INTERFACE.md".to_owned()],
+                    "The review and acceptance nodes prove the interface is implemented and tested.",
+                )
             },
             {
                 "id": "implement",
@@ -102,7 +215,14 @@ fn build_harness(selection: &HarnessSelection, goal: &str, success_criteria: &[S
                 "preconditions": ["plan_ready"],
                 "produced_state": ["implementation_ready"],
                 "instruction": implement,
-                "budget": {"timeout_ms": 180_000}
+                "budget": {"timeout_ms": 180_000},
+                "efficiency": baseline_efficiency_value(
+                    20_000,
+                    vec!["plan".to_owned()],
+                    "The module file specified by INTERFACE.md.",
+                    vec![],
+                    "The acceptance node runs the whole unittest suite.",
+                )
             },
             {
                 "id": "author_tests",
@@ -111,7 +231,14 @@ fn build_harness(selection: &HarnessSelection, goal: &str, success_criteria: &[S
                 "preconditions": ["plan_ready"],
                 "produced_state": ["tests_ready"],
                 "instruction": author_tests,
-                "budget": {"timeout_ms": 180_000}
+                "budget": {"timeout_ms": 180_000},
+                "efficiency": baseline_efficiency_value(
+                    16_000,
+                    vec!["plan".to_owned()],
+                    "A unittest file covering every INTERFACE.md benchmark.",
+                    vec![],
+                    "The acceptance node runs the whole unittest suite.",
+                )
             },
             {
                 "id": "review",
@@ -120,7 +247,14 @@ fn build_harness(selection: &HarnessSelection, goal: &str, success_criteria: &[S
                 "preconditions": ["implementation_ready", "tests_ready"],
                 "produced_state": ["reviewed"],
                 "instruction": review,
-                "budget": {"timeout_ms": 180_000}
+                "budget": {"timeout_ms": 180_000},
+                "efficiency": baseline_efficiency_value(
+                    10_000,
+                    vec!["implement".to_owned(), "author_tests".to_owned()],
+                    "The reconciled implementation and test files.",
+                    vec![],
+                    "python3 -m unittest passes after reconciliation.",
+                )
             },
             {
                 "id": "acceptance",
@@ -129,7 +263,14 @@ fn build_harness(selection: &HarnessSelection, goal: &str, success_criteria: &[S
                 "preconditions": ["reviewed"],
                 "produced_state": ["acceptance_passed"],
                 "instruction": acceptance,
-                "budget": {"timeout_ms": 120_000}
+                "budget": {"timeout_ms": 120_000},
+                "efficiency": baseline_efficiency_value(
+                    4_000,
+                    vec!["review".to_owned()],
+                    "A fully passing unittest run.",
+                    vec![],
+                    "python3 -m unittest exits successfully.",
+                )
             },
             {
                 "id": "complete",
@@ -138,7 +279,14 @@ fn build_harness(selection: &HarnessSelection, goal: &str, success_criteria: &[S
                 "preconditions": ["acceptance_passed"],
                 "produced_state": ["outcome_verified"],
                 "instruction": complete,
-                "budget": {"timeout_ms": 5_000}
+                "budget": {"timeout_ms": 5_000},
+                "efficiency": baseline_efficiency_value(
+                    500,
+                    vec!["acceptance".to_owned()],
+                    "The verified-outcome completion marker.",
+                    vec![],
+                    "The acceptance_passed state is present before completion.",
+                )
             }
         ],
         "edges": [
@@ -165,7 +313,14 @@ fn minimal_harness(selection: &HarnessSelection) -> Value {
                 "memory_scopes": ["work:goal"],
                 "preconditions": [],
                 "produced_state": ["analysis_complete"],
-                "budget": {"timeout_ms": 30_000}
+                "budget": {"timeout_ms": 30_000},
+                "efficiency": baseline_efficiency_value(
+                    4_000,
+                    vec![],
+                    "An analysis of the work goal.",
+                    vec![],
+                    "The verify node checks the implemented result.",
+                )
             },
             {
                 "id": "implement",
@@ -173,7 +328,14 @@ fn minimal_harness(selection: &HarnessSelection) -> Value {
                 "memory_scopes": ["work:goal"],
                 "preconditions": ["analysis_complete"],
                 "produced_state": ["implementation_complete"],
-                "budget": {"timeout_ms": 120_000}
+                "budget": {"timeout_ms": 120_000},
+                "efficiency": baseline_efficiency_value(
+                    12_000,
+                    vec!["analyze".to_owned()],
+                    "The implemented outcome for the work goal.",
+                    vec![],
+                    "The verify node checks the implemented result.",
+                )
             },
             {
                 "id": "verify",
@@ -181,7 +343,14 @@ fn minimal_harness(selection: &HarnessSelection) -> Value {
                 "memory_scopes": ["work:goal"],
                 "preconditions": ["implementation_complete"],
                 "produced_state": ["result_verified"],
-                "budget": {"timeout_ms": 60_000}
+                "budget": {"timeout_ms": 60_000},
+                "efficiency": baseline_efficiency_value(
+                    4_000,
+                    vec!["implement".to_owned()],
+                    "A verified result for the work goal.",
+                    vec![],
+                    "The result.verify capability confirms the outcome.",
+                )
             }
         ],
         "edges": [
@@ -424,6 +593,28 @@ fn annotate_execution_flow(graph: &mut Value, harness: &Value) -> Result<()> {
         .flatten()
         .map(|(id, metadata)| (id.clone(), metadata.clone()))
         .collect();
+    // Planning-time efficiency metadata declared on harness nodes is validated
+    // (ranges + dependency consistency) BEFORE the graph is hashed and
+    // committed. Legacy harnesses whose nodes carry no metadata stay valid.
+    let mut efficiency_by_id: BTreeMap<String, NodeEfficiencyMetadata> = BTreeMap::new();
+    for node in harness
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = node.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(raw) = node.get("efficiency") else {
+            continue;
+        };
+        let meta = node_efficiency_from_graph_value(raw)
+            .map_err(|error| anyhow!("node `{id}` efficiency metadata: {error}"))?;
+        validate_node_metadata(&meta)
+            .map_err(|error| anyhow!("node `{id}` efficiency metadata: {error}"))?;
+        efficiency_by_id.insert(id.to_owned(), meta);
+    }
     let mut wave_positions: BTreeMap<u32, u32> = BTreeMap::new();
     for node in graph_nodes {
         let id = node
@@ -460,6 +651,26 @@ fn annotate_execution_flow(graph: &mut Value, harness: &Value) -> Result<()> {
         }
         if let Some(title) = titles.get(id.as_str()) {
             node["title"] = Value::String((*title).to_owned());
+        }
+        if let Some(meta) = efficiency_by_id.get(&id) {
+            for dependency in &meta.dependencies {
+                if !predecessors
+                    .get(&id)
+                    .is_some_and(|values| values.contains(dependency))
+                {
+                    bail!(
+                        "node `{id}` efficiency dependency `{dependency}` is not an execution dependency of the node"
+                    );
+                }
+            }
+            for peer in meta.similarity_to_other_active_nodes.keys() {
+                if peer == &id || !node_ids.contains(peer) {
+                    bail!(
+                        "node `{id}` efficiency similarity peer `{peer}` must name another graph node"
+                    );
+                }
+            }
+            node["efficiency"] = node_efficiency_to_graph_value(meta);
         }
     }
     let flow_waves = wave_sizes
@@ -561,7 +772,10 @@ mod tests {
     use fractal_harnessc::Target;
     use serde_json::{json, Value};
 
-    use super::{annotate_execution_flow, compile_graph, harness_for, recompile};
+    use super::{
+        annotate_execution_flow, compile_graph, harness_for, node_efficiency_from_graph_value,
+        recompile,
+    };
 
     /// Isolate `FRACTAL_HOME` (compile now persists a genome sidecar) and
     /// serialize with the other tests that mutate the environment.
@@ -776,6 +990,90 @@ mod tests {
         assert_eq!(branch["execution"]["amendment_kind"], "branch");
         assert_eq!(branch["execution"]["branch_parent"], "anchor");
         assert_eq!(branch["execution"]["branch_depth"], 1);
+    }
+
+    #[test]
+    fn compiled_nodes_expose_validated_efficiency_metadata() {
+        let selection = select_harness("nl.code");
+        let harness = harness_for(&selection, "Build a tiny CLI that reverses a string.", &[]);
+        let graph =
+            recompile(&representative_work(), &harness, "darwin-arm64").expect("build compiles");
+        let node = graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["id"] == "implement")
+            .unwrap();
+        assert_eq!(node["efficiency"]["dependencies"], json!(["plan"]));
+        assert_eq!(
+            node["efficiency"]["estimated_remaining_tokens"],
+            json!(20_000)
+        );
+        // Unit-interval fields travel as canonical-JSON-safe decimal strings.
+        assert_eq!(node["efficiency"]["confidence_still_useful"], json!("1"));
+        let decoded = node_efficiency_from_graph_value(&node["efficiency"]).expect("round-trip");
+        crate::efficiency::validate_node_metadata(&decoded).expect("decoded metadata is valid");
+        assert!((decoded.confidence_still_useful - 1.0).abs() < f64::EPSILON);
+        assert!(graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|node| node.get("efficiency").is_some()));
+    }
+
+    #[test]
+    fn out_of_range_efficiency_metadata_fails_before_commitment() {
+        let selection = select_harness("nl.code");
+        let mut harness = harness_for(&selection, "Build a tiny CLI.", &[]);
+        harness["nodes"][1]["efficiency"]["confidence_still_useful"] = json!("1.5");
+        let error = recompile(&representative_work(), &harness, "darwin-arm64")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("confidence_still_useful"), "{error}");
+    }
+
+    #[test]
+    fn efficiency_dependencies_must_match_graph_edges() {
+        let selection = select_harness("nl.code");
+        let mut harness = harness_for(&selection, "Build a tiny CLI.", &[]);
+        harness["nodes"][1]["efficiency"]["dependencies"] = json!(["acceptance"]);
+        let error = recompile(&representative_work(), &harness, "darwin-arm64")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not an execution dependency"), "{error}");
+    }
+
+    #[test]
+    fn efficiency_similarity_peers_must_name_other_nodes() {
+        let selection = select_harness("nl.code");
+        let mut harness = harness_for(&selection, "Build a tiny CLI.", &[]);
+        harness["nodes"][1]["efficiency"]["similarity_to_other_active_nodes"] =
+            json!({"ghost": "0.4"});
+        let error = recompile(&representative_work(), &harness, "darwin-arm64")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("similarity peer"), "{error}");
+
+        let mut harness = harness_for(&selection, "Build a tiny CLI.", &[]);
+        harness["nodes"][1]["efficiency"]["similarity_to_other_active_nodes"] =
+            json!({"implement": "0.4"});
+        assert!(recompile(&representative_work(), &harness, "darwin-arm64").is_err());
+    }
+
+    #[test]
+    fn legacy_harness_without_efficiency_metadata_still_compiles() {
+        let selection = select_harness("nl.code");
+        let mut harness = harness_for(&selection, "Build a tiny CLI.", &[]);
+        for node in harness["nodes"].as_array_mut().unwrap() {
+            node.as_object_mut().unwrap().remove("efficiency");
+        }
+        let graph = recompile(&representative_work(), &harness, "darwin-arm64")
+            .expect("legacy harness still compiles");
+        assert!(graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|node| node.get("efficiency").is_none()));
     }
 
     #[test]

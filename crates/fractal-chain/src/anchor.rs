@@ -300,22 +300,10 @@ mod tests {
     #[test]
     fn convenience_helpers_append_signed_blocks() {
         let mut ledger = ledger();
-        anchor_node_execution(
-            &mut ledger,
-            "node:a",
-            payload_hash(b"ev"),
-            10,
-        )
-        .expect("exec");
+        anchor_node_execution(&mut ledger, "node:a", payload_hash(b"ev"), 10).expect("exec");
         anchor_verifier_verdict(&mut ledger, "node:a", payload_hash(b"ok"), 11).expect("verdict");
         anchor_route_decision(&mut ledger, "node:a", payload_hash(b"route"), 12).expect("route");
-        anchor_promotion(
-            &mut ledger,
-            "cand:1",
-            payload_hash(b"ELIGIBLE"),
-            13,
-        )
-        .expect("promo");
+        anchor_promotion(&mut ledger, "cand:1", payload_hash(b"ELIGIBLE"), 13).expect("promo");
         assert_eq!(ledger.blocks().len(), 4);
         ledger.verify().expect("verify");
         // Heads advance (hash-linked).

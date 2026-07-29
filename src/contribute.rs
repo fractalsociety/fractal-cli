@@ -125,6 +125,7 @@ pub(crate) fn run(
         fractalwork_override,
         coordinate,
         DEFAULT_GRAPH_PORT,
+        None,
     )?;
 
     if git_has_changes(&workspace)? {

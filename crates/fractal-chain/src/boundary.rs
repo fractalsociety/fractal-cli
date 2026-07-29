@@ -171,10 +171,7 @@ pub fn assert_boundary_attested(ledger: &ScaleLedger) -> Result<(), BoundaryAtte
     match found {
         None => Err(BoundaryAttestationError::NotAttested),
         Some(actual) if actual == expected => Ok(()),
-        Some(actual) => Err(BoundaryAttestationError::AttestationMismatch {
-            expected,
-            actual,
-        }),
+        Some(actual) => Err(BoundaryAttestationError::AttestationMismatch { expected, actual }),
     }
 }
 
@@ -233,8 +230,11 @@ mod tests {
                 BoundaryAttestationError::ImmutableTarget { .. }
             ));
         }
-        assert_mutation_outside_boundary(&["route-candidates".to_owned(), "retry-policy".to_owned()])
-            .expect("mutable ok");
+        assert_mutation_outside_boundary(&[
+            "route-candidates".to_owned(),
+            "retry-policy".to_owned(),
+        ])
+        .expect("mutable ok");
         let err = assert_mutation_outside_boundary(&["mystery-knob".to_owned()]).expect_err("unk");
         assert!(matches!(
             err,

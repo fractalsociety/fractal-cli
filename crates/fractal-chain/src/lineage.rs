@@ -81,7 +81,8 @@ impl DevelopmentalStep {
         let scale = self.scale.as_str().as_bytes();
         let subject = self.subject.as_bytes();
         let step_id = self.step_id.as_bytes();
-        let mut pre = Vec::with_capacity(1 + 8 + scale.len() + 8 + subject.len() + 8 + step_id.len() + 64);
+        let mut pre =
+            Vec::with_capacity(1 + 8 + scale.len() + 8 + subject.len() + 8 + step_id.len() + 64);
         pre.push(self.operation.tag());
         pre.extend_from_slice(&(scale.len() as u64).to_be_bytes());
         pre.extend_from_slice(scale);
@@ -270,9 +271,7 @@ pub fn audit_development(lineage: &LineageGraph, ledger: &ScaleLedger) -> Develo
     DevelopmentAudit {
         grew_or_repaired: !reshaping.is_empty(),
         anchored: !reshaping.is_empty()
-            && reshaping
-                .iter()
-                .all(|step| step_is_anchored(ledger, step)),
+            && reshaping.iter().all(|step| step_is_anchored(ledger, step)),
         motivated: !reshaping.is_empty()
             && reshaping
                 .iter()
@@ -341,13 +340,22 @@ mod tests {
 
     #[test]
     fn commitment_and_link_are_deterministic_and_field_sensitive() {
-        let base = step(ScaleLevel::Node, "s1", DevelopmentalOp::Grow, outcome(1), outcome(2));
+        let base = step(
+            ScaleLevel::Node,
+            "s1",
+            DevelopmentalOp::Grow,
+            outcome(1),
+            outcome(2),
+        );
         assert_eq!(base.commitment(), base.commitment());
         let mut other = base.clone();
         other.operation = DevelopmentalOp::Repair;
         assert_ne!(base.commitment(), other.commitment());
         let mut swapped = base.clone();
-        std::mem::swap(&mut swapped.motivating_outcome, &mut swapped.produced_outcome);
+        std::mem::swap(
+            &mut swapped.motivating_outcome,
+            &mut swapped.produced_outcome,
+        );
         assert_ne!(base.link_commitment(), swapped.link_commitment());
     }
 
@@ -377,8 +385,20 @@ mod tests {
     #[test]
     fn single_scale_lineage_is_not_cross_scale() {
         let mut lineage = LineageGraph::new();
-        lineage.insert(step(ScaleLevel::Node, "a", DevelopmentalOp::Grow, outcome(5), outcome(6)));
-        lineage.insert(step(ScaleLevel::Node, "b", DevelopmentalOp::Repair, outcome(6), outcome(7)));
+        lineage.insert(step(
+            ScaleLevel::Node,
+            "a",
+            DevelopmentalOp::Grow,
+            outcome(5),
+            outcome(6),
+        ));
+        lineage.insert(step(
+            ScaleLevel::Node,
+            "b",
+            DevelopmentalOp::Repair,
+            outcome(6),
+            outcome(7),
+        ));
         assert!(!lineage.is_cross_scale("b"));
         assert_eq!(lineage.trail("b").len(), 2);
     }
@@ -387,9 +407,25 @@ mod tests {
     fn trail_is_cycle_safe() {
         // Two steps that motivate each other must not loop forever.
         let mut lineage = LineageGraph::new();
-        lineage.insert(step(ScaleLevel::Node, "x", DevelopmentalOp::Grow, outcome(1), outcome(2)));
-        lineage.insert(step(ScaleLevel::Graph, "y", DevelopmentalOp::Grow, outcome(2), outcome(1)));
-        let ids: Vec<&str> = lineage.trail("x").iter().map(|s| s.step_id.as_str()).collect();
+        lineage.insert(step(
+            ScaleLevel::Node,
+            "x",
+            DevelopmentalOp::Grow,
+            outcome(1),
+            outcome(2),
+        ));
+        lineage.insert(step(
+            ScaleLevel::Graph,
+            "y",
+            DevelopmentalOp::Grow,
+            outcome(2),
+            outcome(1),
+        ));
+        let ids: Vec<&str> = lineage
+            .trail("x")
+            .iter()
+            .map(|s| s.step_id.as_str())
+            .collect();
         // x → producer(1)=y → producer(2)=x already seen → stop.
         assert_eq!(ids, ["x", "y"]);
     }
@@ -397,7 +433,13 @@ mod tests {
     #[test]
     fn audit_passes_for_an_anchored_motivated_repair() {
         let mut ledger = ScaleLedger::new("graph", SigningKey::from_bytes(&[4u8; 32]));
-        let grow = step(ScaleLevel::Graph, "g1", DevelopmentalOp::Grow, outcome(1), outcome(2));
+        let grow = step(
+            ScaleLevel::Graph,
+            "g1",
+            DevelopmentalOp::Grow,
+            outcome(1),
+            outcome(2),
+        );
         anchor_step(&mut ledger, &grow, 10);
         let mut lineage = LineageGraph::new();
         lineage.insert(grow);
@@ -413,7 +455,13 @@ mod tests {
     fn audit_fails_when_step_is_not_anchored() {
         let ledger = ScaleLedger::new("graph", SigningKey::from_bytes(&[4u8; 32]));
         let mut lineage = LineageGraph::new();
-        lineage.insert(step(ScaleLevel::Graph, "g1", DevelopmentalOp::Repair, outcome(1), outcome(2)));
+        lineage.insert(step(
+            ScaleLevel::Graph,
+            "g1",
+            DevelopmentalOp::Repair,
+            outcome(1),
+            outcome(2),
+        ));
         let audit = audit_development(&lineage, &ledger); // nothing anchored
         assert!(audit.grew_or_repaired);
         assert!(!audit.anchored);
@@ -424,7 +472,13 @@ mod tests {
     fn audit_fails_without_a_real_motivating_outcome() {
         let mut ledger = ScaleLedger::new("graph", SigningKey::from_bytes(&[4u8; 32]));
         // motivating_outcome is the empty digest → not a real outcome.
-        let grow = step(ScaleLevel::Graph, "g1", DevelopmentalOp::Grow, [0u8; 32], outcome(2));
+        let grow = step(
+            ScaleLevel::Graph,
+            "g1",
+            DevelopmentalOp::Grow,
+            [0u8; 32],
+            outcome(2),
+        );
         anchor_step(&mut ledger, &grow, 10);
         let mut lineage = LineageGraph::new();
         lineage.insert(grow);
@@ -434,7 +488,13 @@ mod tests {
     #[test]
     fn differentiate_alone_is_not_a_reshaping_signal() {
         let mut ledger = ScaleLedger::new("graph", SigningKey::from_bytes(&[4u8; 32]));
-        let diff = step(ScaleLevel::Graph, "d1", DevelopmentalOp::Differentiate, outcome(1), outcome(2));
+        let diff = step(
+            ScaleLevel::Graph,
+            "d1",
+            DevelopmentalOp::Differentiate,
+            outcome(1),
+            outcome(2),
+        );
         anchor_step(&mut ledger, &diff, 10);
         let mut lineage = LineageGraph::new();
         lineage.insert(diff);
@@ -444,7 +504,13 @@ mod tests {
     #[test]
     fn step_is_anchored_detects_a_tampered_commitment() {
         let mut ledger = ScaleLedger::new("node", SigningKey::from_bytes(&[3u8; 32]));
-        let s = step(ScaleLevel::Node, "s", DevelopmentalOp::Repair, outcome(2), outcome(3));
+        let s = step(
+            ScaleLevel::Node,
+            "s",
+            DevelopmentalOp::Repair,
+            outcome(2),
+            outcome(3),
+        );
         anchor_step(&mut ledger, &s, 1_000);
         assert!(step_is_anchored(&ledger, &s));
         // A step with any changed field has a different commitment → not anchored.
@@ -456,7 +522,13 @@ mod tests {
     #[test]
     fn anchored_steps_are_tamper_evident_on_the_chain() {
         let mut ledger = ScaleLedger::new("node", SigningKey::from_bytes(&[3u8; 32]));
-        let s = step(ScaleLevel::Node, "node-repair", DevelopmentalOp::Repair, outcome(2), outcome(3));
+        let s = step(
+            ScaleLevel::Node,
+            "node-repair",
+            DevelopmentalOp::Repair,
+            outcome(2),
+            outcome(3),
+        );
         anchor_step(&mut ledger, &s, 1_000);
         ledger.verify().expect("anchored lineage verifies");
         assert_eq!(ledger.blocks()[0].receipts.len(), 2);
