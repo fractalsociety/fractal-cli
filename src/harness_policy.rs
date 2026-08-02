@@ -1266,15 +1266,10 @@ fn reject_unsafe_tree(value: &Value, path: &[String]) -> Result<()> {
             if !path.iter().any(|part| part == "allowed_names") {
                 reject_secret_shaped_string(string, &path.join("."))?;
             }
-            // Secrets are forbidden as values in command/path/policy text.  A
-            // URL is fine; an absolute path is never portable or safe.
-            if path.iter().any(|part| {
-                part.contains("path")
-                    || part.contains("writable")
-                    || part.contains("readonly")
-                    || part.contains("forbidden")
-                    || part.contains("root")
-            }) {
+            // A URL is a network destination, not a filesystem path.  Every
+            // other absolute path is rejected recursively, including values
+            // nested under future policy fields.
+            if !string.contains("://") {
                 reject_absolute_path(string, &path.join("."))?;
             }
         }
