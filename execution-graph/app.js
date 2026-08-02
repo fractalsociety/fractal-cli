@@ -1,7 +1,14 @@
 "use strict";
 
 const NS = "http://www.w3.org/2000/svg";
-const state = { data: null, view: "overview", selected: null, initialized: false, pausing: false, estimatedSaved: 0 };
+const state = {
+  data: null, view: "overview", selected: null, initialized: false,
+  pausing: false, estimatedSaved: 0,
+  failure: {
+    data: null, loading: false, error: null, open: false, selected: "",
+    filters: { q: "", state: [], code: "", component: "", lesson: "" }
+  }
+};
 const statusNames = { complete: "Complete", active: "In progress", incomplete: "Incomplete" };
 let masterBrowser = null;
 
@@ -117,6 +124,196 @@ function truncateLabel(text, max = 18) {
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 }
 
+function syncFailureFromUrl() {
+  if (!window.FractalMasterGraph?.failureQueryState) return;
+  const query = FractalMasterGraph.failureQueryState(window.location.search);
+  state.failure.open = query.open;
+  state.failure.selected = query.selected;
+  state.failure.filters = {
+    q: query.query || "", state: query.state || [], code: query.code || "",
+    component: query.component || "", lesson: query.lesson || ""
+  };
+}
+
+function persistFailureUrl(push = true) {
+  if (!window.FractalMasterGraph?.parseQueryState) return;
+  const query = FractalMasterGraph.parseQueryState(window.location.search);
+  query.failurePanel = Boolean(state.failure.open);
+  query.failureSel = state.failure.selected || "";
+  query.failureQuery = state.failure.filters.q || "";
+  query.failureState = (state.failure.filters.state || []).slice();
+  query.failureCode = state.failure.filters.code || "";
+  query.failureComponent = state.failure.filters.component || "";
+  query.failureLesson = state.failure.filters.lesson || "";
+  const text = FractalMasterGraph.serializeQueryState(query);
+  const target = `${window.location.pathname}${text || "?"}`;
+  if (push) history.pushState(null, "", target);
+  else history.replaceState(null, "", target);
+}
+
+function failureRecords() {
+  return FractalMasterGraph.failureRecords(state.failure.data);
+}
+
+function failureCountForNode(nodeId) {
+  if (!nodeId) return 0;
+  return failureRecords().filter(record => record.node_id === nodeId).length;
+}
+
+function failureSummaryLabel(summary) {
+  const unresolved = Number(summary?.unresolved || 0);
+  const total = Number(summary?.total || unresolved || 0);
+  if (!total) return "No failures";
+  return `${unresolved} open · ${total} total`;
+}
+
+function appendFailureEvidence(container, refs) {
+  const list = Array.isArray(refs) ? refs : [];
+  if (!list.length) {
+    const empty = document.createElement("small");
+    empty.className = "failure-empty-copy";
+    empty.textContent = "No evidence hash recorded.";
+    container.append(empty);
+    return;
+  }
+  list.slice(0, 20).forEach(ref => {
+    const row = document.createElement("code");
+    row.className = "failure-evidence-hash";
+    const value = ref.sha256 || ref.legacy_ref || "unidentified evidence";
+    row.textContent = ref.sha256 ? `sha256:${String(value).replace(/^sha256:/, "")}` : String(value);
+    container.append(row);
+  });
+}
+
+function renderFailureHistory() {
+  const section = document.getElementById("failure-history");
+  if (!section) return;
+  const toggle = document.getElementById("failure-history-toggle");
+  const panel = document.getElementById("failure-history-panel");
+  const list = document.getElementById("failure-history-list");
+  const detail = document.getElementById("failure-history-detail");
+  if (!toggle || !panel || !list || !detail) return;
+  const records = failureRecords();
+  const summary = state.failure.data?.summary || {};
+  toggle.textContent = `Failure History · ${failureSummaryLabel(summary)}`;
+  toggle.setAttribute("aria-expanded", state.failure.open ? "true" : "false");
+  panel.hidden = !state.failure.open;
+  section.classList.toggle("failure-history-open", state.failure.open);
+  list.replaceChildren();
+  detail.replaceChildren();
+  if (!state.failure.open) return;
+  if (state.failure.loading) {
+    list.append(Object.assign(document.createElement("p"), { className: "failure-state-copy", textContent: "Loading failure history…" }));
+    return;
+  }
+  if (state.failure.error) {
+    const message = document.createElement("p");
+    message.className = "failure-state-copy failure-state-error";
+    message.textContent = `Failure history unavailable: ${state.failure.error}`;
+    list.append(message);
+    const retry = document.createElement("button");
+    retry.type = "button"; retry.className = "failure-retry"; retry.textContent = "Retry";
+    retry.addEventListener("click", () => loadFailureGraph(true));
+    list.append(retry);
+    return;
+  }
+
+  const columns = panel.querySelector(".failure-history-columns");
+  const controls = document.createElement("div");
+  controls.className = "failure-filters";
+  const search = document.createElement("input");
+  search.type = "search"; search.className = "failure-search"; search.placeholder = "Search failure history";
+  search.setAttribute("aria-label", "Search failure history"); search.value = state.failure.filters.q || "";
+  search.addEventListener("input", () => {
+    state.failure.filters.q = search.value.slice(0, 200); state.failure.selected = ""; persistFailureUrl(true); renderFailureHistory();
+  });
+  controls.append(search);
+  const selectFilter = (label, key, values) => {
+    const select = document.createElement("select");
+    select.className = "failure-filter-select"; select.setAttribute("aria-label", `Filter by ${label}`);
+    const all = document.createElement("option"); all.value = ""; all.textContent = `All ${label}`; select.append(all);
+    values.forEach(value => { const option = document.createElement("option"); option.value = value; option.textContent = value; select.append(option); });
+    select.value = state.failure.filters[key] || "";
+    select.addEventListener("change", () => { state.failure.filters[key] = select.value; state.failure.selected = ""; persistFailureUrl(true); renderFailureHistory(); });
+    controls.append(select);
+  };
+  selectFilter("codes", "code", FractalMasterGraph.failureFieldValues(records, "failure_code"));
+  selectFilter("components", "component", FractalMasterGraph.failureFieldValues(records, "component"));
+  selectFilter("lessons", "lesson", FractalMasterGraph.failureLessons(state.failure.data).map(item => item.id || item.summary).filter(Boolean).sort());
+  const stateFilters = document.createElement("div"); stateFilters.className = "failure-state-filters"; stateFilters.setAttribute("role", "group"); stateFilters.setAttribute("aria-label", "Filter by failure state");
+  FractalMasterGraph.FAILURE_STATES.forEach(token => {
+    const button = document.createElement("button"); button.type = "button"; button.className = "failure-state-filter";
+    button.textContent = token; button.setAttribute("aria-pressed", state.failure.filters.state.includes(token) ? "true" : "false");
+    if (state.failure.filters.state.includes(token)) button.classList.add("active");
+    button.addEventListener("click", () => {
+      const current = state.failure.filters.state.filter(value => value !== token);
+      if (!state.failure.filters.state.includes(token)) current.push(token);
+      state.failure.filters.state = current; state.failure.selected = ""; persistFailureUrl(true); renderFailureHistory();
+    });
+    stateFilters.append(button);
+  });
+  controls.append(stateFilters);
+  if (columns) panel.replaceChildren(controls, columns);
+
+  const filtered = FractalMasterGraph.filterFailureRecords(records, state.failure.filters, state.failure.data);
+  const bounded = FractalMasterGraph.boundedFailureRecords(filtered, 300);
+  if (!bounded.records.length) {
+    const empty = document.createElement("p"); empty.className = "failure-state-copy";
+    empty.textContent = records.length ? "No failure history matches the active filters." : "No failures recorded for this project.";
+    list.append(empty); return;
+  }
+  const selected = bounded.records.find(record => record.id === state.failure.selected) || bounded.records[0];
+  if (selected.id !== state.failure.selected) { state.failure.selected = selected.id; persistFailureUrl(false); }
+  bounded.records.forEach(record => {
+    const item = document.createElement("button"); item.type = "button"; item.className = "failure-record-row";
+    item.classList.toggle("selected", record.id === selected.id);
+    item.setAttribute("role", "option"); item.setAttribute("aria-selected", record.id === selected.id ? "true" : "false");
+    item.innerHTML = `<span class="failure-record-state state-${record.state || "unresolved"}">${record.state || "unresolved"}</span><strong></strong><small></small>`;
+    item.querySelector("strong").textContent = `${record.node_id || "node"} · ${record.failure_code || "failure"}`;
+    item.querySelector("small").textContent = record.summary || "";
+    item.addEventListener("click", () => { state.failure.selected = record.id; persistFailureUrl(true); renderFailureHistory(); });
+    list.append(item);
+  });
+  if (bounded.hiddenCount) {
+    const cap = document.createElement("p"); cap.className = "failure-cap-copy"; cap.textContent = `${bounded.hiddenCount} additional records hidden to keep this view responsive.`; list.append(cap);
+  }
+  renderFailureDetail(detail, selected);
+}
+
+function renderFailureDetail(container, record) {
+  if (!record) return;
+  const title = document.createElement("h3"); title.textContent = record.summary || record.id; container.append(title);
+  const meta = document.createElement("p"); meta.className = "failure-detail-meta"; meta.textContent = `${record.id} · ${record.node_id || "node"} · attempt ${record.attempt || 1}`; container.append(meta);
+  const fields = document.createElement("dl"); fields.className = "failure-detail-fields";
+  [["State", record.state || "unresolved"], ["Code", record.failure_code || "—"], ["Component", record.component || "—"], ["Capability", record.capability || "—"]].forEach(([label, value]) => {
+    const wrap = document.createElement("div"); const dt = document.createElement("dt"); dt.textContent = label; const dd = document.createElement("dd"); dd.textContent = value; wrap.append(dt, dd); fields.append(wrap);
+  });
+  container.append(fields);
+  const timelineTitle = document.createElement("h4"); timelineTitle.textContent = "Timeline"; container.append(timelineTitle);
+  const timeline = document.createElement("ol"); timeline.className = "failure-timeline";
+  FractalMasterGraph.failureTimeline(record).forEach(entry => {
+    const item = document.createElement("li"); item.className = `failure-timeline-${entry.kind}`;
+    const heading = document.createElement("strong"); heading.textContent = `${entry.kind} · ${entry.outcome}`; item.append(heading);
+    const copy = document.createElement("p"); copy.textContent = entry.summary || ""; item.append(copy);
+    const evidence = document.createElement("div"); evidence.className = "failure-evidence"; appendFailureEvidence(evidence, entry.evidence); item.append(evidence); timeline.append(item);
+  });
+  container.append(timeline);
+  const lessonTitle = document.createElement("h4"); lessonTitle.textContent = "Lesson applicability"; container.append(lessonTitle);
+  const lessons = FractalMasterGraph.failureLessonsForRecord(record, state.failure.data);
+  const lessonCopy = document.createElement("p"); lessonCopy.textContent = lessons.length ? lessons.map(lesson => `${lesson.summary || lesson.id} (${lesson.status || "proposed"})`).join(" · ") : "No explicitly applicable lesson recorded."; container.append(lessonCopy);
+  const pathTitle = document.createElement("h4"); pathTitle.textContent = "Explicit causal path"; container.append(pathTitle);
+  const explicitEdges = FractalMasterGraph.failureEdges(state.failure.data);
+  const path = FractalMasterGraph.failurePath(explicitEdges, record.id, record.superseded_by || record.id);
+  const incident = explicitEdges.filter(edge => edge.from === record.id || edge.to === record.id);
+  const pathCopy = document.createElement("p");
+  pathCopy.textContent = (path.length ? path : incident).length
+    ? (path.length ? path : incident).map(edge => `${edge.from} —${edge.type || "related"}→ ${edge.to}`).join(" · ")
+    : "No explicit causal edges recorded.";
+  container.append(pathCopy);
+  const evidenceTitle = document.createElement("h4"); evidenceTitle.textContent = "Resolution / supersession evidence"; container.append(evidenceTitle);
+  const evidence = document.createElement("div"); evidence.className = "failure-evidence"; appendFailureEvidence(evidence, record.resolution?.evidence || record.evidence); container.append(evidence);
+}
+
 function edgePath(from, to, width, taskView) {
   const x1 = from[0] + width / 2;
   const x2 = to[0] - width / 2;
@@ -212,6 +409,9 @@ function renderGraph() {
   nodes.forEach(node => {
     const [x, y] = positions[node.id];
     const assignment = taskView ? node.assignment : null;
+    const failureCount = taskView
+      ? failureCountForNode(node.id)
+      : (state.failure.data?.summary?.total || 0);
     const agentLabel = assignment?.agent_label || assignment?.agent_id || "";
     const item = svgElement("g", {
       class: `node ${node.status}${state.selected?.id === node.id ? " selected" : ""}`,
@@ -227,6 +427,32 @@ function renderGraph() {
     const idText = svgElement("text", { class: "id-label", x: -width / 2 + 17, y: -height / 2 + 22 });
     idText.textContent = node.id;
     item.append(idText);
+    if (failureCount > 0) {
+      const failureBadge = svgElement("g", {
+        class: "failure-badge",
+        transform: `translate(${width / 2 - 15},${height / 2 - 16})`,
+        tabindex: "0", role: "button",
+        "aria-label": `${failureCount} failure${failureCount === 1 ? "" : "s"} recorded`
+      });
+      failureBadge.append(svgElement("circle", { cx: 0, cy: 0, r: 10 }));
+      const failureText = svgElement("text", { x: 0, y: 4, "text-anchor": "middle" });
+      failureText.textContent = String(failureCount);
+      failureBadge.append(failureText);
+      failureBadge.addEventListener("click", event => {
+        event.stopPropagation();
+        state.failure.open = true;
+        const first = failureRecords().find(record => !taskView || record.node_id === node.id);
+        if (first) state.failure.selected = first.id;
+        persistFailureUrl(true);
+        renderFailureHistory();
+      });
+      failureBadge.addEventListener("keydown", event => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault(); failureBadge.click();
+        }
+      });
+      item.append(failureBadge);
+    }
     if (assignment) {
       const badgeLabel = truncateLabel(agentLabel);
       const badgeWidth = Math.max(48, badgeLabel.length * 6.3 + 19);
@@ -432,6 +658,28 @@ async function pauseBuild() {
   }
 }
 
+async function loadFailureGraph(bust = false) {
+  if (queryMode() === "master") return;
+  const project = new URLSearchParams(window.location.search).get("project") || "";
+  state.failure.loading = !state.failure.data;
+  state.failure.error = null;
+  syncFailureFromUrl();
+  renderFailureHistory();
+  try {
+    const api = FractalMasterGraph.createApiClient(window.fetch.bind(window), { now: () => Date.now() });
+    state.failure.data = await api.failureGraph(project, bust);
+    state.failure.loading = false;
+    state.failure.error = null;
+    const records = failureRecords();
+    if (state.failure.selected && !records.some(record => record.id === state.failure.selected)) state.failure.selected = "";
+    renderFailureHistory();
+  } catch (error) {
+    state.failure.loading = false;
+    state.failure.error = error.message || "request failed";
+    renderFailureHistory();
+  }
+}
+
 async function loadGraph() {
   if (queryMode() === "master") return;
   const button = document.getElementById("refresh");
@@ -442,6 +690,8 @@ async function loadGraph() {
     const response = await fetch(`/api/graph${project ? `?project=${encodeURIComponent(project)}&` : "?"}t=${Date.now()}`);
     if (!response.ok) throw new Error(`Graph API returned ${response.status}`);
     state.data = await response.json();
+    syncFailureFromUrl();
+    await loadFailureGraph(false);
     renderRunControl();
     renderEfficiency();
     const totals = state.data.totals;
@@ -466,6 +716,7 @@ async function loadGraph() {
     }
     if (state.view !== "overview" && !state.data.groups.some(group => group.id === state.view)) state.view = "overview";
     renderGraph();
+    renderFailureHistory();
   } catch (error) {
     document.getElementById("graph-title").textContent = "Graph unavailable";
     document.getElementById("source-label").textContent = error.message;
@@ -481,6 +732,12 @@ document.getElementById("refresh").addEventListener("click", () => {
 });
 document.getElementById("back").addEventListener("click", showOverview);
 document.getElementById("pause-build").addEventListener("click", pauseBuild);
+document.getElementById("failure-history-toggle")?.addEventListener("click", () => {
+  state.failure.open = !state.failure.open;
+  persistFailureUrl(true);
+  renderFailureHistory();
+  if (state.failure.open && !state.failure.data) loadFailureGraph(false);
+});
 
 window.addEventListener("popstate", () => {
   if (queryMode() === "master") {
@@ -498,8 +755,10 @@ window.addEventListener("popstate", () => {
 
 if (queryMode() === "master") switchToMaster();
 else {
+  syncFailureFromUrl();
   setBoardMode("individual");
   renderSharedModeToggle();
+  renderFailureHistory();
   loadGraph();
 }
 setInterval(() => { if (queryMode() === "individual") loadGraph(); }, 2000);

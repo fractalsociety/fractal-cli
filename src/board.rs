@@ -15,6 +15,7 @@ const START_COMMAND: &str = "fractal graph board GRAPH_HASH";
 const BOARD_START_TIMEOUT: Duration = Duration::from_secs(6);
 const BOARD_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const BOARD_PROJECTS_SCHEMA: &str = "fractal.board_projects.v1";
+const FAILURE_GRAPH_VIEW_SCHEMA: &str = "fractal.failure_graph_view.v1";
 const READ_ONLY_API_ERROR: &str =
     "the Rust board API is read-only; use `fractal node` for transitions";
 
@@ -495,6 +496,34 @@ fn respond_master(request: tiny_http::Request, state: &MasterBoardState) -> Resu
             }),
         );
     }
+    if route == "/api/failure-graph" && method != Method::Get {
+        return send_json(
+            request,
+            StatusCode(405),
+            &json!({"error": READ_ONLY_API_ERROR, "code": "read_only"}),
+        );
+    }
+    if method == Method::Get && route == "/api/failure-graph" {
+        let project_key = query_param(&url, "project").or_else(|| query_param(&url, "project_key"));
+        let reply = master_failure_graph_reply(state, project_key.as_deref());
+        let if_none_match = request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv("If-None-Match"))
+            .map(|header| header.value.as_str().to_owned());
+        if let (Some(etag), Some(inm)) = (&reply.etag, if_none_match.as_deref()) {
+            if etag_matches(etag, inm) {
+                let response = Response::from_data(Vec::<u8>::new())
+                    .with_status_code(StatusCode(304))
+                    .with_header(
+                        Header::from_bytes("ETag", etag.as_bytes()).expect("valid ETag header"),
+                    );
+                request.respond(response).context("send 304")?;
+                return Ok(());
+            }
+        }
+        return send_json_with_etag(request, reply.status, &reply.body, reply.etag.as_deref());
+    }
     if method == Method::Post && route == "/api/run/pause" {
         let authorized = request.headers().iter().any(|header| {
             header.field.equiv("X-Fractal-Control-Token") && header.value.as_str() == state.token
@@ -622,6 +651,21 @@ fn master_projects_reply(state: &MasterBoardState) -> ApiReply {
                 .projects
                 .iter()
                 .map(|project| {
+                    let (failure_summary, failure_graph_hash) = if project.available {
+                        failure_summary_for_workspace(Path::new(&project.canonical_workspace))
+                    } else {
+                        (
+                            json!({
+                                "unresolved": 0,
+                                "resolved": 0,
+                                "superseded": 0,
+                                "lessons": 0,
+                                "observations": 0,
+                                "total": 0,
+                            }),
+                            None,
+                        )
+                    };
                     json!({
                         "project_key": project.project_key,
                         "labels": project.labels,
@@ -630,6 +674,8 @@ fn master_projects_reply(state: &MasterBoardState) -> ApiReply {
                         "available": project.available,
                         "catalog_state": project.catalog_state,
                         "graph_hash": project.graph_hash,
+                        "failure_summary": failure_summary,
+                        "failure_graph_hash": failure_graph_hash,
                         "unavailable_reason": project.git.unavailable_reason,
                     })
                 })
@@ -695,7 +741,52 @@ fn master_projects_reply(state: &MasterBoardState) -> ApiReply {
 fn master_graph_reply(state: &MasterBoardState) -> ApiReply {
     match compose_master_view(state) {
         Ok(view) => match serde_json::to_value(&view) {
-            Ok(body) => {
+            Ok(mut body) => {
+                if let Some(projects) = body.get_mut("projects").and_then(Value::as_array_mut) {
+                    for project in projects {
+                        let available = project
+                            .get("available")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let (summary, hash) = if available {
+                            project
+                                .get("canonical_workspace")
+                                .and_then(Value::as_str)
+                                .map(Path::new)
+                                .map(failure_summary_for_workspace)
+                                .unwrap_or((
+                                    json!({
+                                        "unresolved": 0,
+                                        "resolved": 0,
+                                        "superseded": 0,
+                                        "lessons": 0,
+                                        "observations": 0,
+                                        "total": 0,
+                                    }),
+                                    None,
+                                ))
+                        } else {
+                            (
+                                json!({
+                                    "unresolved": 0,
+                                    "resolved": 0,
+                                    "superseded": 0,
+                                    "lessons": 0,
+                                    "observations": 0,
+                                    "total": 0,
+                                }),
+                                None,
+                            )
+                        };
+                        if let Some(object) = project.as_object_mut() {
+                            object.insert("failure_summary".to_owned(), summary);
+                            object.insert(
+                                "failure_graph_hash".to_owned(),
+                                hash.map(Value::String).unwrap_or(Value::Null),
+                            );
+                        }
+                    }
+                }
                 let etag = format!("\"{}\"", view.view_hash);
                 ApiReply {
                     status: StatusCode(200),
@@ -906,6 +997,63 @@ fn project_graph_reply(state: &MasterBoardState, project_key: Option<&str>) -> A
     }
 }
 
+fn master_failure_graph_reply(state: &MasterBoardState, project_key: Option<&str>) -> ApiReply {
+    let workspace = if let Some(project_key) = project_key {
+        let project_key = project_key.trim();
+        if !is_safe_project_key(project_key) {
+            return ApiReply {
+                status: StatusCode(404),
+                body: json!({
+                    "error": "project is not a valid inventory member key",
+                    "code": "not_in_inventory",
+                    "diagnostics": [safe_failure_diagnostic(
+                        "invalid_project_key",
+                        "warning",
+                        "Failure history requires an inventory project key.",
+                    )],
+                }),
+                etag: None,
+            };
+        }
+        let Some(record) = inventory_record_for_key(&state.inventory, project_key) else {
+            return ApiReply {
+                status: StatusCode(404),
+                body: json!({
+                    "error": "project is not present in the frozen inventory",
+                    "code": "not_in_inventory",
+                    "project_key": project_key,
+                    "diagnostics": [safe_failure_diagnostic(
+                        "project_not_in_inventory",
+                        "warning",
+                        "Failure history is available only for frozen inventory members.",
+                    )],
+                }),
+                etag: None,
+            };
+        };
+        if !record.exists {
+            return ApiReply {
+                status: StatusCode(409),
+                body: json!({
+                    "error": "project workspace is unavailable",
+                    "code": "unavailable_project",
+                    "project_key": project_key,
+                    "diagnostics": [safe_failure_diagnostic(
+                        "unavailable_workspace",
+                        "warning",
+                        "Failure history is unavailable because the inventory workspace is missing.",
+                    )],
+                }),
+                etag: None,
+            };
+        }
+        PathBuf::from(&record.canonical_workspace)
+    } else {
+        state.bound_workspace.clone()
+    };
+    failure_graph_reply(&workspace)
+}
+
 fn compose_master_view(state: &MasterBoardState) -> Result<crate::master_graph::MasterGraphView> {
     match crate::master_graph::compose_inventory(
         &state.inventory,
@@ -1020,6 +1168,356 @@ fn etag_matches(etag: &str, if_none_match: &str) -> bool {
     })
 }
 
+/// A bounded, presentation-only projection of the canonical failure graph.
+///
+/// The project file remains the authority.  This view deliberately does not
+/// serialize the typed graph wholesale: flattened extension fields can contain
+/// arbitrary data and must never put logs, credentials, or machine-local paths
+/// on the read-only board.
+#[derive(Debug)]
+struct FailureGraphView {
+    body: Value,
+    hash: String,
+    summary: Value,
+}
+
+fn empty_failure_graph() -> crate::failure_graph::FailureGraph {
+    let mut graph = crate::failure_graph::FailureGraph::empty();
+    let _ = crate::failure_graph::normalize(&mut graph);
+    graph
+}
+
+fn safe_failure_diagnostic(code: &str, severity: &str, message: &str) -> Value {
+    json!({
+        "code": code,
+        "severity": severity,
+        "message": message,
+    })
+}
+
+fn safe_provenance(value: &crate::failure_graph::GraphGitProvenance) -> Value {
+    // source_repo is intentionally omitted: despite the typed contract
+    // allowing a reference string, it is frequently an absolute workspace
+    // path in historical records.
+    let mut object = serde_json::Map::new();
+    if let Some(hash) = &value.graph_hash {
+        object.insert("graph_hash".to_owned(), json!(hash));
+    }
+    if let Some(commit) = &value.git_commit {
+        object.insert("git_commit".to_owned(), json!(commit));
+    }
+    if let Some(branch) = &value.git_branch {
+        object.insert("git_branch".to_owned(), json!(branch));
+    }
+    if let Some(dirty) = value.dirty {
+        object.insert("dirty".to_owned(), json!(dirty));
+    }
+    Value::Object(object)
+}
+
+fn safe_evidence(value: &crate::failure_graph::EvidenceRef) -> Value {
+    let mut object = serde_json::Map::new();
+    if let Some(sha256) = &value.sha256 {
+        object.insert("sha256".to_owned(), json!(sha256));
+    }
+    if let Some(legacy_ref) = &value.legacy_ref {
+        object.insert("legacy_ref".to_owned(), json!(legacy_ref));
+    }
+    if let Some(kind) = &value.kind {
+        object.insert("kind".to_owned(), json!(kind));
+    }
+    // `path` and flattened fields are omitted.  Evidence hashes and stable
+    // legacy identifiers are sufficient for an inspector without exposing a
+    // workspace path or an arbitrary log payload.
+    Value::Object(object)
+}
+
+fn safe_observation(value: &crate::failure_graph::FailureObservation) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("attempt".to_owned(), json!(value.attempt));
+    object.insert("outcome".to_owned(), json!(value.outcome));
+    object.insert("summary".to_owned(), json!(value.summary));
+    object.insert(
+        "evidence".to_owned(),
+        Value::Array(value.evidence.iter().map(safe_evidence).collect()),
+    );
+    if let Some(agent) = &value.agent {
+        object.insert("agent".to_owned(), json!(agent));
+    }
+    if let Some(model) = &value.model {
+        object.insert("model".to_owned(), json!(model));
+    }
+    if let Some(version) = &value.version {
+        object.insert("version".to_owned(), json!(version));
+    }
+    object.insert("observed".to_owned(), safe_provenance(&value.observed));
+    Value::Object(object)
+}
+
+fn safe_resolution(value: &crate::failure_graph::FailureResolution) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("success".to_owned(), json!(value.success));
+    object.insert("summary".to_owned(), json!(value.summary));
+    object.insert(
+        "evidence".to_owned(),
+        Value::Array(value.evidence.iter().map(safe_evidence).collect()),
+    );
+    if let Some(resolved_by) = &value.resolved_by {
+        object.insert("resolved_by".to_owned(), json!(resolved_by));
+    }
+    object.insert("observed".to_owned(), safe_provenance(&value.observed));
+    Value::Object(object)
+}
+
+fn safe_failure_record(value: &crate::failure_graph::FailureRecord) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("id".to_owned(), json!(value.id));
+    object.insert("node_id".to_owned(), json!(value.node_id));
+    object.insert("attempt".to_owned(), json!(value.attempt));
+    object.insert("failure_code".to_owned(), json!(value.failure_code));
+    object.insert("outcome".to_owned(), json!(value.outcome));
+    object.insert(
+        "state".to_owned(),
+        json!(match value.state {
+            crate::failure_graph::FailureState::Unresolved => "unresolved",
+            crate::failure_graph::FailureState::Resolved => "resolved",
+            crate::failure_graph::FailureState::Superseded => "superseded",
+        }),
+    );
+    object.insert("summary".to_owned(), json!(value.summary));
+    if let Some(capability) = &value.capability {
+        object.insert("capability".to_owned(), json!(capability));
+    }
+    if let Some(component) = &value.component {
+        object.insert("component".to_owned(), json!(component));
+    }
+    if let Some(source_ref) = &value.source_ref {
+        object.insert("source_ref".to_owned(), json!(source_ref));
+    }
+    object.insert(
+        "evidence".to_owned(),
+        Value::Array(value.evidence.iter().map(safe_evidence).collect()),
+    );
+    object.insert(
+        "observations".to_owned(),
+        Value::Array(value.observations.iter().map(safe_observation).collect()),
+    );
+    if let Some(agent) = &value.agent {
+        object.insert("agent".to_owned(), json!(agent));
+    }
+    if let Some(model) = &value.model {
+        object.insert("model".to_owned(), json!(model));
+    }
+    if let Some(version) = &value.version {
+        object.insert("version".to_owned(), json!(version));
+    }
+    object.insert("observed".to_owned(), safe_provenance(&value.observed));
+    if let Some(resolution) = &value.resolution {
+        object.insert("resolution".to_owned(), safe_resolution(resolution));
+    }
+    if let Some(superseded_by) = &value.superseded_by {
+        object.insert("superseded_by".to_owned(), json!(superseded_by));
+    }
+    Value::Object(object)
+}
+
+fn safe_lesson(value: &crate::failure_graph::LessonRecord) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("id".to_owned(), json!(value.id));
+    object.insert("summary".to_owned(), json!(value.summary));
+    object.insert(
+        "status".to_owned(),
+        json!(match value.status {
+            crate::failure_graph::LessonStatus::Proposed => "proposed",
+            crate::failure_graph::LessonStatus::Adopted => "adopted",
+            crate::failure_graph::LessonStatus::Superseded => "superseded",
+            crate::failure_graph::LessonStatus::Rejected => "rejected",
+        }),
+    );
+    if let Some(capability) = &value.capability {
+        object.insert("capability".to_owned(), json!(capability));
+    }
+    if let Some(component) = &value.component {
+        object.insert("component".to_owned(), json!(component));
+    }
+    if let Some(source_ref) = &value.source_ref {
+        object.insert("source_ref".to_owned(), json!(source_ref));
+    }
+    object.insert(
+        "evidence".to_owned(),
+        Value::Array(value.evidence.iter().map(safe_evidence).collect()),
+    );
+    if let Some(agent) = &value.agent {
+        object.insert("agent".to_owned(), json!(agent));
+    }
+    if let Some(model) = &value.model {
+        object.insert("model".to_owned(), json!(model));
+    }
+    if let Some(version) = &value.version {
+        object.insert("version".to_owned(), json!(version));
+    }
+    object.insert("observed".to_owned(), safe_provenance(&value.observed));
+    if let Some(superseded_by) = &value.superseded_by {
+        object.insert("superseded_by".to_owned(), json!(superseded_by));
+    }
+    Value::Object(object)
+}
+
+fn safe_failure_edge(value: &crate::failure_graph::EdgeRecord) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("id".to_owned(), json!(value.id));
+    object.insert("type".to_owned(), json!(value.edge_type.as_str()));
+    object.insert("from".to_owned(), json!(value.from));
+    object.insert("to".to_owned(), json!(value.to));
+    if let Some(evidence) = &value.evidence {
+        object.insert("evidence".to_owned(), safe_evidence(evidence));
+    }
+    Value::Object(object)
+}
+
+fn failure_graph_view_from_graph(
+    workspace: &Path,
+    mut graph: crate::failure_graph::FailureGraph,
+    mut diagnostics: Vec<Value>,
+) -> FailureGraphView {
+    if crate::failure_graph::normalize(&mut graph).is_err() {
+        graph = empty_failure_graph();
+        diagnostics.push(safe_failure_diagnostic(
+            "invalid_failure_graph",
+            "warning",
+            "Failure history failed validation; showing an empty read-only history.",
+        ));
+    }
+    let hash = graph.failure_graph_hash.clone();
+    let mut unresolved = 0usize;
+    let mut resolved = 0usize;
+    let mut superseded = 0usize;
+    let mut observations = 0usize;
+    let records: Vec<Value> = graph
+        .failures
+        .values()
+        .map(|record| {
+            observations += record.observations.len();
+            match record.state {
+                crate::failure_graph::FailureState::Unresolved => unresolved += 1,
+                crate::failure_graph::FailureState::Resolved => resolved += 1,
+                crate::failure_graph::FailureState::Superseded => superseded += 1,
+            }
+            safe_failure_record(record)
+        })
+        .collect();
+    let lessons: Vec<Value> = graph.lessons.values().map(safe_lesson).collect();
+    let edges: Vec<Value> = graph.edges.values().map(safe_failure_edge).collect();
+    let summary = json!({
+        "unresolved": unresolved,
+        "resolved": resolved,
+        "superseded": superseded,
+        "lessons": lessons.len(),
+        "observations": observations,
+        "total": records.len(),
+    });
+    let project_key = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let project_key = crate::master_graph::derive_project_key(&project_key.to_string_lossy());
+    let body = json!({
+        "schema": FAILURE_GRAPH_VIEW_SCHEMA,
+        "project_key": project_key,
+        "failure_graph_hash": hash.clone(),
+        "canonical_hash": graph.failure_graph_hash.clone(),
+        "summary": summary,
+        "records": records,
+        "lessons": lessons,
+        "edges": edges,
+        "diagnostics": diagnostics,
+    });
+    FailureGraphView {
+        body,
+        hash,
+        summary,
+    }
+}
+
+/// Read and safely project a canonical project failure graph.  Invalid or
+/// unsupported envelopes intentionally degrade to an empty view with a stable
+/// diagnostic rather than taking down the execution board.
+fn failure_graph_view(workspace: &Path) -> FailureGraphView {
+    let path = crate::project_file::path(workspace);
+    let mut diagnostics = Vec::new();
+    let value = match fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    {
+        Some(value) => value,
+        None => {
+            diagnostics.push(safe_failure_diagnostic(
+                "failure_graph_unavailable",
+                "warning",
+                "Failure history is unavailable for this project.",
+            ));
+            return failure_graph_view_from_graph(workspace, empty_failure_graph(), diagnostics);
+        }
+    };
+    let Some(raw) = value.get("failure_graph") else {
+        match crate::project_file::load_failure_graph(workspace) {
+            Ok(graph) => return failure_graph_view_from_graph(workspace, graph, diagnostics),
+            Err(_) => {
+                diagnostics.push(safe_failure_diagnostic(
+                    "legacy_failure_projection_unavailable",
+                    "warning",
+                    "Legacy failure history could not be projected.",
+                ));
+                return failure_graph_view_from_graph(
+                    workspace,
+                    empty_failure_graph(),
+                    diagnostics,
+                );
+            }
+        }
+    };
+    let Some(schema) = raw.get("schema").and_then(Value::as_str) else {
+        diagnostics.push(safe_failure_diagnostic(
+            "invalid_failure_graph_schema",
+            "warning",
+            "Failure history has no supported schema; showing an empty read-only history.",
+        ));
+        return failure_graph_view_from_graph(workspace, empty_failure_graph(), diagnostics);
+    };
+    if schema != crate::failure_graph::FAILURE_GRAPH_SCHEMA {
+        diagnostics.push(safe_failure_diagnostic(
+            "unsupported_failure_graph_schema",
+            "warning",
+            "Failure history uses an unsupported schema; showing an empty read-only history.",
+        ));
+        return failure_graph_view_from_graph(workspace, empty_failure_graph(), diagnostics);
+    }
+    match serde_json::from_value::<crate::failure_graph::FailureGraph>(raw.clone()) {
+        Ok(graph) => failure_graph_view_from_graph(workspace, graph, diagnostics),
+        Err(_) => {
+            diagnostics.push(safe_failure_diagnostic(
+                "invalid_failure_graph",
+                "warning",
+                "Failure history failed validation; showing an empty read-only history.",
+            ));
+            failure_graph_view_from_graph(workspace, empty_failure_graph(), diagnostics)
+        }
+    }
+}
+
+fn failure_graph_reply(workspace: &Path) -> ApiReply {
+    let view = failure_graph_view(workspace);
+    ApiReply {
+        status: StatusCode(200),
+        body: view.body,
+        etag: Some(format!("\"{}\"", view.hash)),
+    }
+}
+
+fn failure_summary_for_workspace(workspace: &Path) -> (Value, Option<String>) {
+    let view = failure_graph_view(workspace);
+    (view.summary, Some(view.hash))
+}
+
 fn respond(
     request: tiny_http::Request,
     workspace: &Path,
@@ -1044,6 +1542,33 @@ fn respond(
                 "project": identity.get("project"),
             }),
         );
+    }
+    if route == "/api/failure-graph" && request.method() != &Method::Get {
+        return send_json(
+            request,
+            StatusCode(405),
+            &json!({"error": READ_ONLY_API_ERROR, "code": "read_only"}),
+        );
+    }
+    if request.method() == &Method::Get && route == "/api/failure-graph" {
+        let reply = failure_graph_reply(workspace);
+        let if_none_match = request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv("If-None-Match"))
+            .map(|header| header.value.as_str().to_owned());
+        if let (Some(etag), Some(inm)) = (&reply.etag, if_none_match.as_deref()) {
+            if etag_matches(etag, inm) {
+                let response = Response::from_data(Vec::<u8>::new())
+                    .with_status_code(StatusCode(304))
+                    .with_header(
+                        Header::from_bytes("ETag", etag.as_bytes()).expect("valid ETag header"),
+                    );
+                request.respond(response).context("send 304")?;
+                return Ok(());
+            }
+        }
+        return send_json_with_etag(request, reply.status, &reply.body, reply.etag.as_deref());
     }
     if request.method() == &Method::Get && route == "/api/graph" {
         return send_json(request, StatusCode(200), &project_view(workspace, token)?);
@@ -1164,6 +1689,7 @@ fn send_json_with_etag(
 
 fn project_view(workspace: &Path, token: &str) -> Result<Value> {
     let project = crate::project_file::load(workspace)?;
+    let (failure_summary, failure_graph_hash) = failure_summary_for_workspace(workspace);
     let assignments = project
         .execution
         .as_ref()
@@ -1244,6 +1770,10 @@ fn project_view(workspace: &Path, token: &str) -> Result<Value> {
         "title": project.project.title,
         "graph": project.graph,
         "efficiency": project.efficiency,
+        // Additive compact projection; detailed records live at
+        // `/api/failure-graph` so existing graph consumers remain stable.
+        "failure_summary": failure_summary,
+        "failure_graph_hash": failure_graph_hash,
         "work_id": project.project.slug,
         "source": ".fractal/project.fractal",
         "source_mtime": project.updated_at,
@@ -1826,5 +2356,79 @@ mod tests {
         assert!(!embedded_asset("master-graph.css").is_empty());
         assert!(embedded_asset("../secrets.txt").is_empty());
         assert!(embedded_asset("/etc/passwd").is_empty());
+    }
+
+    #[test]
+    fn failure_graph_view_is_redacted_bounded_and_etagged() {
+        let _guard = test_lock();
+        let root = temp_root("failure-view");
+        let workspace = root.join("solo");
+        write_minimal_project(&workspace, "Solo");
+        let mut graph = crate::failure_graph::FailureGraph::empty();
+        let failure_id = crate::failure_graph::failure_id("n1", "tool_failure");
+        graph.failures.insert(
+            failure_id.clone(),
+            crate::failure_graph::FailureRecord {
+                id: failure_id.clone(),
+                node_id: "n1".to_owned(),
+                attempt: 1,
+                failure_code: "tool_failure".to_owned(),
+                outcome: "failed_execution".to_owned(),
+                summary: "compiler failed".to_owned(),
+                source_ref: Some("src/main.rs#L1".to_owned()),
+                evidence: vec![crate::failure_graph::EvidenceRef {
+                    sha256: Some(
+                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_owned(),
+                    ),
+                    path: Some("logs/raw.log".to_owned()),
+                    ..Default::default()
+                }],
+                observations: vec![crate::failure_graph::FailureObservation {
+                    attempt: 1,
+                    outcome: "failed_execution".to_owned(),
+                    summary: "compiler failed".to_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        crate::failure_graph::normalize(&mut graph).unwrap();
+        crate::project_file::replace_failure_graph(&workspace, graph).unwrap();
+        let reply = failure_graph_reply(&workspace);
+        assert_eq!(reply.status.0, 200);
+        assert_eq!(
+            reply.body.get("schema").and_then(Value::as_str),
+            Some(FAILURE_GRAPH_VIEW_SCHEMA)
+        );
+        assert_eq!(reply.body["summary"]["unresolved"], 1);
+        assert!(reply.etag.as_deref().unwrap().contains("sha256:"));
+        let body = serde_json::to_string(&reply.body).unwrap();
+        assert!(!body.contains("logs/raw.log"));
+        assert!(body.contains("sha256:aaaaaaaa"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_or_unsupported_failure_envelopes_degrade_with_safe_diagnostics() {
+        let _guard = test_lock();
+        let root = temp_root("failure-invalid");
+        let workspace = root.join("solo");
+        write_minimal_project(&workspace, "Solo");
+        let path = crate::project_file::path(&workspace);
+        let mut raw: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        raw["failure_graph"] =
+            json!({"schema": "fractal.failure_graph.v99", "raw_log": "/tmp/secret.log"});
+        fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+        let reply = failure_graph_reply(&workspace);
+        assert_eq!(reply.status.0, 200);
+        assert_eq!(reply.body["summary"]["total"], 0);
+        assert_eq!(
+            reply.body["diagnostics"][0]["code"],
+            "unsupported_failure_graph_schema"
+        );
+        let body = serde_json::to_string(&reply.body).unwrap();
+        assert!(!body.contains("/tmp/secret.log"));
+        let _ = fs::remove_dir_all(root);
     }
 }
