@@ -394,6 +394,25 @@
   letter-spacing: .08em;
   text-transform: uppercase;
 }
+.mg-failure-badge {
+  grid-column: 2 / -1;
+  color: #9caea5;
+  font: 600 8px/1.3 "SFMono-Regular", Consolas, monospace;
+  letter-spacing: .04em;
+}
+.mg-failure-badge.mg-failure-open { color: var(--red, #ff5f67); }
+.mg-failure-action {
+  justify-self: end;
+  min-height: 25px;
+  padding: 0 8px;
+  border: 1px solid rgba(84, 244, 154, .35);
+  border-radius: 4px;
+  background: rgba(84, 244, 154, .06);
+  color: var(--green, #54f49a);
+  font: 700 8px/1 "SFMono-Regular", Consolas, monospace;
+  cursor: pointer;
+}
+.mg-failure-action:hover, .mg-failure-action:focus-visible { border-color: var(--green, #54f49a); outline: none; }
 .mg-list-gap {
   padding: 8px 12px;
   color: #8ca098;

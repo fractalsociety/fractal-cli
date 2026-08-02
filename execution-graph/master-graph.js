@@ -103,14 +103,18 @@
 
   var QUERY_DEFAULTS = {
     mode: "individual", project: "", view: "", sel: "",
-    q: "", status: [], rel: [], panel: "info"
+    q: "", status: [], rel: [], panel: "info",
+    failurePanel: false, failureSel: "", failureState: [],
+    failureQuery: "", failureCode: "", failureComponent: "", failureLesson: ""
   };
 
   function parseQueryState(search) {
     var params = new URLSearchParams(String(search == null ? "" : search));
     var state = {
       mode: QUERY_DEFAULTS.mode, project: "", view: "", sel: "",
-      q: "", status: [], rel: [], panel: QUERY_DEFAULTS.panel
+      q: "", status: [], rel: [], panel: QUERY_DEFAULTS.panel,
+      failurePanel: false, failureSel: "", failureState: [],
+      failureQuery: "", failureCode: "", failureComponent: "", failureLesson: ""
     };
     var mode = params.get("mode");
     if (MODES.indexOf(mode) !== -1) state.mode = mode;
@@ -122,6 +126,15 @@
     state.rel = sanitizeRelTokens((params.get("rel") || "").split(","));
     var panel = params.get("panel");
     if (PANELS.indexOf(panel) !== -1) state.panel = panel;
+    state.failurePanel = params.get("failure_panel") === "1" || params.get("failure_panel") === "true";
+    state.failureSel = String(params.get("failure_sel") || "").slice(0, RENDER_BUDGET.maxQueryLength);
+    state.failureQuery = String(params.get("failure_query") || "").slice(0, RENDER_BUDGET.maxQueryLength);
+    state.failureState = uniq(String(params.get("failure_state") || "").split(",")
+      .map(function (token) { return token.trim(); })
+      .filter(function (token) { return ["unresolved", "resolved", "superseded"].indexOf(token) !== -1; }));
+    state.failureCode = String(params.get("failure_code") || "").slice(0, RENDER_BUDGET.maxQueryLength);
+    state.failureComponent = String(params.get("failure_component") || "").slice(0, RENDER_BUDGET.maxQueryLength);
+    state.failureLesson = String(params.get("failure_lesson") || "").slice(0, RENDER_BUDGET.maxQueryLength);
     // Unknown params are ignored (forward compatible); `t` cache-bust is
     // orthogonal and never round-trips through application state.
     return state;
@@ -137,6 +150,13 @@
     if (state.status && state.status.length) params.set("status", state.status.join(","));
     if (state.rel && state.rel.length) params.set("rel", state.rel.join(","));
     if (state.panel && state.panel !== QUERY_DEFAULTS.panel) params.set("panel", state.panel);
+    if (state.failurePanel) params.set("failure_panel", "1");
+    if (state.failureSel) params.set("failure_sel", String(state.failureSel).slice(0, RENDER_BUDGET.maxQueryLength));
+    if (state.failureQuery) params.set("failure_query", String(state.failureQuery).slice(0, RENDER_BUDGET.maxQueryLength));
+    if (state.failureState && state.failureState.length) params.set("failure_state", state.failureState.join(","));
+    if (state.failureCode) params.set("failure_code", String(state.failureCode).slice(0, RENDER_BUDGET.maxQueryLength));
+    if (state.failureComponent) params.set("failure_component", String(state.failureComponent).slice(0, RENDER_BUDGET.maxQueryLength));
+    if (state.failureLesson) params.set("failure_lesson", String(state.failureLesson).slice(0, RENDER_BUDGET.maxQueryLength));
     var text = params.toString();
     return text ? "?" + text : "";
   }
@@ -245,7 +265,11 @@
     if (!view) return entries;
     (view.projects || []).forEach(function (project) {
       entries.push({ id: "project:" + project.project_key, kind: "project", project_key: project.project_key,
-        text: normalizeText([project.project_key].concat(project.labels || []).join(" ")) });
+        text: normalizeText([project.project_key].concat(project.labels || []).concat([
+          project.failure_summary && project.failure_summary.unresolved + " open failures",
+          project.failure_summary && project.failure_summary.total + " failures",
+          project.failure_graph_hash
+        ]).join(" ")) });
     });
     (view.nodes || []).forEach(function (node) {
       entries.push({ id: node.id, kind: node.kind || "node", project_key: node.project_key || "",
@@ -340,7 +364,11 @@
 
     (view.projects || []).forEach(function (project) {
       var projectId = "project:" + project.project_key;
-      var projectText = normalizeText([project.project_key].concat(project.labels || []).join(" "));
+      var projectText = normalizeText([project.project_key].concat(project.labels || []).concat([
+        project.failure_summary && project.failure_summary.unresolved + " open failures",
+        project.failure_summary && project.failure_summary.total + " failures",
+        project.failure_graph_hash
+      ]).join(" "));
       var projectMatch = match.empty || projectText.indexOf(normalizeText(filters.q)) !== -1;
       var projectStatus = project.available === false ? "unavailable" :
         (project.catalog_state === "invalid" || project.catalog_state === "unsupported_schema" ? "invalid" :
@@ -1003,6 +1031,13 @@
         var query = params.toString();
         return getJson("/api/graph" + (query ? "?" + query : ""));
       },
+      failureGraph: function (projectKey, bust) {
+        var params = new URLSearchParams();
+        if (projectKey) params.set("project", projectKey);
+        if (bust) params.set("t", String(now()));
+        var query = params.toString();
+        return getJson("/api/failure-graph" + (query ? "?" + query : ""));
+      },
       masterGraph: function () { return getJson("/api/master-graph"); }
     };
   }
@@ -1328,6 +1363,197 @@
     renderFilterGroup(doc, container, "Filter by relationship type", REL_TOKENS, active, onToggle);
   }
 
+  /* ------------------------------------------------------------------ *
+   * Failure graph helpers (read-only, deterministic, and bounded)
+   * ------------------------------------------------------------------ */
+
+  var FAILURE_STATES = ["unresolved", "resolved", "superseded"];
+
+  function failureRecords(view) {
+    if (!view) return [];
+    var records = Array.isArray(view.records) ? view.records :
+      (Array.isArray(view.failures) ? view.failures :
+        (view.failures && typeof view.failures === "object" ? Object.keys(view.failures).map(function (key) {
+          return view.failures[key];
+        }) : []));
+    return records.filter(function (record) { return record && typeof record === "object"; }).slice();
+  }
+
+  function failureLessons(view) {
+    if (!view) return [];
+    var lessons = Array.isArray(view.lessons) ? view.lessons :
+      (view.lessons && typeof view.lessons === "object" ? Object.keys(view.lessons).map(function (key) {
+        return view.lessons[key];
+      }) : []);
+    return lessons.filter(function (lesson) { return lesson && typeof lesson === "object"; }).slice();
+  }
+
+  function failureEdges(view) {
+    return view && Array.isArray(view.edges) ? view.edges.filter(function (edge) {
+      return edge && typeof edge === "object" && edge.from && edge.to;
+    }).slice() : [];
+  }
+
+  function failureFieldValues(records, field) {
+    return uniq((records || []).map(function (record) {
+      return String(record && record[field] || "").trim();
+    }).filter(Boolean)).sort();
+  }
+
+  function failureLessonsForRecord(record, view) {
+    if (!record) return [];
+    var lessons = failureLessons(view);
+    var edges = failureEdges(view);
+    var ids = {};
+    edges.forEach(function (edge) {
+      var type = String(edge.type || "");
+      if ((type === "lesson_from" || type === "applies_to" || type === "reused_in") &&
+        (edge.from === record.id || edge.to === record.id)) {
+        ids[edge.from === record.id ? edge.to : edge.from] = true;
+      }
+    });
+    return lessons.filter(function (lesson) {
+      return ids[lesson.id] ||
+        (record.capability && lesson.capability === record.capability) ||
+        (record.component && lesson.component === record.component);
+    });
+  }
+
+  function filterFailureRecords(records, filters, view) {
+    filters = filters || {};
+    var states = (filters.state || filters.states || []).filter(function (token) {
+      return FAILURE_STATES.indexOf(token) !== -1;
+    });
+    var q = normalizeText(filters.q || filters.search || "");
+    var code = normalizeText(filters.code || "");
+    var component = normalizeText(filters.component || "");
+    var lesson = normalizeText(filters.lesson || "");
+    return (records || []).filter(function (record) {
+      var haystack = normalizeText([
+        record.id, record.node_id, record.failure_code, record.outcome,
+        record.summary, record.capability, record.component,
+        (record.observations || []).map(function (item) { return item.summary; }).join(" ")
+      ].join(" "));
+      if (q && haystack.indexOf(q) === -1) return false;
+      if (states.length && states.indexOf(String(record.state || "unresolved")) === -1) return false;
+      if (code && normalizeText(record.failure_code).indexOf(code) === -1) return false;
+      if (component && normalizeText(record.component).indexOf(component) === -1) return false;
+      if (lesson) {
+        var lessonMatches = failureLessonsForRecord(record, view).some(function (candidate) {
+          return normalizeText(candidate.id).indexOf(lesson) !== -1 ||
+            normalizeText(candidate.summary).indexOf(lesson) !== -1;
+        });
+        if (!lessonMatches) return false;
+      }
+      return true;
+    }).sort(function (left, right) {
+      return String(left.id || "").localeCompare(String(right.id || ""));
+    });
+  }
+
+  function searchFailureRecords(records, query, view) {
+    var filtered = filterFailureRecords(records, { q: query }, view);
+    return { records: filtered, count: filtered.length, empty: !normalizeText(query) };
+  }
+
+  function failureTimeline(record) {
+    if (!record) return [];
+    var timeline = (record.observations || []).map(function (observation, index) {
+      return {
+        key: "observation:" + String(observation.attempt || index + 1) + ":" + index,
+        kind: "observation", attempt: Number(observation.attempt || index + 1),
+        outcome: observation.outcome || record.outcome || "unknown",
+        summary: observation.summary || record.summary || "",
+        evidence: observation.evidence || [],
+        observed: observation.observed || {}
+      };
+    });
+    if (!timeline.length) {
+      timeline.push({
+        key: "observation:" + String(record.attempt || 1) + ":0",
+        kind: "observation", attempt: Number(record.attempt || 1),
+        outcome: record.outcome || "unknown", summary: record.summary || "",
+        evidence: record.evidence || [], observed: record.observed || {}
+      });
+    }
+    if (record.resolution) {
+      timeline.push({
+        key: "resolution", kind: "resolution", attempt: Number(record.attempt || 1),
+        outcome: record.resolution.success ? "resolved" : "resolution_failed",
+        summary: record.resolution.summary || "", evidence: record.resolution.evidence || [],
+        observed: record.resolution.observed || {}
+      });
+    }
+    if (record.superseded_by) {
+      timeline.push({
+        key: "supersession", kind: "supersession", attempt: Number(record.attempt || 1),
+        outcome: "superseded", summary: "Superseded by " + record.superseded_by,
+        evidence: [], observed: {}
+      });
+    }
+    return timeline.sort(function (left, right) {
+      var priority = function (entry) {
+        return entry.kind === "observation" ? 0 : entry.kind === "resolution" ? 1 : entry.kind === "supersession" ? 2 : 9;
+      };
+      return (left.attempt - right.attempt) ||
+        priority(left) - priority(right) ||
+        left.key.localeCompare(right.key);
+    });
+  }
+
+  /* Return only edges explicitly present in the canonical graph.  No inferred
+   * dependency path is constructed from node IDs or retry numbers. */
+  function failurePath(edges, startId, endId) {
+    if (edges && !Array.isArray(edges) && Array.isArray(edges.edges)) edges = edges.edges;
+    var outgoing = {};
+    failureEdges({ edges: edges || [] }).forEach(function (edge) {
+      if (!outgoing[edge.from]) outgoing[edge.from] = [];
+      outgoing[edge.from].push(edge);
+    });
+    Object.keys(outgoing).forEach(function (key) {
+      outgoing[key].sort(function (left, right) { return String(left.id).localeCompare(String(right.id)); });
+    });
+    var queue = [{ id: startId, path: [] }], seen = {};
+    while (queue.length) {
+      var current = queue.shift();
+      if (current.id === endId) return current.path;
+      if (seen[current.id]) continue;
+      seen[current.id] = true;
+      (outgoing[current.id] || []).forEach(function (edge) {
+        queue.push({ id: edge.to, path: current.path.concat([edge]) });
+      });
+    }
+    return [];
+  }
+
+  function boundedFailureRecords(records, cap) {
+    var limit = Number.isFinite(Number(cap)) ? Math.max(0, Number(cap)) : 512;
+    var list = (records || []).slice();
+    return { records: list.slice(0, limit), hiddenCount: Math.max(0, list.length - limit) };
+  }
+
+  function failureQueryState(search) {
+    var state = parseQueryState(search);
+    return {
+      open: Boolean(state.failurePanel), selected: state.failureSel, query: state.failureQuery || "",
+      state: state.failureState.slice(), code: state.failureCode,
+      component: state.failureComponent, lesson: state.failureLesson
+    };
+  }
+
+  function serializeFailureQueryState(failure) {
+    failure = failure || {};
+    var params = new URLSearchParams();
+    if (failure.open) params.set("failure_panel", "1");
+    if (failure.selected) params.set("failure_sel", String(failure.selected).slice(0, RENDER_BUDGET.maxQueryLength));
+    if (failure.query) params.set("failure_query", String(failure.query).slice(0, RENDER_BUDGET.maxQueryLength));
+    if (failure.state && failure.state.length) params.set("failure_state", failure.state.join(","));
+    if (failure.code) params.set("failure_code", String(failure.code).slice(0, RENDER_BUDGET.maxQueryLength));
+    if (failure.component) params.set("failure_component", String(failure.component).slice(0, RENDER_BUDGET.maxQueryLength));
+    if (failure.lesson) params.set("failure_lesson", String(failure.lesson).slice(0, RENDER_BUDGET.maxQueryLength));
+    return params.toString();
+  }
+
   /* Hero metric relabeling for master mode (contract §3.4). */
   function masterHeroMetrics(view) {
     var summary = view && view.summary || {};
@@ -1485,6 +1711,14 @@
             return categoryLabel(key) + " " + node.categoryCounts[key];
           }).join(" · ")].filter(Boolean).join(" · ")
         : (STATUS_LABELS[statusToken] || statusToken).toUpperCase();
+      if (!isCluster && node.kind === "project") {
+        var projectSummary = projectsByKey[node.project_key] && projectsByKey[node.project_key].failure_summary;
+        if (projectSummary) {
+          var openFailures = Number(projectSummary.unresolved || 0);
+          var allFailures = Number(projectSummary.total || openFailures || 0);
+          summary += " · " + (allFailures ? (openFailures + " open failure" + (openFailures === 1 ? "" : "s")) : "no failures");
+        }
+      }
       var group = svgEl(doc, "g", {
         class: "mg-node" + (isCluster ? " mg-cluster mg-cluster-" + (node.level || "group") : "") + " mg-status-" + statusToken + (dimmed ? " mg-dim" : "") + (selected ? " mg-selected" : ""),
         transform: "translate(" + position[0] + "," + position[1] + ")",
@@ -1528,7 +1762,9 @@
         id: "project:" + project.project_key, kind: "project",
         title: projectPrimaryLabel(project),
         status: project.available === false ? "unavailable" : (project.catalog_state || "unknown"),
-        project_key: project.project_key
+        project_key: project.project_key,
+        failure_summary: project.failure_summary || null,
+        failure_graph_hash: project.failure_graph_hash || null
       });
     });
     (view && view.nodes || []).forEach(function (node) {
@@ -1575,6 +1811,24 @@
       item.append(el(doc, "span", "mg-list-kind", row.kind));
       item.append(el(doc, "span", "mg-list-title", row.title));
       item.append(el(doc, "span", "mg-list-status", STATUS_LABELS[row.status] || row.status));
+      if (row.failure_summary) {
+        var unresolved = Number(row.failure_summary.unresolved || 0);
+        var totalFailures = Number(row.failure_summary.total || unresolved || 0);
+        var failureBadge = el(doc, "span", "mg-failure-badge" + (unresolved ? " mg-failure-open" : ""),
+          totalFailures ? (unresolved + " open · " + totalFailures + " failures") : "No failures");
+        failureBadge.setAttribute("aria-label", "Failure history: " + failureBadge.textContent);
+        item.append(failureBadge);
+        if (row.kind === "project" && totalFailures) {
+          var failureButton = el(doc, "button", "mg-failure-action", "Failure history");
+          failureButton.type = "button";
+          failureButton.setAttribute("aria-label", "Open failure history for " + row.title);
+          attachActivation(failureButton, function (event) {
+            if (event && event.stopPropagation) event.stopPropagation();
+            if (handlers.onFailure) handlers.onFailure(row);
+          });
+          item.append(failureButton);
+        }
+      }
       attachActivation(item, function () { if (handlers.onSelectRow) handlers.onSelectRow(row); });
       container.append(item);
     });
@@ -2010,7 +2264,19 @@
         if (activeView() === "list") {
           var rows = buildMasterListRows(state.master, vis);
           renderMasterList(doc, stage, rows, { sel: state.query.sel, caps: caps }, {
-            onSelectRow: function (row) { select(row.id, true); }
+            onSelectRow: function (row) { select(row.id, true); },
+            onFailure: function (row) {
+              if (!row || !row.project_key) return;
+              state.query.mode = "individual";
+              state.query.project = row.project_key;
+              state.query.sel = "";
+              state.query.failurePanel = true;
+              state.query.failureSel = "";
+              syncUrl(true);
+              if (onModeChange) onModeChange("individual");
+              announce("Failure history for project " + row.project_key);
+              loadIndividual(row.project_key).then(render);
+            }
           });
         } else {
           var zoomControls = el(doc, "div", "mg-stage-controls");
@@ -2447,6 +2713,26 @@
     renderSearchControl: renderSearchControl,
     renderStatusFilter: renderStatusFilter,
     renderRelationshipFilter: renderRelationshipFilter,
+    FAILURE_STATES: FAILURE_STATES,
+    failureRecords: failureRecords,
+    failureLessons: failureLessons,
+    failureEdges: failureEdges,
+    failureFieldValues: failureFieldValues,
+    failureLessonsForRecord: failureLessonsForRecord,
+    filterFailureRecords: filterFailureRecords,
+    searchFailureRecords: searchFailureRecords,
+    failureTimeline: failureTimeline,
+    buildFailureTimeline: failureTimeline,
+    failurePath: failurePath,
+    buildFailurePath: failurePath,
+    filterFailures: filterFailureRecords,
+    searchFailures: searchFailureRecords,
+    boundedFailureRecords: boundedFailureRecords,
+    boundFailureRecords: boundedFailureRecords,
+    failureQueryState: failureQueryState,
+    parseFailureQuery: failureQueryState,
+    serializeFailureQueryState: serializeFailureQueryState,
+    serializeFailureQuery: serializeFailureQueryState,
     masterHeroMetrics: masterHeroMetrics,
     masterNodeAccessibleName: masterNodeAccessibleName,
     edgeAccessibleName: edgeAccessibleName,

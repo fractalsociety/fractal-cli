@@ -97,6 +97,21 @@
             <button id="open-milestone" class="inspect-button hidden" type="button">Open milestone graph <span>→</span></button>
           </div>
         </aside>
+        <section class="failure-history" id="failure-history" aria-labelledby="failure-history-toggle">
+          <button class="failure-history-toggle" id="failure-history-toggle" type="button" aria-expanded="false" aria-controls="failure-history-panel">
+            Failure History · loading
+          </button>
+          <div class="failure-history-panel" id="failure-history-panel" hidden>
+            <div class="failure-history-columns">
+              <div class="failure-history-list-wrap">
+                <div class="failure-history-list" id="failure-history-list" role="listbox" aria-label="Failure records"></div>
+              </div>
+              <article class="failure-history-detail" id="failure-history-detail" aria-live="polite">
+                <p class="failure-state-copy">Select a failure record to inspect its evidence, timeline, and resolution.</p>
+              </article>
+            </div>
+          </div>
+        </section>
       </section>
     </main>
 
