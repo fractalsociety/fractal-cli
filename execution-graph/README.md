@@ -1,58 +1,35 @@
-# Fractal Execution Graph
+# Fractal Execution Graph Frontend
 
-This local dashboard compiles `FRACTAL_MAC_RUNTIME_PRD.md` checkboxes into a
-live `fractal.execution_graph_view.v1` projection. Its `graph` member is the
-backend-neutral `fractal.execution_graph.v1` contract; status and presentation
-metadata deliberately remain outside the signed compiled graph.
+This directory contains the static frontend served by the Rust CLI:
 
-- Green: checked in the PRD.
-- Yellow: explicitly active in `graph-state.json`.
-- Red: unchecked and not active.
-- Agent badge: the agent that checked out or completed the task. Amber means
-  checked out, green means completed, and muted means released.
-
-Run:
-
-```bash
-python3 execution-graph/server.py --port 8090
+```sh
+fractal graph board GRAPH_HASH
 ```
 
-Open <http://127.0.0.1:8090/>. The API is available at `/api/graph` and refreshes
-from the PRD on every request.
+The frontend reads the Rust `/api/graph` projection of
+`.fractal/project.fractal`. It does not parse PRD markdown and it does not own
+assignments or status. Checkout, completion, release, dependency checks, and
+status are Rust operations:
 
-## Agent task checkout
-
-Agents should claim a task before editing it. Checkout is atomic and rejects a
-second agent while the first checkout is active:
-
-```bash
-python3 execution-graph/task-state.py checkout M3.13 \
-  --agent-id codex/root --agent-label "Codex · root"
+```sh
+fractal node NODE --show --repo PROJECT
+fractal node NODE --checkout --repo PROJECT
+fractal node NODE --complete --repo PROJECT
+fractal node NODE --release --repo PROJECT
 ```
 
-Unchecked milestone gates are executable verification nodes too. They use the
-same lifecycle and attribution, for example `checkout M3.G1`; a gate may only
-be completed after its corresponding PRD checkbox is checked.
+`server.py`, `task-state.py`, PRD regex parsing, `MILESTONE_DEPS`,
+`graph-state*.json`, and Python task-action endpoints are frozen compatibility
+code for the retired Mac Runtime board. They refuse to run unless the operator
+passes `--legacy-mac-runtime`. Do not use that mode for new projects.
 
-After verification, check the task in the PRD and retain its attribution:
+Import an active legacy state once with:
 
-```bash
-python3 execution-graph/task-state.py complete M3.13 --agent-id codex/root
+```sh
+fractal graph import-legacy --state execution-graph/graph-state.json --repo PROJECT
 ```
 
-Use `release` to abandon a claim without marking the PRD complete, and `status`
-to inspect a task. `FRACTAL_AGENT_ID` and `FRACTAL_AGENT_LABEL` may replace the
-agent flags. Completed and released records stay in `graph-state.json`, so the
-dashboard keeps showing who worked on the task.
-
-The same lifecycle is available while the dashboard server is running:
-
-```text
-POST /api/tasks/M3.13/checkout
-POST /api/tasks/M3.13/complete
-POST /api/tasks/M3.13/release
-{"agent_id":"codex/root","agent_label":"Codex · root"}
-```
-
-`complete` fails unless the same agent owns the checkout and the PRD checkbox is
-already checked. State writes use a process lock and atomic replacement.
+When the project already has a compiled portable graph, the importer maps
+matching assignments onto it. A state-only import cannot recover trustworthy
+dependencies, so it creates a halted historical graph and releases active
+claims for safe replanning.

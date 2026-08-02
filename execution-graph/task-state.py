@@ -19,6 +19,7 @@ from server import (
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--legacy-mac-runtime", action="store_true")
     parser.add_argument("action", choices=("checkout", "complete", "release", "status"))
     parser.add_argument("task_id", help="PRD task or gate id, for example M3.13 or M3.G1")
     parser.add_argument("--agent-id", default=os.environ.get("FRACTAL_AGENT_ID"))
@@ -26,6 +27,11 @@ def main() -> None:
     parser.add_argument("--prd", type=Path, default=DEFAULT_PRD)
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     args = parser.parse_args()
+    if not args.legacy_mac_runtime:
+        parser.error(
+            "task-state.py is archived; use `fractal node NODE "
+            "--checkout|--complete|--release|--show --repo REPO`"
+        )
 
     if args.action == "status":
         graph = parse_prd(args.prd.resolve(), args.state.resolve())
