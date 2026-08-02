@@ -181,8 +181,19 @@ fn is_eligible(graph: &FailureGraph, lesson: &LessonRecord) -> bool {
     if lesson.status != LessonStatus::Adopted || lesson.evidence.is_empty() {
         return false;
     }
+    let stale = lesson.extra.get("stale").is_some_and(|value| {
+        value.as_bool() == Some(true)
+            || value.as_str().is_some_and(|text| {
+                matches!(text.trim().to_ascii_lowercase().as_str(), "true" | "stale")
+            })
+    });
+    let contradicted = lesson
+        .extra
+        .get("contradicted")
+        .is_some_and(|value| value.as_bool() == Some(true));
     if lesson.superseded_by.is_some()
-        || lesson.extra.get("stale").and_then(Value::as_bool) == Some(true)
+        || stale
+        || contradicted
         || lesson
             .extra
             .get("stale_by")
@@ -247,7 +258,8 @@ fn relevance_score(
 ) -> Option<(u8, u8, u8, u8, u8, u32, u32, String)> {
     let lesson_node = extra_string(lesson, "node_id");
     let lesson_failure = extra_string(lesson, "failure_code");
-    let lesson_objective = extra_string(lesson, "objective_fingerprint");
+    let lesson_objective = extra_string(lesson, "objective_fingerprint")
+        .or_else(|| extra_string(lesson, "objective_hash"));
     let exact_node = query
         .node_id
         .as_deref()
@@ -286,12 +298,27 @@ fn relevance_score(
     let confidence = lesson
         .extra
         .get("confidence")
-        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_f64().map(|number| number.max(0.0) as u64))
+                .or_else(|| value.as_str()?.parse().ok())
+        })
         .unwrap_or(0)
         .min(u32::MAX as u64) as u32;
     let recency = extra_string(lesson, "resolved_at")
         .or_else(|| extra_string(lesson, "updated_at"))
         .or_else(|| extra_string(lesson, "created_at"))
+        .or_else(|| {
+            lesson
+                .observed
+                .extra
+                .get("resolved_at")
+                .or_else(|| lesson.observed.extra.get("updated_at"))
+                .or_else(|| lesson.observed.extra.get("created_at"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
         .unwrap_or_default();
     Some((
         exact_node as u8,
