@@ -1,0 +1,72 @@
+{
+  "schema_version": "project-graph-context.live-calibration-report.v1",
+  "experiment_id": "pgc-live-pilot-calculator-pair",
+  "base_harness_commit": "efa0833a4fd82fc527fde0f166e76d1b91a34cb1",
+  "codex_cli": {"version": "0.145.0", "binary": "/opt/homebrew/bin/codex"},
+  "models": {
+    "planner": {"model": "gpt-5.6-sol", "reasoning_effort": "high", "calls_per_attempt": 2},
+    "worker": {"model": "gpt-5.6-luna", "reasoning_effort": "high", "token_cap": 20000, "timeout_seconds": 120}
+  },
+  "scope": {"task": "calculator-add", "arm": "C", "replicate": 0, "pilot_cells_started": 0, "calibration_cells": 2},
+  "calibration_cells": [
+    {
+      "run": "calibration3-baseline",
+      "ledger_sha256": "78af2efd11391f945dda3017a16589781512e0e69219937bd3b4a16d91e61bc3",
+      "source_commit": "605ecdfcd76541a2d4873fe18b2e3cb7350dcada",
+      "context_sha256": "7739ad94a7f8992d4d9f9eb2a35fb8e472226ed0c37cb0e17e7aaff5a505b439",
+      "context_mode": "0555",
+      "oracle_passed": true,
+      "runner_success": false,
+      "runner_timed_out": true,
+      "actual_usage": {"input_tokens": 64789, "output_tokens": 858, "total_tokens": 65647, "cost_usd": null, "receipt_sha256": "4ea1e0997b11ba5bbf310c9bc6408a3828721b3f53569e5be0f94d4ed1110da8"},
+      "changed_paths": ["src/calculator.py"],
+      "intent_violations": {"severe": 0, "weighted": 0.0},
+      "git_mutation_detected": false,
+      "result_evidence_hashes": {"commit": "605ecdfcd76541a2d4873fe18b2e3cb7350dcada", "changed_paths": "b9749764b6f175e1c39983793f40240f0c697eaf5640e6c341369208a3867a36", "file:src/calculator.py": "6c3b3d5c835d1d6fd753cfeead161735dfee21c461f330416d998b902ce2a2dc", "stdout": "b6a7ac8ab2eb602ff73cc553b0ffa059824073786d1b755483db60fd6f6ae0e0", "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "trace": "27b893481a87c5b568ee1ffa1708100a8fd04c762185d20b3da680af0dae5dbb"},
+      "plan_hashes": {"calculator-add": "dc2afbaf5b21c5cc291076128d323321a490cebb7a549bfc02229ab087cfe859", "calculator-subtract": "3d7025d02ece3de8b005600cf9277a06455ab226967b0f51118984fb08e2228a"},
+      "planner_usage_total": 23486
+    },
+    {
+      "run": "calibration4-context-window",
+      "ledger_sha256": "e74bc871442065e93d4222718781a4fc95308e481af218b32916fcfc02464ddf",
+      "source_commit": "605ecdfcd76541a2d4873fe18b2e3cb7350dcada",
+      "context_sha256": "7739ad94a7f8992d4d9f9eb2a35fb8e472226ed0c37cb0e17e7aaff5a505b439",
+      "context_mode": "0555",
+      "oracle_passed": true,
+      "runner_success": false,
+      "runner_timed_out": true,
+      "actual_usage": {"input_tokens": 52403, "output_tokens": 745, "total_tokens": 53148, "cost_usd": null, "receipt_sha256": "f945e3986ec91de94fda9870c62ee93b1654bfcf32ed97918d0e8c0f40524bdd"},
+      "changed_paths": ["src/calculator.py"],
+      "intent_violations": {"severe": 0, "weighted": 0.0},
+      "git_mutation_detected": false,
+      "result_evidence_hashes": {"commit": "605ecdfcd76541a2d4873fe18b2e3cb7350dcada", "changed_paths": "b9749764b6f175e1c39983793f40240f0c697eaf5640e6c341369208a3867a36", "file:src/calculator.py": "6c3b3d5c835d1d6fd753cfeead161735dfee21c461f330416d998b902ce2a2dc", "stdout": "3d99c520dbc1dc4e160fc05ac174aa09163ee5395fb60c194a90e7d5c8c33410", "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "trace": "9eccdb37862d963fa5765ccb2dbb5cfa212ea21e15646cb01e649f33b6be7e99"},
+      "plan_hashes": {"calculator-add": "eb9905a41581defe12f9c45476420c84916c79a381288a2655d4aedd223f5254", "calculator-subtract": "c4974204c371ff90a69f9c45476420c84916c79a381288a2655d4aedd223f5254"},
+      "planner_usage_total": 23090
+    }
+  ],
+  "control_probe_not_counted": {
+    "run": "calibration5-under-development-token-budget",
+    "ledger_sha256": "6b1f833629fa10f9ad858931f26c7a64ad7879f27c311185cdefa315b4ef500f",
+    "actual_usage": {"input_tokens": 66056, "output_tokens": 868, "total_tokens": 66924, "cost_usd": null, "receipt_sha256": "908aec7a0c985f406697486466192af23a11445aa17f251868b3967642d9705d"},
+    "oracle_passed": true,
+    "runner_timed_out": true,
+    "note": "Enabling the CLI's under-development token_budget feature did not enforce a 20k aggregate ceiling and was removed from the committed adapter."
+  },
+  "safety": {
+    "hidden_oracle_visible_to_worker": false,
+    "context_read_only_verified": true,
+    "scope_only_target_file": true,
+    "source_git_mutation_detected": false,
+    "network_or_external_side_effects": false,
+    "raw_traces_prompts_receipts_committed": false
+  },
+  "decision": "inconclusive_no_go",
+  "reason": "Both accepted calibration cells passed the hidden checker and stayed in scope, but actual worker totals (53,148 and 65,647) exceeded the 20,000-token cap. No A/B/C/D cells were started.",
+  "recommendation": "Reduce Codex input overhead (disable unused skills/plugins, shrink system/context payload, and require a documented hard token budget) and repeat one calibration cell. Do not run a full 160-cell study until a calibration receipt is <=20,000 tokens and all required telemetry is available.",
+  "limitations": [
+    "Calibration is one task/arm and not a treatment estimate.",
+    "CLI emitted no cost_usd field; cost remains unavailable rather than estimated.",
+    "Repair, routing, and tool-selection telemetry were not explicitly emitted, so those metrics remain unavailable.",
+    "The report contains hashes and scalar metrics only; raw event streams/worktrees remain outside the repository."
+  ]
+}

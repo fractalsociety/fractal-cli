@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fractalmaster.invalid/project-graph-context/live-plan.v1.schema.json",
+  "title": "Arm-blind Sol orchestration skeleton",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task_id", "objective", "acceptance_checks", "allowed_paths", "steps"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "project-graph-context.sol-plan.v1"},
+    "task_id": {"type": "string"},
+    "objective": {"type": "string", "minLength": 1},
+    "acceptance_checks": {"type": "array", "items": {"type": "string"}},
+    "allowed_paths": {"type": "array", "items": {"type": "string"}},
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string"}
+    }
+  }
+}
