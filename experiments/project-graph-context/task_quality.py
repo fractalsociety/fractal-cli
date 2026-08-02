@@ -660,9 +660,12 @@ def _leakage_checks(task_id: str) -> dict[str, Any]:
     root = corpus_v2.fixture_root(task_id)
     forbidden_tokens = ("chain-of-thought", "answer key", "secret_expected", "learning record", "hidden evaluator", "graph-state")
     leaked = []
+    path_leaks = []
     network_code = []
     for relative in corpus_v2.fixture_files(task_id):
         path = root / relative
+        if any(token in relative.lower() for token in ("answer", "secret", "checker", "evaluator", "learning", "graph-state")):
+            path_leaks.append(relative)
         text = path.read_text(encoding="utf-8", errors="replace")
         lowered = text.lower()
         for token in forbidden_tokens:
@@ -670,7 +673,11 @@ def _leakage_checks(task_id: str) -> dict[str, Any]:
         if path.suffix in {".py", ".js", ".rs"}:
             if any(token in text for token in ("import socket", "import requests", "require(\"http", "require('http", "Command::new(\"curl")):
                 network_code.append(relative)
-    return {"passed": not leaked and not network_code, "leak_tokens": leaked, "network_code": network_code}
+    # The checker process receives only a private root pointer; no answer/env
+    # variables are inherited into episode worktrees.  Treat suspicious API
+    # keys as a leakage signal if they are supplied to this quality process.
+    env_leaks = sorted(key for key in os.environ if key.upper() in {"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "PGC_EXPECTED_ANSWER", "PGC_HIDDEN_CHECKER"})
+    return {"passed": not leaked and not path_leaks and not network_code and not env_leaks, "leak_tokens": leaked, "path_leaks": path_leaks, "network_code": network_code, "environment_leaks": env_leaks}
 
 
 def _determinism(checker: Path, task_id: str, worktree: Path) -> dict[str, Any]:
@@ -714,6 +721,9 @@ def audit_task(task_id: str, *, keep_worktrees: bool = False) -> dict[str, Any]:
             shutil.rmtree(root_context, ignore_errors=True)
     mutation_rate = sum(1 for value in mutants if value["detected"]) / len(mutants) if mutants else 0.0
     clause_total = int(gold.get("clauses_total", 0))
+    dependency_score = min(1.0, len(manifest.get("required_paths", [])) / 3.0) if manifest.get("required_paths") else 0.0
+    scope_score = min(1.0, mutation_rate)
+    localization_score = min(1.0, (len(corpus_v2.fixture_files(task_id)) - len(manifest.get("required_paths", []))) / 2.0) if manifest.get("required_paths") else 0.0
     gates = {
         "prompt_checker_consistency": bool(manifest.get("acceptance_checks")) and clause_total >= len(manifest.get("acceptance_checks", [])),
         "gold_reference_solvable": bool(gold.get("passed", False)),
@@ -742,6 +752,7 @@ def audit_task(task_id: str, *, keep_worktrees: bool = False) -> dict[str, Any]:
         "baseline": {"passed": bool(baseline.get("passed", False)), "failure_code": baseline.get("failure_code")},
         "gold": {"passed": bool(gold.get("passed", False)), "failure_code": gold.get("failure_code")},
         "mutations": {"total": len(mutants), "detected": sum(1 for value in mutants if value["detected"]), "detection_rate": mutation_rate, "minimum_rate": MIN_MUTATION_DETECTION, "cases": mutants},
+        "scores": {"dependency_localization": dependency_score, "scope_discrimination": scope_score, "nontrivial_localization": localization_score},
         "determinism": deterministic,
         "gates": gates,
         "saturation_warning": saturation_warning,
@@ -759,9 +770,10 @@ def _split_hash(entries: list[Mapping[str, Any]]) -> str:
 
 def audit_corpus(*, task_ids: Iterable[str] | None = None, output: str | os.PathLike[str] | None = None) -> dict[str, Any]:
     selected = list(task_ids) if task_ids is not None else corpus_v2.task_ids()
+    selected, duplicate_ids = corpus_v2.dedupe_task_ids(selected)
     reports = [audit_task(task_id) for task_id in selected]
     included = [report["task_id"] for report in reports if not report["quarantined"]]
-    quarantined = [report["task_id"] for report in reports if report["quarantined"]]
+    quarantined = [report["task_id"] for report in reports if report["quarantined"]] + duplicate_ids
     splits: dict[str, list[dict[str, Any]]] = {"public": [], "holdout": []}
     for report in reports:
         if report["task_id"] not in included: continue
@@ -774,6 +786,7 @@ def audit_corpus(*, task_ids: Iterable[str] | None = None, output: str | os.Path
         "reports": reports,
         "included_tasks": included,
         "quarantined_tasks": quarantined,
+        "dedupe": {"basis": ["dependency_shape", "behavior_fingerprint"], "selected": selected, "duplicates_quarantined": duplicate_ids},
         "splits": splits,
         "split_hashes": {name: _split_hash(entries) for name, entries in splits.items()},
         "corpus_hash": corpus_v2.corpus_hash(),
