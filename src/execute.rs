@@ -568,6 +568,10 @@ struct NodeOutcome {
     /// reason instead of collapsing policy failures into generic tool errors.
     failure_code: Option<crate::learning_data::FailureCode>,
     policy_report: Option<crate::policy_executor::PolicyEnforcementReport>,
+    /// Relative content-addressed verifier manifest, when this node ran a
+    /// verification attempt.  Kept separate from the workspace digest so the
+    /// learning/failure projections can retain both references.
+    manifest_ref: Option<String>,
 }
 
 impl NodeOutcome {
@@ -580,6 +584,7 @@ impl NodeOutcome {
             lessons: Vec::new(),
             failure_code: None,
             policy_report: None,
+            manifest_ref: None,
         }
     }
 
@@ -592,6 +597,7 @@ impl NodeOutcome {
             lessons: Vec::new(),
             failure_code: None,
             policy_report: None,
+            manifest_ref: None,
         }
     }
 
@@ -605,6 +611,11 @@ impl NodeOutcome {
         report: crate::policy_executor::PolicyEnforcementReport,
     ) -> Self {
         self.policy_report = Some(report);
+        self
+    }
+
+    fn with_manifest_ref(mut self, reference: Option<String>) -> Self {
+        self.manifest_ref = reference;
         self
     }
 }
@@ -767,35 +778,52 @@ fn run_node_with_graph(
             Ok(outcome)
         }
     } else if is_verify(capability) {
-        // Genuine governance: judge the suite with the real deny-by-default floor.
-        match crate::verify::evaluate_workspace(workspace, id, agent)? {
-            Some(verdict) => {
-                if verdict.complete {
-                    let mut outcome = NodeOutcome::success(Some(true), Some(verdict.detail));
-                    if let Some((policy, snapshot, report)) = policy_context.as_ref() {
-                        let post = crate::policy_executor::postflight(
-                            policy,
-                            snapshot,
-                            workspace,
-                            report.clone(),
-                        )?;
-                        if let Some(error) = post.failure {
-                            return Ok(policy_failure_outcome(error));
-                        }
-                        outcome = outcome.with_policy_report(post.report);
-                    }
-                    Ok(outcome)
-                } else {
-                    Ok(NodeOutcome::failure(
-                        Some(false),
-                        false,
-                        Some(verdict.detail),
-                    ))
-                }
-            }
-            // Nothing to run: unverifiable, but not a failure.
-            None => Ok(NodeOutcome::success(None, None)),
+        // Genuine governance: run public/native tests and every configured
+        // independent verifier as separate processes.  A missing suite or
+        // verifier is an explicit weak-verifier failure, never an unverified
+        // success.  The preflight report hash anchors the manifest; postflight
+        // still runs for both pass and fail so source mutations are detected.
+        let policy = policy_context.as_ref().map(|(policy, _, _)| policy);
+        let pre_report_hash = policy_context
+            .as_ref()
+            .map(|(_, _, report)| report.report_hash.clone());
+        let verdict = crate::verify::evaluate_workspace_with_policy(
+            workspace,
+            id,
+            agent,
+            policy,
+            graph,
+            pre_report_hash,
+        )?;
+        let mut outcome = if verdict.complete {
+            NodeOutcome::success(Some(true), Some(verdict.detail))
+        } else {
+            NodeOutcome::failure(Some(false), false, Some(verdict.detail))
         }
+        .with_manifest_ref(verdict.manifest_ref);
+        if let Some((policy, snapshot, report)) = policy_context.as_ref() {
+            let post =
+                crate::policy_executor::postflight(policy, snapshot, workspace, report.clone())?;
+            let final_manifest = outcome.manifest_ref.as_deref().and_then(|reference| {
+                crate::evidence_manifest::rebind_enforcement_report(
+                    workspace,
+                    reference,
+                    &post.report.report_hash,
+                )
+                .ok()
+                .flatten()
+            });
+            if final_manifest.is_some() {
+                outcome = outcome.with_manifest_ref(final_manifest);
+            }
+            if let Some(error) = post.failure {
+                let mut failure = policy_failure_outcome(error);
+                failure.manifest_ref = outcome.manifest_ref;
+                return Ok(failure);
+            }
+            outcome = outcome.with_policy_report(post.report);
+        }
+        Ok(outcome)
     } else {
         Ok(NodeOutcome::success(None, None))
     }
@@ -1007,6 +1035,13 @@ fn report_node_outcome_with_lessons(
         let human = agent.eq_ignore_ascii_case("human");
         let board_action = "complete";
         crate::run_control::node_transition(board, node, board_action, agent);
+        if let Some(reference) = outcome.manifest_ref.as_deref() {
+            if let Err(error) =
+                crate::project_file::record_artifact_produced(workspace, node, reference)
+            {
+                eprintln!("  evidence manifest artifact note: {error:#}");
+            }
+        }
         let result = finish_learning_success(
             workspace,
             node,
@@ -1018,6 +1053,12 @@ fn report_node_outcome_with_lessons(
         if let Err(error) = result {
             eprintln!("  live graph state note: {error:#}");
         } else {
+            append_manifest_verification_ref(
+                workspace,
+                node,
+                outcome.manifest_ref.as_deref(),
+                true,
+            );
             crate::project_sync::maybe_sync_runtime(workspace);
         }
         record_lesson_reuse(workspace, node, provided_lessons, outcome, evidence_hex);
@@ -1043,6 +1084,36 @@ fn report_node_outcome_with_lessons(
         )
     };
     crate::run_control::node_transition(board, node, "release", agent);
+    if let Some(reference) = outcome.manifest_ref.as_deref() {
+        if let Err(error) =
+            crate::project_file::record_artifact_produced(workspace, node, reference)
+        {
+            eprintln!("  evidence manifest artifact note: {error:#}");
+        }
+        // Seed the verification refs before capture_failure_observation so the
+        // failure graph links the manifest itself, not only the workspace
+        // digest that predates this controller-owned sidecar.
+        let mut refs = vec![evidence_hex.to_owned(), reference.to_owned()];
+        if let Ok(document) = crate::project_file::load(workspace) {
+            if let Some(existing) = document
+                .learning
+                .nodes
+                .get(node)
+                .and_then(|record| record.verification.as_ref())
+            {
+                for value in &existing.evidence_refs {
+                    if !refs.iter().any(|current| current == value) {
+                        refs.push(value.clone());
+                    }
+                }
+            }
+        }
+        if let Err(error) =
+            crate::project_file::record_verification_result(workspace, node, false, refs)
+        {
+            eprintln!("  evidence manifest pre-capture note: {error:#}");
+        }
+    }
     let evidence = compact_evidence_ref(node, evidence_hex);
     let result = release_learning_failure(
         workspace,
@@ -1056,9 +1127,44 @@ fn report_node_outcome_with_lessons(
     if let Err(error) = result {
         eprintln!("  live graph state note: {error:#}");
     } else {
+        append_manifest_verification_ref(workspace, node, outcome.manifest_ref.as_deref(), false);
         crate::project_sync::maybe_sync_runtime(workspace);
     }
     record_lesson_reuse(workspace, node, provided_lessons, outcome, evidence_hex);
+}
+
+/// Add the relative manifest reference alongside the existing compact workspace
+/// evidence without replacing older evidence.  This projection is additive and
+/// cannot alter the immutable graph hash.
+fn append_manifest_verification_ref(
+    workspace: &Path,
+    node: &str,
+    manifest_ref: Option<&str>,
+    passed: bool,
+) {
+    let Some(reference) =
+        manifest_ref.filter(|reference| crate::evidence_manifest::safe_relative_ref(reference))
+    else {
+        return;
+    };
+    let Ok(document) = crate::project_file::load(workspace) else {
+        return;
+    };
+    let mut refs = document
+        .learning
+        .nodes
+        .get(node)
+        .and_then(|record| record.verification.as_ref())
+        .map(|verification| verification.evidence_refs.clone())
+        .unwrap_or_default();
+    if !refs.iter().any(|existing| existing == reference) {
+        refs.push(reference.to_owned());
+    }
+    if let Err(error) =
+        crate::project_file::record_verification_result(workspace, node, passed, refs)
+    {
+        eprintln!("  evidence manifest verification note: {error:#}");
+    }
 }
 
 fn compact_evidence_ref(node: &str, evidence_hex: &str) -> String {

@@ -976,6 +976,10 @@ fn changed_entries(before: &WorkspaceSnapshot, after: &WorkspaceSnapshot) -> Vec
         .collect();
     paths
         .into_iter()
+        // Evidence manifests are controller-owned sidecars written after a
+        // verifier run.  They must not be mistaken for agent edits or require
+        // a project policy grant; their own content hash is the audit boundary.
+        .filter(|path| path != ".fractal/evidence" && !path.starts_with(".fractal/evidence/"))
         .filter(|path| {
             before.files.get(path).map(snapshot_identity)
                 != after.files.get(path).map(snapshot_identity)

@@ -15,6 +15,7 @@ mod efficiency_accounting;
 mod efficiency_config;
 mod efficiency_detector;
 mod efficiency_policy;
+mod evidence_manifest;
 mod evolve;
 mod execute;
 mod failure_cli;

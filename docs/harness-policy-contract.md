@@ -56,6 +56,28 @@ canonical hash, provenance, migration diagnostics, and validation failure. The
 matching `show` command additionally prints normalized policy JSON. Neither
 command writes `.fractal` state.
 
+## Independent evidence manifests
+
+Verification runs produce a bounded `fractal.evidence_manifest.v1` sidecar at
+`.fractal/evidence/<sha256>.json`. The canonical JSON bytes are the content
+address, so retries deduplicate identical evidence and never change the
+immutable execution `graph_hash`. Manifests contain policy/node/attempt
+identity, graph/commit/diff hashes, criterion IDs, verifier argv identities,
+exit and duration values, output hashes, protected status, and pass/fail/
+unavailable states. Prompts, raw logs, environment values, secrets, absolute
+paths, and chain-of-thought are not persisted. The relative sidecar path is
+added to the node's artifact and verification evidence references.
+
+Public tests and operator-owned protected checkers are separate argv
+processes. Protected checker paths stay outside the agent worktree; the
+checker receives a disposable copy with a sanitized offline environment,
+bounded output, and a wall timeout. Mutating that copy, duplicating the public
+invocation, or omitting a required registry entry is an explicit fail/unknown
+verdict. A model-verifier record is emitted only for a separately configured
+model process; a public test exit code is never reused as a model or hidden
+verdict. Missing required evidence is recorded as `weak_verifier` in the
+learning/failure graph rather than being promoted to an unverified success.
+
 ## Research grounding
 
 The contract follows primary benchmark/runtime designs rather than copying
