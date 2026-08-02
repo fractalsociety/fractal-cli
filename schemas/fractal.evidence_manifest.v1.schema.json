@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fractalsociety.dev/schemas/fractal.evidence_manifest.v1.schema.json",
+  "title": "Fractal evidence manifest v1",
+  "type": "object",
+  "required": ["schema", "policy_hash", "node", "attempt", "source", "verifier_runs", "outcome"],
+  "properties": {
+    "schema": {"const": "fractal.evidence_manifest.v1"},
+    "policy_hash": {"type": ["string", "null"]},
+    "node": {"type": "string", "minLength": 1, "maxLength": 512},
+    "attempt": {"type": "integer", "minimum": 1},
+    "source": {
+      "type": "object",
+      "required": ["graph", "commit", "diff"],
+      "properties": {
+        "graph": {"type": ["string", "null"]},
+        "commit": {"type": ["string", "null"]},
+        "diff": {"type": ["string", "null"]}
+      },
+      "additionalProperties": false
+    },
+    "criterion_ids": {"type": "array", "maxItems": 128, "items": {"type": "string", "maxLength": 512}},
+    "verifier_runs": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "argv_identity", "argv_hash", "exit_code", "duration_ms", "output_hash", "status", "protected"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 512},
+          "kind": {"type": "string", "minLength": 1, "maxLength": 512},
+          "argv_identity": {"type": "array", "items": {"type": "string", "maxLength": 512}},
+          "argv_hash": {"type": "string", "maxLength": 512},
+          "exit_code": {"type": ["integer", "null"]},
+          "duration_ms": {"type": ["integer", "null"]},
+          "output_hash": {"type": ["string", "null"]},
+          "status": {"enum": ["pass", "fail", "unavailable"]},
+          "protected": {"type": "boolean"},
+          "artifact_refs": {"type": "array", "items": {"type": "string", "maxLength": 512}}
+        },
+        "additionalProperties": false
+      }
+    },
+    "outcome": {"enum": ["pass", "fail", "unavailable"]},
+    "artifact_refs": {"type": "array", "maxItems": 128, "items": {"type": "string", "maxLength": 512}},
+    "enforcement_report_hash": {"type": ["string", "null"]}
+  },
+  "additionalProperties": false,
+  "maxProperties": 10
+}
