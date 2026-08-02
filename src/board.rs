@@ -1164,6 +1164,7 @@ fn from_hex(byte: u8) -> Option<u8> {
 
 fn etag_matches(etag: &str, if_none_match: &str) -> bool {
     if_none_match.split(',').map(str::trim).any(|candidate| {
+        let candidate = candidate.strip_prefix("W/").unwrap_or(candidate);
         candidate == "*" || candidate == etag || candidate == etag.trim_matches('"')
     })
 }
