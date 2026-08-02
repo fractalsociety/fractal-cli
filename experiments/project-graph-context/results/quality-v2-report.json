@@ -1,0 +1,837 @@
+{
+  "corpus_hash": "4402c1db20243c5313c0158ba95ee78924abdfb65724329e40dc421803854233",
+  "corpus_version": "v2",
+  "holdout_checker_contents": "sealed-external",
+  "included_tasks": [
+    "board-filters",
+    "board-rollback",
+    "graph-diagnostics",
+    "graph-valid",
+    "policy-retry",
+    "policy-terminal",
+    "storage-corrupt",
+    "storage-normal"
+  ],
+  "paid_llm_episodes": false,
+  "quality_report_hash": "c200c58182e5fc11cefcaf1ae8f46172e37cbd0d2d936a1485881d2266874dfa",
+  "quarantined_tasks": [],
+  "reports": [
+    {
+      "baseline": {
+        "failure_code": "oracle_assertion_failed",
+        "passed": false
+      },
+      "checker": "external-private-sanitized",
+      "clauses": {
+        "minimum": 8,
+        "passed_on_gold": 9,
+        "total": 9
+      },
+      "determinism": {
+        "hash": "584fe956481ac4c0bb2562b91197cb857b529eab6181c2f5a2e098555ea0cab5",
+        "passed": true,
+        "runs": 3
+      },
+      "duration_ms": 1907.409,
+      "gates": {
+        "baseline_failure": true,
+        "dependency_localization": true,
+        "deterministic_three_runs": true,
+        "gold_reference_solvable": true,
+        "mutation_detection": true,
+        "no_hidden_answer_leakage": true,
+        "no_network": true,
+        "nontrivial_localization": true,
+        "prompt_checker_consistency": true,
+        "scope_discrimination": true
+      },
+      "gold": {
+        "failure_code": null,
+        "passed": true
+      },
+      "mutations": {
+        "cases": [
+          {
+            "changed_paths": [],
+            "checker_passed": false,
+            "detected": true,
+            "name": "no-op",
+            "scope_severe": 0
+          },
+          {
+            "changed_paths": [
+              "lib/server_stub.js"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "wrong-file",
+            "scope_severe": 1
+          },
+          {
+            "changed_paths": [
+              "lib/board.js"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "happy-path",
+            "scope_severe": 0
+          },
+          {
+            "changed_paths": [
+              "UNSCOPED_CHANGE.txt",
+              "lib/board.js"
+            ],
+            "checker_passed": true,
+            "detected": true,
+            "name": "overbroad",
+            "scope_severe": 1
+          },
+          {
+            "changed_paths": [
+              "lib/board.js"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "policy-bypass",
+            "scope_severe": 0
+          }
+        ],
+        "detected": 5,
+        "detection_rate": 1.0,
+        "minimum_rate": 0.8,
+        "total": 5
+      },
+      "pair_id": "board",
+      "quality_report_hash": "0c901ff477ec70c7c8ebc97ba37cf10f639e6ff391eb462fe19551155e7ae724",
+      "quarantined": false,
+      "saturation_warning": false,
+      "schema_version": "project-graph-context.task-quality.v1",
+      "seed_sha256": "01ba9a23814c21ebeddbb1b7ad7e885d062ca9293172e5cadaaf6e6ea70105e0",
+      "split": "public",
+      "task_id": "board-filters"
+    },
+    {
+      "baseline": {
+        "failure_code": "oracle_assertion_failed",
+        "passed": false
+      },
+      "checker": "external-private-sanitized",
+      "clauses": {
+        "minimum": 8,
+        "passed_on_gold": 9,
+        "total": 9
+      },
+      "determinism": {
+        "hash": "584fe956481ac4c0bb2562b91197cb857b529eab6181c2f5a2e098555ea0cab5",
+        "passed": true,
+        "runs": 3
+      },
+      "duration_ms": 1938.786,
+      "gates": {
+        "baseline_failure": true,
+        "dependency_localization": true,
+        "deterministic_three_runs": true,
+        "gold_reference_solvable": true,
+        "mutation_detection": true,
+        "no_hidden_answer_leakage": true,
+        "no_network": true,
+        "nontrivial_localization": true,
+        "prompt_checker_consistency": true,
+        "scope_discrimination": true
+      },
+      "gold": {
+        "failure_code": null,
+        "passed": true
+      },
+      "mutations": {
+        "cases": [
+          {
+            "changed_paths": [],
+            "checker_passed": false,
+            "detected": true,
+            "name": "no-op",
+            "scope_severe": 0
+          },
+          {
+            "changed_paths": [
+              "lib/server_stub.js"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "wrong-file",
+            "scope_severe": 1
+          },
+          {
+            "changed_paths": [
+              "lib/board.js"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "happy-path",
+            "scope_severe": 0
+          },
+          {
+            "changed_paths": [
+              "UNSCOPED_CHANGE.txt",
+              "lib/board.js"
+            ],
+            "checker_passed": true,
+            "detected": true,
+            "name": "overbroad",
+            "scope_severe": 1
+          },
+          {
+            "changed_paths": [
+              "lib/board.js"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "policy-bypass",
+            "scope_severe": 0
+          }
+        ],
+        "detected": 5,
+        "detection_rate": 1.0,
+        "minimum_rate": 0.8,
+        "total": 5
+      },
+      "pair_id": "board",
+      "quality_report_hash": "3a53ed3fef4a793517d3d11354022d39cabca2099c33f909d35b54b400177ead",
+      "quarantined": false,
+      "saturation_warning": false,
+      "schema_version": "project-graph-context.task-quality.v1",
+      "seed_sha256": "cbf3e902329d5c2505dfa66e5ef4d23cc23e8e9c84470e2f70a6bef733653ad2",
+      "split": "holdout",
+      "task_id": "board-rollback"
+    },
+    {
+      "baseline": {
+        "failure_code": "oracle_assertion_failed",
+        "passed": false
+      },
+      "checker": "external-private-sanitized",
+      "clauses": {
+        "minimum": 8,
+        "passed_on_gold": 8,
+        "total": 8
+      },
+      "determinism": {
+        "hash": "5bb5c188185bc94352128b6f4b29db528cc1f594cea0feb5f224c692452586e4",
+        "passed": true,
+        "runs": 3
+      },
+      "duration_ms": 5256.191,
+      "gates": {
+        "baseline_failure": true,
+        "dependency_localization": true,
+        "deterministic_three_runs": true,
+        "gold_reference_solvable": true,
+        "mutation_detection": true,
+        "no_hidden_answer_leakage": true,
+        "no_network": true,
+        "nontrivial_localization": true,
+        "prompt_checker_consistency": true,
+        "scope_discrimination": true
+      },
+      "gold": {
+        "failure_code": null,
+        "passed": true
+      },
+      "mutations": {
+        "cases": [
+          {
+            "changed_paths": [],
+            "checker_passed": false,
+            "detected": true,
+            "name": "no-op",
+            "scope_severe": 0
+          },
+          {
+            "changed_paths": [
+              "src/graph_utils.rs"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "wrong-file",
+            "scope_severe": 1
+          },
+          {
+            "changed_paths": [
+              "src/resolve.rs"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "happy-path",
+            "scope_severe": 0
+          },
+          {
+            "changed_paths": [
+              "UNSCOPED_CHANGE.txt",
+              "src/resolve.rs"
+            ],
+            "checker_passed": true,
+            "detected": true,
+            "name": "overbroad",
+            "scope_severe": 1
+          },
+          {
+            "changed_paths": [
+              "src/resolve.rs"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "policy-bypass",
+            "scope_severe": 0
+          }
+        ],
+        "detected": 5,
+        "detection_rate": 1.0,
+        "minimum_rate": 0.8,
+        "total": 5
+      },
+      "pair_id": "graph",
+      "quality_report_hash": "2d78afb4fd077e5b84c629ce7c6b907461f7104515cb016c10a620ca53ea6447",
+      "quarantined": false,
+      "saturation_warning": false,
+      "schema_version": "project-graph-context.task-quality.v1",
+      "seed_sha256": "35ee9af973e7d629e1981d46472caff82a77112eabe0a4d9d549e86ee1752015",
+      "split": "holdout",
+      "task_id": "graph-diagnostics"
+    },
+    {
+      "baseline": {
+        "failure_code": "oracle_assertion_failed",
+        "passed": false
+      },
+      "checker": "external-private-sanitized",
+      "clauses": {
+        "minimum": 8,
+        "passed_on_gold": 8,
+        "total": 8
+      },
+      "determinism": {
+        "hash": "5bb5c188185bc94352128b6f4b29db528cc1f594cea0feb5f224c692452586e4",
+        "passed": true,
+        "runs": 3
+      },
+      "duration_ms": 6070.884,
+      "gates": {
+        "baseline_failure": true,
+        "dependency_localization": true,
+        "deterministic_three_runs": true,
+        "gold_reference_solvable": true,
+        "mutation_detection": true,
+        "no_hidden_answer_leakage": true,
+        "no_network": true,
+        "nontrivial_localization": true,
+        "prompt_checker_consistency": true,
+        "scope_discrimination": true
+      },
+      "gold": {
+        "failure_code": null,
+        "passed": true
+      },
+      "mutations": {
+        "cases": [
+          {
+            "changed_paths": [],
+            "checker_passed": false,
+            "detected": true,
+            "name": "no-op",
+            "scope_severe": 0
+          },
+          {
+            "changed_paths": [
+              "src/graph_utils.rs"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "wrong-file",
+            "scope_severe": 1
+          },
+          {
+            "changed_paths": [
+              "src/resolve.rs"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "happy-path",
+            "scope_severe": 0
+          },
+          {
+            "changed_paths": [
+              "UNSCOPED_CHANGE.txt",
+              "src/resolve.rs"
+            ],
+            "checker_passed": true,
+            "detected": true,
+            "name": "overbroad",
+            "scope_severe": 1
+          },
+          {
+            "changed_paths": [
+              "src/resolve.rs"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "policy-bypass",
+            "scope_severe": 0
+          }
+        ],
+        "detected": 5,
+        "detection_rate": 1.0,
+        "minimum_rate": 0.8,
+        "total": 5
+      },
+      "pair_id": "graph",
+      "quality_report_hash": "122fc9e2c5453bb05d6a7fc1d21ae458f90ae037cfd0c5df7e9d44b458d2c84a",
+      "quarantined": false,
+      "saturation_warning": false,
+      "schema_version": "project-graph-context.task-quality.v1",
+      "seed_sha256": "d3b134602deefccf36465227c54354c87cb7213c49bfc8532b57eba46295c036",
+      "split": "public",
+      "task_id": "graph-valid"
+    },
+    {
+      "baseline": {
+        "failure_code": null,
+        "passed": false
+      },
+      "checker": "external-private-sanitized",
+      "clauses": {
+        "minimum": 8,
+        "passed_on_gold": 8,
+        "total": 8
+      },
+      "determinism": {
+        "hash": "5bb5c188185bc94352128b6f4b29db528cc1f594cea0feb5f224c692452586e4",
+        "passed": true,
+        "runs": 3
+      },
+      "duration_ms": 1165.406,
+      "gates": {
+        "baseline_failure": true,
+        "dependency_localization": true,
+        "deterministic_three_runs": true,
+        "gold_reference_solvable": true,
+        "mutation_detection": true,
+        "no_hidden_answer_leakage": true,
+        "no_network": true,
+        "nontrivial_localization": true,
+        "prompt_checker_consistency": true,
+        "scope_discrimination": true
+      },
+      "gold": {
+        "failure_code": null,
+        "passed": true
+      },
+      "mutations": {
+        "cases": [
+          {
+            "changed_paths": [],
+            "checker_passed": false,
+            "detected": true,
+            "name": "no-op",
+            "scope_severe": 0
+          },
+          {
+            "changed_paths": [
+              "policy/legacy_policy.py"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "wrong-file",
+            "scope_severe": 1
+          },
+          {
+            "changed_paths": [
+              "policy/checkpoint.py",
+              "policy/retry.py"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "happy-path",
+            "scope_severe": 0
+          },
+          {
+            "changed_paths": [
+              "UNSCOPED_CHANGE.txt",
+              "policy/checkpoint.py",
+              "policy/retry.py"
+            ],
+            "checker_passed": true,
+            "detected": true,
+            "name": "overbroad",
+            "scope_severe": 1
+          },
+          {
+            "changed_paths": [
+              "policy/checkpoint.py",
+              "policy/retry.py"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "policy-bypass",
+            "scope_severe": 0
+          }
+        ],
+        "detected": 5,
+        "detection_rate": 1.0,
+        "minimum_rate": 0.8,
+        "total": 5
+      },
+      "pair_id": "policy",
+      "quality_report_hash": "4fa480bac16dcb2e613656bf47cedef4cbb7e2c27cc185b034a84b27a3ff0525",
+      "quarantined": false,
+      "saturation_warning": false,
+      "schema_version": "project-graph-context.task-quality.v1",
+      "seed_sha256": "67356999b02f28fd8d460ed19264f9ce69487b1d6beeff42635060381330a556",
+      "split": "public",
+      "task_id": "policy-retry"
+    },
+    {
+      "baseline": {
+        "failure_code": null,
+        "passed": false
+      },
+      "checker": "external-private-sanitized",
+      "clauses": {
+        "minimum": 8,
+        "passed_on_gold": 9,
+        "total": 9
+      },
+      "determinism": {
+        "hash": "584fe956481ac4c0bb2562b91197cb857b529eab6181c2f5a2e098555ea0cab5",
+        "passed": true,
+        "runs": 3
+      },
+      "duration_ms": 1179.797,
+      "gates": {
+        "baseline_failure": true,
+        "dependency_localization": true,
+        "deterministic_three_runs": true,
+        "gold_reference_solvable": true,
+        "mutation_detection": true,
+        "no_hidden_answer_leakage": true,
+        "no_network": true,
+        "nontrivial_localization": true,
+        "prompt_checker_consistency": true,
+        "scope_discrimination": true
+      },
+      "gold": {
+        "failure_code": null,
+        "passed": true
+      },
+      "mutations": {
+        "cases": [
+          {
+            "changed_paths": [],
+            "checker_passed": false,
+            "detected": true,
+            "name": "no-op",
+            "scope_severe": 0
+          },
+          {
+            "changed_paths": [
+              "policy/legacy_policy.py"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "wrong-file",
+            "scope_severe": 1
+          },
+          {
+            "changed_paths": [
+              "policy/checkpoint.py",
+              "policy/retry.py"
+            ],
+            "checker_passed": true,
+            "detected": false,
+            "name": "happy-path",
+            "scope_severe": 0
+          },
+          {
+            "changed_paths": [
+              "UNSCOPED_CHANGE.txt",
+              "policy/checkpoint.py",
+              "policy/retry.py"
+            ],
+            "checker_passed": true,
+            "detected": true,
+            "name": "overbroad",
+            "scope_severe": 1
+          },
+          {
+            "changed_paths": [
+              "policy/checkpoint.py",
+              "policy/retry.py"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "policy-bypass",
+            "scope_severe": 0
+          }
+        ],
+        "detected": 4,
+        "detection_rate": 0.8,
+        "minimum_rate": 0.8,
+        "total": 5
+      },
+      "pair_id": "policy",
+      "quality_report_hash": "992bbdc8bf3f0c4ecc9dcb4b9b8e92bfe649b01e055d7a881c93d679d8d5fdc6",
+      "quarantined": false,
+      "saturation_warning": false,
+      "schema_version": "project-graph-context.task-quality.v1",
+      "seed_sha256": "c8735e2e6f28f9015d0aa565f0b075580662f6c07dc99c1c6a1369521463e459",
+      "split": "holdout",
+      "task_id": "policy-terminal"
+    },
+    {
+      "baseline": {
+        "failure_code": null,
+        "passed": false
+      },
+      "checker": "external-private-sanitized",
+      "clauses": {
+        "minimum": 8,
+        "passed_on_gold": 9,
+        "total": 9
+      },
+      "determinism": {
+        "hash": "584fe956481ac4c0bb2562b91197cb857b529eab6181c2f5a2e098555ea0cab5",
+        "passed": true,
+        "runs": 3
+      },
+      "duration_ms": 1181.986,
+      "gates": {
+        "baseline_failure": true,
+        "dependency_localization": true,
+        "deterministic_three_runs": true,
+        "gold_reference_solvable": true,
+        "mutation_detection": true,
+        "no_hidden_answer_leakage": true,
+        "no_network": true,
+        "nontrivial_localization": true,
+        "prompt_checker_consistency": true,
+        "scope_discrimination": true
+      },
+      "gold": {
+        "failure_code": null,
+        "passed": true
+      },
+      "mutations": {
+        "cases": [
+          {
+            "changed_paths": [],
+            "checker_passed": false,
+            "detected": true,
+            "name": "no-op",
+            "scope_severe": 0
+          },
+          {
+            "changed_paths": [
+              "app/store_helpers.py"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "wrong-file",
+            "scope_severe": 1
+          },
+          {
+            "changed_paths": [
+              "app/storage.py"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "happy-path",
+            "scope_severe": 0
+          },
+          {
+            "changed_paths": [
+              "UNSCOPED_CHANGE.txt",
+              "app/storage.py"
+            ],
+            "checker_passed": true,
+            "detected": true,
+            "name": "overbroad",
+            "scope_severe": 1
+          },
+          {
+            "changed_paths": [
+              "app/storage.py"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "policy-bypass",
+            "scope_severe": 0
+          }
+        ],
+        "detected": 5,
+        "detection_rate": 1.0,
+        "minimum_rate": 0.8,
+        "total": 5
+      },
+      "pair_id": "storage",
+      "quality_report_hash": "02e21811efc04332cd4c45f9ff2e38a4b2308365d9c08e568e496efe8ecaf025",
+      "quarantined": false,
+      "saturation_warning": false,
+      "schema_version": "project-graph-context.task-quality.v1",
+      "seed_sha256": "cefeaac60cb1513158d9dbe63d6896affd14fae5c426f8fd2cf8d00724624942",
+      "split": "holdout",
+      "task_id": "storage-corrupt"
+    },
+    {
+      "baseline": {
+        "failure_code": null,
+        "passed": false
+      },
+      "checker": "external-private-sanitized",
+      "clauses": {
+        "minimum": 8,
+        "passed_on_gold": 10,
+        "total": 10
+      },
+      "determinism": {
+        "hash": "38fc41209899c5759ae282a749c7e06219a77396a2af4fd3af9b71cc0ff47534",
+        "passed": true,
+        "runs": 3
+      },
+      "duration_ms": 1176.613,
+      "gates": {
+        "baseline_failure": true,
+        "dependency_localization": true,
+        "deterministic_three_runs": true,
+        "gold_reference_solvable": true,
+        "mutation_detection": true,
+        "no_hidden_answer_leakage": true,
+        "no_network": true,
+        "nontrivial_localization": true,
+        "prompt_checker_consistency": true,
+        "scope_discrimination": true
+      },
+      "gold": {
+        "failure_code": null,
+        "passed": true
+      },
+      "mutations": {
+        "cases": [
+          {
+            "changed_paths": [],
+            "checker_passed": false,
+            "detected": true,
+            "name": "no-op",
+            "scope_severe": 0
+          },
+          {
+            "changed_paths": [
+              "app/store_helpers.py"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "wrong-file",
+            "scope_severe": 1
+          },
+          {
+            "changed_paths": [
+              "app/storage.py"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "happy-path",
+            "scope_severe": 0
+          },
+          {
+            "changed_paths": [
+              "UNSCOPED_CHANGE.txt",
+              "app/storage.py"
+            ],
+            "checker_passed": true,
+            "detected": true,
+            "name": "overbroad",
+            "scope_severe": 1
+          },
+          {
+            "changed_paths": [
+              "app/storage.py"
+            ],
+            "checker_passed": false,
+            "detected": true,
+            "name": "policy-bypass",
+            "scope_severe": 0
+          }
+        ],
+        "detected": 5,
+        "detection_rate": 1.0,
+        "minimum_rate": 0.8,
+        "total": 5
+      },
+      "pair_id": "storage",
+      "quality_report_hash": "cb7b449d76e15fe50a7f6bedab275a1bfdae65ebbd0f1225e504783a875e8537",
+      "quarantined": false,
+      "saturation_warning": false,
+      "schema_version": "project-graph-context.task-quality.v1",
+      "seed_sha256": "beca12470129b485ec91bdd1dccfe7ca5f9852c9815dcb492974df899b97a922",
+      "split": "public",
+      "task_id": "storage-normal"
+    }
+  ],
+  "schema_version": "project-graph-context.task-quality.v1",
+  "split_hashes": {
+    "holdout": "f71f2c1d4c6698e934d406c9715af08df48e68615f4600fdc13b165d298fbab9",
+    "public": "81e0d3a08ab20869a1ed45334791e6c1825bba450764f5f0cf57e0cca00bb65a"
+  },
+  "splits": {
+    "holdout": [
+      {
+        "behavior_fingerprint": "board:optimistic+rollback",
+        "dependency_shape": "node-modules:board->filter,keyboard",
+        "seed_sha256": "cbf3e902329d5c2505dfa66e5ef4d23cc23e8e9c84470e2f70a6bef733653ad2",
+        "task_id": "board-rollback"
+      },
+      {
+        "behavior_fingerprint": "graph:diagnostics+cycle",
+        "dependency_shape": "rust-bin:main->resolve->model",
+        "seed_sha256": "35ee9af973e7d629e1981d46472caff82a77112eabe0a4d9d549e86ee1752015",
+        "task_id": "graph-diagnostics"
+      },
+      {
+        "behavior_fingerprint": "policy:denial+hard-budget",
+        "dependency_shape": "python-package:retry->checkpoint,decisions",
+        "seed_sha256": "c8735e2e6f28f9015d0aa565f0b075580662f6c07dc99c1c6a1369521463e459",
+        "task_id": "policy-terminal"
+      },
+      {
+        "behavior_fingerprint": "storage:corrupt+reload-boundary",
+        "dependency_shape": "python-package:storage->codec,clock",
+        "seed_sha256": "cefeaac60cb1513158d9dbe63d6896affd14fae5c426f8fd2cf8d00724624942",
+        "task_id": "storage-corrupt"
+      }
+    ],
+    "public": [
+      {
+        "behavior_fingerprint": "board:filter+keyboard-stable",
+        "dependency_shape": "node-modules:board->filter,keyboard",
+        "seed_sha256": "01ba9a23814c21ebeddbb1b7ad7e885d062ca9293172e5cadaaf6e6ea70105e0",
+        "task_id": "board-filters"
+      },
+      {
+        "behavior_fingerprint": "graph:json+unique-resolution",
+        "dependency_shape": "rust-bin:main->resolve->model",
+        "seed_sha256": "d3b134602deefccf36465227c54354c87cb7213c49bfc8532b57eba46295c036",
+        "task_id": "graph-valid"
+      },
+      {
+        "behavior_fingerprint": "policy:transient+checkpoint",
+        "dependency_shape": "python-package:retry->checkpoint,decisions",
+        "seed_sha256": "67356999b02f28fd8d460ed19264f9ce69487b1d6beeff42635060381330a556",
+        "task_id": "policy-retry"
+      },
+      {
+        "behavior_fingerprint": "storage:reload+ttl-boundary",
+        "dependency_shape": "python-package:storage->codec,clock",
+        "seed_sha256": "beca12470129b485ec91bdd1dccfe7ca5f9852c9815dcb492974df899b97a922",
+        "task_id": "storage-normal"
+      }
+    ]
+  }
+}
