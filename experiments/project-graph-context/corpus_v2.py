@@ -198,6 +198,32 @@ def related_pairs() -> list[list[str]]:
     return [sorted(value) for _, value in sorted(groups.items())]
 
 
+def deduplication_key(task_id: str) -> tuple[str, str]:
+    """Return the structural dedupe key; titles are intentionally excluded."""
+
+    manifest = TASKS_V2[task_id]
+    return (str(manifest["dependency_shape"]), str(manifest["behavior_fingerprint"]))
+
+
+def dedupe_task_ids(task_ids_input: Iterable[str]) -> tuple[list[str], list[str]]:
+    """Dedupe by dependency shape and behavior fingerprint, stably by id.
+
+    The second return value contains later colliding IDs so callers can
+    quarantine them rather than silently selecting by title.
+    """
+
+    kept: list[str] = []
+    duplicates: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for task_id in sorted(set(task_ids_input)):
+        key = deduplication_key(task_id)
+        if key in seen:
+            duplicates.append(task_id)
+        else:
+            seen.add(key); kept.append(task_id)
+    return kept, duplicates
+
+
 def task_manifest(task_id: str, *, include_holdout: bool = True) -> dict[str, Any]:
     if task_id not in TASKS_V2:
         raise KeyError(f"unknown v2 task: {task_id}")
@@ -335,6 +361,7 @@ def split_metadata() -> dict[str, Any]:
         "split_hashes": {name: hashlib.sha256(json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()).hexdigest() for name, entries in splits.items()},
         "corpus_hash": corpus_hash(),
         "holdout_checker_contents": "sealed-external",
+        "dedupe_basis": ["dependency_shape", "behavior_fingerprint"],
     }
 
 
@@ -375,4 +402,3 @@ def _cli() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(_cli())
-
