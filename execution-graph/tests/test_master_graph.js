@@ -41,6 +41,8 @@ const query = Graph.parseQueryState("?mode=master&view=list&q=core&panel=tests")
 assert.strictEqual(query.mode, "master");
 assert.strictEqual(query.view, "list");
 assert.strictEqual(Graph.serializeQueryState(query), "?mode=master&view=list&q=core&panel=tests");
+assert.strictEqual(Graph.effectiveView(Graph.parseQueryState("?mode=master"), 1440), "graph");
+assert.strictEqual(Graph.effectiveView(Graph.parseQueryState("?mode=master"), 560), "list");
 
 const visibility = Graph.computeMasterVisibility(view, { q: "fractal-cli", status: [], rel: [] });
 assert(visibility.matchCount > 0 && visibility.matchIds["component:fractal-cli-bbbfd315b970/core"]);
@@ -58,4 +60,25 @@ assert(plan.diagnostics.some((diagnostic) => diagnostic.code === "graph_truncate
 
 const windowPlan = Graph.computeListWindow(2577, 1288, Graph.RENDER_BUDGET);
 assert(windowPlan.virtualized && windowPlan.end - windowPlan.start <= Graph.RENDER_BUDGET.rowOverscan * 2 + 1);
+
+assert.strictEqual(Graph.clampMasterZoom(0.1), 0.5);
+assert.strictEqual(Graph.clampMasterZoom(4), 2);
+assert.strictEqual(Graph.masterZoomLabel(1.25), "130%");
+
+/* Escape/focus must not call focus() on an opener detached from the document
+ * (a common state during mode swaps and in DOM harnesses). */
+let detachedFocusCalls = 0;
+const detached = { focus: () => { detachedFocusCalls += 1; } };
+const detachedDoc = { documentElement: { contains: () => false } };
+assert.strictEqual(Graph.isConnectedElement(detachedDoc, detached), false);
+assert.strictEqual(Graph.focusIfConnected(detachedDoc, detached), false);
+assert.strictEqual(detachedFocusCalls, 0);
+
+const explicitPlan = Graph.planMasterRender(view, {
+  caps: Graph.RENDER_BUDGET,
+  forceHierarchy: true,
+  visibility
+});
+assert(explicitPlan.nodes.some((node) => node.id === "component:fractal-cli-bbbfd315b970/core"),
+  "search should reveal a matching node through hierarchy");
 console.log("master graph helper tests passed");
