@@ -965,6 +965,9 @@ final class BuildCoordinator: ObservableObject {
     }
 
     func requestMicrophonePermission(startRecordingWhenGranted: Bool = false) {
+        guard PermissionPolicy.shouldRequestMicrophone(in: .explicitVoiceRecording) else {
+            return
+        }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             microphoneDenied = false
@@ -2321,25 +2324,53 @@ final class BuildCoordinator: ObservableObject {
             let settings = await center.notificationSettings()
             switch settings.authorizationStatus {
             case .notDetermined:
-                let explanation = NSAlert()
-                explanation.messageText = "Allow build notifications?"
-                explanation.informativeText =
-                    "Fractal uses notifications only to tell you when a build finishes "
-                    + "or needs attention while its window is in the background. "
-                    + "Notifications never expose credentials or grant access to your files."
-                explanation.alertStyle = .informational
-                explanation.addButton(withTitle: "Continue")
-                explanation.addButton(withTitle: "Not Now")
-                guard explanation.runModal() == .alertFirstButtonReturn else { return }
-                guard (try? await center.requestAuthorization(options: [.alert, .sound])) == true
-                else { return }
-                Self.deliverNotification(title: title, body: body)
+                // Build completion is not consent. The explicit opt-in action
+                // below is the only path that can ask macOS for notification
+                // authorization.
+                return
             case .authorized, .provisional, .ephemeral:
                 Self.deliverNotification(title: title, body: body)
             case .denied:
                 return
             @unknown default:
                 return
+            }
+        }
+    }
+
+    /// Explicitly opt in to background build notifications from the Fractal
+    /// menu. Build status updates never call `requestAuthorization` on their
+    /// own, which keeps text handoffs and startup permission-free.
+    func requestBuildNotifications() {
+        guard PermissionPolicy.shouldRequestNotifications(in: .explicitNotificationOptIn) else {
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let center = UNUserNotificationCenter.current()
+            let settings = await center.notificationSettings()
+            switch settings.authorizationStatus {
+            case .authorized, .provisional, .ephemeral:
+                latestActivity = "Build notifications are already enabled"
+            case .denied:
+                latestActivity = "Build notifications are disabled in System Settings"
+            case .notDetermined:
+                let explanation = NSAlert()
+                explanation.messageText = "Enable build notifications?"
+                explanation.informativeText =
+                    "Fractal can notify you when a build finishes or needs attention while "
+                    + "the app is in the background. Notifications never expose credentials "
+                    + "or grant access to your files."
+                explanation.alertStyle = .informational
+                explanation.addButton(withTitle: "Enable")
+                explanation.addButton(withTitle: "Not Now")
+                guard explanation.runModal() == .alertFirstButtonReturn else { return }
+                let granted = (try? await center.requestAuthorization(options: [.alert, .sound])) == true
+                latestActivity = granted
+                    ? "Build notifications enabled"
+                    : "Build notifications were not enabled"
+            @unknown default:
+                latestActivity = "Build notification status is unavailable"
             }
         }
     }
