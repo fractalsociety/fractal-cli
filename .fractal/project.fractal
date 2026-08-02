@@ -729,5 +729,291 @@
     },
     "updated_at": "2026-07-29T13:32:06Z"
   },
-  "updated_at": "2026-07-29T13:32:06Z"
+  "learning": {
+    "schema": "fractal.learning.v1",
+    "nodes": {
+      "add_cross_boundary_rust_tests": {
+        "node_id": "add_cross_boundary_rust_tests",
+        "node_type": "implementation",
+        "objective": "Add cross-boundary Rust regression coverage",
+        "depends_on": [
+          "preserve_sync_boundaries",
+          "record_graph_edit_events",
+          "record_runtime_lifecycle"
+        ],
+        "created_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "add_native_swift_tests": {
+        "node_id": "add_native_swift_tests",
+        "node_type": "implementation",
+        "objective": "Add native Swift compatibility and display tests",
+        "depends_on": [
+          "display_learning_in_voice"
+        ],
+        "created_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "add_swift_graph_models": {
+        "node_id": "add_swift_graph_models",
+        "node_type": "implementation",
+        "objective": "Add tolerant Swift graph learning models",
+        "depends_on": [
+          "define_learning_contract"
+        ],
+        "created_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "aggregate_graph_outcomes": {
+        "node_id": "aggregate_graph_outcomes",
+        "node_type": "implementation",
+        "objective": "Derive and persist terminal graph outcomes",
+        "depends_on": [
+          "record_graph_edit_events",
+          "record_runtime_lifecycle"
+        ],
+        "created_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "audit_acceptance_and_scope": {
+        "node_id": "audit_acceptance_and_scope",
+        "node_type": "implementation",
+        "objective": "Audit acceptance evidence and excluded release scope",
+        "depends_on": [
+          "verify_native_swift",
+          "verify_rust_repository"
+        ],
+        "created_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "define_learning_contract": {
+        "node_id": "define_learning_contract",
+        "node_type": "implementation",
+        "objective": "Define the versioned learning-data contract",
+        "depends_on": [
+          "lead_plan"
+        ],
+        "created_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "display_learning_in_voice": {
+        "node_id": "display_learning_in_voice",
+        "node_type": "implementation",
+        "objective": "Read and display enriched graphs in Fractal Voice",
+        "depends_on": [
+          "add_swift_graph_models",
+          "integrate_portable_persistence"
+        ],
+        "created_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "enrich_graph_producers": {
+        "node_id": "enrich_graph_producers",
+        "node_type": "implementation",
+        "objective": "Populate structural learning fields in every graph producer",
+        "depends_on": [
+          "define_learning_contract"
+        ],
+        "created_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "integrate_portable_persistence": {
+        "node_id": "integrate_portable_persistence",
+        "node_type": "implementation",
+        "objective": "Integrate migration and validation into portable persistence",
+        "depends_on": [
+          "define_learning_contract"
+        ],
+        "created_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "lead_closeout": {
+        "node_id": "lead_closeout",
+        "node_type": "control",
+        "objective": "Lead acceptance review and closeout",
+        "depends_on": [
+          "audit_acceptance_and_scope"
+        ],
+        "created_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "lead_plan": {
+        "node_id": "lead_plan",
+        "node_type": "control",
+        "objective": "Lead PRD and architecture approved",
+        "depends_on": [],
+        "created_at": "2026-07-29T13:32:06Z",
+        "ready_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "preserve_sync_boundaries": {
+        "node_id": "preserve_sync_boundaries",
+        "node_type": "implementation",
+        "objective": "Preserve learning data across validation and sync boundaries",
+        "depends_on": [
+          "integrate_portable_persistence"
+        ],
+        "created_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "record_graph_edit_events": {
+        "node_id": "record_graph_edit_events",
+        "node_type": "implementation",
+        "objective": "Record graph-edit decision events",
+        "depends_on": [
+          "enrich_graph_producers",
+          "integrate_portable_persistence"
+        ],
+        "created_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "record_runtime_lifecycle": {
+        "node_id": "record_runtime_lifecycle",
+        "node_type": "implementation",
+        "objective": "Record complete node lifecycle facts",
+        "depends_on": [
+          "enrich_graph_producers",
+          "integrate_portable_persistence"
+        ],
+        "created_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "verify.define_learning_contract.harness": {
+        "node_id": "verify.define_learning_contract.harness",
+        "node_type": "verification",
+        "objective": "Re-run the acceptance suite against the produced artifact; fail if any test fails.",
+        "depends_on": [
+          "define_learning_contract"
+        ],
+        "created_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "verify_native_swift": {
+        "node_id": "verify_native_swift",
+        "node_type": "verification",
+        "objective": "Run the native Fractal Voice quality gate",
+        "depends_on": [
+          "add_native_swift_tests"
+        ],
+        "created_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "verify_rust_repository": {
+        "node_id": "verify_rust_repository",
+        "node_type": "verification",
+        "objective": "Run the complete Rust quality gate",
+        "depends_on": [
+          "add_cross_boundary_rust_tests",
+          "aggregate_graph_outcomes"
+        ],
+        "created_at": "2026-07-29T13:32:06Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      }
+    },
+    "graph_edits": []
+  },
+  "efficiency": {
+    "schema": "fractal.efficiency.v1",
+    "mode": "suggest",
+    "aggregation_version": 1,
+    "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c",
+    "episodes": [],
+    "build": {
+      "episode_count": 0,
+      "gross_estimated_tokens_avoided": 0,
+      "confidence_adjusted_tokens_avoided": 0,
+      "realized_tokens_saved": 0,
+      "estimated_cost_avoided": 0.0,
+      "realized_cost_avoided": 0.0,
+      "estimated_agent_hours_avoided": 0.0,
+      "realized_agent_hours_avoided": 0.0,
+      "rework_prevented": 0,
+      "waste_breakdown": {},
+      "aggregation_version": 1,
+      "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c"
+    },
+    "lifetime": {
+      "episode_count": 0,
+      "gross_estimated_tokens_avoided": 0,
+      "confidence_adjusted_tokens_avoided": 0,
+      "realized_tokens_saved": 0,
+      "estimated_cost_avoided": 0.0,
+      "realized_cost_avoided": 0.0,
+      "estimated_agent_hours_avoided": 0.0,
+      "realized_agent_hours_avoided": 0.0,
+      "rework_prevented": 0,
+      "waste_breakdown": {},
+      "aggregation_version": 1,
+      "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c"
+    }
+  },
+  "updated_at": "2026-08-02T08:05:19Z"
 }
