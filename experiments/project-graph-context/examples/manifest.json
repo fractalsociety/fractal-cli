@@ -1,0 +1,23 @@
+{
+  "schema_version": "project-graph-context.experiment-manifest.v1",
+  "experiment_id": "pgc-pilot-001",
+  "protocol_version": "1.0",
+  "source_repo": "REPLACE_WITH_FROZEN_REPO",
+  "frozen_commit": "REPLACE_WITH_40_CHAR_COMMIT",
+  "planner": {"model": "Sol-high", "fixed_across_arms": true},
+  "worker": {"model": "Luna", "fixed_across_arms": true},
+  "arms": [
+    {"arm_id": "A", "label": "search-only", "context_kind": "search_only", "context_path": "contexts/A.json", "read_only": true},
+    {"arm_id": "B", "label": "behavior-source-handbook", "context_kind": "behavior_source_handbook", "context_path": "contexts/B.json", "read_only": true},
+    {"arm_id": "C", "label": "three-layer-graph", "context_kind": "three_layer_graph", "context_path": "contexts/C.json", "read_only": true},
+    {"arm_id": "D", "label": "three-layer-graph-plus-prior", "context_kind": "three_layer_graph_prior", "context_path": "contexts/D.json", "read_only": true}
+  ],
+  "task_ids": ["calculator-add", "calculator-subtract", "text-slugify", "text-slugify-edge"],
+  "replicates": 10,
+  "seed": 1729,
+  "budgets": {"timeout_seconds": 120, "max_output_bytes": 1000000, "max_repairs": 8, "max_episodes": 160},
+  "offline": true,
+  "worker_command": ["python3", "scripted_worker.py"],
+  "dry_run": false,
+  "notes": "Replace repo/commit only after a clean frozen source commit is prepared."
+}

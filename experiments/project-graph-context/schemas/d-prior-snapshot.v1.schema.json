@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fractalmaster.invalid/project-graph-context/d-prior-snapshot.v1.schema.json",
+  "title": "Arm D time-sliced prior evidence snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "prior_id", "task_id", "window", "evidence", "outcomes", "lessons"],
+  "properties": {
+    "schema_version": {"const": "project-graph-context.d-prior-snapshot.v1"},
+    "prior_id": {"type": "string"},
+    "task_id": {"type": "string"},
+    "window": {"type": "object", "additionalProperties": false, "required": ["start", "end", "timezone"], "properties": {"start": {"type": "string"}, "end": {"type": "string"}, "timezone": {"const": "UTC"}}},
+    "evidence": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["id", "source", "claim", "confidence"], "properties": {"id": {"type": "string"}, "source": {"type": "string"}, "claim": {"type": "string"}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}}}},
+    "outcomes": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["task_id", "success", "failure_codes"], "properties": {"task_id": {"type": "string"}, "success": {"type": "boolean"}, "failure_codes": {"type": "array", "items": {"type": "string"}}}}},
+    "lessons": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["lesson", "scope"], "properties": {"lesson": {"type": "string"}, "scope": {"type": "string"}}}},
+    "source_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  }
+}

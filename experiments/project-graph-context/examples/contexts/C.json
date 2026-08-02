@@ -1,0 +1,11 @@
+{
+  "schema_version": "project-graph-context.c-graph-context.v1",
+  "task_id": "template",
+  "layers": {
+    "behavior": [{"id": "behavior.goal", "kind": "acceptance", "summary": "Satisfy the task's observable behavior."}],
+    "source": [{"id": "source.target", "kind": "file", "summary": "Edit the target source file only.", "path": "src/calculator.py", "line": 1}],
+    "execution": [{"id": "execution.check", "kind": "checker", "summary": "Run focused checker after the edit."}]
+  },
+  "edges": [{"from": "behavior.goal", "to": "source.target", "relation": "implemented_by"}, {"from": "source.target", "to": "execution.check", "relation": "verified_by"}],
+  "retrieval_policy": {"top_k": 8, "include_neighbors": true}
+}

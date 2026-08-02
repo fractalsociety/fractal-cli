@@ -1,0 +1,25 @@
+{
+  "schema_version": "project-graph-context.event-result-ledger.v1",
+  "episode_id": "example-A-calculator-add-0",
+  "experiment_id": "example",
+  "arm_id": "A",
+  "task_id": "calculator-add",
+  "replicate": 0,
+  "events": [{"sequence": 0, "kind": "runner_started"}],
+  "result": {
+    "correctness": {"passed": false, "checker_failure_code": "oracle_assertion_failed"},
+    "intent_violations": {"severe": 0, "weighted": 0.0},
+    "irrelevant_opens": null,
+    "tokens": {"available": false, "input": null, "output": null, "total": null, "cost_usd": null},
+    "repair_iterations": null,
+    "repeated_failure_codes": null,
+    "routing": null,
+    "tool_selection": null,
+    "changed_paths": [],
+    "evidence_hashes": {},
+    "timed_out": false,
+    "exit_code": 1,
+    "duration_ms": 1.0,
+    "path_scope": {"severe": 0, "weighted": 0.0, "violations": []}
+  }
+}

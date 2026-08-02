@@ -1,0 +1,9 @@
+{
+  "schema_version": "project-graph-context.arm-context.v1",
+  "arm_id": "B",
+  "kind": "behavior_source_handbook",
+  "behavior": [{"id": "behavior.goal", "summary": "Implement the named function and satisfy acceptance examples."}],
+  "source": [{"id": "source.target", "path": "src/calculator.py", "summary": "Target module contains the incomplete function."}],
+  "handbook": {"scope": "Edit only the allowed target path; run focused checks."},
+  "disclosure": "Behavior and source handbook; no execution graph or prior evidence."
+}
