@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -11,6 +12,8 @@ use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:8091/";
 const START_COMMAND: &str = "fractal graph board GRAPH_HASH";
+const BOARD_START_TIMEOUT: Duration = Duration::from_secs(6);
+const BOARD_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Deserialize)]
 struct BoardPayload {
@@ -67,29 +70,16 @@ impl Counts {
     }
 }
 
-pub(crate) fn wait_until_listening(port: u16) {
-    let url = format!("http://127.0.0.1:{port}/api/health");
-    let deadline = Instant::now() + Duration::from_secs(6);
-    while Instant::now() < deadline {
-        if ureq::get(&url)
-            .timeout(Duration::from_millis(300))
-            .call()
-            .is_ok()
-        {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn free_board_port(port: u16) {
-    let Ok(listing) = Command::new("lsof")
+fn free_board_port(port: u16) -> Result<()> {
+    let listing = Command::new("lsof")
         .args(["-ti", &format!("tcp:{port}")])
         .output()
-    else {
-        return;
-    };
-    for pid in String::from_utf8_lossy(&listing.stdout).split_whitespace() {
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    let pids: Vec<String> = listing.split_whitespace().map(str::to_owned).collect();
+    let mut board_pids = Vec::new();
+    for pid in &pids {
         let command = Command::new("ps")
             .args(["-p", pid, "-o", "command="])
             .output()
@@ -97,10 +87,121 @@ fn free_board_port(port: u16) {
             .unwrap_or_default();
         if command.contains("fractal graph serve") || command.contains("execution-graph/server.py")
         {
-            let _ = Command::new("kill").arg(pid).status();
+            board_pids.push(pid.clone());
+            let _ = Command::new("kill").args(["-TERM", pid]).status();
         }
     }
-    std::thread::sleep(Duration::from_millis(150));
+    // A short fixed sleep is not enough here: the old board can still own the
+    // socket while the replacement is spawned.  In that race the replacement
+    // exits on bind and the health probe below falsely succeeds against the
+    // old project's board.  Wait for the actual socket to become bindable and
+    // escalate only for the board processes we identified above.
+    if wait_for_port_release(port, BOARD_STOP_TIMEOUT) {
+        return Ok(());
+    }
+    for pid in board_pids {
+        let _ = Command::new("kill").args(["-KILL", &pid]).status();
+    }
+    if wait_for_port_release(port, BOARD_STOP_TIMEOUT) {
+        Ok(())
+    } else {
+        bail!("board port {port} is still in use after its previous server was stopped")
+    }
+}
+
+fn wait_for_port_release(port: u16, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn board_identity_matches(port: u16, workspace: &Path, graph_hash: &str) -> bool {
+    let endpoint = format!("http://127.0.0.1:{port}/api/identity");
+    let Ok(response) = ureq::get(&endpoint)
+        .timeout(Duration::from_millis(300))
+        .call()
+    else {
+        return false;
+    };
+    let Ok(body) = response.into_string() else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&body) else {
+        return false;
+    };
+    identity_matches_value(&value, workspace, graph_hash)
+}
+
+fn wait_until_board_identity(
+    port: u16,
+    workspace: &Path,
+    graph_hash: &str,
+    child: &mut std::process::Child,
+) -> Result<()> {
+    let endpoint = format!("http://127.0.0.1:{port}/api/identity");
+    let deadline = Instant::now() + BOARD_START_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait().context("check execution board process")? {
+            bail!(
+                "execution board exited before serving {} (status {status})",
+                workspace.display()
+            );
+        }
+        if let Ok(response) = ureq::get(&endpoint)
+            .timeout(Duration::from_millis(300))
+            .call()
+        {
+            if let Ok(body) = response.into_string() {
+                if let Ok(value) = serde_json::from_str::<Value>(&body) {
+                    if identity_matches_value(&value, workspace, graph_hash) {
+                        return Ok(());
+                    }
+                    // A listener answering with another project's identity is not
+                    // a successful startup.  Keep polling briefly in case this is
+                    // the old process completing its shutdown, then fail closed.
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            bail!(
+                "execution board on 127.0.0.1:{port} did not publish the expected project identity"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn identity_matches_value(value: &Value, workspace: &Path, graph_hash: &str) -> bool {
+    let expected_workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    value.get("schema").and_then(Value::as_str) == Some("fractal.board_identity.v1")
+        && value.get("workspace").and_then(Value::as_str) == Some(expected_workspace.as_str())
+        && value.get("graph_hash").and_then(Value::as_str) == Some(graph_hash)
+}
+
+fn board_identity(workspace: &Path) -> Result<Value> {
+    let project = crate::project_file::load(workspace)?;
+    let canonical_workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    Ok(json!({
+        "schema": "fractal.board_identity.v1",
+        "backend": "rust",
+        "workspace": canonical_workspace.to_string_lossy(),
+        "project": project.project.slug,
+        "graph_hash": project.graph_hash,
+    }))
 }
 
 pub(crate) fn open() -> Result<()> {
@@ -179,9 +280,22 @@ fn spawn_project_server(
     exec_graph_dir: Option<&Path>,
     no_open: bool,
 ) -> Result<()> {
+    let project = crate::project_file::load(workspace)?;
+    // A board is keyed by both its repository and graph.  Reusing a listener
+    // by port alone can display a different project's graph (especially when
+    // a previous server is still shutting down), so only reuse an existing
+    // server after an authenticated local identity check.
+    if board_identity_matches(port, workspace, &project.graph_hash) {
+        let url = format!("http://127.0.0.1:{port}/");
+        println!("Reusing {url} for {}", workspace.display());
+        if !no_open {
+            open_url(&url)?;
+        }
+        return Ok(());
+    }
     let viewer_dir = resolve_exec_graph_dir(exec_graph_dir)?;
     let executable = env::current_exe().context("resolve Fractal executable")?;
-    free_board_port(port);
+    free_board_port(port)?;
     let mut command = Command::new(&executable);
     command
         .args(["graph", "serve", "--repo"])
@@ -194,13 +308,13 @@ fn spawn_project_server(
     if !viewer_dir.as_os_str().is_empty() {
         command.arg("--exec-graph-dir").arg(&viewer_dir);
     }
-    command.spawn().with_context(|| {
+    let mut child = command.spawn().with_context(|| {
         format!(
             "launch Rust execution board for {}",
             crate::project_file::path(workspace).display()
         )
     })?;
-    wait_until_listening(port);
+    wait_until_board_identity(port, workspace, &project.graph_hash, &mut child)?;
     let url = format!("http://127.0.0.1:{port}/");
     println!("Serving {url}");
     println!(
@@ -249,11 +363,21 @@ fn respond(
     token: &str,
 ) -> Result<()> {
     let route = request.url().split('?').next().unwrap_or("/");
+    if request.method() == &Method::Get && route == "/api/identity" {
+        return send_json(request, StatusCode(200), &board_identity(workspace)?);
+    }
     if request.method() == &Method::Get && route == "/api/health" {
+        let identity = board_identity(workspace)?;
         return send_json(
             request,
             StatusCode(200),
-            &json!({"ok": true, "backend": "rust"}),
+            &json!({
+                "ok": true,
+                "backend": "rust",
+                "workspace": identity.get("workspace"),
+                "graph_hash": identity.get("graph_hash"),
+                "project": identity.get("project"),
+            }),
         );
     }
     if request.method() == &Method::Get && route == "/api/graph" {
@@ -623,5 +747,65 @@ mod tests {
         assert!(html.contains("Estimated 0 tokens saved"));
         assert!(script.contains("renderEfficiency"));
         assert!(script.contains("realized_tokens_saved"));
+    }
+
+    #[test]
+    fn board_identity_requires_the_expected_workspace_and_graph() {
+        let workspace = std::env::current_dir().unwrap();
+        let canonical = workspace.canonicalize().unwrap();
+        let graph_hash = "sha256:test-graph";
+        let identity = json!({
+            "schema": "fractal.board_identity.v1",
+            "workspace": canonical.to_string_lossy(),
+            "graph_hash": graph_hash,
+        });
+        assert!(identity_matches_value(&identity, &workspace, graph_hash));
+
+        let mut wrong_graph = identity.clone();
+        wrong_graph["graph_hash"] = json!("sha256:another-graph");
+        assert!(!identity_matches_value(
+            &wrong_graph,
+            &workspace,
+            graph_hash
+        ));
+
+        let mut wrong_workspace = identity;
+        wrong_workspace["workspace"] = json!("/tmp/another-project");
+        assert!(!identity_matches_value(
+            &wrong_workspace,
+            &workspace,
+            graph_hash
+        ));
+    }
+
+    #[test]
+    fn board_identity_payload_is_derived_from_the_canonical_project() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let identity = board_identity(workspace).unwrap();
+        let canonical_workspace = workspace.canonicalize().unwrap();
+        let canonical_workspace = canonical_workspace.to_string_lossy();
+        assert_eq!(
+            identity.get("schema").and_then(Value::as_str),
+            Some("fractal.board_identity.v1")
+        );
+        assert_eq!(
+            identity.get("backend").and_then(Value::as_str),
+            Some("rust")
+        );
+        assert_eq!(
+            identity.get("workspace").and_then(Value::as_str),
+            Some(canonical_workspace.as_ref())
+        );
+        let graph_hash = identity.get("graph_hash").and_then(Value::as_str).unwrap();
+        assert!(identity_matches_value(&identity, workspace, graph_hash));
+    }
+
+    #[test]
+    fn board_port_release_waits_for_socket_not_a_fixed_sleep() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(!wait_for_port_release(port, Duration::from_millis(30)));
+        drop(listener);
+        assert!(wait_for_port_release(port, Duration::from_millis(100)));
     }
 }
