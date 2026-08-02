@@ -448,6 +448,25 @@ fn respond_master(request: tiny_http::Request, state: &MasterBoardState) -> Resu
     let route = url.split('?').next().unwrap_or("/");
     let method = request.method().clone();
 
+    // Keep a pasted bare master-board URL in master mode as well.  Individual
+    // boards intentionally continue serving `/` without a mode query; this
+    // redirect is scoped to the inventory-backed server and avoids the
+    // confusing first render where the shared frontend would otherwise pick
+    // its individual default.
+    if method == Method::Get
+        && route == "/"
+        && query_param(&url, "mode").as_deref() != Some("master")
+    {
+        let response = Response::empty(StatusCode(302)).with_header(
+            Header::from_bytes("Location", "/?mode=master")
+                .expect("valid master mode redirect header"),
+        );
+        request
+            .respond(response)
+            .context("redirect bare master board")?;
+        return Ok(());
+    }
+
     if method == Method::Get && route == "/api/identity" {
         return send_json(
             request,

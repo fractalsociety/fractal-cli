@@ -370,7 +370,8 @@
        * mode consumes nodeShown and therefore still shows only direct matches. */
       var shown = directMatch && statusOk;
       result.nodeShown[node.id] = shown;
-      result.nodeDimmed[node.id] = Boolean(filters.q) && !directMatch;
+      result.nodeDimmed[node.id] = (!match.empty && !directMatch) ||
+        (statusSet.length > 0 && !statusOk);
     });
     return result;
   }
@@ -717,6 +718,7 @@
     var visualNodes = items.map(function (item) { return { id: item.id }; });
     var aggregate = new Map();
     allEdges.slice().sort(function (a, b) { return String(a.id).localeCompare(String(b.id)); }).forEach(function (edge) {
+      if (visibility && visibility.edgeShown[edge.id] === false) return;
       var from = visualForNode[edgeEndpoint(edge.from).node_id];
       var to = visualForNode[edgeEndpoint(edge.to).node_id];
       if (!from || !to || from === to) return;
@@ -1026,6 +1028,25 @@
     element.addEventListener("keydown", function (event) { handleActivationKey(event, activate); });
   }
 
+  /* Detached roots are common in DOM tests and can also occur for one frame
+   * while the host app swaps the individual/master browser. Calling focus()
+   * on an opener that is no longer connected makes Escape appear to do
+   * nothing (and can throw in a few WebKit versions). Keep focus restoration
+   * strictly connected-element only. */
+  function isConnectedElement(doc, element) {
+    if (!element || typeof element.focus !== "function") return false;
+    if (element.isConnected === false) return false;
+    var root = doc && (doc.documentElement || doc.body);
+    if (root && typeof root.contains === "function") return root.contains(element);
+    return element.isConnected !== false;
+  }
+
+  function focusIfConnected(doc, element) {
+    if (!isConnectedElement(doc, element)) return false;
+    element.focus();
+    return true;
+  }
+
   function captureFocusId(doc, root) {
     var active = doc && doc.activeElement;
     if (!active || !root || (root.contains && !root.contains(active))) return null;
@@ -1038,10 +1059,15 @@
     if (!root) return false;
     if (savedId) {
       var target = root.querySelector('[data-node-id="' + cssEscape(savedId) + '"]');
-      if (target && typeof target.focus === "function") { target.focus(); return true; }
+      if (focusIfConnected(root.ownerDocument, target)) return true;
+      /* Controls such as the zoom buttons use an ordinary id rather than a
+       * graph selection id. Preserve their focus across a render as well. */
+      if (root.querySelector) {
+        target = root.querySelector("#" + cssEscape(savedId));
+        if (focusIfConnected(root.ownerDocument, target)) return true;
+      }
     }
-    if (typeof root.focus === "function") root.focus();
-    return false;
+    return focusIfConnected(root.ownerDocument, root);
   }
 
   /* ------------------------------------------------------------------ *
@@ -1148,8 +1174,16 @@
         project.available === false
           ? "unavailable" + (project.unavailable_reason ? " · " + project.unavailable_reason : "")
           : (project.catalog_state || "unknown")));
-      attachActivation(row, function () {
-        if (handlers.onSelect) handlers.onSelect(project, { available: selectable });
+      attachActivation(row, function (event) {
+        /* A host page may delegate clicks from the browser root. Stop this
+         * row's event after resolving its own key so a delegated fallback can
+         * never substitute the bound cwd project for the clicked row. */
+        if (event && typeof event.stopPropagation === "function") event.stopPropagation();
+        var key = row.getAttribute("data-project-key") || project.project_key;
+        var selected = (payload && payload.projects || []).find(function (candidate) {
+          return candidate.project_key === key;
+        }) || project;
+        if (handlers.onSelect) handlers.onSelect(selected, { available: selected.available !== false });
       });
       list.append(row);
       options.push(row);
@@ -1163,7 +1197,8 @@
       row.append(el(doc, "span", "mg-switcher-label", unavailableLabel));
       row.append(el(doc, "span", "mg-switcher-state mg-status-unavailable",
         "unavailable · " + (entry.reason || "unknown reason")));
-      attachActivation(row, function () {
+      attachActivation(row, function (event) {
+        if (event && typeof event.stopPropagation === "function") event.stopPropagation();
         if (handlers.onSelectUnavailable) handlers.onSelectUnavailable(entry);
       });
       list.append(row);
@@ -1174,7 +1209,7 @@
     container.addEventListener("keydown", function (event) {
       if (event.key === "Escape") {
         if (handlers.onClose) handlers.onClose(opener);
-        else opener.focus();
+        else focusIfConnected(doc, opener);
         return;
       }
       if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
@@ -1320,6 +1355,43 @@
       " to " + edgeEndpoint(edge.to).node_id + ", " + (edge.resolution || "resolved");
   }
 
+  function clampMasterZoom(value) {
+    var zoom = Number(value);
+    if (!Number.isFinite(zoom)) zoom = 1;
+    return Math.max(0.5, Math.min(2, Math.round(zoom * 10) / 10));
+  }
+
+  function masterZoomLabel(value) {
+    return Math.round(clampMasterZoom(value) * 100) + "%";
+  }
+
+  /* Small, keyboard-friendly controls keep a large master canvas both
+   * pannable (the stage scrollbars) and zoomable without making SVG geometry
+   * itself responsible for pointer gesture state. */
+  function renderMasterZoomControls(doc, container, zoom, handlers) {
+    handlers = handlers || {};
+    container.replaceChildren();
+    container.classList.add("mg-zoom-controls");
+    container.setAttribute("aria-label", "Master graph zoom");
+    [
+      { id: "zoom-out", label: "−", name: "Zoom out", delta: -0.1 },
+      { id: "zoom-reset", label: masterZoomLabel(zoom), name: "Reset zoom", reset: true },
+      { id: "zoom-in", label: "+", name: "Zoom in", delta: 0.1 }
+    ].forEach(function (control) {
+      var button = el(doc, "button", "mg-zoom-button" + (control.reset ? " mg-zoom-value" : ""));
+      button.type = "button";
+      button.id = "mg-" + control.id;
+      button.setAttribute("aria-label", control.name + " (" + masterZoomLabel(zoom) + ")");
+      button.textContent = control.label;
+      attachActivation(button, function () {
+        if (!handlers.onZoom) return;
+        handlers.onZoom(control.reset ? 1 : clampMasterZoom(Number(zoom) + control.delta));
+      });
+      container.append(button);
+    });
+    return container;
+  }
+
   /* Deterministic cluster-column layout grouped by project_key (§2.4). */
   function layoutMasterGraph(plan) {
     var positions = {};
@@ -1369,8 +1441,9 @@
      * readable and pannable instead of being compressed into the viewport. */
     svg.setAttribute("width", String(layout.contentWidth));
     svg.setAttribute("height", String(layout.contentHeight));
-    svg.style.width = layout.contentWidth + "px";
-    svg.style.height = layout.contentHeight + "px";
+    var zoom = clampMasterZoom(state && state.zoom);
+    svg.style.width = Math.round(layout.contentWidth * zoom) + "px";
+    svg.style.height = Math.round(layout.contentHeight * zoom) + "px";
 
     var edgeLayer = svgEl(doc, "g", {});
     plan.edges.forEach(function (edge) {
@@ -1828,6 +1901,7 @@
       expandedGroups: [],
       expandedProjects: [],
       expandedCategories: [],
+      zoom: 1,
       error: null,
       loading: false,
       focusMemo: null
@@ -1889,7 +1963,7 @@
             state.switcherOpen = false;
             renderChrome();
             var replacement = chrome.querySelector(".mg-switcher-opener");
-            if (replacement && typeof replacement.focus === "function") replacement.focus();
+            focusIfConnected(doc, replacement);
           },
           onSelect: function (project, meta) {
             state.switcherOpen = false;
@@ -1939,6 +2013,15 @@
             onSelectRow: function (row) { select(row.id, true); }
           });
         } else {
+          var zoomControls = el(doc, "div", "mg-stage-controls");
+          renderMasterZoomControls(doc, zoomControls, state.zoom, {
+            onZoom: function (value) {
+              state.zoom = clampMasterZoom(value);
+              render();
+              announce("Master graph zoom " + masterZoomLabel(state.zoom));
+            }
+          });
+          stage.append(zoomControls);
           var plan = planMasterRender(state.master,
             { caps: caps, visibility: vis, keepDimmed: true,
               forceHierarchy: true,
@@ -1964,7 +2047,7 @@
           }
           var svg = svgEl(doc, "svg", { class: "mg-master-svg" });
           stage.append(svg);
-          renderMasterSvg(doc, svg, state.master, plan, { sel: state.query.sel, visibility: vis }, {
+          renderMasterSvg(doc, svg, state.master, plan, { sel: state.query.sel, visibility: vis, zoom: state.zoom }, {
             onSelectNode: function (node) { select(node.id, true); },
             onSelectEdge: function (edge) { activateEdge(edge); },
             onExpandCluster: function (item) {
@@ -2350,6 +2433,8 @@
     createApiClient: createApiClient,
     handleActivationKey: handleActivationKey,
     attachActivation: attachActivation,
+    isConnectedElement: isConnectedElement,
+    focusIfConnected: focusIfConnected,
     captureFocusId: captureFocusId,
     restoreFocusById: restoreFocusById,
     createAnnouncer: createAnnouncer,
@@ -2365,6 +2450,9 @@
     masterHeroMetrics: masterHeroMetrics,
     masterNodeAccessibleName: masterNodeAccessibleName,
     edgeAccessibleName: edgeAccessibleName,
+    clampMasterZoom: clampMasterZoom,
+    masterZoomLabel: masterZoomLabel,
+    renderMasterZoomControls: renderMasterZoomControls,
     layoutMasterGraph: layoutMasterGraph,
     renderMasterSvg: renderMasterSvg,
     buildMasterListRows: buildMasterListRows,

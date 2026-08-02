@@ -12,6 +12,10 @@ function queryMode() {
 function setBoardMode(mode) {
   document.body.classList.toggle("master-active", mode === "master");
   document.getElementById("master-browser").classList.toggle("hidden", mode !== "master");
+  /* Pause is an execution control and must never appear to apply to the
+   * read-only estate view. Individual mode lets renderRunControl restore it
+   * after the project payload arrives. */
+  if (mode === "master") document.getElementById("pause-build").classList.add("hidden");
   renderSharedModeToggle();
 }
 

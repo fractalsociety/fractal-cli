@@ -64,7 +64,10 @@
             </div>
           </div>
           <div class="graph-stage" id="graph-stage">
-            <svg id="graph" role="img" aria-label="Fractal Runtime PRD execution graph"></svg>
+            <!-- Interactive nodes live inside this SVG, so expose it as a
+                 labelled group rather than an image (which hides descendants
+                 from assistive technology). -->
+            <svg id="graph" role="group" aria-label="Fractal Runtime PRD execution graph"></svg>
             <div class="graph-hint">Select a milestone to inspect its executable checklist</div>
           </div>
         </div>
