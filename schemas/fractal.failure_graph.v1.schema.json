@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fractalsociety.dev/schemas/fractal.failure_graph.v1.schema.json",
+  "title": "Fractal failure and lesson graph",
+  "description": "Bounded additive failure/lesson evidence stored beside fractal.project.v1. The envelope never participates in graph_hash.",
+  "type": "object",
+  "required": ["schema", "failures", "lessons", "edges", "cross_project_links", "failure_graph_hash"],
+  "additionalProperties": true,
+  "properties": {
+    "schema": {"const": "fractal.failure_graph.v1"},
+    "failures": {
+      "type": "object",
+      "maxProperties": 512,
+      "additionalProperties": {"$ref": "#/$defs/failure"}
+    },
+    "lessons": {
+      "type": "object",
+      "maxProperties": 512,
+      "additionalProperties": {"$ref": "#/$defs/lesson"}
+    },
+    "edges": {
+      "type": "object",
+      "maxProperties": 2048,
+      "additionalProperties": {"$ref": "#/$defs/edge"}
+    },
+    "cross_project_links": {
+      "type": "object",
+      "maxProperties": 512,
+      "additionalProperties": {"$ref": "#/$defs/crossProjectLink"}
+    },
+    "failure_graph_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "id": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[^\\\\/].*$"},
+    "summary": {"type": "string", "minLength": 1, "maxLength": 512},
+    "state": {"enum": ["unresolved", "resolved", "superseded"]},
+    "lessonStatus": {"enum": ["proposed", "adopted", "superseded", "rejected"]},
+    "edgeType": {"enum": ["caused_by", "resolved_by", "lesson_from", "applies_to", "related_component", "supersedes", "reused_in", "contradicts", "retry_of"]},
+    "evidence": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "sha256": {"type": "string", "maxLength": 512},
+        "legacy_ref": {"type": "string", "maxLength": 512},
+        "kind": {"type": "string", "maxLength": 512},
+        "path": {"type": "string", "maxLength": 512}
+      },
+      "oneOf": [{"required": ["sha256"]}, {"required": ["legacy_ref"]}]
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "graph_hash": {"type": "string", "maxLength": 512},
+        "git_commit": {"type": "string", "maxLength": 512},
+        "git_branch": {"type": "string", "maxLength": 512},
+        "source_repo": {"type": "string", "maxLength": 512},
+        "dirty": {"type": "boolean"}
+      }
+    },
+    "observation": {
+      "type": "object",
+      "required": ["attempt", "outcome", "summary", "observed"],
+      "additionalProperties": true,
+      "properties": {
+        "attempt": {"type": "integer", "minimum": 1},
+        "outcome": {"type": "string", "minLength": 1, "maxLength": 256},
+        "summary": {"$ref": "#/$defs/summary"},
+        "evidence": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/evidence"}},
+        "agent": {"type": "string", "maxLength": 512},
+        "model": {"type": "string", "maxLength": 512},
+        "version": {"type": "string", "maxLength": 512},
+        "observed": {"$ref": "#/$defs/provenance"}
+      }
+    },
+    "resolution": {
+      "type": "object",
+      "required": ["success", "summary", "observed"],
+      "additionalProperties": true,
+      "properties": {
+        "success": {"const": true},
+        "summary": {"$ref": "#/$defs/summary"},
+        "evidence": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"$ref": "#/$defs/evidence"}},
+        "resolved_by": {"type": "string", "maxLength": 512},
+        "observed": {"$ref": "#/$defs/provenance"}
+      }
+    },
+    "failure": {
+      "type": "object",
+      "required": ["id", "node_id", "attempt", "failure_code", "outcome", "state", "summary", "observed"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "node_id": {"$ref": "#/$defs/id"},
+        "attempt": {"type": "integer", "minimum": 1},
+        "failure_code": {"type": "string", "minLength": 1, "maxLength": 256},
+        "outcome": {"type": "string", "minLength": 1, "maxLength": 256},
+        "state": {"$ref": "#/$defs/state"},
+        "summary": {"$ref": "#/$defs/summary"},
+        "capability": {"type": "string", "maxLength": 512},
+        "component": {"type": "string", "maxLength": 512},
+        "source_ref": {"type": "string", "maxLength": 512},
+        "evidence": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/evidence"}},
+        "observations": {"type": "array", "maxItems": 80, "items": {"$ref": "#/$defs/observation"}},
+        "agent": {"type": "string", "maxLength": 512},
+        "model": {"type": "string", "maxLength": 512},
+        "version": {"type": "string", "maxLength": 512},
+        "observed": {"$ref": "#/$defs/provenance"},
+        "resolution": {"$ref": "#/$defs/resolution"},
+        "superseded_by": {"$ref": "#/$defs/id"}
+      }
+    },
+    "lesson": {
+      "type": "object",
+      "required": ["id", "summary", "status", "observed"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "summary": {"$ref": "#/$defs/summary"},
+        "status": {"$ref": "#/$defs/lessonStatus"},
+        "capability": {"type": "string", "maxLength": 512},
+        "component": {"type": "string", "maxLength": 512},
+        "source_ref": {"type": "string", "maxLength": 512},
+        "evidence": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/evidence"}},
+        "agent": {"type": "string", "maxLength": 512},
+        "model": {"type": "string", "maxLength": 512},
+        "version": {"type": "string", "maxLength": 512},
+        "observed": {"$ref": "#/$defs/provenance"},
+        "superseded_by": {"$ref": "#/$defs/id"}
+      }
+    },
+    "edge": {
+      "type": "object",
+      "required": ["id", "type", "from", "to"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "type": {"$ref": "#/$defs/edgeType"},
+        "from": {"$ref": "#/$defs/id"},
+        "to": {"$ref": "#/$defs/id"},
+        "evidence": {"$ref": "#/$defs/evidence"}
+      }
+    },
+    "crossProjectLink": {
+      "type": "object",
+      "required": ["id", "project"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "project": {"$ref": "#/$defs/id"},
+        "failure_id": {"$ref": "#/$defs/id"},
+        "lesson_id": {"$ref": "#/$defs/id"},
+        "source_ref": {"type": "string", "maxLength": 512},
+        "evidence": {"$ref": "#/$defs/evidence"}
+      },
+      "oneOf": [{"required": ["failure_id"]}, {"required": ["lesson_id"]}]
+    }
+  }
+}
