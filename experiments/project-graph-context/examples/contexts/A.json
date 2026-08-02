@@ -1,0 +1,7 @@
+{
+  "schema_version": "project-graph-context.arm-context.v1",
+  "arm_id": "A",
+  "kind": "search_only",
+  "search": {"queries": ["task goal", "allowed source files"], "max_results": 8},
+  "disclosure": "Search index snippets only; no curated behavior, source, execution, or prior evidence graph."
+}

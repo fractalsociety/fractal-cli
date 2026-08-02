@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fractalmaster.invalid/project-graph-context/event-result-ledger.v1.schema.json",
+  "title": "Episode event and result ledger",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "episode_id", "experiment_id", "arm_id", "task_id", "events", "result"],
+  "properties": {
+    "schema_version": {"const": "project-graph-context.event-result-ledger.v1"},
+    "episode_id": {"type": "string"},
+    "experiment_id": {"type": "string"},
+    "arm_id": {"enum": ["A", "B", "C", "D"]},
+    "task_id": {"type": "string"},
+    "replicate": {"type": "integer", "minimum": 0},
+    "events": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["sequence", "kind"], "properties": {"sequence": {"type": "integer", "minimum": 0}, "kind": {"type": "string"}, "elapsed_ms": {"type": "number", "minimum": 0}, "data": {"type": "object"}}}},
+    "result": {"$ref": "#/$defs/result"}
+  },
+  "$defs": {
+    "metric": {"type": ["number", "integer", "null"]},
+    "result": {"type": "object", "additionalProperties": false, "required": ["correctness", "intent_violations", "irrelevant_opens", "tokens", "repair_iterations", "repeated_failure_codes", "routing", "tool_selection", "changed_paths", "evidence_hashes", "timed_out", "exit_code"], "properties": {
+      "correctness": {"type": "object", "additionalProperties": false, "required": ["passed", "checker_failure_code"], "properties": {"passed": {"type": "boolean"}, "checker_failure_code": {"type": ["string", "null"]}}},
+      "intent_violations": {"type": "object", "additionalProperties": false, "required": ["severe", "weighted"], "properties": {"severe": {"type": "integer", "minimum": 0}, "weighted": {"type": "number", "minimum": 0}}},
+      "irrelevant_opens": {"type": ["integer", "null"], "minimum": 0},
+      "tokens": {"type": "object", "additionalProperties": false, "required": ["available", "input", "output", "total", "cost_usd"], "properties": {"available": {"type": "boolean"}, "input": {"type": ["integer", "null"], "minimum": 0}, "output": {"type": ["integer", "null"], "minimum": 0}, "total": {"type": ["integer", "null"], "minimum": 0}, "cost_usd": {"type": ["number", "null"], "minimum": 0}}},
+      "repair_iterations": {"type": ["integer", "null"], "minimum": 0},
+      "repeated_failure_codes": {"type": ["integer", "null"], "minimum": 0},
+      "routing": {"type": ["object", "null"]},
+      "tool_selection": {"type": ["object", "null"]},
+      "changed_paths": {"type": "array", "items": {"type": "string"}},
+      "evidence_hashes": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[a-f0-9]{64}$"}},
+      "timed_out": {"type": "boolean"},
+      "exit_code": {"type": ["integer", "null"]},
+      "duration_ms": {"type": "number", "minimum": 0},
+      "path_scope": {"type": "object"}
+    }}
+  }
+}

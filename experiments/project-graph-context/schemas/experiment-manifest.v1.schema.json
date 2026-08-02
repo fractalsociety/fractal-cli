@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fractalmaster.invalid/project-graph-context/experiment-manifest.v1.schema.json",
+  "title": "Project graph context experiment manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "experiment_id", "frozen_commit", "arms", "task_ids", "replicates", "seed", "budgets", "offline"],
+  "properties": {
+    "schema_version": {"const": "project-graph-context.experiment-manifest.v1"},
+    "experiment_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"},
+    "protocol_version": {"type": "string"},
+    "source_repo": {"type": "string"},
+    "frozen_commit": {"type": "string", "minLength": 7},
+    "planner": {"type": "object", "additionalProperties": false, "properties": {"model": {"type": "string"}, "fixed_across_arms": {"type": "boolean"}}},
+    "worker": {"type": "object", "additionalProperties": false, "properties": {"model": {"type": "string"}, "fixed_across_arms": {"type": "boolean"}}},
+    "arms": {
+      "type": "array", "minItems": 4, "uniqueItems": true,
+      "items": {"type": "object", "additionalProperties": false, "required": ["arm_id", "label", "context_kind"], "properties": {"arm_id": {"enum": ["A", "B", "C", "D"]}, "label": {"type": "string"}, "context_kind": {"enum": ["search_only", "behavior_source_handbook", "three_layer_graph", "three_layer_graph_prior"]}, "context_path": {"type": "string"}, "read_only": {"type": "boolean"}}}
+    },
+    "task_ids": {"type": "array", "minItems": 2, "items": {"type": "string"}},
+    "replicates": {"type": "integer", "minimum": 1},
+    "seed": {"type": "integer", "minimum": 0},
+    "budgets": {"type": "object", "additionalProperties": false, "required": ["timeout_seconds", "max_output_bytes"], "properties": {"timeout_seconds": {"type": "number", "exclusiveMinimum": 0}, "max_output_bytes": {"type": "integer", "minimum": 1024}, "max_repairs": {"type": "integer", "minimum": 0}, "max_episodes": {"type": "integer", "minimum": 1}}},
+    "offline": {"const": true},
+    "worker_command": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "dry_run": {"type": "boolean"},
+    "notes": {"type": "string"}
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "schema_version": "project-graph-context.d-prior-snapshot.v1",
+  "prior_id": "prior-template",
+  "task_id": "template",
+  "window": {"start": "2025-01-01T00:00:00Z", "end": "2025-01-31T23:59:59Z", "timezone": "UTC"},
+  "evidence": [{"id": "e1", "source": "calibration", "claim": "Focused checker catches incorrect behavior.", "confidence": 0.8}],
+  "outcomes": [{"task_id": "template", "success": true, "failure_codes": []}],
+  "lessons": [{"lesson": "Read the target module before editing and run the focused checker.", "scope": "same task family"}],
+  "source_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+}

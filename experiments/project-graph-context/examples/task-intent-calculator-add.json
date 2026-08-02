@@ -1,0 +1,11 @@
+{
+  "schema_version": "project-graph-context.task-intent-scope-manifest.v1",
+  "task_id": "calculator-add",
+  "pair_id": "calculator",
+  "title": "Implement calculator addition",
+  "goal": "Implement add(a, b) in src/calculator.py.",
+  "allowed_paths": ["src/calculator.py"],
+  "forbidden_paths": [".git", "tests/secret_expected.py"],
+  "acceptance_checks": ["add(2, 3) == 5", "add(-2, 2) == 0"],
+  "dependencies": []
+}

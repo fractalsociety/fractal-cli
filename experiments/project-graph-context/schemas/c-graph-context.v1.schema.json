@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fractalmaster.invalid/project-graph-context/c-graph-context.v1.schema.json",
+  "title": "Arm C three-layer graph context",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task_id", "layers", "edges"],
+  "properties": {
+    "schema_version": {"const": "project-graph-context.c-graph-context.v1"},
+    "task_id": {"type": "string"},
+    "layers": {
+      "type": "object", "additionalProperties": false, "required": ["behavior", "source", "execution"],
+      "properties": {
+        "behavior": {"type": "array", "items": {"$ref": "#/$defs/node"}},
+        "source": {"type": "array", "items": {"$ref": "#/$defs/node"}},
+        "execution": {"type": "array", "items": {"$ref": "#/$defs/node"}}
+      }
+    },
+    "edges": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["from", "to", "relation"], "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "relation": {"type": "string"}}}},
+    "retrieval_policy": {"type": "object", "additionalProperties": false, "properties": {"top_k": {"type": "integer", "minimum": 0}, "include_neighbors": {"type": "boolean"}}}
+  },
+  "$defs": {"node": {"type": "object", "additionalProperties": false, "required": ["id", "kind", "summary"], "properties": {"id": {"type": "string"}, "kind": {"type": "string"}, "summary": {"type": "string"}, "path": {"type": "string"}, "line": {"type": "integer", "minimum": 1}}}}
+}
