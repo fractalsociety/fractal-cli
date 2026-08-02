@@ -38,6 +38,11 @@ pub(crate) struct NodeRun {
     /// signal the mid-run morphogenesis supervisor reads (a slow node triggers a
     /// proactive verification graft). Zero when unmeasured.
     pub latency_ms: u64,
+    /// Compact immutable-policy enforcement evidence.  The report contains
+    /// hashes/statuses/limits only; prompts, environment values, logs, and
+    /// absolute paths are intentionally excluded.
+    #[allow(dead_code)]
+    pub policy_report: Option<crate::policy_executor::PolicyEnforcementReport>,
 }
 
 /// Outcome of driving one graph.
@@ -166,7 +171,12 @@ fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> 
             if let Some(model) = model_for("claude") {
                 c.arg("--model").arg(model);
             }
-            c.arg("--dangerously-skip-permissions").arg(prompt);
+            // Keep Claude's permission checks enabled in print mode; the
+            // dangerous bypass flag is intentionally never used.
+            c.arg("--permission-mode")
+                .arg("acceptEdits")
+                .arg("--no-session-persistence")
+                .arg(prompt);
             c
         }
         "codex" | "codex-luna" => {
@@ -185,7 +195,16 @@ fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> 
                 // reach this branch for a solo lead running a non-root node.
                 c.arg("--model").arg("gpt-5.6-luna");
             }
-            c.arg("--dangerously-bypass-approvals-and-sandbox")
+            // Current Codex exposes approval policy and network access through
+            // config keys.  Workspace-write is the least-privilege profile.
+            c.arg("--config")
+                .arg("approval_policy=\"never\"")
+                .arg("--config")
+                .arg("sandbox_workspace_write.network_access=false")
+                .arg("--sandbox")
+                .arg("workspace-write")
+                .arg("--color")
+                .arg("never")
                 .arg(prompt);
             c
         }
@@ -195,7 +214,7 @@ fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> 
             if let Some(model) = model_for("cursor") {
                 c.arg("--model").arg(model);
             }
-            c.arg("--force").arg(prompt);
+            c.arg("--sandbox").arg("enabled").arg(prompt);
             c
         }
         "hermes" => {
@@ -203,7 +222,6 @@ fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> 
             // model routes through OpenRouter (where the free nemotron models live)
             // unless $FRACTAL_HERMES_PROVIDER overrides the provider.
             let mut c = Command::new("hermes");
-            c.arg("--yolo");
             if let Some(model) = model_for("hermes") {
                 let provider = std::env::var("FRACTAL_HERMES_PROVIDER")
                     .ok()
@@ -239,7 +257,7 @@ fn run_worker_as(
     workspace: &Path,
     timeout_ms: u64,
 ) -> Result<AgentRun> {
-    run_worker_as_for_node(kind, instruction, workspace, timeout_ms, None)
+    run_worker_as_for_node(kind, instruction, workspace, timeout_ms, None, None)
 }
 
 fn run_worker_as_for_node(
@@ -248,6 +266,7 @@ fn run_worker_as_for_node(
     workspace: &Path,
     timeout_ms: u64,
     node: Option<&Value>,
+    policy: Option<&crate::policy_executor::EffectivePolicy>,
 ) -> Result<AgentRun> {
     let (lesson_section, lesson_ids) = node
         .map(|node| {
@@ -272,7 +291,7 @@ fn run_worker_as_for_node(
          entirely in the current directory. Create or edit only the files this task needs and make \
          any tests pass. Do not ask questions; make reasonable choices.{lesson_section}"
     );
-    let mut run = run_agent_prompt(kind, &prompt, workspace, timeout_ms)?;
+    let mut run = run_agent_prompt_with_policy(kind, &prompt, workspace, timeout_ms, policy)?;
     run.lesson_ids = lesson_ids;
     Ok(run)
 }
@@ -282,6 +301,7 @@ fn run_lead_agent_as(
     instruction: &str,
     workspace: &Path,
     timeout_ms: u64,
+    policy: Option<&crate::policy_executor::EffectivePolicy>,
 ) -> Result<AgentRun> {
     let prompt = format!(
         "You are the lead planner/orchestrator for a coordinated team. Do exactly this assigned \
@@ -289,18 +309,37 @@ fn run_lead_agent_as(
          Preserve the team's graph contract and make any required verification pass. Do not ask \
          questions; make reasonable choices."
     );
-    run_lead_agent_prompt(kind, &prompt, workspace, timeout_ms)
+    run_agent_prompt_with_role(
+        kind,
+        &prompt,
+        workspace,
+        timeout_ms,
+        AgentRole::LeadPlanner,
+        "lead planner",
+        policy,
+    )
 }
 
 /// Run an agent with a verbatim prompt (no team-task wrapper) under a hard time
 /// budget: if it does not finish within `timeout_ms`, the process is killed and
 /// reported as a (timed-out) failure — so a hung agent never stalls the whole
 /// build; the node fails and the governed repair loop re-instructs it.
+#[allow(dead_code)]
 pub(crate) fn run_agent_prompt(
     kind: &str,
     prompt: &str,
     workspace: &Path,
     timeout_ms: u64,
+) -> Result<AgentRun> {
+    run_agent_prompt_with_policy(kind, prompt, workspace, timeout_ms, None)
+}
+
+fn run_agent_prompt_with_policy(
+    kind: &str,
+    prompt: &str,
+    workspace: &Path,
+    timeout_ms: u64,
+    policy: Option<&crate::policy_executor::EffectivePolicy>,
 ) -> Result<AgentRun> {
     run_agent_prompt_with_role(
         kind,
@@ -309,6 +348,7 @@ pub(crate) fn run_agent_prompt(
         timeout_ms,
         AgentRole::Worker,
         "worker",
+        policy,
     )
 }
 
@@ -327,6 +367,7 @@ pub(crate) fn run_lead_agent_prompt(
         timeout_ms,
         AgentRole::LeadPlanner,
         "lead planner",
+        None,
     )
 }
 
@@ -337,12 +378,31 @@ fn run_agent_prompt_with_role(
     timeout_ms: u64,
     role: AgentRole,
     label: &str,
+    policy: Option<&crate::policy_executor::EffectivePolicy>,
 ) -> Result<AgentRun> {
     // Detach the worker's stdin: headless agents (e.g. `claude -p`) otherwise
     // inherit the CLI's piped stdin and block reading it instead of exiting.
-    let mut command = worker_command(kind, prompt, role)?;
+    let mut command = if let Some(policy) = policy {
+        crate::policy_executor::worker_command(
+            kind,
+            prompt,
+            match role {
+                AgentRole::LeadPlanner => "lead planner",
+                AgentRole::Worker => "worker",
+            },
+            policy,
+        )?
+    } else {
+        worker_command(kind, prompt, role)?
+    };
+    let network_denied = policy.is_some_and(|policy| {
+        matches!(policy.network.default.as_str(), "deny" | "deny_by_default")
+    });
+    let child_env = crate::policy_executor::sanitized_environment(kind, network_denied);
     command
         .current_dir(workspace)
+        .env_clear()
+        .envs(child_env)
         .stdin(std::process::Stdio::null());
     #[cfg(unix)]
     command.process_group(0);
@@ -378,23 +438,32 @@ fn run_agent_prompt_with_role(
     }
 }
 
-/// The kill-timeout for an agent working `node`. `$FRACTAL_AGENT_TIMEOUT_MS`, when
-/// set, is an explicit absolute override; otherwise it is the node's declared
-/// budget but never less than a generous 15-minute floor — so a legitimately long
-/// task is not killed, only a genuinely hung agent.
+/// The kill-timeout for an agent working `node`.  The strictest declared limit
+/// wins: node budget, immutable policy max_minutes, and an optional operator
+/// override are all upper bounds.  There is intentionally no historical
+/// timeout floor.
 fn agent_timeout_ms(node: &Value) -> u64 {
-    if let Some(override_ms) = std::env::var("FRACTAL_AGENT_TIMEOUT_MS")
+    let override_ms = std::env::var("FRACTAL_AGENT_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-    {
-        return override_ms;
-    }
-    let budget = node
+        .filter(|value| *value > 0);
+    let node_budget = node
         .get("budget")
         .and_then(|budget| budget.get("timeout_ms"))
         .and_then(Value::as_u64)
-        .unwrap_or(0);
-    budget.max(900_000) // 15-minute floor
+        .filter(|value| *value > 0);
+    let policy_budget = node
+        .get("policy_contract")
+        .and_then(|contract| contract.get("budgets"))
+        .and_then(|budgets| budgets.get("max_minutes"))
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .map(|minutes| minutes.saturating_mul(60_000));
+    [override_ms, node_budget, policy_budget]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(1)
 }
 
 /// The binary that provides a given logical agent.
@@ -494,6 +563,11 @@ struct NodeOutcome {
     /// Prior verified lesson IDs that were injected into this node's worker
     /// prompt.  This is bookkeeping only; lesson confidence is never updated.
     lessons: Vec<String>,
+    /// Explicit failure code used by policy/budget enforcement.  Keeping this
+    /// on the outcome lets the existing failure-graph seam retain the precise
+    /// reason instead of collapsing policy failures into generic tool errors.
+    failure_code: Option<crate::learning_data::FailureCode>,
+    policy_report: Option<crate::policy_executor::PolicyEnforcementReport>,
 }
 
 impl NodeOutcome {
@@ -504,6 +578,8 @@ impl NodeOutcome {
             timed_out: false,
             note,
             lessons: Vec::new(),
+            failure_code: None,
+            policy_report: None,
         }
     }
 
@@ -514,6 +590,8 @@ impl NodeOutcome {
             timed_out,
             note,
             lessons: Vec::new(),
+            failure_code: None,
+            policy_report: None,
         }
     }
 
@@ -521,23 +599,153 @@ impl NodeOutcome {
         self.lessons = lessons;
         self
     }
+
+    fn with_policy_report(
+        mut self,
+        report: crate::policy_executor::PolicyEnforcementReport,
+    ) -> Self {
+        self.policy_report = Some(report);
+        self
+    }
 }
 
 /// Execute one node with a given agent: build nodes run the worker; verify nodes
 /// run the tests and are judged by the genuine `fractal-verify` evidence floor;
 /// passive nodes (analyze/control) are no-ops.
+#[allow(dead_code)]
 fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> {
+    run_node_with_graph(node, agent, workspace, None, 0)
+}
+
+fn policy_failure_outcome(error: crate::policy_executor::PolicyError) -> NodeOutcome {
+    let code = error.failure.failure_code();
+    let mut outcome = NodeOutcome::failure(None, false, Some(error.message));
+    outcome.failure_code = Some(code);
+    outcome.policy_report = error.report;
+    outcome
+}
+
+fn run_node_with_graph(
+    node: &Value,
+    agent: &str,
+    workspace: &Path,
+    graph: Option<&Value>,
+    steps_used: u64,
+) -> Result<NodeOutcome> {
     let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
     let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
     let instruction = node
         .get("instruction")
         .and_then(Value::as_str)
         .unwrap_or("");
+
+    // Legacy/unit fixtures without immutable contracts continue to use the
+    // pre-policy path only when this helper is called directly.  Committed
+    // graph execution always supplies a graph and is therefore fail-closed.
+    let enforce = graph.is_some() || node.get("policy_contract").is_some();
+    let policy_context = if enforce {
+        if is_build(capability) || capability == "control.closeout" {
+            match crate::policy_executor::preflight(node, graph, workspace, agent, steps_used) {
+                Ok((policy, snapshot, report)) => Some((policy, snapshot, report)),
+                Err(error) => return Ok(policy_failure_outcome(error)),
+            }
+        } else {
+            let policy = match crate::policy_executor::parse_contract(node, graph) {
+                Ok(policy) => policy,
+                Err(error) => return Ok(policy_failure_outcome(error)),
+            };
+            if let Err(error) =
+                crate::policy_executor::enforce_limits(&policy, node, workspace, steps_used)
+            {
+                return Ok(policy_failure_outcome(error));
+            }
+            let snapshot = match crate::policy_executor::snapshot_workspace(workspace) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return Ok(policy_failure_outcome(
+                        crate::policy_executor::PolicyError {
+                            failure: crate::policy_executor::PolicyFailure::ProviderUnavailable,
+                            report: None,
+                            message: format!("cannot snapshot workspace: {error:#}"),
+                        },
+                    ))
+                }
+            };
+            if snapshot.has_symlink_escape() {
+                return Ok(policy_failure_outcome(
+                    crate::policy_executor::PolicyError {
+                        failure: crate::policy_executor::PolicyFailure::SymlinkEscape,
+                        report: None,
+                        message: "workspace contains a symlink escaping the workspace root"
+                            .to_owned(),
+                    },
+                ));
+            }
+            let mut controls = BTreeMap::new();
+            controls.insert(
+                "contract".to_owned(),
+                crate::policy_executor::ControlStatus::Enforced,
+            );
+            controls.insert(
+                "provider_route".to_owned(),
+                crate::policy_executor::ControlStatus::Detected,
+            );
+            let mut report = crate::policy_executor::PolicyEnforcementReport {
+                schema: "fractal.policy_enforcement_report.v1".to_owned(),
+                policy_hash: policy.policy_hash.clone(),
+                controls,
+                limits: policy.limits.clone(),
+                violations: Vec::new(),
+                pre_snapshot_hash: snapshot.digest.clone(),
+                post_snapshot_hash: None,
+                evidence_hash: String::new(),
+                report_hash: String::new(),
+            };
+            // Hashing is performed by postflight; an empty report hash is safe
+            // as an in-memory preflight marker.
+            report.report_hash = crate::policy_executor::report_hash(&report);
+            Some((policy, snapshot, report))
+        }
+    } else {
+        None
+    };
+
     if capability == "control.closeout" {
-        run_lead_closeout(node, agent, workspace)
-    } else if is_build(capability) {
+        let outcome = run_lead_closeout(node, agent, workspace, policy_context.as_ref())?;
+        return Ok(outcome);
+    }
+    if is_build(capability) {
         let timeout_ms = agent_timeout_ms(node);
-        let run = run_worker_as_for_node(agent, instruction, workspace, timeout_ms, Some(node))?;
+        let policy = policy_context.as_ref().map(|(policy, _, _)| policy);
+        let run = run_worker_as_for_node(
+            agent,
+            instruction,
+            workspace,
+            timeout_ms,
+            Some(node),
+            policy,
+        )?;
+        let mut post_report = policy_context.as_ref().map(|(_, _, report)| report.clone());
+        let postflight_failure = if let Some((policy, snapshot, report)) = policy_context.as_ref() {
+            match crate::policy_executor::postflight(policy, snapshot, workspace, report.clone()) {
+                Ok(post) => {
+                    post_report = Some(post.report);
+                    post.failure
+                }
+                Err(error) => Some(crate::policy_executor::PolicyError {
+                    failure: crate::policy_executor::PolicyFailure::ProviderUnavailable,
+                    report: post_report.clone(),
+                    message: format!("postflight snapshot unavailable: {error:#}"),
+                }),
+            }
+        } else {
+            None
+        };
+        if let Some(error) = postflight_failure {
+            let mut outcome = policy_failure_outcome(error);
+            outcome.policy_report = post_report;
+            return Ok(outcome);
+        }
         let note = run.timed_out.then(|| {
             format!(
                 "agent hung — killed after {}s; failing the task so it is repaired",
@@ -545,16 +753,38 @@ fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> 
             )
         });
         if run.ok {
-            Ok(NodeOutcome::success(None, note).with_lessons(run.lesson_ids))
+            let mut outcome = NodeOutcome::success(None, note).with_lessons(run.lesson_ids);
+            if let Some(report) = post_report {
+                outcome = outcome.with_policy_report(report);
+            }
+            Ok(outcome)
         } else {
-            Ok(NodeOutcome::failure(None, run.timed_out, note).with_lessons(run.lesson_ids))
+            let mut outcome =
+                NodeOutcome::failure(None, run.timed_out, note).with_lessons(run.lesson_ids);
+            if let Some(report) = post_report {
+                outcome = outcome.with_policy_report(report);
+            }
+            Ok(outcome)
         }
     } else if is_verify(capability) {
         // Genuine governance: judge the suite with the real deny-by-default floor.
         match crate::verify::evaluate_workspace(workspace, id, agent)? {
             Some(verdict) => {
                 if verdict.complete {
-                    Ok(NodeOutcome::success(Some(true), Some(verdict.detail)))
+                    let mut outcome = NodeOutcome::success(Some(true), Some(verdict.detail));
+                    if let Some((policy, snapshot, report)) = policy_context.as_ref() {
+                        let post = crate::policy_executor::postflight(
+                            policy,
+                            snapshot,
+                            workspace,
+                            report.clone(),
+                        )?;
+                        if let Some(error) = post.failure {
+                            return Ok(policy_failure_outcome(error));
+                        }
+                        outcome = outcome.with_policy_report(post.report);
+                    }
+                    Ok(outcome)
                 } else {
                     Ok(NodeOutcome::failure(
                         Some(false),
@@ -571,7 +801,16 @@ fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> 
     }
 }
 
-fn run_lead_closeout(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> {
+fn run_lead_closeout(
+    node: &Value,
+    agent: &str,
+    workspace: &Path,
+    policy_context: Option<&(
+        crate::policy_executor::EffectivePolicy,
+        crate::policy_executor::WorkspaceSnapshot,
+        crate::policy_executor::PolicyEnforcementReport,
+    )>,
+) -> Result<NodeOutcome> {
     let closeout_path = workspace.join(".fractal").join("closeout.json");
     std::fs::remove_file(&closeout_path).ok();
     let instruction = node
@@ -579,7 +818,8 @@ fn run_lead_closeout(node: &Value, agent: &str, workspace: &Path) -> Result<Node
         .and_then(Value::as_str)
         .unwrap_or("Review and close out the project.");
     let timeout_ms = agent_timeout_ms(node);
-    let run = run_lead_agent_as(agent, instruction, workspace, timeout_ms)?;
+    let policy = policy_context.map(|(policy, _, _)| policy);
+    let run = run_lead_agent_as(agent, instruction, workspace, timeout_ms, policy)?;
     if !run.ok {
         return Ok(NodeOutcome::failure(
             Some(false),
@@ -602,10 +842,18 @@ fn run_lead_closeout(node: &Value, agent: &str, workspace: &Path) -> Result<Node
     )
     .context("decode lead closeout")?;
     let approved = validate_closeout(&prd, &closeout)?;
-    Ok(NodeOutcome::success(
+    let mut outcome = NodeOutcome::success(
         Some(true),
         Some(format!("lead approved {approved} acceptance criteria")),
-    ))
+    );
+    if let Some((policy, snapshot, report)) = policy_context {
+        let post = crate::policy_executor::postflight(policy, snapshot, workspace, report.clone())?;
+        if let Some(error) = post.failure {
+            return Ok(policy_failure_outcome(error));
+        }
+        outcome = outcome.with_policy_report(post.report);
+    }
+    Ok(outcome)
 }
 
 fn validate_closeout(prd: &Value, closeout: &Value) -> Result<usize> {
@@ -680,6 +928,7 @@ fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str, works
             crate::learning_data::NodeOutcome::FailedVerification,
             crate::learning_data::FailureCode::WeakVerifier,
             None,
+            None,
         ),
         "timeout" => release_learning_failure(
             workspace,
@@ -687,6 +936,7 @@ fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str, works
             agent,
             crate::learning_data::NodeOutcome::FailedExecution,
             crate::learning_data::FailureCode::Timeout,
+            None,
             None,
         ),
         "failed_execution" => release_learning_failure(
@@ -696,6 +946,7 @@ fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str, works
             crate::learning_data::NodeOutcome::FailedExecution,
             crate::learning_data::FailureCode::ToolFailure,
             None,
+            None,
         ),
         "cancelled" => release_learning_failure(
             workspace,
@@ -703,6 +954,7 @@ fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str, works
             agent,
             crate::learning_data::NodeOutcome::Cancelled,
             crate::learning_data::FailureCode::PrematureCompletion,
+            None,
             None,
         ),
         other => Err(anyhow::anyhow!("unsupported learning transition `{other}`")),
@@ -772,7 +1024,9 @@ fn report_node_outcome_with_lessons(
         return;
     }
 
-    let (learning_outcome, failure_code) = if outcome.verified == Some(false) {
+    let (learning_outcome, failure_code) = if let Some(code) = outcome.failure_code {
+        (crate::learning_data::NodeOutcome::FailedExecution, code)
+    } else if outcome.verified == Some(false) {
         (
             crate::learning_data::NodeOutcome::FailedVerification,
             crate::learning_data::FailureCode::WeakVerifier,
@@ -797,6 +1051,7 @@ fn report_node_outcome_with_lessons(
         learning_outcome,
         failure_code,
         Some((evidence.as_str(), latency_ms)),
+        outcome.policy_report.as_ref(),
     );
     if let Err(error) = result {
         eprintln!("  live graph state note: {error:#}");
@@ -947,6 +1202,7 @@ fn capture_failure_observation(
     outcome: crate::learning_data::NodeOutcome,
     failure_code: crate::learning_data::FailureCode,
     evidence_hex: Option<&str>,
+    policy_report: Option<&crate::policy_executor::PolicyEnforcementReport>,
 ) -> Result<String> {
     let document = crate::project_file::load(workspace)?;
     let record = document
@@ -999,12 +1255,26 @@ fn capture_failure_observation(
         return Ok(id);
     }
     let executor = record.executor.clone().unwrap_or_default();
-    let extra = [(
+    let mut extra = [(
         "objective_fingerprint".to_owned(),
         Value::String(crate::lessons::objective_fingerprint(&objective)),
     )]
     .into_iter()
-    .collect();
+    .collect::<BTreeMap<_, _>>();
+    if let Some(report) = policy_report {
+        extra.insert(
+            "policy_report_hash".to_owned(),
+            Value::String(report.report_hash.clone()),
+        );
+        extra.insert(
+            "policy_evidence_hash".to_owned(),
+            Value::String(report.evidence_hash.clone()),
+        );
+        extra.insert(
+            "policy_violation_count".to_owned(),
+            Value::from(report.violations.len() as u64),
+        );
+    }
     let failure = crate::failure_graph::FailureRecord {
         id: id.clone(),
         node_id: node.to_owned(),
@@ -1067,6 +1337,7 @@ fn capture_existing_failure_before_overwrite(
         outcome,
         failure_code,
         evidence,
+        None,
     )
     .map(Some)
 }
@@ -1137,6 +1408,7 @@ fn release_learning_failure(
     outcome: crate::learning_data::NodeOutcome,
     failure_code: crate::learning_data::FailureCode,
     measured: Option<(&str, u64)>,
+    policy_report: Option<&crate::policy_executor::PolicyEnforcementReport>,
 ) -> Result<()> {
     // Capture first.  The policy is diagnostic fail-closed for the task result:
     // a capture error is returned after release, so callers cannot interpret
@@ -1148,6 +1420,7 @@ fn release_learning_failure(
         outcome,
         failure_code,
         measured.map(|(evidence, _)| evidence),
+        policy_report,
     );
     let release =
         crate::project_file::release_node(workspace, node, agent, Some((outcome, failure_code)));
@@ -1414,6 +1687,7 @@ pub(crate) fn cancel_checked_out_node(workspace: &Path, node: &str, agent: &str)
         crate::learning_data::NodeOutcome::Cancelled,
         crate::learning_data::FailureCode::PrematureCompletion,
         None,
+        None,
     );
     let release = crate::project_file::release_node(
         workspace,
@@ -1614,12 +1888,25 @@ pub(crate) fn run_multi_agent(
                 }
                 report_node(board, &id, "checkout", &agent, workspace);
                 let started = std::time::Instant::now();
-                let result = run_node(node, &agent, workspace);
+                let result = run_node_with_graph(
+                    node,
+                    &agent,
+                    workspace,
+                    Some(graph),
+                    schedule
+                        .lock()
+                        .map(|state| {
+                            (state.completed.len() + state.in_progress.len().saturating_sub(1))
+                                as u64
+                        })
+                        .unwrap_or(0),
+                );
                 let latency_ms = started.elapsed().as_millis() as u64;
 
                 let evidence_hex = workspace_digest(workspace);
                 let node_is_verify = is_verify(capability);
                 let mut node_verified: Option<bool> = None;
+                let mut policy_report: Option<crate::policy_executor::PolicyEnforcementReport> = None;
                 let preds = predecessors.get(&id).cloned().unwrap_or_default();
                 let mut state = schedule.lock().expect("schedule lock");
                 state.in_progress.remove(&id);
@@ -1631,7 +1918,10 @@ pub(crate) fn run_multi_agent(
                             timed_out: _,
                             note,
                             lessons,
+                            policy_report: outcome_report,
+                            ..
                         } = &outcome;
+                        policy_report = outcome_report.clone();
                         if is_build(capability) && *ok {
                             state.built = true;
                         }
@@ -1704,6 +1994,7 @@ pub(crate) fn run_multi_agent(
                     verified: node_verified,
                     evidence_hex,
                     latency_ms,
+                    policy_report,
                 });
               }
             });
@@ -2351,7 +2642,13 @@ fn apply_hash_safe_repair(
 /// Execute one node with one agent, timing it and reporting board transitions.
 /// Mirrors the per-node body of `run_multi_agent` and is the shared unit both the
 /// whole-graph executor and the wave executor build on.
-fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&str>) -> NodeRun {
+fn run_and_record(
+    node: &Value,
+    graph: &Value,
+    agent: &str,
+    workspace: &Path,
+    board: Option<&str>,
+) -> NodeRun {
     let id = node
         .get("id")
         .and_then(Value::as_str)
@@ -2367,7 +2664,7 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
         report_node(board, &id, "checkout", agent, workspace);
     }
     let started = std::time::Instant::now();
-    let result = run_node(node, agent, workspace);
+    let result = run_node_with_graph(node, agent, workspace, Some(graph), 0);
     let latency_ms = started.elapsed().as_millis() as u64;
     let evidence_hex = workspace_digest(workspace);
     let is_verify_node = is_verify(capability);
@@ -2382,9 +2679,11 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
             .collect::<Vec<_>>()
     };
     let mut verified = None;
+    let mut policy_report = None;
     let ok = match result {
         Ok(outcome) => {
             verified = outcome.verified;
+            policy_report = outcome.policy_report.clone();
             let suffix = outcome
                 .note
                 .as_deref()
@@ -2431,6 +2730,7 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
         verified,
         evidence_hex,
         latency_ms,
+        policy_report,
     }
 }
 
@@ -2487,7 +2787,7 @@ pub(crate) fn run_wave_with_runtime(
             };
             let (node, runs) = (node, &runs);
             scope.spawn(move || {
-                let run = run_and_record(node, &agent, workspace, board);
+                let run = run_and_record(node, graph, &agent, workspace, board);
                 runs.lock().expect("wave runs lock").push(run);
             });
         }
