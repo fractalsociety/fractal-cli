@@ -6,7 +6,7 @@
     "prompt": "Update the Fractal CLI and macOS Fractal Voice app, without Apple signing, notarization, or release submission, so portable .fractal execution graphs record compact, structurally meaningful learning data. Preserve backward compatibility wit",
     "visibility": "private"
   },
-  "graph_hash": "sha256:52fdd8393c9c06ca583d6808ca0a796b214cf92f2b210333cec3993c9f34d588",
+  "graph_hash": "sha256:2d582d4c735de8a65d8af41a56e73d07d1773f3a108ba9ed58cb59afb729c230",
   "graph": {
     "compiler_version": "fractal-harnessc/0.1.0",
     "edges": [
@@ -137,7 +137,7 @@
       }
     ],
     "evolution": 1,
-    "evolution_arm": "grow.verification",
+    "evolution_arm": "repair.reinstruct",
     "execution_flow": {
       "schema": "fractal.execution_flow.v1",
       "waves": [
@@ -217,9 +217,9 @@
         }
       ]
     },
-    "graph_hash": "sha256:52fdd8393c9c06ca583d6808ca0a796b214cf92f2b210333cec3993c9f34d588",
-    "graph_id": "fg_6cd32b4aa2adf1a5cdb05db646206761",
-    "harness_hash": "sha256:20a775d1c3f5e6d67d8c9d7b8a5c678bf308b73f2fe90065bcf61b552afa5330",
+    "graph_hash": "sha256:2d582d4c735de8a65d8af41a56e73d07d1773f3a108ba9ed58cb59afb729c230",
+    "graph_id": "fg_5cf869eedf9e381f7013bfa9e11b307a",
+    "harness_hash": "sha256:97c71ef150b18d101b2d78f30e394e1ef53b980da6297f4fce7f2fe243b06ac9",
     "nodes": [
       {
         "budget": {
@@ -233,7 +233,7 @@
           "wave": 4
         },
         "id": "add_cross_boundary_rust_tests",
-        "instruction": "Extend the existing #[cfg(test)] suites in src/compile.rs, src/execute.rs, src/amendments.rs, src/harness_evolution.rs, src/project_sync.rs, and src/graph_store.rs with end-to-end fixtures that compile a graph, persist it, execute success/failure/retry/verification/artifact-consumption/human-intervention paths, apply graph edits, serialize/reload it, and inspect the sync payload. Assert every AC-1 through AC-8 field and invariant, including exact controlled values, legacy migration, round-trip preservation, compact reference-only evidence, and graph hash validity. Keep tests deterministic with injected/fixed timestamps and no live network, model, agent, or cloud dependency. Do not edit src/learning_data.rs, src/project_file.rs, Swift files, production behavior, or dist-* paths.",
+        "instruction": "Extend the existing #[cfg(test)] suites in src/compile.rs, src/execute.rs, src/amendments.rs, src/harness_evolution.rs, src/project_sync.rs, and src/graph_store.rs with end-to-end fixtures that compile a graph, persist it, execute success/failure/retry/verification/artifact-consumption/human-intervention paths, apply graph edits, serialize/reload it, and inspect the sync payload. Assert every AC-1 through AC-8 field and invariant, including exact controlled values, legacy migration, round-trip preservation, compact reference-only evidence, and graph hash validity. Keep tests deterministic with injected/fixed timestamps and no live network, model, agent, or cloud dependency. Do not edit src/learning_data.rs, src/project_file.rs, Swift files, production behavior, or dist-* paths.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
         "kind": "container",
         "memory_scopes": [
           "work:goal",
@@ -262,7 +262,7 @@
           "wave": 4
         },
         "id": "add_native_swift_tests",
-        "instruction": "Edit macos/FractalVoice/Tests/FractalVoiceTests/FractalVoiceTests.swift to add temporary project.fractal fixtures for a legacy graph with no learning fields, a fully enriched graph containing all controlled records and a graph outcome, a partially populated graph, and a graph with unknown future controlled strings. Test Codable parsing, fallback behavior, concise node and graph formatting, BuildCoordinator active-project loading, and the relevant HUD/status presentation without starting a real build. Assert no crash and no false corruption status for missing additive data. Do not edit production Swift, Rust, Package.swift, generated resources, signing settings, or dist-* paths.",
+        "instruction": "Edit macos/FractalVoice/Tests/FractalVoiceTests/FractalVoiceTests.swift to add temporary project.fractal fixtures for a legacy graph with no learning fields, a fully enriched graph containing all controlled records and a graph outcome, a partially populated graph, and a graph with unknown future controlled strings. Test Codable parsing, fallback behavior, concise node and graph formatting, BuildCoordinator active-project loading, and the relevant HUD/status presentation without starting a real build. Assert no crash and no false corruption status for missing additive data. Do not edit production Swift, Rust, Package.swift, generated resources, signing settings, or dist-* paths.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
         "kind": "container",
         "memory_scopes": [
           "work:goal",
@@ -289,7 +289,7 @@
           "wave": 2
         },
         "id": "add_swift_graph_models",
-        "instruction": "Create macos/FractalVoice/Sources/FractalVoice/ProjectGraphLearning.swift containing additive Codable projections for fractal.project.v1, enriched graph nodes, executor, verification, artifact references, human intervention, controlled outcomes/failure codes, graph-edit events, and graph outcome summaries. Make every new learning field optional or safely defaulted so legacy and partially enriched project.fractal files decode; retain raw unknown controlled strings for forward-compatible display rather than crashing. Provide pure formatting helpers for concise node outcome/attempt/verification text and graph completion summaries. Do not edit BuildCoordinator.swift, views, tests, Rust files, Package.swift, generated resources, or dist-* paths.",
+        "instruction": "Create macos/FractalVoice/Sources/FractalVoice/ProjectGraphLearning.swift containing additive Codable projections for fractal.project.v1, enriched graph nodes, executor, verification, artifact references, human intervention, controlled outcomes/failure codes, graph-edit events, and graph outcome summaries. Make every new learning field optional or safely defaulted so legacy and partially enriched project.fractal files decode; retain raw unknown controlled strings for forward-compatible display rather than crashing. Provide pure formatting helpers for concise node outcome/attempt/verification text and graph completion summaries. Do not edit BuildCoordinator.swift, views, tests, Rust files, Package.swift, generated resources, or dist-* paths.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
         "kind": "inference",
         "memory_scopes": [
           "work:goal",
@@ -315,7 +315,7 @@
           "wave": 4
         },
         "id": "aggregate_graph_outcomes",
-        "instruction": "Edit src/learning_data.rs and src/project_file.rs to implement deterministic terminal aggregation and invoke it exactly when a project becomes completed, cancelled/halted terminal, or human-completed. Derive final_verified_success; every PRD acceptance criterion passed/failed with compact evidence IDs; wall-clock total duration; DAG critical-path duration using recorded node intervals; summed agent time; observed maximum overlapping executions; summed measured total cost; retry and reopened-node counts; dead/unused nodes; human-intervention count; verification coverage with an explicit denominator; and evidence-based stopped-too-early and expanded-unnecessarily booleans. Represent unknown inputs explicitly and never estimate missing historical facts. Recompute safely after an event eventual_effect update without double counting. Add deterministic fixtures for sequential, parallel, retry, reopen, dead-node, failed-verification, cancellation, superseded expansion, and human-completed graphs. Do not edit callers outside project_file.rs, sync, Swift, or dist-* files.",
+        "instruction": "Edit src/learning_data.rs and src/project_file.rs to implement deterministic terminal aggregation and invoke it exactly when a project becomes completed, cancelled/halted terminal, or human-completed. Derive final_verified_success; every PRD acceptance criterion passed/failed with compact evidence IDs; wall-clock total duration; DAG critical-path duration using recorded node intervals; summed agent time; observed maximum overlapping executions; summed measured total cost; retry and reopened-node counts; dead/unused nodes; human-intervention count; verification coverage with an explicit denominator; and evidence-based stopped-too-early and expanded-unnecessarily booleans. Represent unknown inputs explicitly and never estimate missing historical facts. Recompute safely after an event eventual_effect update without double counting. Add deterministic fixtures for sequential, parallel, retry, reopen, dead-node, failed-verification, cancellation, superseded expansion, and human-completed graphs. Do not edit callers outside project_file.rs, sync, Swift, or dist-* files.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
         "kind": "container",
         "memory_scopes": [
           "work:goal",
@@ -370,7 +370,7 @@
           "wave": 1
         },
         "id": "define_learning_contract",
-        "instruction": "Create src/learning_data.rs and register it from src/main.rs. Define serde types and controlled enums for all requested node fields, the exact seven outcomes, exact twelve failure codes, verification type/passed/evidence_refs, compact artifact IDs, consumed_by, human_intervention, executor agent/model/version-or-config-hash, costs, graph-edit actions/events, eventual_effect, acceptance results, and graph outcomes. Implement bounded notes/reference validation, forbidden large-content and chain-of-thought-style key rejection, RFC 3339 timestamp helpers, dependency normalization from graph edges, and backward-compatible serde defaults that never fabricate unknown historical facts. Add exhaustive unit tests in src/learning_data.rs for allowed enum round trips, unknown controlled values, cross-field invariants, bounds, and legacy defaulting. Do not edit project persistence, runtime producers, Swift files, or any dist-* path.",
+        "instruction": "Create src/learning_data.rs and register it from src/main.rs. Define serde types and controlled enums for all requested node fields, the exact seven outcomes, exact twelve failure codes, verification type/passed/evidence_refs, compact artifact IDs, consumed_by, human_intervention, executor agent/model/version-or-config-hash, costs, graph-edit actions/events, eventual_effect, acceptance results, and graph outcomes. Implement bounded notes/reference validation, forbidden large-content and chain-of-thought-style key rejection, RFC 3339 timestamp helpers, dependency normalization from graph edges, and backward-compatible serde defaults that never fabricate unknown historical facts. Add exhaustive unit tests in src/learning_data.rs for allowed enum round trips, unknown controlled values, cross-field invariants, bounds, and legacy defaulting. Do not edit project persistence, runtime producers, Swift files, or any dist-* path.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
         "kind": "inference",
         "memory_scopes": [
           "work:goal",
@@ -396,7 +396,7 @@
           "wave": 3
         },
         "id": "display_learning_in_voice",
-        "instruction": "Edit macos/FractalVoice/Sources/FractalVoice/BuildCoordinator.swift and the smallest relevant existing SwiftUI status surface, preferably macos/FractalVoice/Sources/FractalVoice/RecordingHUD.swift, to load the active workspace .fractal/project.fractal through ProjectGraphLearning.swift and display concise available node outcome, attempt, verification, and final graph summary information. Missing learning fields in legacy files, partially written files, and unknown future controlled strings must degrade to existing status text without a crash or false failure. Keep file reads off latency-sensitive audio paths and preserve current voice/build state behavior. Do not edit Swift tests, Rust, Package.swift, generated resources, signing settings, or dist-* paths.",
+        "instruction": "Edit macos/FractalVoice/Sources/FractalVoice/BuildCoordinator.swift and the smallest relevant existing SwiftUI status surface, preferably macos/FractalVoice/Sources/FractalVoice/RecordingHUD.swift, to load the active workspace .fractal/project.fractal through ProjectGraphLearning.swift and display concise available node outcome, attempt, verification, and final graph summary information. Missing learning fields in legacy files, partially written files, and unknown future controlled strings must degrade to existing status text without a crash or false failure. Keep file reads off latency-sensitive audio paths and preserve current voice/build state behavior. Do not edit Swift tests, Rust, Package.swift, generated resources, signing settings, or dist-* paths.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
         "kind": "container",
         "memory_scopes": [
           "work:goal",
@@ -424,7 +424,7 @@
           "wave": 2
         },
         "id": "enrich_graph_producers",
-        "instruction": "Edit src/compile.rs, src/decompose.rs, and src/work_builder.rs so planning previews, normal compiled DAGs, fallback graphs, and lead-generated task graphs initialize every node with stable ID/type, objective, normalized dependency IDs, created_at, ready_at when root-ready, executor configuration metadata when known, attempt_count zero, estimated_cost when actually available, empty verification/artifact/consumption/intervention collections, and absent historical/terminal facts rather than invented values. Ensure stable IDs survive serialization and graph recompilation, and dependency mirrors exactly match incoming edges. Update the existing module tests to cover preview, sequential, parallel, verification, and closeout nodes. Do not edit runtime lifecycle, persistence, amendment/evolution, Swift, sync, or dist-* files.",
+        "instruction": "Edit src/compile.rs, src/decompose.rs, and src/work_builder.rs so planning previews, normal compiled DAGs, fallback graphs, and lead-generated task graphs initialize every node with stable ID/type, objective, normalized dependency IDs, created_at, ready_at when root-ready, executor configuration metadata when known, attempt_count zero, estimated_cost when actually available, empty verification/artifact/consumption/intervention collections, and absent historical/terminal facts rather than invented values. Ensure stable IDs survive serialization and graph recompilation, and dependency mirrors exactly match incoming edges. Update the existing module tests to cover preview, sequential, parallel, verification, and closeout nodes. Do not edit runtime lifecycle, persistence, amendment/evolution, Swift, sync, or dist-* files.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
         "kind": "container",
         "memory_scopes": [
           "work:goal",
@@ -451,7 +451,7 @@
           "wave": 2
         },
         "id": "integrate_portable_persistence",
-        "instruction": "Edit src/project_file.rs and src/graph_store.rs to load old fractal.project.v1 and fractal.execution_graph.v1 documents with missing learning data, normalize them through src/learning_data.rs, validate enriched node/event/outcome records, and atomically serialize them without losing topology, identity, unknown forward-compatible fields, or graph-hash integrity. Add central mutation APIs for node-ready, checkout/start, finish, release/reopen, verification result, artifact produced/consumed, human intervention, estimated/actual cost, graph-edit event append/update, and terminal graph outcome storage; make APIs enforce monotonic timestamps and controlled state combinations. Preserve parent-to-child execution attribution and local-board backfill. Add legacy fixture, enriched round-trip, invalid-record, secret/oversized-content, and evolved-child preservation tests in these modules. Do not edit execution callers, compiler producers, sync code, Swift files, or dist-* paths.",
+        "instruction": "Edit src/project_file.rs and src/graph_store.rs to load old fractal.project.v1 and fractal.execution_graph.v1 documents with missing learning data, normalize them through src/learning_data.rs, validate enriched node/event/outcome records, and atomically serialize them without losing topology, identity, unknown forward-compatible fields, or graph-hash integrity. Add central mutation APIs for node-ready, checkout/start, finish, release/reopen, verification result, artifact produced/consumed, human intervention, estimated/actual cost, graph-edit event append/update, and terminal graph outcome storage; make APIs enforce monotonic timestamps and controlled state combinations. Preserve parent-to-child execution attribution and local-board backfill. Add legacy fixture, enriched round-trip, invalid-record, secret/oversized-content, and evolved-child preservation tests in these modules. Do not edit execution callers, compiler producers, sync code, Swift files, or dist-* paths.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
         "kind": "container",
         "memory_scopes": [
           "work:goal",
@@ -527,7 +527,7 @@
           "wave": 3
         },
         "id": "preserve_sync_boundaries",
-        "instruction": "Edit src/project_sync.rs and src/projects.rs to ensure project discovery, runtime coalesced uploads, one-shot uploads, conflict handling, and remote-hash state always read the validated current project.fractal and preserve its complete enriched graph, events, and outcomes. Add boundary tests using legacy and enriched local fixtures plus mocked upload payloads, asserting canonical learning fields are neither stripped nor rewritten and invalid/oversized data is refused before upload. Keep local persistence fail-soft with respect to network errors and do not alter authentication, visibility behavior, remote APIs, GitHub publication semantics, or any dist-* path.",
+        "instruction": "Edit src/project_sync.rs and src/projects.rs to ensure project discovery, runtime coalesced uploads, one-shot uploads, conflict handling, and remote-hash state always read the validated current project.fractal and preserve its complete enriched graph, events, and outcomes. Add boundary tests using legacy and enriched local fixtures plus mocked upload payloads, asserting canonical learning fields are neither stripped nor rewritten and invalid/oversized data is refused before upload. Keep local persistence fail-soft with respect to network errors and do not alter authentication, visibility behavior, remote APIs, GitHub publication semantics, or any dist-* path.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
         "kind": "container",
         "memory_scopes": [
           "work:goal",
@@ -554,7 +554,7 @@
           "wave": 3
         },
         "id": "record_graph_edit_events",
-        "instruction": "Edit src/amendments.rs, src/harness_evolution.rs, and src/supervise.rs so every accepted human split, reroute, cancel, dependency edit, and autonomous grow/repair/differentiate graph mutation appends a compact learning event through project_file APIs. Capture the verified graph_before_hash before mutation; controlled action type with target and created_nodes; bounded trigger; actor identity; timestamp; and eventual_effect success/rework_reduced, initially unknown where necessary and updated when downstream evidence arrives. Ensure rejected/no-op edits do not claim success, child graph hashes remain valid, and created/cancelled/superseded nodes get appropriate structural and controlled outcome fields. Add tests for all four human-edit forms, autonomous edits, event ordering, before-hash accuracy, eventual-effect update, and no-op rejection. Do not edit runtime lifecycle files, persistence schema, Swift, sync, or dist-* files.",
+        "instruction": "Edit src/amendments.rs, src/harness_evolution.rs, and src/supervise.rs so every accepted human split, reroute, cancel, dependency edit, and autonomous grow/repair/differentiate graph mutation appends a compact learning event through project_file APIs. Capture the verified graph_before_hash before mutation; controlled action type with target and created_nodes; bounded trigger; actor identity; timestamp; and eventual_effect success/rework_reduced, initially unknown where necessary and updated when downstream evidence arrives. Ensure rejected/no-op edits do not claim success, child graph hashes remain valid, and created/cancelled/superseded nodes get appropriate structural and controlled outcome fields. Add tests for all four human-edit forms, autonomous edits, event ordering, before-hash accuracy, eventual-effect update, and no-op rejection. Do not edit runtime lifecycle files, persistence schema, Swift, sync, or dist-* files.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
         "kind": "container",
         "memory_scopes": [
           "work:goal",
@@ -582,7 +582,7 @@
           "wave": 3
         },
         "id": "record_runtime_lifecycle",
-        "instruction": "Edit src/execute.rs, src/orchestrate.rs, src/run_control.rs, and src/checkpoint.rs to call the central project_file learning mutation APIs at dependency readiness, checkout/start, success, execution error, verification failure, timeout, retry/reopen, cancellation/stale release, resume, and human completion. Record executor agent/model/version-or-config-hash from real agent configuration, increment attempt_count only for actual starts, attach controlled outcomes/failure codes, verification type/passed/compact evidence_refs, actual elapsed agent time and actual cost only when measured, and artifact production/consumption IDs where runtime facts exist. Map errors deterministically to requested failure codes without arbitrary self-evaluation; preserve previous attempts on retry. Extend module tests for retries, tool failure, timeout, failed verification, cancellation, stale release/resume, artifact lineage, human intervention, and monotonic timestamps. Do not edit graph-edit producers, persistence schema, sync, Swift, or dist-* files.",
+        "instruction": "Edit src/execute.rs, src/orchestrate.rs, src/run_control.rs, and src/checkpoint.rs to call the central project_file learning mutation APIs at dependency readiness, checkout/start, success, execution error, verification failure, timeout, retry/reopen, cancellation/stale release, resume, and human completion. Record executor agent/model/version-or-config-hash from real agent configuration, increment attempt_count only for actual starts, attach controlled outcomes/failure codes, verification type/passed/compact evidence_refs, actual elapsed agent time and actual cost only when measured, and artifact production/consumption IDs where runtime facts exist. Map errors deterministically to requested failure codes without arbitrary self-evaluation; preserve previous attempts on retry. Extend module tests for retries, tool failure, timeout, failed verification, cancellation, stale release/resume, artifact lineage, human intervention, and monotonic timestamps. Do not edit graph-edit producers, persistence schema, sync, Swift, or dist-* files.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
         "kind": "container",
         "memory_scopes": [
           "work:goal",
@@ -708,14 +708,14 @@
         "title": "Run the complete Rust quality gate"
       }
     ],
-    "parent_graph": "sha256:573f1f253b42ac7065e941e4eb776bbbb5e7ccbec288ef1c398db5fbe2ba8ce4",
+    "parent_graph": "sha256:52fdd8393c9c06ca583d6808ca0a796b214cf92f2b210333cec3993c9f34d588",
     "schema": "fractal.execution_graph.v1",
     "target": "darwin-arm64",
     "work_hash": "sha256:3f3cd1a955e6ccd688c0849c282aada8b2f943a92c036be727189a32c8899dbe"
   },
   "execution": {
     "schema": "fractal.execution_state.v1",
-    "phase": "halted",
+    "phase": "executing",
     "assignments": {
       "add_swift_graph_models": {
         "agent_id": "hermes",
@@ -732,11 +732,11 @@
         "completed_at": "2026-07-29T10:04:02Z"
       },
       "display_learning_in_voice": {
-        "agent_id": "hermes",
-        "agent_label": "hermes",
-        "state": "released",
+        "agent_id": "cursor",
+        "agent_label": "cursor",
+        "state": "completed",
         "checked_out_at": "2026-08-02T08:51:47Z",
-        "released_at": "2026-08-02T08:52:49Z"
+        "completed_at": "2026-08-02T08:56:10Z"
       },
       "enrich_graph_producers": {
         "agent_id": "codex/luna-enrich",
@@ -760,25 +760,24 @@
         "completed_at": "2026-07-29T10:01:24Z"
       },
       "preserve_sync_boundaries": {
-        "agent_id": "claude",
-        "agent_label": "claude",
-        "state": "released",
-        "checked_out_at": "2026-08-02T08:51:47Z",
-        "released_at": "2026-08-02T08:52:49Z"
-      },
-      "record_graph_edit_events": {
         "agent_id": "hermes",
         "agent_label": "hermes",
-        "state": "released",
+        "state": "completed",
         "checked_out_at": "2026-08-02T08:51:47Z",
-        "released_at": "2026-08-02T08:52:49Z"
+        "completed_at": "2026-08-02T12:03:45Z"
+      },
+      "record_graph_edit_events": {
+        "agent_id": "codex/luna-graph-events",
+        "agent_label": "Codex Luna · Graph Edit Events",
+        "state": "checked_out",
+        "checked_out_at": "2026-08-02T08:51:47Z"
       },
       "record_runtime_lifecycle": {
-        "agent_id": "claude",
-        "agent_label": "claude",
-        "state": "released",
+        "agent_id": "cursor",
+        "agent_label": "cursor",
+        "state": "completed",
         "checked_out_at": "2026-08-02T08:51:47Z",
-        "released_at": "2026-08-02T08:52:49Z"
+        "completed_at": "2026-08-02T12:01:11Z"
       },
       "verify.define_learning_contract.harness": {
         "agent_id": "cursor",
@@ -795,7 +794,7 @@
         "completed_at": "2026-08-02T08:51:48Z"
       }
     },
-    "updated_at": "2026-08-02T08:52:49Z"
+    "updated_at": "2026-08-02T12:03:45Z"
   },
   "learning": {
     "schema": "fractal.learning.v1",
@@ -904,12 +903,14 @@
           "integrate_portable_persistence"
         ],
         "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T08:51:47Z",
+        "started_at": "2026-08-02T08:53:02Z",
+        "finished_at": "2026-08-02T08:56:10Z",
         "executor": {
-          "agent": "hermes",
+          "agent": "cursor",
           "version": "0.1.0"
         },
-        "attempt_count": 1,
+        "attempt_count": 2,
+        "outcome": "unverified_success",
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -992,12 +993,14 @@
           "integrate_portable_persistence"
         ],
         "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T08:51:47Z",
+        "started_at": "2026-08-02T08:53:02Z",
+        "finished_at": "2026-08-02T12:03:45Z",
         "executor": {
-          "agent": "claude",
+          "agent": "hermes",
           "version": "0.1.0"
         },
-        "attempt_count": 1,
+        "attempt_count": 2,
+        "outcome": "unverified_success",
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -1012,16 +1015,16 @@
           "integrate_portable_persistence"
         ],
         "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T08:51:47Z",
+        "started_at": "2026-08-02T12:01:00Z",
         "executor": {
-          "agent": "hermes",
+          "agent": "Codex Luna · Graph Edit Events",
           "version": "0.1.0"
         },
-        "attempt_count": 1,
+        "attempt_count": 3,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
-        "reopen_count": 0
+        "reopen_count": 1
       },
       "record_runtime_lifecycle": {
         "node_id": "record_runtime_lifecycle",
@@ -1032,12 +1035,14 @@
           "integrate_portable_persistence"
         ],
         "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T08:51:47Z",
+        "started_at": "2026-08-02T08:53:03Z",
+        "finished_at": "2026-08-02T12:01:11Z",
         "executor": {
-          "agent": "claude",
+          "agent": "cursor",
           "version": "0.1.0"
         },
-        "attempt_count": 1,
+        "attempt_count": 2,
+        "outcome": "unverified_success",
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -1149,5 +1154,5 @@
       "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c"
     }
   },
-  "updated_at": "2026-08-02T08:52:59Z"
+  "updated_at": "2026-08-02T12:03:45Z"
 }
