@@ -169,7 +169,7 @@ fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> 
             c.arg("--dangerously-skip-permissions").arg(prompt);
             c
         }
-        "codex" => {
+        "codex" | "codex-luna" => {
             let mut c = Command::new("codex");
             c.arg("exec");
             if role == AgentRole::LeadPlanner {
@@ -177,8 +177,13 @@ fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> 
                 // independent of ~/.codex/config.toml or worker routing pins.
                 c.arg("--model").arg("gpt-5.6-sol");
                 c.arg("--config").arg("model_reasoning_effort=\"high\"");
-            } else if let Some(model) = model_for("codex") {
-                c.arg("--model").arg(model);
+            } else {
+                // `codex-luna` is a logical worker route backed by the Codex
+                // binary. Keep the worker model explicit so a lead's
+                // FRACTAL_CODEX_MODEL (or local Codex config) can never leak
+                // Sol High into implementation work. Plain `codex` can still
+                // reach this branch for a solo lead running a non-root node.
+                c.arg("--model").arg("gpt-5.6-luna");
             }
             c.arg("--dangerously-bypass-approvals-and-sandbox")
                 .arg(prompt);
@@ -209,7 +214,7 @@ fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> 
             c.arg("-z").arg(prompt);
             c
         }
-        other => bail!("unknown worker: {other} (use claude|codex|cursor|hermes)"),
+        other => bail!("unknown worker: {other} (use claude|codex|codex-luna|cursor|hermes)"),
     };
     command.env("FRACTAL_WORKER", kind);
     Ok(command)
@@ -360,6 +365,7 @@ fn agent_timeout_ms(node: &Value) -> u64 {
 fn agent_binary(kind: &str) -> &str {
     match kind {
         "cursor" | "cursor-agent" => "cursor-agent",
+        "codex-luna" => "codex",
         other => other,
     }
 }
@@ -387,6 +393,14 @@ pub(crate) fn available_agents() -> Vec<String> {
 
 /// The agents to run, from `$FRACTAL_AGENTS` (comma-separated) or auto-detected
 /// among claude / codex / cursor on `PATH`.
+///
+/// Codex has two logical routes in the scheduler: plain `codex` is reserved
+/// for the first (lead planner/orchestrator) slot, while `codex-luna` is the
+/// implementation-worker slot. When Codex is the lead, the physical binary is
+/// represented by both slots; when it is not the lead, it contributes only the
+/// worker slot. Both routes use the `codex` binary, but the worker route is
+/// pinned to `gpt-5.6-luna` by [`worker_command`]. Keeping the logical route in
+/// the roster makes leases and board assignments truthful.
 pub(crate) fn detect_agents() -> Vec<String> {
     if let Ok(list) = std::env::var("FRACTAL_AGENTS") {
         let chosen: Vec<String> = list
@@ -395,7 +409,7 @@ pub(crate) fn detect_agents() -> Vec<String> {
             .filter(|value| !value.is_empty())
             .collect();
         if !chosen.is_empty() {
-            return chosen;
+            return logical_agent_routes(chosen);
         }
     }
     let mut detected: Vec<String> = ["codex", "cursor", "claude", "hermes"]
@@ -410,7 +424,27 @@ pub(crate) fn detect_agents() -> Vec<String> {
             detected.insert(0, selected);
         }
     }
-    detected
+    logical_agent_routes(detected)
+}
+
+/// Convert physical Codex entries into the role-aware logical routes used by
+/// scheduling and durable assignments. The first roster entry is always the
+/// lead slot; subsequent Codex entries are Luna implementation workers.
+fn logical_agent_routes(agents: Vec<String>) -> Vec<String> {
+    let mut routes = Vec::with_capacity(agents.len() + 1);
+    for (index, agent) in agents.into_iter().enumerate() {
+        if agent == "codex" {
+            if index == 0 {
+                routes.push("codex".to_owned());
+                routes.push("codex-luna".to_owned());
+            } else {
+                routes.push("codex-luna".to_owned());
+            }
+        } else {
+            routes.push(agent);
+        }
+    }
+    routes
 }
 
 /// Result of executing one node.
@@ -1946,9 +1980,45 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
+        assert!(worker_args
+            .windows(2)
+            .any(|pair| { pair == ["--model".to_owned(), "gpt-5.6-luna".to_owned()] }));
         assert!(!worker_args
             .iter()
             .any(|arg| arg == "model_reasoning_effort=\"high\""));
+    }
+
+    #[test]
+    fn codex_luna_worker_route_uses_the_codex_binary_and_luna_model() {
+        assert_eq!(agent_binary("codex-luna"), "codex");
+        let worker = worker_command("codex-luna", "build", AgentRole::Worker).unwrap();
+        assert_eq!(worker.get_program().to_string_lossy(), "codex");
+        let args: Vec<String> = worker
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair == ["--model".to_owned(), "gpt-5.6-luna".to_owned()] }));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "gpt-5.6-sol" || arg == "model_reasoning_effort=\"high\""));
+    }
+
+    #[test]
+    fn codex_roster_exposes_a_lead_and_luna_worker_route() {
+        assert_eq!(
+            logical_agent_routes(vec!["codex".to_owned(), "cursor".to_owned()]),
+            vec![
+                "codex".to_owned(),
+                "codex-luna".to_owned(),
+                "cursor".to_owned()
+            ]
+        );
+        assert_eq!(
+            logical_agent_routes(vec!["cursor".to_owned(), "codex".to_owned()]),
+            vec!["cursor".to_owned(), "codex-luna".to_owned()]
+        );
     }
 
     #[test]
