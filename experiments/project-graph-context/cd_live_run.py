@@ -79,6 +79,25 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _verified_oracle_sha256(source_run: Path) -> str:
+    """Verify the prior run's copied checker matches this frozen harness."""
+
+    prior = sorted(source_run.glob("episodes/*/hidden-checker/checker.py"))
+    if not prior:
+        raise RunError("source A-vs-D run has no verifiable hidden-oracle copy")
+    prior_hashes = {sha256_file(path) for path in prior}
+    if len(prior_hashes) != 1:
+        raise RunError("source A-vs-D hidden-oracle copies disagree")
+    current = ROOT / "fixtures" / "oracles" / "checker.py"
+    if not current.is_file():
+        raise RunError("current hidden oracle is missing")
+    current_hash = sha256_file(current)
+    source_hash = next(iter(prior_hashes))
+    if current_hash != source_hash:
+        raise RunError(f"hidden oracle changed since A-vs-D run: {current_hash} != {source_hash}")
+    return current_hash
+
+
 def pair_for(task_id: str) -> str:
     pair_id = task_manifest(task_id)["pair_id"]
     for candidate in TASKS:
@@ -239,6 +258,7 @@ def _schedule(source_setup: Mapping[str, Any], seed: int) -> list[dict[str, Any]
 def _setup(output: Path, source_run: Path, seed: int) -> dict[str, Any]:
     output.mkdir(parents=True, exist_ok=True)
     source_setup, source_report = _source_setup(source_run, seed)
+    oracle_sha256 = _verified_oracle_sha256(source_run)
     intents, contexts, sources = _prepare_files(output, source_run, source_setup)
     planner_plans, planner_tokens, plan_hashes = _copy_verified_plan_artifacts(output, source_run, source_setup)
     schedule = _schedule(source_setup, seed)
@@ -282,6 +302,7 @@ def _setup(output: Path, source_run: Path, seed: int) -> dict[str, Any]:
             "source_setup_schema": source_setup.get("schema_version"),
             "source_report_schema": source_report.get("schema_version"),
             "source_seed": source_setup.get("seed"),
+            "hidden_oracle_sha256": oracle_sha256,
         },
     }
     setup_path = output / "setup.json"
@@ -449,7 +470,7 @@ def make_summary(output: Path, setup_payload: Mapping[str, Any], ledgers: Sequen
         "randomization": {"seed": setup_payload["seed"], "schedule": setup_payload["schedule"], "counterbalance": "reused A/D order mapped A→C; 6 C-first and 6 D-first pairs"},
         "planner": setup_payload["planner"],
         "worker": setup_payload["worker"],
-        "provenance": {"reused": "A-vs-D plans, task versions, hidden-oracle corpus, and counterbalanced schedule", "new": "C contexts and all 24 isolated Luna episodes", "plan_hashes": setup_payload["planner"]["plan_hashes"], "context_hashes": setup_payload["context_hashes"], "source_commits": setup_payload["source_commits"]},
+        "provenance": {"reused": "A-vs-D plans, task versions, hidden-oracle corpus, and counterbalanced schedule", "new": "C contexts and all 24 isolated Luna episodes", "plan_hashes": setup_payload["planner"]["plan_hashes"], "context_hashes": setup_payload["context_hashes"], "source_commits": setup_payload["source_commits"], "hidden_oracle_sha256": setup_payload["reused_source"].get("hidden_oracle_sha256")},
         "token_accounting": {"reused_planner_tokens": int(setup_payload["planner"].get("usage_total_tokens", 0) or 0), "worker_actual_tokens": actual_total, "all_agent_actual_tokens": actual_total + int(setup_payload["planner"].get("usage_total_tokens", 0) or 0), "worker_aggregate_cap": AGGREGATE_WORKER_CAP, "all_agent_hard_cap": ALL_AGENT_CAP},
         "analysis": analysis,
         "failure_patterns": {"checker_failure_codes": dict(sorted(checker_failures.items())), "changed_paths": dict(sorted(changed_paths.items())), "infrastructure_failures": list(failures), "safety_signals": list(safety_events), "stop_reason": stop_reason},

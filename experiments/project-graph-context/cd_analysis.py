@@ -163,8 +163,10 @@ def _threshold(metric: Mapping[str, Any], *, name: str, direction: str, limit: f
     paired_n = int(metric["paired_n"])
     estimate = metric["mean_ratio_D_over_C"] if direction == "max_ratio" else metric["mean_delta_D_minus_C"]
     reasons: list[str] = []
-    if pair_total == 0 or paired_n != pair_total:
+    if pair_total == 0:
         reasons.append("missing:paired-observation")
+    elif paired_n != pair_total:
+        reasons.append("missing:metric")
     if direction == "max_ratio" and require_positive_denom:
         # A complete pair can still have ratio=None when C's metric is zero.
         if len(metric["ratios"]) != paired_n:
