@@ -610,6 +610,12 @@ pub(crate) enum GraphCommand {
     Status(GraphStatusArgs),
     /// Load a committed execution graph from the local store.
     Show(GraphShowArgs),
+    /// Audit projects from a frozen repository inventory shard.
+    Audit(GraphAuditArgs),
+    /// Compose a read-only master graph from a frozen repository inventory.
+    Compose(GraphComposeArgs),
+    /// Serve a read-only master graph from a frozen repository inventory.
+    Master(GraphMasterArgs),
     /// Import a legacy graph-state JSON file into .fractal/project.fractal once.
     ImportLegacy(GraphImportLegacyArgs),
     /// Internal foreground Rust board server.
@@ -630,6 +636,97 @@ pub(crate) struct GraphBoardArgs {
     /// Directory containing the execution-graph viewer's server.py.
     #[arg(long, value_name = "PATH")]
     pub(crate) exec_graph_dir: Option<PathBuf>,
+
+    /// Do not open the served board in the default macOS browser.
+    #[arg(long)]
+    pub(crate) no_open: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ShardSpec {
+    pub(crate) index: u32,
+    pub(crate) total: u32,
+}
+
+impl std::str::FromStr for ShardSpec {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let Some((index, total)) = value.split_once('/') else {
+            return Err("shard must be INDEX/TOTAL".to_owned());
+        };
+        if index.is_empty() || total.is_empty() || value.matches('/').count() != 1 {
+            return Err("shard must be INDEX/TOTAL".to_owned());
+        }
+        if index.starts_with('+')
+            || total.starts_with('+')
+            || index.starts_with('-')
+            || total.starts_with('-')
+        {
+            return Err("shard values must be unsigned decimal integers".to_owned());
+        }
+        let index: u32 = index
+            .parse()
+            .map_err(|_| "shard index must be an unsigned decimal integer".to_owned())?;
+        let total: u32 = total
+            .parse()
+            .map_err(|_| "shard total must be an unsigned decimal integer".to_owned())?;
+        if total == 0 {
+            return Err("shard total must be greater than zero".to_owned());
+        }
+        if index >= total {
+            return Err("shard index must be less than shard total".to_owned());
+        }
+        Ok(Self { index, total })
+    }
+}
+
+/// Arguments accepted by `fractal graph audit`.
+#[derive(Debug, Args)]
+pub(crate) struct GraphAuditArgs {
+    /// Frozen fractal.repository_inventory.v1 JSON artifact.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) inventory: PathBuf,
+
+    /// Inventory shard in strict INDEX/TOTAL form; INDEX is zero-based.
+    #[arg(long, value_name = "INDEX/TOTAL")]
+    pub(crate) shard: ShardSpec,
+
+    /// Run bounded native test commands for audited workspaces.
+    #[arg(long)]
+    pub(crate) run_tests: bool,
+
+    /// Write the stable JSON audit report to this path.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) report: PathBuf,
+}
+
+/// Arguments accepted by `fractal graph compose`.
+#[derive(Debug, Args)]
+pub(crate) struct GraphComposeArgs {
+    /// Frozen fractal.repository_inventory.v1 JSON artifact.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) inventory: PathBuf,
+
+    /// Print the composed graph or validation summary as JSON.
+    #[arg(long)]
+    pub(crate) json: bool,
+
+    /// Validate composition only and print a validation summary.
+    #[arg(long)]
+    pub(crate) validate_only: bool,
+}
+
+/// Arguments accepted by `fractal graph master`.
+#[derive(Debug, Args)]
+pub(crate) struct GraphMasterArgs {
+    /// Frozen fractal.repository_inventory.v1 JSON artifact.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) inventory: PathBuf,
+
+    /// Port on which to serve the read-only master board.
+    #[arg(long, default_value_t = DEFAULT_GRAPH_PORT)]
+    pub(crate) port: u16,
 
     /// Do not open the served board in the default macOS browser.
     #[arg(long)]
@@ -1055,6 +1152,72 @@ mod tests {
                 command: GraphCommand::ImportLegacy(GraphImportLegacyArgs { .. })
             }))
         ));
+
+        let audit = Cli::try_parse_from([
+            "fractal",
+            "graph",
+            "audit",
+            "--inventory",
+            "/tmp/inventory.json",
+            "--shard",
+            "2/5",
+            "--run-tests",
+            "--report",
+            "/tmp/report.json",
+        ])
+        .unwrap();
+        let Some(Command::Graph(GraphArgs {
+            command: GraphCommand::Audit(args),
+        })) = audit.command
+        else {
+            panic!("expected graph audit command");
+        };
+        assert_eq!(args.inventory, PathBuf::from("/tmp/inventory.json"));
+        assert_eq!(args.shard, ShardSpec { index: 2, total: 5 });
+        assert!(args.run_tests);
+        assert_eq!(args.report, PathBuf::from("/tmp/report.json"));
+
+        let compose = Cli::try_parse_from([
+            "fractal",
+            "graph",
+            "compose",
+            "--inventory",
+            "/tmp/inventory.json",
+            "--json",
+            "--validate-only",
+        ])
+        .unwrap();
+        assert!(matches!(
+            compose.command,
+            Some(Command::Graph(GraphArgs {
+                command: GraphCommand::Compose(GraphComposeArgs {
+                    inventory,
+                    json: true,
+                    validate_only: true,
+                })
+            })) if inventory == std::path::Path::new("/tmp/inventory.json")
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_graph_audit_shards() {
+        for shard in ["1", "1/0", "2/2", "-1/2", "+1/2", "1/2/3", "a/2"] {
+            assert!(
+                Cli::try_parse_from([
+                    "fractal",
+                    "graph",
+                    "audit",
+                    "--inventory",
+                    "/tmp/inventory.json",
+                    "--shard",
+                    shard,
+                    "--report",
+                    "/tmp/report.json",
+                ])
+                .is_err(),
+                "shard {shard:?} should fail"
+            );
+        }
     }
 
     #[test]

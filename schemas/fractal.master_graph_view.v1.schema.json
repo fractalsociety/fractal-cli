@@ -1,0 +1,832 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fractalsociety.dev/schemas/fractal.master_graph_view.v1.schema.json",
+  "title": "fractal.master_graph_view.v1",
+  "description": "Deterministic, read-only, in-memory composition of validated fractal.catalog.v1 envelopes across the frozen fractal.repository_inventory.v1. Never persisted as canonical state and never written back to any source repository. Contains no wall-clock timestamps: identical source bytes MUST produce byte-identical canonical JSON regardless of inventory ordering. Normative composition, ordering, hashing, and diagnostic rules live in docs/project-catalog-contract.md.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema",
+    "view_hash",
+    "inventory_hash",
+    "summary",
+    "projects",
+    "nodes",
+    "edges",
+    "diagnostics",
+    "sources",
+    "unavailable"
+  ],
+  "properties": {
+    "schema": {
+      "const": "fractal.master_graph_view.v1"
+    },
+    "view_hash": {
+      "$ref": "#/$defs/hash256",
+      "description": "'sha256:<64 hex>' over the canonical JSON bytes of this view with the 'view_hash' key removed (sorted keys, compact separators, UTF-8)."
+    },
+    "inventory_hash": {
+      "$ref": "#/$defs/hash256",
+      "description": "inventory_hash of the frozen fractal.repository_inventory.v1 artifact composed from."
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "projects_total",
+        "available_inventory_count",
+        "audited_available",
+        "invalid_catalogs",
+        "node_count",
+        "edge_count",
+        "links_resolved",
+        "links_unresolved",
+        "cycle_count",
+        "diagnostic_counts"
+      ],
+      "properties": {
+        "projects_total": {
+          "$ref": "#/$defs/count"
+        },
+        "available_inventory_count": {
+          "$ref": "#/$defs/count"
+        },
+        "audited_available": {
+          "$ref": "#/$defs/count",
+          "description": "Available inventory records whose catalog validated as fractal.catalog.v1."
+        },
+        "invalid_catalogs": {
+          "$ref": "#/$defs/count"
+        },
+        "node_count": {
+          "$ref": "#/$defs/count"
+        },
+        "edge_count": {
+          "$ref": "#/$defs/count"
+        },
+        "links_resolved": {
+          "$ref": "#/$defs/count"
+        },
+        "links_unresolved": {
+          "$ref": "#/$defs/count"
+        },
+        "cycle_count": {
+          "$ref": "#/$defs/count"
+        },
+        "diagnostic_counts": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "error",
+            "warning",
+            "info"
+          ],
+          "properties": {
+            "error": {
+              "$ref": "#/$defs/count"
+            },
+            "warning": {
+              "$ref": "#/$defs/count"
+            },
+            "info": {
+              "$ref": "#/$defs/count"
+            }
+          }
+        }
+      }
+    },
+    "projects": {
+      "type": "array",
+      "maxItems": 2048,
+      "items": {
+        "$ref": "#/$defs/projectEntry"
+      },
+      "description": "One entry per unique existing inventory workspace. Sorted ascending by project_key."
+    },
+    "nodes": {
+      "type": "array",
+      "maxItems": 65536,
+      "items": {
+        "$ref": "#/$defs/node"
+      },
+      "description": "Sorted ascending by id; ids unique."
+    },
+    "edges": {
+      "type": "array",
+      "maxItems": 65536,
+      "items": {
+        "$ref": "#/$defs/edge"
+      },
+      "description": "Sorted ascending by id; ids unique. Unresolved, self, and cyclic edges are retained, never dropped or recursively expanded."
+    },
+    "diagnostics": {
+      "type": "array",
+      "maxItems": 16384,
+      "items": {
+        "$ref": "#/$defs/viewDiagnostic"
+      },
+      "description": "Sorted by (code, project_key, edge_id, context) with null sorting before any string."
+    },
+    "sources": {
+      "type": "array",
+      "maxItems": 2048,
+      "items": {
+        "$ref": "#/$defs/sourceProvenance"
+      },
+      "description": "Byte-level provenance for every project.fractal that was read. Sorted ascending by project_key. Deliberately excludes mtimes and timestamps."
+    },
+    "unavailable": {
+      "type": "array",
+      "maxItems": 2048,
+      "items": {
+        "$ref": "#/$defs/unavailableEntry"
+      },
+      "description": "Inventory records whose workspace does not exist or cannot be read; explicit diagnostics instead of fabricated content. Sorted by canonical_workspace."
+    }
+  },
+  "$defs": {
+    "hash256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "gitCommit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "projectKey": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,47}-[0-9a-f]{12}$"
+    },
+    "nodeId": {
+      "type": "string",
+      "pattern": "^(project:[a-z0-9][a-z0-9-]{0,47}-[0-9a-f]{12}|(component|capability):[a-z0-9][a-z0-9-]{0,47}-[0-9a-f]{12}/[a-z0-9][a-z0-9-]{0,63})$",
+      "description": "Namespaced: 'project:<project_key>', 'component:<project_key>/<component_key>', 'capability:<project_key>/<capability_key>'."
+    },
+    "edgeId": {
+      "type": "string",
+      "pattern": "^(link:[a-z0-9][a-z0-9-]{0,47}-[0-9a-f]{12}/[a-z0-9][a-z0-9-]{0,63}|dep:[a-z0-9][a-z0-9-]{0,47}-[0-9a-f]{12}/[a-z0-9][a-z0-9-]{0,63}->[a-z0-9][a-z0-9-]{0,63}(:[a-z]{1,16})?)$",
+      "description": "'link:<origin project_key>/<link key>' for cross_graph_links; 'dep:<project_key>/<from_component>-><to_component>[:<kind>]' for internal dependencies."
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "verified",
+        "implemented_unverified",
+        "partial",
+        "unknown"
+      ]
+    },
+    "catalogState": {
+      "type": "string",
+      "enum": [
+        "valid",
+        "invalid",
+        "missing",
+        "unsupported_schema",
+        "unavailable"
+      ]
+    },
+    "projectEntry": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "project_key",
+        "canonical_workspace",
+        "workspace_fingerprint",
+        "labels",
+        "registry_numbers",
+        "available",
+        "catalog_state",
+        "graph_hash",
+        "catalog_hash",
+        "git",
+        "status_counts"
+      ],
+      "properties": {
+        "project_key": {
+          "$ref": "#/$defs/projectKey"
+        },
+        "canonical_workspace": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^/"
+        },
+        "workspace_fingerprint": {
+          "$ref": "#/$defs/hash256"
+        },
+        "labels": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "registry_numbers": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "catalog_state": {
+          "$ref": "#/$defs/catalogState"
+        },
+        "graph_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 256,
+          "description": "The project's execution-graph hash exactly as stored; null when the document could not be loaded."
+        },
+        "catalog_hash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/hash256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "git": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "commit",
+            "dirty",
+            "unavailable_reason"
+          ],
+          "properties": {
+            "commit": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/gitCommit"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "dirty": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "unavailable_reason": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 512
+            }
+          }
+        },
+        "status_counts": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "verified",
+            "implemented_unverified",
+            "partial",
+            "unknown"
+          ],
+          "properties": {
+            "verified": {
+              "$ref": "#/$defs/count"
+            },
+            "implemented_unverified": {
+              "$ref": "#/$defs/count"
+            },
+            "partial": {
+              "$ref": "#/$defs/count"
+            },
+            "unknown": {
+              "$ref": "#/$defs/count"
+            }
+          }
+        }
+      }
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "id",
+        "kind",
+        "project_key",
+        "key",
+        "title"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/nodeId"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "project",
+            "component",
+            "capability"
+          ]
+        },
+        "project_key": {
+          "$ref": "#/$defs/projectKey"
+        },
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+          "description": "The un-namespaced local key (for project nodes, equal to project_key's slug-and-fingerprint form is not required; use the project_key itself)."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "component_kind": {
+          "type": "string",
+          "maxLength": 32
+        }
+      }
+    },
+    "edge": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "id",
+        "type",
+        "origin_project_key",
+        "from",
+        "to",
+        "resolution",
+        "cycle_group"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/edgeId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "depends_on",
+            "uses_component",
+            "derived_from",
+            "forked_from",
+            "supersedes",
+            "shares_component",
+            "related_to",
+            "internal_dependency"
+          ]
+        },
+        "origin_project_key": {
+          "$ref": "#/$defs/projectKey"
+        },
+        "from": {
+          "$ref": "#/$defs/nodeId"
+        },
+        "to": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "node_id",
+            "raw"
+          ],
+          "properties": {
+            "node_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/nodeId"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Resolved target node; null when resolution is 'unresolved' or 'ambiguous'."
+            },
+            "raw": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": true,
+              "description": "The original target specifier from the source catalog, preserved verbatim for unresolved/ambiguous edges; null for resolved edges."
+            }
+          }
+        },
+        "resolution": {
+          "type": "string",
+          "enum": [
+            "resolved",
+            "unresolved",
+            "ambiguous",
+            "self"
+          ]
+        },
+        "cycle_group": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Index into the deterministic cycle numbering when this edge participates in a cross-project cycle; null otherwise."
+        },
+        "confidence": {
+          "type": "string",
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ]
+        }
+      }
+    },
+    "viewDiagnostic": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "code",
+        "severity",
+        "message",
+        "project_key",
+        "edge_id"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "ambiguous_alias",
+            "catalog_bound_exceeded",
+            "component_key_collision",
+            "cross_project_cycle",
+            "duplicate_alias",
+            "duplicate_link_key",
+            "invalid_catalog",
+            "invalid_project_document",
+            "missing_catalog",
+            "missing_project_fractal",
+            "project_key_collision",
+            "self_link",
+            "unavailable_workspace",
+            "unresolved_link_component",
+            "unresolved_link_target",
+            "unsupported_catalog_schema",
+            "view_truncated"
+          ]
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "info"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "project_key": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/projectKey"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "edge_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/edgeId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "context": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      }
+    },
+    "sourceProvenance": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "project_key",
+        "canonical_workspace",
+        "relative_path",
+        "project_fractal_sha256",
+        "size_bytes",
+        "graph_hash",
+        "catalog_hash"
+      ],
+      "properties": {
+        "project_key": {
+          "$ref": "#/$defs/projectKey"
+        },
+        "canonical_workspace": {
+          "type": "string",
+          "pattern": "^/",
+          "maxLength": 1024
+        },
+        "relative_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[^/\\\\~]"
+        },
+        "project_fractal_sha256": {
+          "$ref": "#/$defs/hash256",
+          "description": "SHA-256 of the exact on-disk bytes read; re-hashing after composition MUST match (read-only proof)."
+        },
+        "size_bytes": {
+          "$ref": "#/$defs/count"
+        },
+        "graph_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 256
+        },
+        "catalog_hash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/hash256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "unavailableEntry": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "canonical_workspace",
+        "reason",
+        "registry_numbers"
+      ],
+      "properties": {
+        "canonical_workspace": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "registry_numbers": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "schema": "fractal.master_graph_view.v1",
+      "inventory_hash": "sha256:a0bbf8551226effda0186e95c0c2a0ae7efb5edc67d77b992f2b4ec5342b7baa",
+      "summary": {
+        "projects_total": 3,
+        "available_inventory_count": 2,
+        "audited_available": 2,
+        "invalid_catalogs": 0,
+        "node_count": 6,
+        "edge_count": 3,
+        "links_resolved": 1,
+        "links_unresolved": 1,
+        "cycle_count": 0,
+        "diagnostic_counts": {
+          "error": 0,
+          "warning": 2,
+          "info": 0
+        }
+      },
+      "projects": [
+        {
+          "project_key": "fractal-cli-bbbfd315b970",
+          "canonical_workspace": "/Users/jamesstar/fractal-cli",
+          "workspace_fingerprint": "sha256:bbbfd315b97032d8324f48b8ab1b9c749b26fffcb3b2680d26b2df797b29a0de",
+          "labels": [
+            "fractal-cli"
+          ],
+          "registry_numbers": [
+            18
+          ],
+          "available": true,
+          "catalog_state": "valid",
+          "graph_hash": "sha256:9b9b72c888c3bf318515a95dc79c16af21175cb1ead37c3a742839b4e8de48bb",
+          "catalog_hash": "sha256:7996e73720de288102cb1b0af161830086f2f09ed38449c01a3a087b99dd913d",
+          "git": {
+            "commit": "56df19ed4dd0f19b56fc2c10faaa40278dc07936",
+            "dirty": true,
+            "unavailable_reason": null
+          },
+          "status_counts": {
+            "verified": 2,
+            "implemented_unverified": 1,
+            "partial": 0,
+            "unknown": 0
+          }
+        },
+        {
+          "project_key": "fractal-efficiency-yfzdff-fe96f21dda82",
+          "canonical_workspace": "/Users/jamesstar/fractal-efficiency.yFzdFF",
+          "workspace_fingerprint": "sha256:fe96f21dda82b510eee6d8c9aa48f3d89134180a836ac7816ccfe5b43713d159",
+          "labels": [
+            "fractal-efficiency.yFzdFF"
+          ],
+          "registry_numbers": [
+            32
+          ],
+          "available": true,
+          "catalog_state": "valid",
+          "graph_hash": "sha256:3e4043e530b4b6079a71e12ff5df7457d26bf9dd6c55d2ee7035ae39d3b45ab6",
+          "catalog_hash": "sha256:959c87020618c71d818fb6547b80c6435cbf3b304ea781876e907c9c7e96d39d",
+          "git": {
+            "commit": "df332a6ab5a093efe40fe914858de07829f24a93",
+            "dirty": true,
+            "unavailable_reason": null
+          },
+          "status_counts": {
+            "verified": 0,
+            "implemented_unverified": 1,
+            "partial": 0,
+            "unknown": 0
+          }
+        }
+      ],
+      "nodes": [
+        {
+          "id": "capability:fractal-cli-bbbfd315b970/canonical-project-persistence",
+          "kind": "capability",
+          "project_key": "fractal-cli-bbbfd315b970",
+          "key": "canonical-project-persistence",
+          "title": "Locked, validated, atomic persistence of .fractal/project.fractal",
+          "status": "verified"
+        },
+        {
+          "id": "component:fractal-cli-bbbfd315b970/fractal-chain",
+          "kind": "component",
+          "project_key": "fractal-cli-bbbfd315b970",
+          "key": "fractal-chain",
+          "title": "fractal-chain",
+          "status": "implemented_unverified",
+          "component_kind": "library"
+        },
+        {
+          "id": "component:fractal-cli-bbbfd315b970/fractal-cli-bin",
+          "kind": "component",
+          "project_key": "fractal-cli-bbbfd315b970",
+          "key": "fractal-cli-bin",
+          "title": "fractal-cli",
+          "status": "verified",
+          "component_kind": "binary"
+        },
+        {
+          "id": "component:fractal-efficiency-yfzdff-fe96f21dda82/fractal-chain",
+          "kind": "component",
+          "project_key": "fractal-efficiency-yfzdff-fe96f21dda82",
+          "key": "fractal-chain",
+          "title": "fractal-chain",
+          "status": "implemented_unverified",
+          "component_kind": "library"
+        },
+        {
+          "id": "project:fractal-cli-bbbfd315b970",
+          "kind": "project",
+          "project_key": "fractal-cli-bbbfd315b970",
+          "key": "fractal-cli-bbbfd315b970",
+          "title": "fractal-cli"
+        },
+        {
+          "id": "project:fractal-efficiency-yfzdff-fe96f21dda82",
+          "kind": "project",
+          "project_key": "fractal-efficiency-yfzdff-fe96f21dda82",
+          "key": "fractal-efficiency-yfzdff-fe96f21dda82",
+          "title": "fractal-efficiency.yFzdFF"
+        }
+      ],
+      "edges": [
+        {
+          "id": "dep:fractal-cli-bbbfd315b970/fractal-cli-bin->fractal-chain:build",
+          "type": "internal_dependency",
+          "origin_project_key": "fractal-cli-bbbfd315b970",
+          "from": "component:fractal-cli-bbbfd315b970/fractal-cli-bin",
+          "to": {
+            "node_id": "component:fractal-cli-bbbfd315b970/fractal-chain",
+            "raw": null
+          },
+          "resolution": "resolved",
+          "cycle_group": null
+        },
+        {
+          "id": "link:fractal-cli-bbbfd315b970/shares-fractal-chain",
+          "type": "shares_component",
+          "origin_project_key": "fractal-cli-bbbfd315b970",
+          "from": "component:fractal-cli-bbbfd315b970/fractal-chain",
+          "to": {
+            "node_id": "component:fractal-efficiency-yfzdff-fe96f21dda82/fractal-chain",
+            "raw": null
+          },
+          "resolution": "resolved",
+          "cycle_group": null,
+          "confidence": "high"
+        },
+        {
+          "id": "link:fractal-efficiency-yfzdff-fe96f21dda82/depends-on-voice-models",
+          "type": "depends_on",
+          "origin_project_key": "fractal-efficiency-yfzdff-fe96f21dda82",
+          "from": "project:fractal-efficiency-yfzdff-fe96f21dda82",
+          "to": {
+            "node_id": null,
+            "raw": {
+              "project_key": null,
+              "alias": "fractal-voice-models",
+              "component_key": null
+            }
+          },
+          "resolution": "unresolved",
+          "cycle_group": null,
+          "confidence": "medium"
+        }
+      ],
+      "diagnostics": [
+        {
+          "code": "unavailable_workspace",
+          "severity": "warning",
+          "message": "registry workspace does not exist and was recorded without fabricating content",
+          "project_key": null,
+          "edge_id": null,
+          "context": "/Users/jamesstar/fractal-rust-convergence.MtjZnv/fractal-cli"
+        },
+        {
+          "code": "unresolved_link_target",
+          "severity": "warning",
+          "message": "alias 'fractal-voice-models' matched no project_key, label, remote fingerprint, or workspace fingerprint in the frozen inventory",
+          "project_key": "fractal-efficiency-yfzdff-fe96f21dda82",
+          "edge_id": "link:fractal-efficiency-yfzdff-fe96f21dda82/depends-on-voice-models",
+          "context": "cross_graph_links[key=depends-on-voice-models]"
+        }
+      ],
+      "sources": [
+        {
+          "project_key": "fractal-cli-bbbfd315b970",
+          "canonical_workspace": "/Users/jamesstar/fractal-cli",
+          "relative_path": ".fractal/project.fractal",
+          "project_fractal_sha256": "sha256:07afdc826a8d766ee1dbef8681d146c8d1473e337a96958a6c5582da0cbc7a75",
+          "size_bytes": 55656,
+          "graph_hash": "sha256:9b9b72c888c3bf318515a95dc79c16af21175cb1ead37c3a742839b4e8de48bb",
+          "catalog_hash": "sha256:7996e73720de288102cb1b0af161830086f2f09ed38449c01a3a087b99dd913d"
+        },
+        {
+          "project_key": "fractal-efficiency-yfzdff-fe96f21dda82",
+          "canonical_workspace": "/Users/jamesstar/fractal-efficiency.yFzdFF",
+          "relative_path": ".fractal/project.fractal",
+          "project_fractal_sha256": "sha256:7bb6f30ce4f793d4a2819c3adb1af777c904140a88af19ff98f9071319ea73c9",
+          "size_bytes": 58267,
+          "graph_hash": "sha256:3e4043e530b4b6079a71e12ff5df7457d26bf9dd6c55d2ee7035ae39d3b45ab6",
+          "catalog_hash": "sha256:959c87020618c71d818fb6547b80c6435cbf3b304ea781876e907c9c7e96d39d"
+        }
+      ],
+      "unavailable": [
+        {
+          "canonical_workspace": "/Users/jamesstar/fractal-rust-convergence.MtjZnv/fractal-cli",
+          "reason": "workspace_path_does_not_exist",
+          "registry_numbers": [
+            33
+          ]
+        }
+      ],
+      "view_hash": "sha256:71f2a6154872be950c255edb35872d483d7a060739d40b28aa15f30877e06ef5"
+    }
+  ]
+}

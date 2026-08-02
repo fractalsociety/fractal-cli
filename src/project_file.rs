@@ -11,6 +11,11 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+// Included here so catalog persistence can ship without clap/main wiring yet.
+// Later command registration may re-declare this as a crate-root module.
+#[path = "project_catalog.rs"]
+pub(crate) mod project_catalog;
+
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct FractalProject {
     pub(crate) schema: String,
@@ -1425,6 +1430,16 @@ fn validate(document: &FractalProject) -> Result<()> {
         reject_secret_fields(&encoded)
             .context("efficiency envelope contains forbidden credential-shaped fields")?;
     }
+    if let Some(catalog) = document.extra.get("catalog") {
+        let schema = catalog.get("schema").and_then(Value::as_str).unwrap_or("");
+        if schema == project_catalog::CATALOG_SCHEMA {
+            project_catalog::validate_value(catalog)
+                .map_err(|error| anyhow::anyhow!("invalid fractal.catalog.v1 document: {error}"))?;
+        } else if schema.is_empty() {
+            bail!("catalog envelope is missing schema");
+        }
+        // Unsupported future catalog schemas stay opaque; do not partial-parse.
+    }
     if let Some(execution) = &document.execution {
         if execution.schema != "fractal.execution_state.v1"
             || !matches!(
@@ -1548,6 +1563,26 @@ pub(crate) fn mutate_document(
     update(&mut document)?;
     document.updated_at = timestamp();
     write_document(workspace, &document)
+}
+
+/// Guarded catalog write: validate a typed `fractal.catalog.v1` envelope, then
+/// atomically replace only `extra["catalog"]`. Sibling identity, graph,
+/// graph_hash, execution, learning, efficiency, and other unknown top-level
+/// fields are preserved. This is not a generic JSON mutation API.
+pub(crate) fn replace_catalog(
+    workspace: &Path,
+    catalog: &project_catalog::CatalogV1,
+) -> Result<()> {
+    project_catalog::validate(catalog)
+        .map_err(|error| anyhow::anyhow!("invalid fractal.catalog.v1 document: {error}"))?;
+    let encoded = serde_json::to_value(catalog)
+        .map_err(|error| anyhow::anyhow!("encode fractal.catalog.v1: {error}"))?;
+    reject_secret_fields(&encoded)
+        .context("catalog envelope contains forbidden credential-shaped fields")?;
+    mutate_document(workspace, |document| {
+        document.extra.insert("catalog".to_owned(), encoded.clone());
+        Ok(())
+    })
 }
 
 pub(crate) fn project_timestamp() -> String {
@@ -2319,6 +2354,215 @@ mod tests {
         );
         assert_eq!(document.graph["nodes"][1]["future_child_field"], json!(7));
         assert_eq!(document.learning.nodes["repair"].depends_on, vec!["build"]);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    fn sample_catalog_for(workspace_label: &str) -> project_catalog::CatalogV1 {
+        use project_catalog::*;
+        let canonical = format!("/tmp/{workspace_label}");
+        let evidence = CatalogEvidence {
+            path: "src/project_file.rs".to_owned(),
+            sha256: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            kind: CatalogEvidenceKind::Source,
+            observed_commit: Some("56df19ed4dd0f19b56fc2c10faaa40278dc07936".to_owned()),
+            spans: None,
+            note: None,
+            extra: BTreeMap::new(),
+        };
+        let mut catalog = CatalogV1 {
+            schema: CATALOG_SCHEMA.to_owned(),
+            project_key: project_key(&canonical),
+            generated_at: "2026-08-02T14:05:00Z".to_owned(),
+            catalog_hash: String::new(),
+            source: CatalogSource {
+                canonical_workspace: canonical.clone(),
+                workspace_fingerprint: workspace_fingerprint(&canonical),
+                registry_numbers: vec![1],
+                labels: vec![workspace_label.to_owned()],
+                git: CatalogGit {
+                    is_git_repository: true,
+                    commit: Some("56df19ed4dd0f19b56fc2c10faaa40278dc07936".to_owned()),
+                    dirty: Some(false),
+                    dirty_fingerprint: None,
+                    unavailable_reason: None,
+                    remotes: vec![],
+                    extra: BTreeMap::new(),
+                },
+                extra: BTreeMap::new(),
+            },
+            audit: CatalogAudit {
+                auditor: "fractal graph audit".to_owned(),
+                cli_version: Some("0.9.4".to_owned()),
+                inventory_hash:
+                    "sha256:a0bbf8551226effda0186e95c0c2a0ae7efb5edc67d77b992f2b4ec5342b7baa"
+                        .to_owned(),
+                started_at: "2026-08-02T14:03:12Z".to_owned(),
+                finished_at: "2026-08-02T14:05:00Z".to_owned(),
+                bounds: CatalogBounds {
+                    max_catalog_bytes: Some(DEFAULT_MAX_CATALOG_BYTES as u64),
+                    max_evidence_per_claim: Some(20),
+                    max_log_excerpt_chars: Some(1024),
+                    max_string_chars: Some(2048),
+                    test_timeout_ms: Some(600_000),
+                    extra: BTreeMap::new(),
+                },
+                truncated: false,
+                evidence_counts: None,
+                extra: BTreeMap::new(),
+            },
+            capabilities: vec![CatalogCapability {
+                key: "canonical-project-persistence".to_owned(),
+                title: "Persistence".to_owned(),
+                description: None,
+                status: CatalogStatus::Verified,
+                evidence: vec![evidence.clone()],
+                test_keys: vec!["cargo-test".to_owned()],
+                component_keys: vec!["fractal-cli-bin".to_owned()],
+                extra: BTreeMap::new(),
+            }],
+            components: vec![CatalogComponent {
+                key: "fractal-cli-bin".to_owned(),
+                name: "fractal-cli".to_owned(),
+                kind: CatalogComponentKind::Binary,
+                paths: vec!["src".to_owned()],
+                description: None,
+                status: CatalogStatus::Verified,
+                evidence: vec![evidence.clone()],
+                extra: BTreeMap::new(),
+            }],
+            dependencies: vec![],
+            tests: vec![CatalogTest {
+                key: "cargo-test".to_owned(),
+                command: "cargo test --no-fail-fast".to_owned(),
+                classification: CatalogTestClassification::Pass,
+                exit_code: Some(0),
+                duration_ms: Some(10),
+                log_sha256: Some(
+                    "sha256:1a46b67449e33a32d4f3335cc7072442d774a058db25255a3240579d45c9a0e1"
+                        .to_owned(),
+                ),
+                log_excerpt: None,
+                evidence: vec![evidence.clone()],
+                extra: BTreeMap::new(),
+            }],
+            decisions: vec![],
+            cross_graph_links: vec![],
+            diagnostics: vec![],
+            extra: BTreeMap::new(),
+        };
+        normalize(&mut catalog).expect("normalize catalog fixture");
+        catalog
+    }
+
+    #[test]
+    fn replace_catalog_preserves_sibling_fields_and_unknown_extras() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_catalog",
+            "nodes": [{"id": "build", "capability": "code.generate", "instruction": "Build"}],
+            "edges": [],
+            "future_graph_field": {"kept": true}
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        persist(&workspace, &graph, "Catalog Preserve")?;
+        mutate_document(&workspace, |document| {
+            document.extra.insert(
+                "future_project_field".to_owned(),
+                json!({"must": "survive"}),
+            );
+            document.efficiency = Some(crate::efficiency::EfficiencyData::for_config(
+                crate::efficiency::EfficiencyMode::Observe,
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ));
+            Ok(())
+        })?;
+        checkout_start_node(&workspace, "build", "agent-1", "Agent One")?;
+
+        let before = load(&workspace)?;
+        let before_graph = before.graph.clone();
+        let before_hash = before.graph_hash.clone();
+        let before_execution = serde_json::to_value(&before.execution)?;
+        let before_learning = serde_json::to_value(&before.learning)?;
+        let before_efficiency = serde_json::to_value(&before.efficiency)?;
+        let before_project = serde_json::to_value(&before.project)?;
+        let before_future = before.extra.get("future_project_field").cloned();
+
+        let catalog = sample_catalog_for("catalog-preserve-fixture");
+        replace_catalog(&workspace, &catalog)?;
+
+        let after = load(&workspace)?;
+        assert_eq!(after.graph, before_graph);
+        assert_eq!(after.graph_hash, before_hash);
+        assert_eq!(serde_json::to_value(&after.execution)?, before_execution);
+        assert_eq!(serde_json::to_value(&after.learning)?, before_learning);
+        assert_eq!(serde_json::to_value(&after.efficiency)?, before_efficiency);
+        assert_eq!(serde_json::to_value(&after.project)?, before_project);
+        assert_eq!(
+            after.extra.get("future_project_field").cloned(),
+            before_future
+        );
+        assert_eq!(
+            after.extra["catalog"]["project_key"],
+            json!(catalog.project_key)
+        );
+        assert_eq!(after.graph["future_graph_field"], json!({"kept": true}));
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_catalog_replace_leaves_on_disk_bytes_unchanged() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [{"id": "build", "capability": "code.generate", "instruction": "Build"}],
+            "edges": []
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        persist(&workspace, &graph, "Catalog Reject")?;
+        let before_bytes = fs::read(path(&workspace))?;
+
+        let mut catalog = sample_catalog_for("catalog-reject-fixture");
+        catalog.catalog_hash =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned();
+        let error = replace_catalog(&workspace, &catalog)
+            .expect_err("invalid catalog hash must be refused");
+        assert!(error.to_string().contains("catalog_hash"));
+
+        let after_bytes = fs::read(path(&workspace))?;
+        assert_eq!(before_bytes, after_bytes);
+        assert!(!load(&workspace)?.extra.contains_key("catalog"));
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn secret_catalog_replace_is_rejected_without_mutation() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [],
+            "edges": []
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        persist(&workspace, &graph, "Catalog Secret")?;
+        let before_bytes = fs::read(path(&workspace))?;
+
+        let mut catalog = sample_catalog_for("catalog-secret-fixture");
+        catalog
+            .extra
+            .insert("token".to_owned(), json!("must-not-leak"));
+        project_catalog::normalize(&mut catalog).unwrap();
+        let error =
+            replace_catalog(&workspace, &catalog).expect_err("secret catalog must be refused");
+        assert!(error.to_string().contains("forbidden credential field"));
+        assert_eq!(before_bytes, fs::read(path(&workspace))?);
         fs::remove_dir_all(workspace)?;
         Ok(())
     }
