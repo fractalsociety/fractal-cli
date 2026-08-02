@@ -1,6 +1,7 @@
 //! Compact, portable learning records stored beside the immutable graph.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +41,8 @@ pub(crate) struct Executor {
     pub(crate) model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) version: Option<String>,
+    #[serde(flatten)]
+    pub(crate) extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -50,6 +53,8 @@ pub(crate) struct Verification {
     pub(crate) passed: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) evidence_refs: Vec<String>,
+    #[serde(flatten)]
+    pub(crate) extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -91,6 +96,8 @@ pub(crate) struct NodeRecord {
     pub(crate) notes: Option<String>,
     #[serde(default)]
     pub(crate) reopen_count: u32,
+    #[serde(flatten)]
+    pub(crate) extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -101,6 +108,8 @@ pub(crate) struct GraphEditAction {
     pub(crate) target: Option<String>,
     #[serde(default)]
     pub(crate) created_nodes: Vec<String>,
+    #[serde(flatten)]
+    pub(crate) extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -109,6 +118,8 @@ pub(crate) struct EventualEffect {
     pub(crate) success: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rework_reduced: Option<bool>,
+    #[serde(flatten)]
+    pub(crate) extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -120,6 +131,8 @@ pub(crate) struct GraphEditEvent {
     pub(crate) timestamp: String,
     #[serde(default)]
     pub(crate) eventual_effect: EventualEffect,
+    #[serde(flatten)]
+    pub(crate) extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -128,6 +141,8 @@ pub(crate) struct AcceptanceResult {
     pub(crate) passed: bool,
     #[serde(default)]
     pub(crate) evidence_refs: Vec<String>,
+    #[serde(flatten)]
+    pub(crate) extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -144,8 +159,8 @@ pub(crate) struct GraphOutcome {
     pub(crate) total_agent_time_seconds: Option<f64>,
     #[serde(default)]
     pub(crate) maximum_parallelism: u32,
-    #[serde(default)]
-    pub(crate) total_cost: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) total_cost: Option<f64>,
     #[serde(default)]
     pub(crate) retry_count: u32,
     #[serde(default)]
@@ -156,10 +171,14 @@ pub(crate) struct GraphOutcome {
     pub(crate) human_intervention_count: u32,
     #[serde(default)]
     pub(crate) verification_coverage: f64,
+    #[serde(default)]
+    pub(crate) verification_coverage_denominator: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) stopped_too_early: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) expanded_unnecessarily: Option<bool>,
+    #[serde(flatten)]
+    pub(crate) extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -171,6 +190,8 @@ pub(crate) struct LearningData {
     pub(crate) graph_edits: Vec<GraphEditEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) outcome: Option<GraphOutcome>,
+    #[serde(flatten)]
+    pub(crate) extra: BTreeMap<String, Value>,
 }
 
 impl Default for LearningData {
@@ -180,8 +201,88 @@ impl Default for LearningData {
             nodes: BTreeMap::new(),
             graph_edits: Vec::new(),
             outcome: None,
+            extra: BTreeMap::new(),
         }
     }
+}
+
+pub(crate) fn normalize(mut data: LearningData, graph: &Value, now: &str) -> LearningData {
+    let mut dependencies: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for edge in graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let (Some(from), Some(to)) = (
+            edge.get("from").and_then(Value::as_str),
+            edge.get("to").and_then(Value::as_str),
+        ) {
+            dependencies
+                .entry(to.to_owned())
+                .or_default()
+                .push(from.to_owned());
+        }
+    }
+    for node in graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = node.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let depends_on = dependencies.remove(id).unwrap_or_default();
+        let capability = node
+            .get("capability")
+            .and_then(Value::as_str)
+            .unwrap_or("implementation");
+        let node_type = if capability.starts_with("project.tests") || capability.contains("verify")
+        {
+            "verification"
+        } else if capability.starts_with("control.") {
+            "control"
+        } else {
+            "implementation"
+        };
+        let objective = node
+            .get("title")
+            .or_else(|| node.get("instruction"))
+            .and_then(Value::as_str)
+            .unwrap_or(id)
+            .chars()
+            .take(1_000)
+            .collect::<String>();
+        data.nodes
+            .entry(id.to_owned())
+            .and_modify(|record| {
+                record.node_id = id.to_owned();
+                record.depends_on = depends_on.clone();
+                if record.node_type.trim().is_empty() {
+                    record.node_type = node_type.to_owned();
+                }
+                if record.objective.trim().is_empty() {
+                    record.objective = objective.clone();
+                }
+                if record.created_at.is_none() {
+                    record.created_at = Some(now.to_owned());
+                }
+                if record.ready_at.is_none() && depends_on.is_empty() {
+                    record.ready_at = Some(now.to_owned());
+                }
+            })
+            .or_insert_with(|| NodeRecord {
+                node_id: id.to_owned(),
+                node_type: node_type.to_owned(),
+                objective,
+                ready_at: depends_on.is_empty().then(|| now.to_owned()),
+                depends_on,
+                created_at: Some(now.to_owned()),
+                ..NodeRecord::default()
+            });
+    }
+    data
 }
 
 pub(crate) fn validate(data: &LearningData) -> Result<(), String> {
@@ -241,92 +342,309 @@ fn validate_reference(reference: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn aggregate(data: &LearningData) -> GraphOutcome {
+    aggregate_with_acceptance(data, Vec::new())
+}
+
+pub(crate) fn aggregate_for_graph(data: &LearningData, graph: &Value) -> GraphOutcome {
+    let mut criteria = acceptance_from_graph(graph);
+    if let Some(values) = data
+        .extra
+        .get("acceptance_criteria")
+        .and_then(Value::as_array)
+    {
+        criteria.extend(values.iter().filter_map(Value::as_str).map(str::to_owned));
+        criteria.sort();
+        criteria.dedup();
+    }
+    aggregate_with_acceptance(data, criteria)
+}
+
+fn aggregate_with_acceptance(data: &LearningData, criteria: Vec<String>) -> GraphOutcome {
     let nodes: Vec<_> = data.nodes.values().collect();
+    let verification_denominator = nodes
+        .iter()
+        .filter(|node| node.node_type != "control")
+        .count();
     let verified = nodes
         .iter()
+        .filter(|node| node.node_type != "control")
         .filter(|node| node.verification.as_ref().and_then(|v| v.passed).is_some())
         .count();
-    let terminal_success = nodes.iter().all(|node| {
-        matches!(
-            node.outcome,
-            Some(
-                NodeOutcome::VerifiedSuccess
-                    | NodeOutcome::UnverifiedSuccess
-                    | NodeOutcome::HumanCompleted
-                    | NodeOutcome::Superseded
-            )
-        )
+    let intervals = complete_intervals(&nodes);
+    let total_duration_seconds = intervals.as_ref().and_then(|intervals| {
+        intervals
+            .iter()
+            .map(|(_, start, _)| *start)
+            .min()
+            .zip(intervals.iter().map(|(_, _, finish)| *finish).max())
+            .map(|(start, finish)| finish.saturating_sub(start) as f64)
     });
-    let intervals = nodes
-        .iter()
-        .filter_map(|node| {
-            Some((
-                node.node_id.as_str(),
-                parse_rfc3339_seconds(node.started_at.as_deref()?)?,
-                parse_rfc3339_seconds(node.finished_at.as_deref()?)?,
-            ))
-        })
-        .collect::<Vec<_>>();
-    let total_duration_seconds = intervals
-        .iter()
-        .map(|(_, start, _)| *start)
-        .min()
-        .zip(intervals.iter().map(|(_, _, finish)| *finish).max())
-        .map(|(start, finish)| finish.saturating_sub(start) as f64);
-    let total_agent_time_seconds = (!intervals.is_empty()).then(|| {
+    let total_agent_time_seconds = intervals.as_ref().map(|intervals| {
         intervals
             .iter()
             .map(|(_, start, finish)| finish.saturating_sub(*start))
             .sum::<u64>() as f64
     });
-    let mut events = intervals
+    let maximum_parallelism = intervals
+        .as_ref()
+        .map(|intervals| observed_parallelism(intervals))
+        .unwrap_or(0);
+    let total_cost = if nodes.is_empty() {
+        None
+    } else {
+        nodes
+            .iter()
+            .map(|node| node.actual_cost)
+            .try_fold(0.0, |sum, cost| cost.map(|cost| sum + cost))
+    };
+    let acceptance_criteria = acceptance_results(&criteria, &nodes);
+    let failed_acceptance = acceptance_criteria
         .iter()
-        .flat_map(|(_, start, finish)| [(*start, 1_i32), (*finish, -1_i32)])
-        .collect::<Vec<_>>();
-    events.sort_by_key(|(at, delta)| (*at, *delta));
-    let mut active = 0_i32;
-    let mut maximum_parallelism = 0_i32;
-    for (_, delta) in events {
-        active += delta;
-        maximum_parallelism = maximum_parallelism.max(active);
-    }
+        .any(|criterion| !criterion.passed);
+    let final_verified_success = final_verified_success(&nodes, failed_acceptance);
     GraphOutcome {
-        final_verified_success: Some(
-            terminal_success
-                && nodes
-                    .iter()
-                    .filter(|n| n.node_type != "control")
-                    .all(|node| {
-                        matches!(
-                            node.outcome,
-                            Some(
-                                NodeOutcome::VerifiedSuccess
-                                    | NodeOutcome::HumanCompleted
-                                    | NodeOutcome::Superseded
-                            )
-                        )
-                    }),
-        ),
+        final_verified_success,
+        acceptance_criteria,
         total_duration_seconds,
         critical_path_duration_seconds: critical_path_seconds(data),
         total_agent_time_seconds,
-        maximum_parallelism: maximum_parallelism as u32,
-        total_cost: nodes.iter().filter_map(|node| node.actual_cost).sum(),
+        maximum_parallelism,
+        total_cost,
         retry_count: nodes
             .iter()
             .map(|node| node.attempt_count.saturating_sub(1))
             .sum(),
         reopened_node_count: nodes.iter().filter(|node| node.reopen_count > 0).count() as u32,
         dead_or_unused_node_count: unused_nodes(data),
-        human_intervention_count: nodes.iter().filter(|node| node.human_intervention).count()
-            as u32,
-        verification_coverage: if nodes.is_empty() {
+        human_intervention_count: human_intervention_count(data),
+        verification_coverage: if verification_denominator == 0 {
             0.0
         } else {
-            verified as f64 / nodes.len() as f64
+            verified as f64 / verification_denominator as f64
         },
+        verification_coverage_denominator: verification_denominator as u32,
+        stopped_too_early: stopped_too_early(data, final_verified_success),
+        expanded_unnecessarily: expanded_unnecessarily(data),
         ..GraphOutcome::default()
+    }
+}
+
+/// Return all recorded, parseable node intervals only when every node has a
+/// trustworthy start and finish timestamp.  A partial set would make duration
+/// and concurrency metrics look more precise than the historical record is.
+fn complete_intervals<'a>(nodes: &[&'a NodeRecord]) -> Option<Vec<(&'a str, u64, u64)>> {
+    if nodes.is_empty() {
+        return None;
+    }
+    nodes
+        .iter()
+        .map(|node| {
+            let start = parse_rfc3339_seconds(node.started_at.as_deref()?)?;
+            let finish = parse_rfc3339_seconds(node.finished_at.as_deref()?)?;
+            (finish >= start).then_some((node.node_id.as_str(), start, finish))
+        })
+        .collect()
+}
+
+/// Sweep half-open intervals and report the largest number active at once.
+/// Endings are applied before starts at a shared timestamp so adjacent nodes
+/// do not appear concurrent; zero-length intervals still count as one start.
+fn observed_parallelism(intervals: &[(&str, u64, u64)]) -> u32 {
+    let mut events: BTreeMap<u64, (u32, u32)> = BTreeMap::new();
+    for (_, start, finish) in intervals {
+        let entry = events.entry(*start).or_default();
+        entry.0 = entry.0.saturating_add(1);
+        let entry = events.entry(*finish).or_default();
+        entry.1 = entry.1.saturating_add(1);
+    }
+    let mut active = 0_u32;
+    let mut maximum = 0_u32;
+    for (_, (starts, finishes)) in events {
+        active = active.saturating_sub(finishes);
+        active = active.saturating_add(starts);
+        maximum = maximum.max(active);
+    }
+    maximum
+}
+
+/// Extract criterion IDs from graph metadata.  Compiled graphs historically
+/// placed this metadata in different envelopes, so accept the small set of
+/// additive locations while keeping ordering deterministic and de-duplicated.
+fn acceptance_from_graph(graph: &Value) -> Vec<String> {
+    let locations = [
+        graph.get("acceptance_criteria"),
+        graph
+            .get("prd")
+            .and_then(|value| value.get("acceptance_criteria")),
+        graph
+            .get("metadata")
+            .and_then(|value| value.get("acceptance_criteria")),
+        graph.get("acceptance"),
+    ];
+    let mut ids = BTreeSet::new();
+    for location in locations.into_iter().flatten() {
+        let Some(entries) = location.as_array() else {
+            continue;
+        };
+        for entry in entries {
+            let id = entry
+                .as_str()
+                .or_else(|| entry.get("id").and_then(Value::as_str))
+                .or_else(|| entry.get("criterion_id").and_then(Value::as_str));
+            if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
+                ids.insert(id.trim().chars().take(120).collect::<String>());
+            }
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn acceptance_results(criteria: &[String], nodes: &[&NodeRecord]) -> Vec<AcceptanceResult> {
+    criteria
+        .iter()
+        .map(|criterion| {
+            let matching = nodes.iter().copied().filter(|node| {
+                node_matches_criterion(node, criterion)
+                    || (criteria.len() == 1 && is_verification_node(node))
+            });
+            let matching = matching.collect::<Vec<_>>();
+            let passed = !matching.is_empty()
+                && matching.iter().any(|node| {
+                    node.verification
+                        .as_ref()
+                        .and_then(|verification| verification.passed)
+                        == Some(true)
+                });
+            let mut evidence_refs = BTreeSet::new();
+            for node in matching {
+                if node
+                    .verification
+                    .as_ref()
+                    .and_then(|verification| verification.passed)
+                    == Some(true)
+                {
+                    evidence_refs.extend(
+                        node.verification
+                            .as_ref()
+                            .into_iter()
+                            .flat_map(|verification| verification.evidence_refs.iter().cloned()),
+                    );
+                }
+            }
+            AcceptanceResult {
+                id: criterion.clone(),
+                passed,
+                evidence_refs: evidence_refs.into_iter().collect(),
+                ..AcceptanceResult::default()
+            }
+        })
+        .collect()
+}
+
+fn is_verification_node(node: &NodeRecord) -> bool {
+    node.node_type == "verification"
+        || node.node_id.contains("accept")
+        || node.node_id.contains("verify")
+}
+
+fn node_matches_criterion(node: &NodeRecord, criterion: &str) -> bool {
+    const ID_KEYS: [&str; 5] = [
+        "acceptance_id",
+        "criterion_id",
+        "acceptance_criterion",
+        "acceptance_criteria",
+        "criteria",
+    ];
+    ID_KEYS.iter().any(|key| {
+        let Some(value) = node.extra.get(*key) else {
+            return false;
+        };
+        value.as_str() == Some(criterion)
+            || value
+                .as_array()
+                .is_some_and(|values| values.iter().any(|item| item.as_str() == Some(criterion)))
+    })
+}
+
+fn final_verified_success(nodes: &[&NodeRecord], failed_acceptance: bool) -> Option<bool> {
+    let relevant = nodes
+        .iter()
+        .copied()
+        .filter(|node| node.node_type != "control")
+        .collect::<Vec<_>>();
+    if relevant.is_empty() || relevant.iter().any(|node| node.outcome.is_none()) {
+        return None;
+    }
+    Some(
+        !failed_acceptance
+            && relevant.iter().all(|node| {
+                matches!(
+                    node.outcome,
+                    Some(
+                        NodeOutcome::VerifiedSuccess
+                            | NodeOutcome::HumanCompleted
+                            | NodeOutcome::Superseded
+                    )
+                )
+            }),
+    )
+}
+
+fn human_intervention_count(data: &LearningData) -> u32 {
+    data.nodes
+        .values()
+        .filter(|node| node.human_intervention)
+        .count() as u32
+}
+
+fn stopped_too_early(data: &LearningData, final_verified_success: Option<bool>) -> Option<bool> {
+    if data.nodes.is_empty() {
+        return None;
+    }
+    if data.nodes.values().any(|node| {
+        node.failure_code == Some(FailureCode::PrematureCompletion)
+            || node.outcome == Some(NodeOutcome::Cancelled)
+                && node.failure_code == Some(FailureCode::PrematureCompletion)
+    }) {
+        return Some(true);
+    }
+    if data.graph_edits.iter().any(|event| {
+        event.action.kind == "cancel_node" && event.eventual_effect.success == Some(false)
+    }) {
+        return Some(true);
+    }
+    let all_terminal = data.nodes.values().all(|node| node.outcome.is_some());
+    if !all_terminal {
+        return None;
+    }
+    final_verified_success.map(|_| false)
+}
+
+fn expanded_unnecessarily(data: &LearningData) -> Option<bool> {
+    let expansion = ["add_branch", "add_wave_task", "evolve_graph", "split_node"];
+    let relevant = data
+        .graph_edits
+        .iter()
+        .filter(|event| expansion.contains(&event.action.kind.as_str()))
+        .collect::<Vec<_>>();
+    if relevant
+        .iter()
+        .any(|event| event.eventual_effect.success == Some(false))
+    {
+        return Some(true);
+    }
+    if relevant.is_empty() {
+        return None;
+    }
+    if relevant
+        .iter()
+        .all(|event| event.eventual_effect.success.is_some())
+    {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -403,12 +721,40 @@ fn unused_nodes(data: &LearningData) -> u32 {
     data.nodes
         .values()
         .filter(|node| node.artifacts_produced.is_empty() && !used.contains(&node.node_id))
+        .filter(|node| {
+            !matches!(
+                node.outcome,
+                Some(
+                    NodeOutcome::VerifiedSuccess
+                        | NodeOutcome::UnverifiedSuccess
+                        | NodeOutcome::HumanCompleted
+                )
+            )
+        })
         .count() as u32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_node(
+        id: &str,
+        node_type: &str,
+        start: Option<&str>,
+        finish: Option<&str>,
+        outcome: Option<NodeOutcome>,
+    ) -> NodeRecord {
+        NodeRecord {
+            node_id: id.to_owned(),
+            node_type: node_type.to_owned(),
+            objective: id.to_owned(),
+            started_at: start.map(str::to_owned),
+            finished_at: finish.map(str::to_owned),
+            outcome,
+            ..NodeRecord::default()
+        }
+    }
 
     #[test]
     fn controlled_labels_are_exact() {
@@ -436,5 +782,170 @@ mod tests {
         );
         assert!(serde_json::from_str::<NodeOutcome>("\"running\"").is_err());
         assert!(serde_json::from_str::<FailureCode>("\"internal_error\"").is_err());
+    }
+
+    #[test]
+    fn aggregate_sequential_graph_is_deterministic_and_complete() {
+        let mut first = fixture_node(
+            "first",
+            "implementation",
+            Some("2024-01-01T00:00:00Z"),
+            Some("2024-01-01T00:00:10Z"),
+            Some(NodeOutcome::VerifiedSuccess),
+        );
+        first.verification = Some(Verification {
+            kind: Some("automated".to_owned()),
+            passed: Some(true),
+            evidence_refs: vec!["evidence:first".to_owned()],
+            ..Verification::default()
+        });
+        first.actual_cost = Some(2.0);
+        first.attempt_count = 1;
+        let mut second = fixture_node(
+            "second",
+            "verification",
+            Some("2024-01-01T00:00:10Z"),
+            Some("2024-01-01T00:00:20Z"),
+            Some(NodeOutcome::VerifiedSuccess),
+        );
+        second.depends_on = vec!["first".to_owned()];
+        second.verification = Some(Verification {
+            kind: Some("automated".to_owned()),
+            passed: Some(true),
+            evidence_refs: vec!["evidence:second".to_owned()],
+            ..Verification::default()
+        });
+        second.actual_cost = Some(3.0);
+        second.attempt_count = 1;
+
+        let mut data = LearningData::default();
+        data.nodes.insert("first".to_owned(), first);
+        data.nodes.insert("second".to_owned(), second);
+        let outcome = aggregate(&data);
+
+        assert_eq!(outcome.final_verified_success, Some(true));
+        assert_eq!(outcome.total_duration_seconds, Some(20.0));
+        assert_eq!(outcome.critical_path_duration_seconds, Some(20.0));
+        assert_eq!(outcome.total_agent_time_seconds, Some(20.0));
+        assert_eq!(outcome.maximum_parallelism, 1);
+        assert_eq!(outcome.total_cost, Some(5.0));
+        assert_eq!(outcome.verification_coverage, 1.0);
+        assert_eq!(outcome.verification_coverage_denominator, 2);
+        assert_eq!(outcome.retry_count, 0);
+        assert_eq!(outcome.dead_or_unused_node_count, 0);
+    }
+
+    #[test]
+    fn aggregate_parallel_retry_failure_and_unknown_facts_are_explicit() {
+        let mut good = fixture_node(
+            "good",
+            "implementation",
+            Some("2024-01-01T00:00:00Z"),
+            Some("2024-01-01T00:00:10Z"),
+            Some(NodeOutcome::VerifiedSuccess),
+        );
+        good.verification = Some(Verification {
+            passed: Some(true),
+            ..Verification::default()
+        });
+        let mut failed = fixture_node(
+            "failed",
+            "implementation",
+            Some("2024-01-01T00:00:00Z"),
+            Some("2024-01-01T00:00:10Z"),
+            Some(NodeOutcome::FailedVerification),
+        );
+        failed.verification = Some(Verification {
+            passed: Some(false),
+            ..Verification::default()
+        });
+        failed.failure_code = Some(FailureCode::WeakVerifier);
+        failed.attempt_count = 2;
+        failed.reopen_count = 1;
+        let cancelled = fixture_node(
+            "cancelled",
+            "implementation",
+            None,
+            Some("2024-01-01T00:00:10Z"),
+            Some(NodeOutcome::Cancelled),
+        );
+        let mut data = LearningData::default();
+        data.nodes.insert("good".to_owned(), good);
+        data.nodes.insert("failed".to_owned(), failed);
+        data.nodes.insert("cancelled".to_owned(), cancelled);
+
+        let outcome = aggregate(&data);
+
+        assert_eq!(outcome.final_verified_success, Some(false));
+        assert_eq!(outcome.total_duration_seconds, None);
+        assert_eq!(outcome.total_agent_time_seconds, None);
+        assert_eq!(outcome.maximum_parallelism, 0);
+        assert_eq!(outcome.total_cost, None);
+        assert_eq!(outcome.retry_count, 1);
+        assert_eq!(outcome.reopened_node_count, 1);
+        assert_eq!(outcome.verification_coverage_denominator, 3);
+        assert_eq!(outcome.verification_coverage, 2.0 / 3.0);
+    }
+
+    #[test]
+    fn aggregate_acceptance_and_edit_flags_use_only_recorded_evidence() {
+        let mut acceptance = fixture_node(
+            "acceptance",
+            "verification",
+            Some("2024-01-01T00:00:00Z"),
+            Some("2024-01-01T00:00:01Z"),
+            Some(NodeOutcome::VerifiedSuccess),
+        );
+        acceptance
+            .extra
+            .insert("acceptance_id".to_owned(), Value::String("AC-1".to_owned()));
+        acceptance.verification = Some(Verification {
+            passed: Some(true),
+            evidence_refs: vec!["evidence:ac-1".to_owned()],
+            ..Verification::default()
+        });
+        let mut data = LearningData::default();
+        data.nodes.insert("acceptance".to_owned(), acceptance);
+        data.graph_edits.push(GraphEditEvent {
+            graph_before_hash: "sha256:before".to_owned(),
+            action: GraphEditAction {
+                kind: "add_branch".to_owned(),
+                created_nodes: vec!["acceptance".to_owned()],
+                ..GraphEditAction::default()
+            },
+            trigger: "repair".to_owned(),
+            actor: "agent".to_owned(),
+            timestamp: "2024-01-01T00:00:00Z".to_owned(),
+            eventual_effect: EventualEffect {
+                success: Some(false),
+                rework_reduced: Some(false),
+                ..EventualEffect::default()
+            },
+            ..GraphEditEvent::default()
+        });
+        let graph = serde_json::json!({
+            "acceptance_criteria": [{"id": "AC-1"}, {"id": "AC-2"}]
+        });
+        let outcome = aggregate_for_graph(&data, &graph);
+
+        assert_eq!(
+            outcome.acceptance_criteria,
+            vec![
+                AcceptanceResult {
+                    id: "AC-1".to_owned(),
+                    passed: true,
+                    evidence_refs: vec!["evidence:ac-1".to_owned()],
+                    ..AcceptanceResult::default()
+                },
+                AcceptanceResult {
+                    id: "AC-2".to_owned(),
+                    passed: false,
+                    ..AcceptanceResult::default()
+                }
+            ]
+        );
+        assert_eq!(outcome.final_verified_success, Some(false));
+        assert_eq!(outcome.expanded_unnecessarily, Some(true));
+        assert_eq!(outcome.stopped_too_early, Some(false));
     }
 }

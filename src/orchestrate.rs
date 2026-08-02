@@ -135,6 +135,9 @@ pub(crate) fn run_end_to_end_with_efficiency(
     // failure so an interrupted or failed run can be picked back up.
     let recorder = crate::checkpoint::Recorder::new(workspace, &graph_id, request);
     let mut run_completed: std::collections::BTreeSet<String> = resume_completed.clone();
+    if let Err(error) = crate::checkpoint::prepare_resume(workspace, &graph, &run_completed) {
+        eprintln!("  resume learning note: {error:#}");
+    }
 
     let mut attempt = 0u32;
     // The pending harness evolution awaiting its verifiable reward (RL feedback):
@@ -179,17 +182,15 @@ pub(crate) fn run_end_to_end_with_efficiency(
                 };
                 let efficiency = efficiency.unwrap_or(&default_efficiency);
                 let mut runtime = execute::EfficiencyRuntime::default();
-                if !run_completed.is_empty() {
-                    if let Err(error) = execute::run_efficiency_boundary(
-                        &graph,
-                        &current_hash,
-                        &run_completed,
-                        workspace,
-                        efficiency,
-                        &mut runtime,
-                    ) {
-                        eprintln!("  efficiency boundary note: {error:#}");
-                    }
+                if let Err(error) = execute::run_efficiency_boundary(
+                    &graph,
+                    &current_hash,
+                    &run_completed,
+                    workspace,
+                    efficiency,
+                    &mut runtime,
+                ) {
+                    eprintln!("  efficiency boundary note: {error:#}");
                 }
                 execute::run_multi_agent(&graph, workspace, agents, board, &run_completed)?
             }
@@ -271,6 +272,9 @@ pub(crate) fn run_end_to_end_with_efficiency(
                 evolution.cause, evolution.note, evolution.arm
             );
             println!("  ⟳ {}", evolution.verdict);
+            if let Err(error) = execute::reopen_for_retry(workspace, &failed_node) {
+                eprintln!("  reopen learning note: {error:#}");
+            }
 
             // (4) Anchor the developmental step + child lineage on the signed chain.
             let motivating = outcome
@@ -468,4 +472,83 @@ fn export_to_dataevol(
         None => println!("  (DataEvol not installed here — kept the sanitized export file)"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_workspace(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "fractal-orchestrate-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn resume_and_retry_reopen_preserve_attempt_count() {
+        let workspace = temp_workspace("retry");
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_orch",
+            "nodes": [
+                {"id": "build", "capability": "code.generate", "instruction": "Build", "title": "Build"}
+            ],
+            "edges": []
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::project_file::persist(&workspace, &graph, "Orch").unwrap();
+        crate::project_file::checkout_start_node(&workspace, "build", "cursor", "cursor").unwrap();
+        crate::project_file::release_node(
+            &workspace,
+            "build",
+            "cursor",
+            Some((
+                crate::learning_data::NodeOutcome::FailedExecution,
+                crate::learning_data::FailureCode::Timeout,
+            )),
+        )
+        .unwrap();
+
+        crate::checkpoint::prepare_resume(&workspace, &graph, &BTreeSet::new()).unwrap();
+        execute::reopen_for_retry(&workspace, "build").ok();
+        let document = crate::project_file::load(&workspace).unwrap();
+        assert!(document.learning.nodes["build"].outcome.is_none());
+        assert_eq!(document.learning.nodes["build"].attempt_count, 1);
+        assert!(document.learning.nodes["build"].reopen_count >= 1);
+
+        crate::project_file::checkout_start_node(&workspace, "build", "cursor", "cursor").unwrap();
+        let retried = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(retried.learning.nodes["build"].attempt_count, 2);
+        let started = retried.learning.nodes["build"]
+            .started_at
+            .clone()
+            .expect("started");
+        crate::project_file::finish_node(
+            &workspace,
+            "build",
+            "cursor",
+            crate::learning_data::NodeOutcome::UnverifiedSuccess,
+        )
+        .unwrap();
+        let finished = crate::project_file::load(&workspace).unwrap();
+        assert!(
+            finished.learning.nodes["build"]
+                .finished_at
+                .as_ref()
+                .unwrap()
+                >= &started
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
 }

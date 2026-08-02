@@ -27,6 +27,9 @@ pub(crate) struct PendingAmendment {
     pub(crate) wave: Option<u32>,
     pub(crate) instruction: String,
     pub(crate) source: String,
+    /// Optional dependency node/task ref for add/remove dependency edits.
+    #[serde(default)]
+    pub(crate) dependency: Option<String>,
 }
 
 fn default_action() -> String {
@@ -57,10 +60,19 @@ pub(crate) struct AppliedAmendment {
     pub(crate) command_id: String,
     pub(crate) graph: Value,
     pub(crate) graph_hash: String,
+    /// Existing nodes whose structural lifecycle ended in this edit.
+    pub(crate) retired_nodes: Vec<String>,
 }
 
 fn queue_path(workspace: &Path) -> PathBuf {
     workspace.join(".fractal").join("pending-amendments.jsonl")
+}
+
+pub(crate) fn has_pending(workspace: &Path) -> bool {
+    let path = queue_path(workspace);
+    fs::read_to_string(path)
+        .ok()
+        .is_some_and(|raw| raw.lines().any(|line| !line.trim().is_empty()))
 }
 
 pub(crate) fn queue(
@@ -104,11 +116,84 @@ pub(crate) fn queue(
             wave,
             instruction: instruction.to_owned(),
             source: source.to_owned(),
+            dependency: None,
         },
     )?;
     file.write_all(b"\n")?;
     file.sync_data().ok();
     Ok(())
+}
+
+/// Queue a controlled human graph edit that applies without invoking a planner.
+#[allow(dead_code)]
+pub(crate) fn queue_edit(
+    workspace: &Path,
+    command_id: impl Into<String>,
+    action: &str,
+    task_ref: &str,
+    dependency: Option<&str>,
+    instruction: &str,
+    source: &str,
+) -> Result<()> {
+    if !is_direct_edit(action) {
+        bail!("unsupported direct graph edit action `{action}`");
+    }
+    let task_ref = task_ref.trim();
+    if !valid_task_ref(task_ref) && resolve_task_id_only(task_ref).is_none() {
+        // Accept wave.position refs; node ids are validated at apply time.
+        if task_ref.is_empty() || task_ref.len() > 120 {
+            bail!("direct edit target must be a non-empty task reference");
+        }
+    }
+    if matches!(action, "add_dependency" | "remove_dependency")
+        && dependency
+            .map(str::trim)
+            .is_none_or(|value| value.is_empty())
+    {
+        bail!("dependency edits require a dependency reference");
+    }
+    if action == "reroute_node" && instruction.trim().is_empty() {
+        bail!("reroute edits require a replacement instruction");
+    }
+    if instruction.len() > 4_000 {
+        bail!("amendment instruction must be at most 4000 characters");
+    }
+    let path = queue_path(workspace);
+    fs::create_dir_all(path.parent().expect("amendment queue has parent"))?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("open amendment queue {}", path.display()))?;
+    serde_json::to_writer(
+        &mut file,
+        &PendingAmendment {
+            command_id: command_id.into(),
+            action: action.to_owned(),
+            task_ref: task_ref.to_owned(),
+            wave: None,
+            instruction: instruction.to_owned(),
+            source: source.to_owned(),
+            dependency: dependency.map(|value| value.trim().to_owned()),
+        },
+    )?;
+    file.write_all(b"\n")?;
+    file.sync_data().ok();
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn resolve_task_id_only(task_ref: &str) -> Option<&str> {
+    (!task_ref.is_empty() && !task_ref.contains('.')).then_some(task_ref)
+}
+
+fn is_direct_edit(action: &str) -> bool {
+    matches!(
+        action,
+        "split_node" | "reroute_node" | "cancel_node" | "add_dependency" | "remove_dependency"
+    )
 }
 
 pub(crate) fn apply_pending(
@@ -117,6 +202,12 @@ pub(crate) fn apply_pending(
     workspace: &Path,
     lead_agent: &str,
 ) -> (Value, String) {
+    if graph.get("graph_hash").and_then(Value::as_str) != Some(graph_hash.as_str())
+        || crate::graph_store::verify_graph_document(&graph).is_err()
+    {
+        eprintln!("  amendment note: refusing to mutate a graph with an invalid parent hash");
+        return (graph, graph_hash);
+    }
     for request in drain(workspace) {
         if request.action == "add_wave_task" {
             println!(
@@ -165,6 +256,9 @@ pub(crate) fn apply_pending(
                         &request.source,
                     )
                     .ok();
+                    if !applied.retired_nodes.is_empty() {
+                        mark_retired_nodes(workspace, &applied.retired_nodes, &request.action).ok();
+                    }
                     crate::project_sync::maybe_sync_runtime(workspace);
                 }
                 if request.command_id.starts_with("amend_") {
@@ -234,6 +328,9 @@ fn apply_one(
     lead_agent: &str,
     request: &PendingAmendment,
 ) -> Result<AppliedAmendment> {
+    if is_direct_edit(&request.action) {
+        return apply_direct_edit(graph, parent_hash, request);
+    }
     let (anchor, wave_dependencies, wave_downstream) = if request.action == "add_wave_task" {
         let wave = request
             .wave
@@ -388,6 +485,315 @@ fn apply_one(
         command_id: request.command_id.clone(),
         graph: child,
         graph_hash: record.graph_hash,
+        retired_nodes: Vec::new(),
+    })
+}
+
+/// Apply a controlled human edit directly to the immutable graph. This path
+/// never invokes a planner: it verifies the parent's hash, rejects no-ops and
+/// cycles, records structural/controlled fields, and commits a rehashed child.
+fn apply_direct_edit(
+    graph: &Value,
+    parent_hash: &str,
+    request: &PendingAmendment,
+) -> Result<AppliedAmendment> {
+    if graph.get("graph_hash").and_then(Value::as_str) != Some(parent_hash) {
+        bail!("direct edit parent hash does not match the current graph");
+    }
+    crate::graph_store::verify_graph_document(graph).context("current graph hash is invalid")?;
+    let target = resolve_task(graph, &request.task_ref)
+        .with_context(|| format!("task {} is not in the current graph", request.task_ref))?;
+    let dependency = request
+        .dependency
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| resolve_task(graph, value).or_else(|| Some(value.to_owned())));
+    let mut child = graph.clone();
+    child["parent_graph"] = json!(parent_hash);
+    child["evolution_arm"] = json!(format!("human_{}", request.action));
+    let mut retired_nodes = Vec::new();
+
+    match request.action.as_str() {
+        "split_node" => {
+            let suffix = sanitize_id(&request.command_id);
+            let created = format!(
+                "{}.split.{}",
+                target,
+                if suffix.is_empty() { "human" } else { &suffix }
+            );
+            if node_exists(&child, &created) {
+                bail!("split node `{created}` already exists");
+            }
+            let mut created_node = node_mut(&mut child, &target)?.clone();
+            let instruction = if request.instruction.trim().is_empty() {
+                format!("Complete the human-requested split follow-up for `{target}`.")
+            } else {
+                request.instruction.trim().to_owned()
+            };
+            initialize_direct_node(&mut created_node, &created, &instruction, "created")?;
+            child
+                .get_mut("nodes")
+                .and_then(Value::as_array_mut)
+                .context("graph nodes are missing")?
+                .push(created_node);
+            let target_node = node_mut(&mut child, &target)?
+                .as_object_mut()
+                .context("graph node must be an object")?;
+            target_node.insert("structural_outcome".to_owned(), json!("superseded"));
+            target_node.insert("controlled_outcome".to_owned(), json!("accepted"));
+            target_node.insert("human_intervention".to_owned(), json!(true));
+            child
+                .get_mut("edges")
+                .and_then(Value::as_array_mut)
+                .context("graph edges are missing")?
+                .push(json!({"from": target, "to": created, "condition": "success"}));
+            retired_nodes.push(target.clone());
+        }
+        "reroute_node" => {
+            let instruction = request.instruction.trim();
+            if instruction.is_empty() {
+                bail!("reroute edits require a replacement instruction");
+            }
+            let object = node_mut(&mut child, &target)?
+                .as_object_mut()
+                .context("graph node must be an object")?;
+            if object.get("instruction").and_then(Value::as_str) == Some(instruction) {
+                bail!("reroute is a no-op");
+            }
+            object.insert("instruction".to_owned(), json!(instruction));
+            object.insert("human_intervention".to_owned(), json!(true));
+            object.insert("structural_outcome".to_owned(), json!("rerouted"));
+            object.insert("controlled_outcome".to_owned(), json!("accepted"));
+        }
+        "cancel_node" => {
+            let object = node_mut(&mut child, &target)?
+                .as_object_mut()
+                .context("graph node must be an object")?;
+            if object.get("controlled_outcome").and_then(Value::as_str) == Some("cancelled") {
+                bail!("cancel is a no-op");
+            }
+            object.insert("structural_outcome".to_owned(), json!("cancelled"));
+            object.insert("controlled_outcome".to_owned(), json!("cancelled"));
+            object.insert("human_intervention".to_owned(), json!(true));
+            object.insert("capability".to_owned(), json!("control.cancelled"));
+            object.insert(
+                "instruction".to_owned(),
+                json!("Cancelled by accepted human graph edit."),
+            );
+            retired_nodes.push(target.clone());
+        }
+        "add_dependency" => {
+            let dependency = dependency.context("add_dependency requires dependency")?;
+            if dependency == target {
+                bail!("a node cannot depend on itself");
+            }
+            if edge_exists(&child, &dependency, &target) {
+                bail!("dependency edit is a no-op");
+            }
+            if path_exists(&child, &target, &dependency) {
+                bail!("dependency edit would create a cycle");
+            }
+            child
+                .get_mut("edges")
+                .and_then(Value::as_array_mut)
+                .context("graph edges are missing")?
+                .push(json!({"from": dependency, "to": target, "condition": "success"}));
+        }
+        "remove_dependency" => {
+            let dependency = dependency.context("remove_dependency requires dependency")?;
+            let edges = child
+                .get_mut("edges")
+                .and_then(Value::as_array_mut)
+                .context("graph edges are missing")?;
+            let before = edges.len();
+            edges.retain(|edge| {
+                !(edge.get("from").and_then(Value::as_str) == Some(dependency.as_str())
+                    && edge.get("to").and_then(Value::as_str) == Some(target.as_str())
+                    && edge
+                        .get("condition")
+                        .and_then(Value::as_str)
+                        .is_none_or(|condition| condition != "failure"))
+            });
+            if edges.len() == before {
+                bail!("dependency edit is a no-op");
+            }
+        }
+        _ => bail!("unsupported graph edit action `{}`", request.action),
+    }
+    rebuild_dependencies(&mut child)?;
+    crate::graph_store::rehash_graph(&mut child)?;
+    let record = crate::graph_store::commit_graph(&child)?;
+    Ok(AppliedAmendment {
+        command_id: request.command_id.clone(),
+        graph: child,
+        graph_hash: record.graph_hash,
+        retired_nodes,
+    })
+}
+
+fn node_exists(graph: &Value, id: &str) -> bool {
+    graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|node| node.get("id").and_then(Value::as_str) == Some(id))
+}
+
+fn node_mut<'a>(graph: &'a mut Value, id: &str) -> Result<&'a mut Value> {
+    graph
+        .get_mut("nodes")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+        .find(|node| node.get("id").and_then(Value::as_str) == Some(id))
+        .with_context(|| format!("graph node `{id}` is missing"))
+}
+
+fn edge_exists(graph: &Value, from: &str, to: &str) -> bool {
+    graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|edge| {
+            edge.get("from").and_then(Value::as_str) == Some(from)
+                && edge.get("to").and_then(Value::as_str) == Some(to)
+                && edge
+                    .get("condition")
+                    .and_then(Value::as_str)
+                    .is_none_or(|condition| condition != "failure")
+        })
+}
+
+fn path_exists(graph: &Value, from: &str, to: &str) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![from.to_owned()];
+    while let Some(current) = stack.pop() {
+        if current == to {
+            return true;
+        }
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        for edge in graph
+            .get("edges")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if edge.get("from").and_then(Value::as_str) == Some(current.as_str())
+                && edge
+                    .get("condition")
+                    .and_then(Value::as_str)
+                    .is_none_or(|condition| condition != "failure")
+            {
+                if let Some(next) = edge.get("to").and_then(Value::as_str) {
+                    stack.push(next.to_owned());
+                }
+            }
+        }
+    }
+    false
+}
+
+fn initialize_direct_node(
+    node: &mut Value,
+    id: &str,
+    instruction: &str,
+    structural_outcome: &str,
+) -> Result<()> {
+    let object = node
+        .as_object_mut()
+        .context("graph node must be an object")?;
+    object.insert("id".to_owned(), json!(id));
+    object.insert("instruction".to_owned(), json!(instruction));
+    object.insert("structural_outcome".to_owned(), json!(structural_outcome));
+    object.insert("controlled_outcome".to_owned(), json!("accepted"));
+    object.insert("human_intervention".to_owned(), json!(true));
+    object.remove("started_at");
+    object.remove("finished_at");
+    object.remove("outcome");
+    object.remove("failure_code");
+    object.remove("verification");
+    Ok(())
+}
+
+fn rebuild_dependencies(graph: &mut Value) -> Result<()> {
+    let mut dependencies: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for edge in graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if edge.get("condition").and_then(Value::as_str) == Some("failure") {
+            continue;
+        }
+        if let (Some(from), Some(to)) = (
+            edge.get("from").and_then(Value::as_str),
+            edge.get("to").and_then(Value::as_str),
+        ) {
+            dependencies
+                .entry(to.to_owned())
+                .or_default()
+                .push(from.to_owned());
+        }
+    }
+    for node in graph
+        .get_mut("nodes")
+        .and_then(Value::as_array_mut)
+        .context("graph nodes are missing")?
+    {
+        let id = node
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let depends_on = dependencies.remove(&id).unwrap_or_default();
+        if let Some(object) = node.as_object_mut() {
+            object.insert(
+                "depends_on".to_owned(),
+                Value::Array(depends_on.into_iter().map(Value::String).collect()),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn mark_retired_nodes(workspace: &Path, nodes: &[String], action: &str) -> Result<()> {
+    let outcome = if action == "cancel_node" {
+        crate::learning_data::NodeOutcome::Cancelled
+    } else {
+        crate::learning_data::NodeOutcome::Superseded
+    };
+    crate::project_file::mutate_document(workspace, |document| {
+        let now = crate::project_file::project_timestamp();
+        for id in nodes {
+            if let Some(record) = document.learning.nodes.get_mut(id) {
+                record.finished_at = Some(now.clone());
+                record.outcome = Some(outcome);
+                record.failure_code = None;
+                record.verification = None;
+                record.human_intervention = true;
+            } else {
+                document.learning.nodes.insert(
+                    id.clone(),
+                    crate::learning_data::NodeRecord {
+                        node_id: id.clone(),
+                        node_type: "implementation".to_owned(),
+                        objective: format!("Human {action} target `{id}`"),
+                        created_at: Some(now.clone()),
+                        finished_at: Some(now.clone()),
+                        outcome: Some(outcome),
+                        human_intervention: true,
+                        ..crate::learning_data::NodeRecord::default()
+                    },
+                );
+            }
+        }
+        Ok(())
     })
 }
 
@@ -722,6 +1128,286 @@ fn valid_task_ref(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn editable_graph() -> Value {
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "edit-test",
+            "nodes": [
+                {"id":"plan","capability":"content.analyze","instruction":"plan","execution":{"task_number":"0.1"}},
+                {"id":"build","capability":"code.generate","instruction":"build","execution":{"task_number":"1.1"}},
+                {"id":"verify","capability":"project.tests.execute","instruction":"verify","execution":{"task_number":"2.1"}}
+            ],
+            "edges": [
+                {"from":"plan","to":"build","condition":"success"},
+                {"from":"build","to":"verify","condition":"success"}
+            ]
+        });
+        crate::graph_store::rehash_graph(&mut graph).unwrap();
+        graph
+    }
+
+    #[test]
+    fn direct_human_edits_preserve_hashes_and_reject_noops() {
+        let _lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let _home = crate::graph_store::TestHome::new("direct-human-edits").unwrap();
+        let graph = editable_graph();
+        crate::graph_store::commit_graph(&graph).unwrap();
+        let before = graph["graph_hash"].as_str().unwrap().to_owned();
+        let split = PendingAmendment {
+            command_id: "cmd_split".to_owned(),
+            action: "split_node".to_owned(),
+            task_ref: "1.1".to_owned(),
+            wave: None,
+            instruction: "split build".to_owned(),
+            source: "human".to_owned(),
+            dependency: None,
+        };
+        let applied = apply_direct_edit(&graph, &before, &split).unwrap();
+        assert_eq!(applied.retired_nodes, vec!["build"]);
+        assert!(applied.graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| {
+                node["id"] == "build.split.cmd_split" && node["structural_outcome"] == "created"
+            }));
+        crate::graph_store::verify_graph_document(&applied.graph).unwrap();
+
+        let reroute = PendingAmendment {
+            command_id: "cmd_reroute".to_owned(),
+            action: "reroute_node".to_owned(),
+            task_ref: "1.1".to_owned(),
+            wave: None,
+            instruction: "new build route".to_owned(),
+            source: "human".to_owned(),
+            dependency: None,
+        };
+        assert!(apply_direct_edit(&applied.graph, &applied.graph_hash, &reroute).is_ok());
+        assert!(apply_direct_edit(
+            &applied.graph,
+            &applied.graph_hash,
+            &PendingAmendment {
+                instruction: "build".to_owned(),
+                ..reroute.clone()
+            }
+        )
+        .is_err());
+
+        let add = PendingAmendment {
+            command_id: "cmd_add".to_owned(),
+            action: "add_dependency".to_owned(),
+            task_ref: "2.1".to_owned(),
+            wave: None,
+            instruction: String::new(),
+            source: "human".to_owned(),
+            dependency: Some("0.1".to_owned()),
+        };
+        let with_dependency = apply_direct_edit(&applied.graph, &applied.graph_hash, &add).unwrap();
+        assert!(edge_exists(&with_dependency.graph, "plan", "verify"));
+        let remove = PendingAmendment {
+            command_id: "cmd_remove".to_owned(),
+            action: "remove_dependency".to_owned(),
+            ..add.clone()
+        };
+        let removed =
+            apply_direct_edit(&with_dependency.graph, &with_dependency.graph_hash, &remove)
+                .unwrap();
+        assert!(!edge_exists(&removed.graph, "plan", "verify"));
+        let cancel = PendingAmendment {
+            command_id: "cmd_cancel".to_owned(),
+            action: "cancel_node".to_owned(),
+            task_ref: "2.1".to_owned(),
+            wave: None,
+            instruction: String::new(),
+            source: "human".to_owned(),
+            dependency: None,
+        };
+        let cancelled = apply_direct_edit(&removed.graph, &removed.graph_hash, &cancel).unwrap();
+        assert!(cancelled.graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| { node["id"] == "verify" && node["controlled_outcome"] == "cancelled" }));
+        crate::graph_store::verify_graph_document(&cancelled.graph).unwrap();
+    }
+
+    #[test]
+    fn human_edit_events_are_ordered_and_keep_verified_before_hashes() {
+        let _lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let _home = crate::graph_store::TestHome::new("human-event-order").unwrap();
+        std::env::set_var("FRACTAL_OFFLINE", "1");
+        let workspace = std::env::temp_dir().join(format!(
+            "fractal-amend-events-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut graph = editable_graph();
+        crate::graph_store::commit_graph(&graph).unwrap();
+        crate::project_file::persist(&workspace, &graph, "Human Events").unwrap();
+        let mut hashes = Vec::new();
+        let edits = [
+            ("split_node", "1.1", None, "split"),
+            ("reroute_node", "1.1", None, "reroute"),
+            ("cancel_node", "2.1", None, ""),
+            ("add_dependency", "2.1", Some("0.1"), ""),
+            ("remove_dependency", "2.1", Some("0.1"), ""),
+        ];
+        for (index, (action, target, dependency, instruction)) in edits.iter().enumerate() {
+            hashes.push(graph["graph_hash"].as_str().unwrap().to_owned());
+            queue_edit(
+                &workspace,
+                format!("cmd-{index}"),
+                action,
+                target,
+                *dependency,
+                if *action == "reroute_node" {
+                    "new route"
+                } else {
+                    instruction
+                },
+                "human",
+            )
+            .unwrap();
+            let before = graph["graph_hash"].as_str().unwrap().to_owned();
+            let (next_graph, next_hash) = apply_pending(graph, before, &workspace, "lead");
+            graph = next_graph;
+            assert_eq!(graph["graph_hash"].as_str(), Some(next_hash.as_str()));
+            crate::graph_store::verify_graph_document(&graph).unwrap();
+        }
+        let project = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(project.learning.graph_edits.len(), edits.len());
+        for (event, before) in project.learning.graph_edits.iter().zip(hashes) {
+            assert_eq!(event.graph_before_hash, before);
+            assert!(!event.timestamp.is_empty());
+            assert!(event.eventual_effect.success.is_none());
+            assert_eq!(event.trigger, "human_amendment");
+            assert_eq!(event.actor, "human");
+        }
+        assert_eq!(
+            project.learning.graph_edits[0].action.created_nodes,
+            vec!["build.split.cmd-0"]
+        );
+        assert_eq!(
+            project
+                .learning
+                .graph_edits
+                .iter()
+                .map(|event| event.action.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "split_node",
+                "reroute_node",
+                "cancel_node",
+                "add_dependency",
+                "remove_dependency"
+            ]
+        );
+        crate::project_file::update_graph_edit_event_effect(
+            &workspace,
+            0,
+            crate::learning_data::EventualEffect {
+                success: Some(true),
+                rework_reduced: Some(true),
+                ..crate::learning_data::EventualEffect::default()
+            },
+        )
+        .unwrap();
+        let updated = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(
+            updated.learning.graph_edits[0].eventual_effect.success,
+            Some(true)
+        );
+        assert_eq!(
+            updated.learning.graph_edits[0]
+                .eventual_effect
+                .rework_reduced,
+            Some(true)
+        );
+        let noop = PendingAmendment {
+            command_id: "noop".to_owned(),
+            action: "remove_dependency".to_owned(),
+            task_ref: "2.1".to_owned(),
+            wave: None,
+            instruction: String::new(),
+            source: "human".to_owned(),
+            dependency: Some("0.1".to_owned()),
+        };
+        assert!(apply_direct_edit(&graph, graph["graph_hash"].as_str().unwrap(), &noop).is_err());
+        assert_eq!(
+            crate::project_file::load(&workspace)
+                .unwrap()
+                .learning
+                .graph_edits
+                .len(),
+            edits.len()
+        );
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn cross_boundary_human_edits_round_trip_learning_events() {
+        let _lock = crate::graph_store::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home = crate::graph_store::TestHome::new("cross-boundary-edits").unwrap();
+        std::env::set_var("FRACTAL_OFFLINE", "1");
+        let workspace = std::env::temp_dir().join(format!(
+            "fractal-amend-e2e-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let graph = editable_graph();
+        crate::graph_store::commit_graph(&graph).unwrap();
+        crate::project_file::persist(&workspace, &graph, "E2E Edits").unwrap();
+        let before = graph["graph_hash"].as_str().unwrap().to_owned();
+        queue_edit(
+            &workspace,
+            "e2e-split",
+            "split_node",
+            "1.1",
+            None,
+            "split for e2e",
+            "operator",
+        )
+        .unwrap();
+        let (graph, hash) = apply_pending(graph, before.clone(), &workspace, "lead");
+        assert_ne!(hash, before);
+        crate::graph_store::verify_graph_document(&graph).unwrap();
+
+        let raw = std::fs::read(crate::project_file::path(&workspace)).unwrap();
+        let encoded: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            encoded["learning"]["graph_edits"][0]["action"]["type"],
+            json!("split_node")
+        );
+        assert_eq!(
+            encoded["learning"]["graph_edits"][0]["graph_before_hash"],
+            json!(before)
+        );
+        assert_eq!(
+            encoded["learning"]["graph_edits"][0]["action"]["created_nodes"],
+            json!(["build.split.e2e-split"])
+        );
+        let reloaded = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(reloaded.graph_hash, hash);
+        assert_eq!(reloaded.learning.graph_edits.len(), 1);
+        assert_eq!(
+            reloaded.learning.nodes["build"].outcome,
+            Some(crate::learning_data::NodeOutcome::Superseded)
+        );
+        assert!(reloaded.learning.nodes["build"].human_intervention);
+        std::fs::remove_dir_all(workspace).ok();
+    }
 
     #[test]
     fn task_references_are_wave_dot_position() {

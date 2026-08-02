@@ -813,6 +813,354 @@ final class FractalVoiceTests: XCTestCase {
         )
     }
 
+    func testProjectFractalLearningFixturesDecodeFormatAndPresentWithoutCorruption() throws {
+        let root = temporaryDirectory()
+        let legacyURL = try writeProjectFractal(Self.legacyProjectFractalJSON, under: root, name: "legacy")
+        let enrichedURL = try writeProjectFractal(Self.enrichedProjectFractalJSON, under: root, name: "enriched")
+        let partialURL = try writeProjectFractal(Self.partialProjectFractalJSON, under: root, name: "partial")
+        let futureURL = try writeProjectFractal(Self.futureLabelsProjectFractalJSON, under: root, name: "future")
+
+        // Legacy: missing additive learning must not crash or look corrupted.
+        let legacyEnvelope = try JSONDecoder().decode(
+            ProjectGraphLearning.Envelope.self,
+            from: Data(contentsOf: legacyURL)
+        )
+        XCTAssertEqual(legacyEnvelope.schema, "fractal.project.v1")
+        XCTAssertNil(legacyEnvelope.learning)
+        let legacyData = try Data(contentsOf: legacyURL)
+        XCTAssertNil(ProjectGraphLearning.decode(from: legacyData))
+        XCTAssertNil(BuildCoordinator.learningStatusPresentation(from: legacyURL))
+        XCTAssertNil(BuildCoordinator.learningStatusPresentation(data: legacyData))
+
+        // Fully enriched: Codable round-trip, formatting, graph edits, outcome.
+        let enrichedData = try Data(contentsOf: enrichedURL)
+        let enriched = try XCTUnwrap(ProjectGraphLearning.decode(from: enrichedData))
+        XCTAssertEqual(enriched.schema, ProjectGraphLearning.schemaID)
+        let node = try XCTUnwrap(enriched.nodes["n_auth"])
+        XCTAssertEqual(node.outcome, "verified_success")
+        XCTAssertEqual(node.failureCode, nil)
+        XCTAssertEqual(node.attemptCount, 2)
+        XCTAssertEqual(node.verification?.passed, true)
+        XCTAssertEqual(node.artifactsProduced, ["artifact:commit-42"])
+        XCTAssertTrue(node.humanIntervention)
+        XCTAssertEqual(node.executor?.agent, "codex")
+        XCTAssertEqual(node.outcomeText, "verified success")
+        XCTAssertEqual(node.attemptText, "2 attempts")
+        XCTAssertEqual(node.verificationText, "verified")
+        XCTAssertEqual(
+            node.compactSummary,
+            "verified success · 2 attempts · verified · human assisted"
+        )
+        XCTAssertEqual(enriched.graphEdits.count, 1)
+        XCTAssertEqual(
+            enriched.graphEdits[0].compactSummary,
+            "split · 2 nodes"
+        )
+        XCTAssertEqual(
+            enriched.outcome?.compactSummary,
+            "verified success · 100% verified · 1 retries · 1 human intervention"
+        )
+        XCTAssertEqual(
+            enriched.compactCompletionSummary,
+            "verified success · 100% verified · 1 retries · 1 human intervention"
+        )
+
+        let enrichedPresentation = try XCTUnwrap(
+            BuildCoordinator.learningStatusPresentation(from: enrichedURL)
+        )
+        XCTAssertEqual(enrichedPresentation.nodeOutcome, "verified success")
+        XCTAssertEqual(enrichedPresentation.nodeAttempt, "2 attempts")
+        XCTAssertEqual(enrichedPresentation.nodeVerification, "verified")
+        XCTAssertEqual(
+            enrichedPresentation.graphSummary,
+            "verified success · 100% verified · 1 retries · 1 human intervention"
+        )
+        let enrichedDetail = try XCTUnwrap(enrichedPresentation.detailLine)
+        XCTAssertFalse(enrichedDetail.localizedCaseInsensitiveContains("corrupt"))
+        XCTAssertFalse(enrichedDetail.localizedCaseInsensitiveContains("invalid"))
+
+        // Partial: absent fields fall back safely; available fields still format.
+        let partial = try XCTUnwrap(ProjectGraphLearning.load(from: partialURL))
+        XCTAssertEqual(partial.nodes.count, 1)
+        XCTAssertNil(partial.outcome)
+        XCTAssertTrue(partial.graphEdits.isEmpty)
+        let partialNode = try XCTUnwrap(partial.nodes["n_partial"])
+        XCTAssertNil(partialNode.outcome)
+        XCTAssertEqual(partialNode.attemptCount, 1)
+        XCTAssertNil(partialNode.verification)
+        XCTAssertEqual(partialNode.outcomeText, "not finished")
+        XCTAssertEqual(partialNode.attemptText, "1 attempt")
+        XCTAssertEqual(partialNode.verificationText, "not verified")
+        XCTAssertEqual(partialNode.compactSummary, "not finished · 1 attempt")
+        XCTAssertEqual(partial.compactCompletionSummary, "0/1 verified · 1 attempt")
+
+        let partialPresentation = try XCTUnwrap(
+            BuildCoordinator.learningStatusPresentation(from: partialURL)
+        )
+        XCTAssertEqual(partialPresentation.nodeOutcome, "not finished")
+        XCTAssertEqual(partialPresentation.nodeAttempt, "1 attempt")
+        XCTAssertEqual(partialPresentation.nodeVerification, "not verified")
+        // Missing additive outcome must not surface as corruption.
+        let partialDetail = try XCTUnwrap(partialPresentation.detailLine)
+        XCTAssertFalse(partialDetail.localizedCaseInsensitiveContains("corrupt"))
+        XCTAssertFalse(partialDetail.localizedCaseInsensitiveContains("invalid"))
+        XCTAssertFalse(partialDetail.contains("not verified"))
+
+        // Empty learning shell: no displayable fields → nil presentation, not failure.
+        let emptyLearning = """
+        {"schema":"fractal.project.v1","learning":{"schema":"fractal.learning.v1","nodes":{},"graph_edits":[]}}
+        """.data(using: .utf8)!
+        XCTAssertNotNil(ProjectGraphLearning.decode(from: emptyLearning))
+        XCTAssertNil(BuildCoordinator.learningStatusPresentation(data: emptyLearning))
+
+        // Unknown future controlled strings remain readable and re-encodable.
+        let future = try XCTUnwrap(ProjectGraphLearning.load(from: futureURL))
+        let futureNode = try XCTUnwrap(future.nodes["n_7"])
+        XCTAssertEqual(futureNode.outcome, "future_success_kind")
+        XCTAssertEqual(futureNode.failureCode, "future_failure_code")
+        XCTAssertNil(futureNode.knownOutcome)
+        XCTAssertNil(futureNode.knownFailureCode)
+        XCTAssertEqual(
+            futureNode.outcomeText,
+            "future success kind (future failure code)"
+        )
+        XCTAssertEqual(
+            futureNode.compactSummary,
+            "future success kind (future failure code) · 2 attempts · verified"
+        )
+        XCTAssertEqual(future.graphEdits.first?.kind, "future_split_kind")
+        XCTAssertEqual(
+            future.graphEdits.first?.compactSummary,
+            "future split kind · 1 node"
+        )
+        XCTAssertEqual(
+            future.outcome?.compactSummary,
+            "verified success · 100% verified · 1 retries"
+        )
+        let reencoded = try JSONEncoder().encode(future)
+        let roundTripped = try XCTUnwrap(ProjectGraphLearning.decode(from: """
+        {"learning":\(String(data: reencoded, encoding: .utf8)!)}
+        """.data(using: .utf8)!))
+        XCTAssertEqual(roundTripped.nodes["n_7"]?.outcome, "future_success_kind")
+        XCTAssertEqual(roundTripped.graphEdits.first?.kind, "future_split_kind")
+
+        let futurePresentation = try XCTUnwrap(
+            BuildCoordinator.learningStatusPresentation(from: futureURL)
+        )
+        XCTAssertTrue(
+            (futurePresentation.nodeOutcome ?? "")
+                .contains("future success kind")
+        )
+        XCTAssertFalse(
+            (futurePresentation.detailLine ?? "")
+                .localizedCaseInsensitiveContains("corrupt")
+        )
+    }
+
+    @MainActor
+    func testLearningStatusPresentationFeedsHUDWithoutStartingABuild() throws {
+        let root = temporaryDirectory()
+        let enrichedURL = try writeProjectFractal(
+            Self.enrichedProjectFractalJSON,
+            under: root,
+            name: "hud-enriched"
+        )
+        let legacyURL = try writeProjectFractal(
+            Self.legacyProjectFractalJSON,
+            under: root,
+            name: "hud-legacy"
+        )
+
+        let presentation = try XCTUnwrap(
+            BuildCoordinator.learningStatusPresentation(from: enrichedURL)
+        )
+        let detail = try XCTUnwrap(presentation.detailLine)
+
+        let hud = RecordingHUD(onStop: {}, onRestart: {})
+        defer { hud.close() }
+
+        hud.showBuilding(summary: "Building authentication…", detail: detail)
+        XCTAssertTrue(hud.isShowingBuildProgressForTesting)
+        XCTAssertEqual(hud.summaryForTesting, "Building authentication…")
+        XCTAssertEqual(hud.detailForTesting, detail)
+        XCTAssertFalse((hud.detailForTesting ?? "").localizedCaseInsensitiveContains("corrupt"))
+
+        hud.updateLearningDetail(
+            BuildCoordinator.learningStatusPresentation(from: legacyURL)?.detailLine
+        )
+        XCTAssertNil(hud.detailForTesting)
+
+        hud.showBuilding(summary: "Still building…")
+        XCTAssertNil(hud.detailForTesting)
+        hud.updateBuilding(
+            summary: "Still building…",
+            detail: presentation.finishedSummary,
+            updateDetail: true
+        )
+        XCTAssertEqual(hud.detailForTesting, presentation.finishedSummary)
+    }
+
+    private static let legacyProjectFractalJSON = """
+    {
+      "schema": "fractal.project.v1",
+      "graph": {
+        "schema": "fractal.execution_graph.v1",
+        "nodes": [{"id": "n1", "title": "Legacy task"}],
+        "edges": []
+      }
+    }
+    """
+
+    private static let enrichedProjectFractalJSON = """
+    {
+      "schema": "fractal.project.v1",
+      "learning": {
+        "schema": "fractal.learning.v1",
+        "nodes": {
+          "n_auth": {
+            "node_id": "n_auth",
+            "node_type": "implementation",
+            "objective": "Implement authentication endpoint",
+            "title": "Auth endpoint",
+            "depends_on": ["n_contract"],
+            "executor": {
+              "agent": "codex",
+              "model": "gpt-5",
+              "version": "1.0.0",
+              "label": "worker-1"
+            },
+            "attempt_count": 2,
+            "outcome": "verified_success",
+            "verification": {
+              "type": "integration_test",
+              "status": "passed",
+              "passed": true,
+              "evidence_refs": ["artifact:test-result-17"]
+            },
+            "artifacts_produced": ["artifact:commit-42"],
+            "artifact_refs": [{"ref": "artifact:commit-42", "kind": "commit"}],
+            "consumed_by": ["n_verify"],
+            "human_intervention": true,
+            "intervention": {
+              "required": true,
+              "actor": "owner",
+              "reason": "approved split"
+            },
+            "started_at": "2026-08-02T12:00:00Z",
+            "completed_at": "2026-08-02T12:05:00Z"
+          }
+        },
+        "graph_edits": [
+          {
+            "event_id": "ge_1",
+            "kind": "split",
+            "actor": "owner",
+            "reason": "node too broad",
+            "affected_node_ids": ["n_auth"],
+            "created_node_ids": ["n_verify"],
+            "removed_node_ids": [],
+            "occurred_at": "2026-08-02T11:59:00Z",
+            "artifact_refs": [{"ref": "artifact:edit-1"}]
+          }
+        ],
+        "artifact_refs": [{"ref": "artifact:commit-42"}],
+        "outcome": {
+          "final_verified_success": true,
+          "total_cost": 0.11,
+          "retry_count": 1,
+          "reopened_node_count": 0,
+          "human_intervention_count": 1,
+          "verification_coverage": 1.0,
+          "completed_node_count": 1,
+          "failed_node_count": 0,
+          "blocked_node_count": 0,
+          "artifact_count": 1
+        }
+      }
+    }
+    """
+
+    private static let partialProjectFractalJSON = """
+    {
+      "schema": "fractal.project.v1",
+      "learning": {
+        "schema": "fractal.learning.v1",
+        "nodes": {
+          "n_partial": {
+            "node_id": "n_partial",
+            "node_type": "implementation",
+            "objective": "Draft interface only",
+            "attempt_count": 1,
+            "started_at": "2026-08-02T12:01:00Z"
+          }
+        }
+      }
+    }
+    """
+
+    private static let futureLabelsProjectFractalJSON = """
+    {
+      "schema": "fractal.project.v1",
+      "learning": {
+        "schema": "fractal.learning.v1",
+        "nodes": {
+          "n_7": {
+            "node_id": "n_7",
+            "node_type": "implementation",
+            "objective": "Implement authentication endpoint",
+            "depends_on": ["n_2"],
+            "attempt_count": 2,
+            "outcome": "future_success_kind",
+            "failure_code": "future_failure_code",
+            "verification": {
+              "type": "integration_test",
+              "passed": true,
+              "evidence_refs": ["artifact:test-result-17"]
+            },
+            "artifacts_produced": ["artifact:commit-42"],
+            "consumed_by": ["n_9"],
+            "human_intervention": false,
+            "completed_at": "2026-08-02T12:10:00Z"
+          }
+        },
+        "graph_edits": [
+          {
+            "event_id": "ge_future",
+            "kind": "future_split_kind",
+            "affected_node_ids": ["n_7"],
+            "created_node_ids": [],
+            "removed_node_ids": []
+          }
+        ],
+        "outcome": {
+          "final_verified_success": true,
+          "total_cost": 0.11,
+          "retry_count": 1,
+          "reopened_node_count": 0,
+          "human_intervention_count": 0,
+          "verification_coverage": 1.0
+        }
+      }
+    }
+    """
+
+    private func writeProjectFractal(
+        _ json: String,
+        under root: URL,
+        name: String
+    ) throws -> URL {
+        let project = root
+            .appendingPathComponent(name, isDirectory: true)
+            .appendingPathComponent(".fractal", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: project,
+            withIntermediateDirectories: true
+        )
+        let url = project.appendingPathComponent("project.fractal")
+        try Data(json.utf8).write(to: url)
+        return url
+    }
+
     private func temporaryDirectory() -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

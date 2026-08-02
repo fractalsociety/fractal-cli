@@ -82,6 +82,17 @@ pub struct NlWorkRequest {
     pub max_cost_microunits: Option<u64>,
 }
 
+/// Encode a work creation time as the RFC 3339 UTC representation used by
+/// portable learning records.
+///
+/// The work contract stores creation time in Unix milliseconds while learning
+/// records use second-resolution RFC 3339 timestamps.  Keeping this conversion
+/// here gives every graph producer the same deterministic representation (and
+/// avoids consulting the wall clock while recompiling a graph).
+pub(crate) fn rfc3339_from_unix_millis(milliseconds: u64) -> String {
+    rfc3339_utc(milliseconds / 1_000)
+}
+
 /// Errors from the NL → work constructor.
 #[derive(Debug)]
 pub enum NlWorkError {
@@ -389,6 +400,27 @@ fn sha256_hex_prefixed(bytes: &[u8]) -> String {
     format!("sha256:{hex}")
 }
 
+fn rfc3339_utc(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let seconds_of_day = seconds % 86_400;
+    // Howard Hinnant's civil-from-days algorithm, with Unix epoch adjustment.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    let hour = seconds_of_day / 3_600;
+    let minute = seconds_of_day % 3_600 / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +464,10 @@ mod tests {
             .memory_scopes
             .iter()
             .any(|scope| scope == "project:demo-cli"));
+        assert_eq!(
+            rfc3339_from_unix_millis(first.created_at_ms),
+            "1970-01-01T00:00:01Z"
+        );
     }
 
     #[test]

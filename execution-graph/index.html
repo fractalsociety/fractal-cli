@@ -16,6 +16,19 @@
         <span><strong>FRACTAL</strong><small>EXECUTION GRAPH</small></span>
       </a>
       <div class="live-state" id="live-state"><span></span> PRD SOURCE LIVE</div>
+      <details class="efficiency-counter" id="efficiency-counter">
+        <summary id="efficiency-summary">Estimated 0 tokens saved</summary>
+        <div class="efficiency-panel">
+          <p id="efficiency-status">Efficiency tracking is active. No avoidable work has been detected yet.</p>
+          <dl>
+            <div><dt>Confidence-adjusted estimate</dt><dd id="efficiency-adjusted">0 tokens</dd></div>
+            <div><dt>Realized savings</dt><dd id="efficiency-realized">0 tokens</dd></div>
+            <div><dt>Interventions</dt><dd id="efficiency-episodes">0</dd></div>
+            <div><dt>Confidence</dt><dd id="efficiency-confidence">—</dd></div>
+          </dl>
+          <small id="efficiency-basis">Estimated and realized savings are tracked separately.</small>
+        </div>
+      </details>
       <button class="pause-build hidden" id="pause-build" type="button">Ⅱ Pause Build</button>
       <button class="icon-button" id="refresh" type="button" aria-label="Refresh graph">↻</button>
     </header>

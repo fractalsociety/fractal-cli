@@ -1151,6 +1151,47 @@ mod tests {
     }
 
     #[test]
+    fn decomposed_graph_mirrors_sequential_parallel_verification_and_closeout_dependencies() {
+        let raw = valid_plan(
+            r#"[
+          {"id":"app","title":"Build app","capability":"code.generate","instruction":"build app","depends_on":[]},
+          {"id":"docs","title":"Write docs","capability":"code.edit","instruction":"write docs","depends_on":[]},
+          {"id":"verify","title":"Run verification","capability":"project.tests.execute","instruction":"run tests","depends_on":["app","docs"]}
+        ]"#,
+        );
+        let planned = parse_and_validate(&raw).expect("plan");
+        let genome = build_harness_genome(&planned.tasks, "X.md");
+        let work = build_work_value("Execute the plan").expect("work");
+        let graph =
+            crate::compile::recompile(&work, &genome, "darwin-arm64").expect("decomposed graph");
+        let nodes = graph["nodes"].as_array().expect("nodes");
+        let node = |id: &str| {
+            nodes
+                .iter()
+                .find(|node| node["id"] == id)
+                .unwrap_or_else(|| panic!("missing node {id}"))
+        };
+
+        let lead = node("lead_plan");
+        assert_eq!(lead["node_type"], "control");
+        assert_eq!(lead["depends_on"], json!([]));
+        assert_eq!(lead["ready_at"], lead["created_at"]);
+        assert_eq!(node("app")["depends_on"], json!(["lead_plan"]));
+        assert_eq!(node("docs")["depends_on"], json!(["lead_plan"]));
+        assert_eq!(node("app")["execution"]["mode"], "parallel");
+        assert_eq!(node("docs")["execution"]["mode"], "parallel");
+        assert_eq!(node("verify")["node_type"], "verification");
+        assert_eq!(node("verify")["depends_on"], json!(["app", "docs"]));
+        assert_eq!(node("lead_closeout")["node_type"], "control");
+        assert_eq!(node("lead_closeout")["depends_on"], json!(["verify"]));
+        for id in ["lead_plan", "app", "docs", "verify", "lead_closeout"] {
+            assert_eq!(node(id)["attempt_count"], 0);
+            assert_eq!(node(id)["artifacts_produced"], json!([]));
+            assert!(node(id).get("outcome").is_none());
+        }
+    }
+
+    #[test]
     fn detects_only_referenced_existing_files() {
         let dir = std::env::temp_dir().join(format!("fractal-prd-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1186,5 +1227,13 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0]["capability"], "control.plan");
         assert_eq!(nodes[0]["execution"]["wave"], 0);
+        assert_eq!(nodes[0]["node_type"], "control");
+        assert_eq!(nodes[0]["depends_on"], json!([]));
+        assert_eq!(nodes[0]["ready_at"], nodes[0]["created_at"]);
+        assert_eq!(nodes[0]["executor"]["agent"], "claude");
+        assert_eq!(nodes[0]["executor"]["label"], "claude");
+        assert_eq!(nodes[0]["attempt_count"], 0);
+        assert_eq!(nodes[0]["artifacts_produced"], json!([]));
+        assert!(nodes[0].get("outcome").is_none());
     }
 }

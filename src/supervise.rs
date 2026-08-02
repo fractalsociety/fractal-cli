@@ -30,6 +30,8 @@ use crate::orchestrate::hex_to_hash;
 /// Bounded so a single run cannot spawn unbounded mid-run mutations.
 const MAX_MIDRUN: u32 = 2;
 
+type PendingEvolution = (String, Vec<i32>, String, Governance, Option<usize>);
+
 /// The result of a supervised run: the outcome plus the (possibly evolved) graph
 /// so the caller continues its failure-evolution loop from the adapted harness.
 pub(crate) struct Supervised {
@@ -268,15 +270,15 @@ pub(crate) fn run_supervised_with_efficiency(
     let mut failed: Option<String> = None;
 
     // Mid-run governed grows awaiting the run's final verifiable verdict (RLVR):
-    // (arm, bandit context, cause, open canary session).
-    let mut pending: Vec<(String, Vec<i32>, String, Governance)> = Vec::new();
+    // (arm, bandit context, cause, open canary session, learning-event index).
+    let mut pending: Vec<PendingEvolution> = Vec::new();
     // Sources we have already grafted a checkpoint off, so we don't re-graft.
     let mut grown: BTreeSet<String> = BTreeSet::new();
     let mut midrun = 0u32;
     let min_hops = min_verify_hops();
     // Efficiency runs after a frontier completes (or on resume before the next
     // checkout), never concurrently with checkout.
-    let mut between_waves = !completed.is_empty();
+    let mut between_waves = true;
     loop {
         let previous_hash = hash.clone();
         (graph, hash) = crate::amendments::apply_pending(graph, hash, workspace, &agents[0]);
@@ -428,13 +430,24 @@ pub(crate) fn run_supervised_with_efficiency(
                     midrun,
                 );
 
-                if let Err(error) =
-                    crate::project_file::persist_evolved(workspace, &evolution.child_graph)
-                {
-                    eprintln!("  project graph note: {error:#}");
-                } else {
-                    crate::project_sync::maybe_sync_runtime(workspace);
-                }
+                let event_index =
+                    match crate::project_file::persist_evolved(workspace, &evolution.child_graph) {
+                        Ok(_) => {
+                            let index = evolution
+                                .record_learning_event_in_with_index(
+                                    workspace,
+                                    &hash,
+                                    "autonomous_midrun_grow",
+                                )
+                                .ok();
+                            crate::project_sync::maybe_sync_runtime(workspace);
+                            index
+                        }
+                        Err(error) => {
+                            eprintln!("  project graph note: {error:#}");
+                            None
+                        }
+                    };
                 crate::run_control::set_graph(&evolution.child_hash, board.unwrap_or_default());
 
                 // Board follows the adapted graph immediately.
@@ -455,6 +468,7 @@ pub(crate) fn run_supervised_with_efficiency(
                     evolution.context_bp,
                     evolution.cause,
                     evolution.governance,
+                    event_index,
                 ));
                 graph = evolution.child_graph;
                 hash = evolution.child_hash;
@@ -474,9 +488,16 @@ pub(crate) fn run_supervised_with_efficiency(
     // Settle every mid-run canary with the run's final verifiable verdict, and
     // reward the bandit so proactive grows learn from independently-verified wins.
     let succeeded = verified != Some(false) && failed.is_none();
-    for (arm, context_bp, cause, governance) in pending {
+    for (arm, context_bp, cause, governance, event_index) in pending {
         harness_evolution::record_reward(&arm, &context_bp, &cause, succeeded);
         let settle = harness_evolution::settle(governance, succeeded);
+        if let Some(index) = event_index {
+            if let Err(error) = harness_evolution::Evolution::update_learning_event_effect(
+                workspace, index, succeeded,
+            ) {
+                eprintln!("  learning event note: {error:#}");
+            }
+        }
         if !settle.is_empty() {
             println!("  ⟳ mid-run {settle}");
         }

@@ -333,19 +333,19 @@ fn start_hosted_control_monitor(run_id: String) {
 /// Queue a spoken or typed amendment against the one active build. The lead
 /// consumes it at the next dependency-safe boundary between execution waves.
 pub(crate) fn queue_active_amendment(task_ref: &str, instruction: &str) -> Result<()> {
-    let runs: Vec<_> = live_runs()?
-        .into_iter()
-        .filter(|run| run.status == "running" && process_alive(run.pid))
-        .collect();
-    if runs.is_empty() {
-        bail!("no Fractal build is currently running");
-    }
-    if runs.len() > 1 {
-        bail!("more than one Fractal build is running; add the branch from its project graph");
-    }
+    let run = active_amendment_run()?;
+    queue_workspace_branch_amendment(Path::new(&run.workspace), task_ref, instruction)
+}
+
+pub(crate) fn queue_workspace_branch_amendment(
+    workspace: &Path,
+    task_ref: &str,
+    instruction: &str,
+) -> Result<()> {
+    crate::project_file::load(workspace)?;
     let command_id = format!("local-{}-{}", now_ms(), std::process::id());
     crate::amendments::queue(
-        Path::new(&runs[0].workspace),
+        workspace,
         command_id,
         "add_branch",
         task_ref,
@@ -359,6 +359,87 @@ pub(crate) fn queue_active_amendment(task_ref: &str, instruction: &str) -> Resul
     Ok(())
 }
 
+/// Queue a bounded project-level instruction as one peer task in the earliest
+/// unfinished build wave. The explicit ingest transport is the authorization:
+/// this path never launches a project and never reads from `/dev/tty`.
+pub(crate) fn queue_active_project_amendment(instruction: &str) -> Result<()> {
+    let run = active_amendment_run()?;
+    queue_workspace_project_amendment(Path::new(&run.workspace), instruction)
+}
+
+pub(crate) fn queue_workspace_project_amendment(workspace: &Path, instruction: &str) -> Result<()> {
+    crate::project_file::load(workspace)?;
+    let wave = amendment_target_wave(workspace)?;
+    let command_id = format!("local-{}-{}", now_ms(), std::process::id());
+    crate::amendments::queue(
+        workspace,
+        command_id,
+        "add_wave_task",
+        "",
+        Some(wave),
+        instruction,
+        "explicit_amendment",
+    )?;
+    println!("Accepted: project amendment queued in wave {wave}; no new build was started.");
+    Ok(())
+}
+
+fn active_amendment_run() -> Result<ActiveRun> {
+    let runs: Vec<_> = live_runs()?
+        .into_iter()
+        .filter(|run| run.status == "running" && process_alive(run.pid))
+        .collect();
+    if runs.is_empty() {
+        bail!("no Fractal build is currently running");
+    }
+    let mut selected = select_runs(runs, None)?;
+    selected
+        .pop()
+        .context("no Fractal build is currently running")
+}
+
+fn amendment_target_wave(workspace: &Path) -> Result<u32> {
+    let path = workspace.join(".fractal").join("project.fractal");
+    let document: serde_json::Value = serde_json::from_slice(
+        &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("decode {}", path.display()))?;
+    amendment_target_wave_in(&document)
+}
+
+fn amendment_target_wave_in(document: &serde_json::Value) -> Result<u32> {
+    let nodes = document
+        .pointer("/graph/nodes")
+        .and_then(serde_json::Value::as_array)
+        .context("project graph nodes are missing")?;
+    let assignments = document
+        .pointer("/execution/assignments")
+        .and_then(serde_json::Value::as_object);
+    let unfinished = nodes
+        .iter()
+        .filter_map(|node| {
+            let id = node.get("id")?.as_str()?;
+            let wave = node.pointer("/execution/wave")?.as_u64()?;
+            let completed = assignments
+                .and_then(|values| values.get(id))
+                .and_then(|assignment| assignment.get("state"))
+                .and_then(serde_json::Value::as_str)
+                == Some("completed");
+            (wave > 0 && !completed).then_some(wave as u32)
+        })
+        .min();
+    unfinished
+        .or_else(|| {
+            nodes
+                .iter()
+                .filter_map(|node| node.pointer("/execution/wave")?.as_u64())
+                .filter(|wave| *wave > 0)
+                .max()
+                .map(|wave| wave as u32)
+        })
+        .context("project graph has no build wave to amend")
+}
+
 fn halt(original: &ActiveRun, hosted_command_id: Option<&str>) -> Result<()> {
     let mut run = original.clone();
     run.status = "halted".to_owned();
@@ -366,23 +447,24 @@ fn halt(original: &ActiveRun, hosted_command_id: Option<&str>) -> Result<()> {
     write_run(&run)?;
     write_project_state(&run).ok();
 
-    if let Some(board) = &run.board_url {
-        let http = ureq::AgentBuilder::new()
-            .timeout(Duration::from_millis(500))
-            .build();
-        for (node, agent) in &run.active_nodes {
-            let url = format!("{}/api/tasks/{}/release", board.trim_end_matches('/'), node);
-            let body = serde_json::json!({ "agent_id": agent, "agent_label": "Fractal · Halted" })
-                .to_string();
-            let _ = http
-                .post(&url)
-                .set("Content-Type", "application/json")
-                .send_string(&body);
-        }
-    }
     let workspace = Path::new(&run.workspace);
     for (node, agent) in &run.active_nodes {
-        crate::project_file::transition(workspace, node, "release", agent, agent).ok();
+        if let Err(error) = crate::project_file::release_node(
+            workspace,
+            node,
+            agent,
+            Some((
+                crate::learning_data::NodeOutcome::Cancelled,
+                crate::learning_data::FailureCode::PrematureCompletion,
+            )),
+        ) {
+            // Fall back to a plain release if the richer cancel path cannot run
+            // (for example a race where the worker already finished).
+            eprintln!("  cancel learning note: {error:#}");
+            crate::project_file::transition(workspace, node, "release", agent, agent).ok();
+        } else {
+            crate::project_sync::maybe_sync_runtime(workspace);
+        }
     }
 
     // Stop the coordinator first so a terminated planner cannot be mistaken for
@@ -425,6 +507,7 @@ fn finalize_halted_graph(workspace: &Path) -> Result<()> {
     if !crate::project_file::path(workspace).exists() {
         return Ok(());
     }
+    cancel_stale_checkouts(workspace)?;
     crate::project_file::release_stale_assignments(workspace)?;
     // release_stale_assignments only changes the phase when a checkout exists.
     // Always write the terminal phase so an idle or planning graph cannot remain
@@ -435,6 +518,32 @@ fn finalize_halted_graph(workspace: &Path) -> Result<()> {
         .map(|execution| execution.phase);
     if phase.as_deref() != Some("halted") {
         bail!("halted graph verification failed");
+    }
+    Ok(())
+}
+
+/// Release any lingering checkouts as controlled Cancelled outcomes before the
+/// generic stale-assignment sweeper runs.
+fn cancel_stale_checkouts(workspace: &Path) -> Result<()> {
+    let document = crate::project_file::load(workspace)?;
+    let Some(execution) = document.execution else {
+        return Ok(());
+    };
+    for (node, assignment) in execution.assignments {
+        if assignment.state != "checked_out" {
+            continue;
+        }
+        if let Err(error) = crate::project_file::release_node(
+            workspace,
+            &node,
+            &assignment.agent_id,
+            Some((
+                crate::learning_data::NodeOutcome::Cancelled,
+                crate::learning_data::FailureCode::PrematureCompletion,
+            )),
+        ) {
+            eprintln!("  stale cancel learning note: {error:#}");
+        }
     }
     Ok(())
 }
@@ -895,6 +1004,30 @@ mod tests {
     }
 
     #[test]
+    fn project_amendment_targets_the_earliest_unfinished_build_wave() {
+        let document = serde_json::json!({
+            "graph": {"nodes": [
+                {"id":"lead", "execution":{"wave":0}},
+                {"id":"done", "execution":{"wave":1}},
+                {"id":"active", "execution":{"wave":2}},
+                {"id":"later", "execution":{"wave":3}}
+            ]},
+            "execution": {"assignments": {
+                "lead": {"state":"completed"},
+                "done": {"state":"completed"},
+                "active": {"state":"checked_out"}
+            }}
+        });
+        assert_eq!(amendment_target_wave_in(&document).unwrap(), 2);
+
+        let complete = serde_json::json!({
+            "graph": {"nodes": [{"id":"done", "execution":{"wave":1}}]},
+            "execution": {"assignments": {"done": {"state":"completed"}}}
+        });
+        assert_eq!(amendment_target_wave_in(&complete).unwrap(), 1);
+    }
+
+    #[test]
     fn project_selection_is_exact_and_case_insensitive() {
         let run = ActiveRun {
             schema: "fractal.active_run.v1".to_owned(),
@@ -1044,6 +1177,14 @@ mod tests {
         let execution = project.execution.unwrap();
         assert_eq!(execution.phase, "halted");
         assert_eq!(execution.assignments["build"].state, "released");
+        assert_eq!(
+            project.learning.nodes["build"].outcome,
+            Some(crate::learning_data::NodeOutcome::Cancelled)
+        );
+        assert_eq!(
+            project.learning.nodes["build"].failure_code,
+            Some(crate::learning_data::FailureCode::PrematureCompletion)
+        );
         assert_eq!(read_project_run_state(&root).unwrap().status, "halted");
         fs::remove_dir_all(root).ok();
     }
@@ -1116,6 +1257,44 @@ mod tests {
         );
         halt_persisted_workspace(&root, false).unwrap();
         assert_eq!(read_project_run_state(&root).unwrap().status, "halted");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn finalize_halted_graph_cancels_stale_checkouts_with_learning_outcome() {
+        let root = std::env::temp_dir().join(format!(
+            "fractal-stale-cancel-learning-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut graph = serde_json::json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [{
+                "id": "build",
+                "capability": "code.generate",
+                "instruction": "Build it.",
+                "title": "Build"
+            }],
+            "edges": []
+        });
+        graph["graph_hash"] =
+            serde_json::Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::project_file::persist(&root, &graph, "Cancel").unwrap();
+        crate::project_file::checkout_start_node(&root, "build", "codex", "Codex").unwrap();
+
+        finalize_halted_graph(&root).unwrap();
+
+        let project = crate::project_file::load(&root).unwrap();
+        assert_eq!(project.execution.as_ref().unwrap().phase, "halted");
+        assert_eq!(
+            project.execution.as_ref().unwrap().assignments["build"].state,
+            "released"
+        );
+        assert_eq!(
+            project.learning.nodes["build"].outcome,
+            Some(crate::learning_data::NodeOutcome::Cancelled)
+        );
         fs::remove_dir_all(root).ok();
     }
 }

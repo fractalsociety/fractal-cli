@@ -1,7 +1,7 @@
 "use strict";
 
 const NS = "http://www.w3.org/2000/svg";
-const state = { data: null, view: "overview", selected: null, initialized: false, pausing: false };
+const state = { data: null, view: "overview", selected: null, initialized: false, pausing: false, estimatedSaved: 0 };
 const statusNames = { complete: "Complete", active: "In progress", incomplete: "Incomplete" };
 
 const overviewPositions = {
@@ -281,6 +281,51 @@ function renderRunControl() {
   live.lastChild.textContent = halted ? " BUILD PAUSED" : " BUILD RUNNING";
 }
 
+function formatTokens(value) {
+  const amount = Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;
+  if (amount >= 1_000_000_000) return `${(amount / 1_000_000_000).toFixed(amount >= 10_000_000_000 ? 0 : 1)}B`;
+  if (amount >= 1_000_000) return `${(amount / 1_000_000).toFixed(amount >= 10_000_000 ? 0 : 1)}M`;
+  if (amount >= 1_000) return `${(amount / 1_000).toFixed(amount >= 10_000 ? 0 : 1)}K`;
+  return Math.round(amount).toLocaleString();
+}
+
+function renderEfficiency() {
+  const efficiency = state.data?.efficiency;
+  const build = efficiency?.build || {};
+  const episodes = Array.isArray(efficiency?.episodes) ? efficiency.episodes : [];
+  const estimated = Number(build.gross_estimated_tokens_avoided || 0);
+  const adjusted = Number(build.confidence_adjusted_tokens_avoided || 0);
+  const realized = Number(build.realized_tokens_saved || 0);
+  const counter = document.getElementById("efficiency-counter");
+  document.getElementById("efficiency-summary").textContent = `Estimated ${formatTokens(estimated)} tokens saved`;
+  document.getElementById("efficiency-adjusted").textContent = `${formatTokens(adjusted)} tokens`;
+  document.getElementById("efficiency-realized").textContent = `${formatTokens(realized)} tokens`;
+  document.getElementById("efficiency-episodes").textContent = String(episodes.length);
+  document.getElementById("efficiency-confidence").textContent =
+    estimated > 0 ? `${Math.round((adjusted / estimated) * 100)}%` : "—";
+  const status = document.getElementById("efficiency-status");
+  const basis = document.getElementById("efficiency-basis");
+  if (!efficiency) {
+    status.textContent = "Efficiency tracking is awaiting canonical build data.";
+    basis.textContent = "No savings are claimed until Fractal records an auditable envelope.";
+  } else if (episodes.length === 0) {
+    status.textContent = "Efficiency tracking is active. No avoidable work has been detected yet.";
+    basis.textContent = "Estimated and realized savings remain zero until an intervention is recorded.";
+  } else {
+    const primary = episodes.reduce((best, episode) =>
+      Number(episode.estimated_tokens_avoided || 0) > Number(best.estimated_tokens_avoided || 0)
+        ? episode : best, episodes[0]);
+    const affected = Number(primary.affected_count || primary.affected_node_ids?.length || 0);
+    status.textContent = `${String(primary.waste_type || "efficiency").replaceAll("_", " ")} contained across ${affected} node${affected === 1 ? "" : "s"}.`;
+    basis.textContent = primary.estimation_basis || "Estimate recorded from the active execution graph.";
+  }
+  if (estimated > state.estimatedSaved) {
+    counter.classList.remove("pulse");
+    requestAnimationFrame(() => counter.classList.add("pulse"));
+  }
+  state.estimatedSaved = estimated;
+}
+
 async function pauseBuild() {
   const control = state.data?.run_control;
   if (!control?.available || control.phase === "halted" || state.pausing) return;
@@ -311,6 +356,7 @@ async function loadGraph() {
     if (!response.ok) throw new Error(`Graph API returned ${response.status}`);
     state.data = await response.json();
     renderRunControl();
+    renderEfficiency();
     const totals = state.data.totals;
     document.getElementById("percent").textContent = `${totals.percent}%`;
     document.getElementById("completed").textContent = totals.complete;

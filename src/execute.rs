@@ -351,8 +351,30 @@ pub(crate) fn detect_agents() -> Vec<String> {
 struct NodeOutcome {
     ok: bool,
     verified: Option<bool>,
+    /// True when the agent was killed for exceeding its time budget.
+    timed_out: bool,
     /// A human-readable note (e.g. the evidence-floor verdict) to surface.
     note: Option<String>,
+}
+
+impl NodeOutcome {
+    fn success(verified: Option<bool>, note: Option<String>) -> Self {
+        Self {
+            ok: true,
+            verified,
+            timed_out: false,
+            note,
+        }
+    }
+
+    fn failure(verified: Option<bool>, timed_out: bool, note: Option<String>) -> Self {
+        Self {
+            ok: false,
+            verified,
+            timed_out,
+            note,
+        }
+    }
 }
 
 /// Execute one node with a given agent: build nodes run the worker; verify nodes
@@ -376,32 +398,30 @@ fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> 
                 timeout_ms / 1000
             )
         });
-        Ok(NodeOutcome {
-            ok: run.ok,
-            verified: None,
-            note,
-        })
+        if run.ok {
+            Ok(NodeOutcome::success(None, note))
+        } else {
+            Ok(NodeOutcome::failure(None, run.timed_out, note))
+        }
     } else if is_verify(capability) {
         // Genuine governance: judge the suite with the real deny-by-default floor.
         match crate::verify::evaluate_workspace(workspace, id, agent)? {
-            Some(verdict) => Ok(NodeOutcome {
-                ok: verdict.complete,
-                verified: Some(verdict.complete),
-                note: Some(verdict.detail),
-            }),
+            Some(verdict) => {
+                if verdict.complete {
+                    Ok(NodeOutcome::success(Some(true), Some(verdict.detail)))
+                } else {
+                    Ok(NodeOutcome::failure(
+                        Some(false),
+                        false,
+                        Some(verdict.detail),
+                    ))
+                }
+            }
             // Nothing to run: unverifiable, but not a failure.
-            None => Ok(NodeOutcome {
-                ok: true,
-                verified: None,
-                note: None,
-            }),
+            None => Ok(NodeOutcome::success(None, None)),
         }
     } else {
-        Ok(NodeOutcome {
-            ok: true,
-            verified: None,
-            note: None,
-        })
+        Ok(NodeOutcome::success(None, None))
     }
 }
 
@@ -415,15 +435,15 @@ fn run_lead_closeout(node: &Value, agent: &str, workspace: &Path) -> Result<Node
     let timeout_ms = agent_timeout_ms(node);
     let run = run_worker_as(agent, instruction, workspace, timeout_ms)?;
     if !run.ok {
-        return Ok(NodeOutcome {
-            ok: false,
-            verified: Some(false),
-            note: Some(if run.timed_out {
+        return Ok(NodeOutcome::failure(
+            Some(false),
+            run.timed_out,
+            Some(if run.timed_out {
                 "lead closeout timed out".to_owned()
             } else {
                 "lead closeout agent failed".to_owned()
             }),
-        });
+        ));
     }
 
     let prd: Value = serde_json::from_slice(
@@ -436,11 +456,10 @@ fn run_lead_closeout(node: &Value, agent: &str, workspace: &Path) -> Result<Node
     )
     .context("decode lead closeout")?;
     let approved = validate_closeout(&prd, &closeout)?;
-    Ok(NodeOutcome {
-        ok: true,
-        verified: Some(true),
-        note: Some(format!("lead approved {approved} acceptance criteria")),
-    })
+    Ok(NodeOutcome::success(
+        Some(true),
+        Some(format!("lead approved {approved} acceptance criteria")),
+    ))
 }
 
 fn validate_closeout(prd: &Value, closeout: &Value) -> Result<usize> {
@@ -488,32 +507,283 @@ fn validate_closeout(prd: &Value, closeout: &Value) -> Result<usize> {
     Ok(required.len())
 }
 
-/// Best-effort report of a node transition to the live board so the dashboard
-/// turns yellow (checkout) then green (complete) as agents work.
+/// Commit a node transition through the central learning mutation APIs.
+/// The local and hosted boards are projections of that same file.
 fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str, workspace: &Path) {
-    let board_action = if action.starts_with("failed_") {
-        "release"
-    } else {
-        action
+    let board_action = match action {
+        "failed_execution" | "failed_verification" | "timeout" | "cancelled" => "release",
+        other => other,
     };
     crate::run_control::node_transition(board, node, board_action, agent);
-    if let Err(error) = crate::project_file::transition(workspace, node, action, agent, agent) {
+    let result = match action {
+        "checkout" => crate::project_file::checkout_start_node(workspace, node, agent, agent),
+        "complete" => finish_learning_success(workspace, node, agent, None, None, false),
+        "failed_verification" => release_learning_failure(
+            workspace,
+            node,
+            agent,
+            crate::learning_data::NodeOutcome::FailedVerification,
+            crate::learning_data::FailureCode::WeakVerifier,
+            None,
+        ),
+        "timeout" => release_learning_failure(
+            workspace,
+            node,
+            agent,
+            crate::learning_data::NodeOutcome::FailedExecution,
+            crate::learning_data::FailureCode::Timeout,
+            None,
+        ),
+        "failed_execution" => release_learning_failure(
+            workspace,
+            node,
+            agent,
+            crate::learning_data::NodeOutcome::FailedExecution,
+            crate::learning_data::FailureCode::ToolFailure,
+            None,
+        ),
+        "cancelled" => release_learning_failure(
+            workspace,
+            node,
+            agent,
+            crate::learning_data::NodeOutcome::Cancelled,
+            crate::learning_data::FailureCode::PrematureCompletion,
+            None,
+        ),
+        other => Err(anyhow::anyhow!("unsupported learning transition `{other}`")),
+    };
+    if let Err(error) = result {
         eprintln!("  live graph state note: {error:#}");
     } else {
         crate::project_sync::maybe_sync_runtime(workspace);
     }
-    if let Some(base) = board {
-        let url = format!(
-            "{}/api/tasks/{}/{}",
-            base.trim_end_matches('/'),
+}
+
+/// Record a full success/failure transition with measured evidence and costs.
+#[allow(clippy::too_many_arguments)]
+fn report_node_outcome(
+    board: Option<&str>,
+    node: &str,
+    agent: &str,
+    workspace: &Path,
+    outcome: &NodeOutcome,
+    evidence_hex: &str,
+    latency_ms: u64,
+    predecessors: &[String],
+) {
+    if outcome.ok {
+        let human = agent.eq_ignore_ascii_case("human");
+        let board_action = "complete";
+        crate::run_control::node_transition(board, node, board_action, agent);
+        let result = finish_learning_success(
+            workspace,
             node,
-            board_action
+            agent,
+            outcome.verified,
+            Some((evidence_hex, latency_ms, predecessors)),
+            human,
         );
-        let body = serde_json::json!({ "agent_id": agent, "agent_label": agent }).to_string();
-        let _ = ureq::post(&url)
-            .set("Content-Type", "application/json")
-            .send_string(&body);
+        if let Err(error) = result {
+            eprintln!("  live graph state note: {error:#}");
+        } else {
+            crate::project_sync::maybe_sync_runtime(workspace);
+        }
+        return;
     }
+
+    let (learning_outcome, failure_code) = if outcome.verified == Some(false) {
+        (
+            crate::learning_data::NodeOutcome::FailedVerification,
+            crate::learning_data::FailureCode::WeakVerifier,
+        )
+    } else if outcome.timed_out {
+        (
+            crate::learning_data::NodeOutcome::FailedExecution,
+            crate::learning_data::FailureCode::Timeout,
+        )
+    } else {
+        (
+            crate::learning_data::NodeOutcome::FailedExecution,
+            crate::learning_data::FailureCode::ToolFailure,
+        )
+    };
+    crate::run_control::node_transition(board, node, "release", agent);
+    let evidence = compact_evidence_ref(node, evidence_hex);
+    let result = release_learning_failure(
+        workspace,
+        node,
+        agent,
+        learning_outcome,
+        failure_code,
+        Some((evidence.as_str(), latency_ms)),
+    );
+    if let Err(error) = result {
+        eprintln!("  live graph state note: {error:#}");
+    } else {
+        crate::project_sync::maybe_sync_runtime(workspace);
+    }
+}
+
+fn compact_evidence_ref(node: &str, evidence_hex: &str) -> String {
+    let digest = evidence_hex.strip_prefix("sha256:").unwrap_or(evidence_hex);
+    let short: String = digest.chars().take(24).collect();
+    let reference = format!("evidence:{node}:{short}");
+    if reference.len() <= 240 && !reference.chars().any(char::is_whitespace) {
+        reference
+    } else {
+        format!("evidence:{node}")
+    }
+}
+
+fn compact_artifact_ref(node: &str, evidence_hex: &str) -> String {
+    let digest = evidence_hex.strip_prefix("sha256:").unwrap_or(evidence_hex);
+    let short: String = digest.chars().take(24).collect();
+    let reference = format!("artifact:{node}:{short}");
+    if reference.len() <= 240 && !reference.chars().any(char::is_whitespace) {
+        reference
+    } else {
+        format!("artifact:{node}")
+    }
+}
+
+fn finish_learning_success(
+    workspace: &Path,
+    node: &str,
+    agent: &str,
+    verified: Option<bool>,
+    measured: Option<(&str, u64, &[String])>,
+    human: bool,
+) -> Result<()> {
+    if let Some((evidence_hex, _latency_ms, predecessors)) = measured {
+        let artifact = compact_artifact_ref(node, evidence_hex);
+        let _ = crate::project_file::record_artifact_produced(workspace, node, &artifact);
+        record_predecessor_consumption(workspace, node, predecessors);
+        match verified {
+            Some(true) => {
+                let evidence = vec![compact_evidence_ref(node, evidence_hex)];
+                crate::project_file::record_verification_result(workspace, node, true, evidence)?;
+            }
+            Some(false) => {
+                let evidence = vec![compact_evidence_ref(node, evidence_hex)];
+                crate::project_file::record_verification_result(workspace, node, false, evidence)?;
+            }
+            None => {}
+        }
+    }
+    if human {
+        crate::project_file::record_human_intervention(
+            workspace,
+            node,
+            Some("human completed node"),
+        )?;
+        crate::project_file::finish_node(
+            workspace,
+            node,
+            agent,
+            crate::learning_data::NodeOutcome::HumanCompleted,
+        )?;
+        return Ok(());
+    }
+    let outcome = match verified {
+        Some(true) => crate::learning_data::NodeOutcome::VerifiedSuccess,
+        _ => crate::learning_data::NodeOutcome::UnverifiedSuccess,
+    };
+    crate::project_file::finish_node(workspace, node, agent, outcome)?;
+    Ok(())
+}
+
+fn release_learning_failure(
+    workspace: &Path,
+    node: &str,
+    agent: &str,
+    outcome: crate::learning_data::NodeOutcome,
+    failure_code: crate::learning_data::FailureCode,
+    measured: Option<(&str, u64)>,
+) -> Result<()> {
+    crate::project_file::release_node(workspace, node, agent, Some((outcome, failure_code)))?;
+    if let Some((evidence, _latency_ms)) = measured {
+        if outcome == crate::learning_data::NodeOutcome::FailedVerification {
+            let _ = crate::project_file::record_verification_result(
+                workspace,
+                node,
+                false,
+                vec![evidence.to_owned()],
+            );
+        }
+    }
+    Ok(())
+}
+
+fn record_predecessor_consumption(workspace: &Path, node: &str, predecessors: &[String]) {
+    let Ok(document) = crate::project_file::load(workspace) else {
+        return;
+    };
+    for predecessor in predecessors {
+        let Some(record) = document.learning.nodes.get(predecessor) else {
+            continue;
+        };
+        for artifact in &record.artifacts_produced {
+            let _ = crate::project_file::record_artifact_consumed(workspace, node, artifact);
+        }
+    }
+}
+
+/// Mark dependency-ready incomplete nodes before they are claimed.
+pub(crate) fn mark_ready_frontier(
+    workspace: &Path,
+    graph: &Value,
+    completed: &BTreeSet<String>,
+) -> Result<()> {
+    let preds = predecessor_map(graph);
+    for (id, dependencies) in &preds {
+        if completed.contains(id) {
+            continue;
+        }
+        if dependencies.iter().all(|dep| completed.contains(dep)) {
+            let _ = crate::project_file::mark_node_ready(workspace, id);
+        }
+    }
+    Ok(())
+}
+
+/// Reopen a previously failed/released node so a retry can start cleanly while
+/// preserving attempt_count from earlier runs.
+pub(crate) fn reopen_for_retry(workspace: &Path, node: &str) -> Result<()> {
+    crate::project_file::reopen_node(workspace, node)
+}
+
+/// Operator-driven completion path: record intervention and HumanCompleted.
+#[allow(dead_code)]
+pub(crate) fn complete_as_human(workspace: &Path, node: &str, agent: &str) -> Result<()> {
+    crate::project_file::record_human_intervention(
+        workspace,
+        node,
+        Some("operator marked node complete"),
+    )?;
+    crate::project_file::finish_node(
+        workspace,
+        node,
+        agent,
+        crate::learning_data::NodeOutcome::HumanCompleted,
+    )?;
+    crate::project_sync::maybe_sync_runtime(workspace);
+    Ok(())
+}
+
+/// Cancel an in-flight checkout with a controlled Cancelled outcome.
+#[allow(dead_code)]
+pub(crate) fn cancel_checked_out_node(workspace: &Path, node: &str, agent: &str) -> Result<()> {
+    crate::project_file::release_node(
+        workspace,
+        node,
+        agent,
+        Some((
+            crate::learning_data::NodeOutcome::Cancelled,
+            crate::learning_data::FailureCode::PrematureCompletion,
+        )),
+    )?;
+    crate::project_sync::maybe_sync_runtime(workspace);
+    Ok(())
 }
 
 /// A content-addressed digest of the workspace's top-level files (sorted names +
@@ -607,6 +877,7 @@ pub(crate) fn run_multi_agent(
             .collect(),
         ..Schedule::default()
     });
+    let _ = mark_ready_frontier(workspace, graph, completed_seed);
 
     // The lead (first agent) is the ORCHESTRATOR: it plans the project (the root
     // node) and closes it out (control), then assigns + monitors — it does not do
@@ -619,8 +890,8 @@ pub(crate) fn run_multi_agent(
         for agent in agents {
             let agent = agent.clone();
             let is_lead = agent.as_str() == lead;
-            let (schedule, ids, node_by_id, predecessors) =
-                (&schedule, &ids, &node_by_id, &predecessors);
+            let (schedule, ids, node_by_id, predecessors, graph) =
+                (&schedule, &ids, &node_by_id, &predecessors, graph);
             scope.spawn(move || {
               let mut mine: u64 = 0;
               loop {
@@ -705,25 +976,42 @@ pub(crate) fn run_multi_agent(
                 let evidence_hex = workspace_digest(workspace);
                 let node_is_verify = is_verify(capability);
                 let mut node_verified: Option<bool> = None;
+                let preds = predecessors.get(&id).cloned().unwrap_or_default();
                 let mut state = schedule.lock().expect("schedule lock");
                 state.in_progress.remove(&id);
                 let node_ok = match result {
-                    Ok(NodeOutcome { ok, verified, note }) => {
-                        if is_build(capability) && ok {
+                    Ok(outcome) => {
+                        let NodeOutcome {
+                            ok,
+                            verified,
+                            timed_out: _,
+                            note,
+                        } = &outcome;
+                        if is_build(capability) && *ok {
                             state.built = true;
                         }
-                        node_verified = verified;
+                        node_verified = *verified;
                         if let Some(value) = verified {
-                            state.verified = Some(value);
+                            state.verified = Some(*value);
                         }
                         let suffix = note
                             .as_deref()
                             .map(|note| format!(" — {note}"))
                             .unwrap_or_default();
-                        if ok {
+                        if *ok {
                             state.completed.insert(id.clone());
                             mine += 1;
-                            report_node(board, &id, "complete", &agent, workspace);
+                            report_node_outcome(
+                                board,
+                                &id,
+                                &agent,
+                                workspace,
+                                &outcome,
+                                &evidence_hex,
+                                latency_ms,
+                                &preds,
+                            );
+                            let _ = mark_ready_frontier(workspace, graph, &state.completed);
                             if is_planning {
                                 println!("{clr}  [{agent}] ✓ plan ready — dispatching tasks to the workers.");
                             } else {
@@ -731,24 +1019,32 @@ pub(crate) fn run_multi_agent(
                             }
                         } else {
                             state.failed = Some(id.clone());
-                            report_node(
+                            report_node_outcome(
                                 board,
                                 &id,
-                                if verified == Some(false) {
-                                    "failed_verification"
-                                } else {
-                                    "failed_execution"
-                                },
                                 &agent,
                                 workspace,
+                                &outcome,
+                                &evidence_hex,
+                                latency_ms,
+                                &preds,
                             );
                             println!("{clr}  [{agent}] ✗ {id}{suffix}");
                         }
-                        ok
+                        *ok
                     }
                     Err(error) => {
                         state.failed = Some(id.clone());
-                        report_node(board, &id, "failed_execution", &agent, workspace);
+                        report_node_outcome(
+                            board,
+                            &id,
+                            &agent,
+                            workspace,
+                            &NodeOutcome::failure(None, false, None),
+                            &evidence_hex,
+                            latency_ms,
+                            &preds,
+                        );
                         eprintln!("  [{agent}] ✗ {id}: {error:#}");
                         false
                     }
@@ -977,6 +1273,13 @@ pub(crate) fn run_efficiency_boundary_inner(
         PolicyDecision::ApplyApproved | PolicyDecision::AutoApply
     );
     let human_override = approval == ApprovalState::Overridden;
+    if human_override {
+        let _ = crate::project_file::record_human_intervention(
+            workspace,
+            &detection.detected_node,
+            Some("efficiency human override"),
+        );
+    }
     let draft = EpisodeDraft {
         waste_type: detection.waste_type,
         detected_node: detection.detected_node.clone(),
@@ -1421,39 +1724,53 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
     let latency_ms = started.elapsed().as_millis() as u64;
     let evidence_hex = workspace_digest(workspace);
     let is_verify_node = is_verify(capability);
+    let predecessors = {
+        // Wave callers pass single nodes; consume any artifacts already recorded
+        // for declared dependencies when the project file is present.
+        node.get("depends_on")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
     let mut verified = None;
     let ok = match result {
-        Ok(NodeOutcome {
-            ok,
-            verified: node_verified,
-            note,
-        }) => {
-            verified = node_verified;
-            let suffix = note
+        Ok(outcome) => {
+            verified = outcome.verified;
+            let suffix = outcome
+                .note
                 .as_deref()
                 .map(|note| format!(" — {note}"))
                 .unwrap_or_default();
-            if ok {
-                report_node(board, &id, "complete", agent, workspace);
+            report_node_outcome(
+                board,
+                &id,
+                agent,
+                workspace,
+                &outcome,
+                &evidence_hex,
+                latency_ms,
+                &predecessors,
+            );
+            if outcome.ok {
                 println!("{clr}  [{agent}] ✓ {id}{suffix}");
             } else {
-                report_node(
-                    board,
-                    &id,
-                    if node_verified == Some(false) {
-                        "failed_verification"
-                    } else {
-                        "failed_execution"
-                    },
-                    agent,
-                    workspace,
-                );
                 println!("{clr}  [{agent}] ✗ {id}{suffix}");
             }
-            ok
+            outcome.ok
         }
         Err(error) => {
-            report_node(board, &id, "failed_execution", agent, workspace);
+            report_node_outcome(
+                board,
+                &id,
+                agent,
+                workspace,
+                &NodeOutcome::failure(None, false, None),
+                &evidence_hex,
+                latency_ms,
+                &predecessors,
+            );
             eprintln!("  [{agent}] ✗ {id}: {error:#}");
             false
         }
@@ -1868,5 +2185,380 @@ mod tests {
             .collect();
         assert!(ids.contains(&"task_a"));
         assert!(!ids.contains(&"task_b"));
+    }
+
+    fn lifecycle_workspace(name: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // Keep lifecycle fixtures offline so background graph sync cannot race
+        // checkouts in temporary workspaces.
+        std::env::set_var("FRACTAL_OFFLINE", "1");
+        std::env::temp_dir().join(format!(
+            "fractal-lifecycle-{name}-{}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn checkout(workspace: &std::path::Path, node: &str, agent: &str) {
+        crate::project_file::checkout_start_node(workspace, node, agent, agent)
+            .unwrap_or_else(|error| panic!("checkout {node}: {error:#}"));
+    }
+
+    fn persist_two_node_graph(workspace: &std::path::Path) -> Value {
+        fs::create_dir_all(workspace).unwrap();
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_lifecycle",
+            "nodes": [
+                {
+                    "id": "build",
+                    "capability": "code.generate",
+                    "instruction": "Build",
+                    "title": "Build"
+                },
+                {
+                    "id": "verify",
+                    "capability": "project.tests",
+                    "instruction": "Verify",
+                    "title": "Verify",
+                    "depends_on": ["build"]
+                }
+            ],
+            "edges": [{"from": "build", "to": "verify"}]
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::project_file::persist(workspace, &graph, "Lifecycle").unwrap();
+        graph
+    }
+
+    #[test]
+    fn lifecycle_records_ready_checkout_success_artifacts_and_monotonic_timestamps() {
+        let workspace = lifecycle_workspace("success");
+        let graph = persist_two_node_graph(&workspace);
+        mark_ready_frontier(&workspace, &graph, &BTreeSet::new()).unwrap();
+        let ready = crate::project_file::load(&workspace).unwrap();
+        assert!(ready.learning.nodes["build"].ready_at.is_some());
+        assert!(ready.learning.nodes["verify"].ready_at.is_none());
+
+        checkout(&workspace, "build", "codex");
+        let after_start = crate::project_file::load(&workspace).unwrap();
+        let build = &after_start.learning.nodes["build"];
+        assert_eq!(build.attempt_count, 1);
+        assert!(build.started_at.is_some());
+        assert_eq!(
+            build.executor.as_ref().and_then(|e| e.agent.as_deref()),
+            Some("codex")
+        );
+        let started = build.started_at.clone().unwrap();
+
+        report_node_outcome(
+            None,
+            "build",
+            "codex",
+            &workspace,
+            &NodeOutcome::success(None, None),
+            "sha256:abcdef0123456789abcdef0123456789",
+            1_500,
+            &[],
+        );
+        let after_success = crate::project_file::load(&workspace).unwrap();
+        let build = &after_success.learning.nodes["build"];
+        assert_eq!(
+            build.outcome,
+            Some(crate::learning_data::NodeOutcome::UnverifiedSuccess)
+        );
+        assert!(build.finished_at.as_ref().unwrap() >= &started);
+        assert!(!build.artifacts_produced.is_empty());
+        assert_eq!(build.attempt_count, 1);
+        assert!(build.actual_cost.is_none());
+
+        mark_ready_frontier(&workspace, &graph, &BTreeSet::from(["build".to_owned()])).unwrap();
+        let ready_verify = crate::project_file::load(&workspace).unwrap();
+        assert!(ready_verify.learning.nodes["verify"].ready_at.is_some());
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn lifecycle_maps_tool_failure_timeout_and_failed_verification() {
+        let workspace = lifecycle_workspace("failures");
+        let _graph = persist_two_node_graph(&workspace);
+
+        checkout(&workspace, "build", "cursor");
+        report_node_outcome(
+            None,
+            "build",
+            "cursor",
+            &workspace,
+            &NodeOutcome::failure(None, false, Some("tool blew up".into())),
+            "sha256:11111111111111111111111111111111",
+            10,
+            &[],
+        );
+        let tool = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(
+            tool.learning.nodes["build"].outcome,
+            Some(crate::learning_data::NodeOutcome::FailedExecution)
+        );
+        assert_eq!(
+            tool.learning.nodes["build"].failure_code,
+            Some(crate::learning_data::FailureCode::ToolFailure)
+        );
+
+        reopen_for_retry(&workspace, "build").unwrap();
+        let reopened = crate::project_file::load(&workspace).unwrap();
+        assert!(reopened.learning.nodes["build"].outcome.is_none());
+        assert_eq!(reopened.learning.nodes["build"].attempt_count, 1);
+        assert!(reopened.learning.nodes["build"].reopen_count >= 1);
+
+        checkout(&workspace, "build", "cursor");
+        report_node_outcome(
+            None,
+            "build",
+            "cursor",
+            &workspace,
+            &NodeOutcome::failure(None, true, Some("hung".into())),
+            "sha256:22222222222222222222222222222222",
+            20,
+            &[],
+        );
+        let timeout = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(
+            timeout.learning.nodes["build"].failure_code,
+            Some(crate::learning_data::FailureCode::Timeout)
+        );
+        assert_eq!(timeout.learning.nodes["build"].attempt_count, 2);
+
+        reopen_for_retry(&workspace, "build").unwrap();
+        checkout(&workspace, "build", "cursor");
+        report_node_outcome(
+            None,
+            "build",
+            "cursor",
+            &workspace,
+            &NodeOutcome::failure(Some(false), false, Some("tests failed".into())),
+            "sha256:33333333333333333333333333333333",
+            30,
+            &[],
+        );
+        let verify = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(
+            verify.learning.nodes["build"].outcome,
+            Some(crate::learning_data::NodeOutcome::FailedVerification)
+        );
+        assert_eq!(
+            verify.learning.nodes["build"].failure_code,
+            Some(crate::learning_data::FailureCode::WeakVerifier)
+        );
+        assert_eq!(
+            verify.learning.nodes["build"]
+                .verification
+                .as_ref()
+                .and_then(|v| v.passed),
+            Some(false)
+        );
+        assert!(!verify.learning.nodes["build"]
+            .verification
+            .as_ref()
+            .unwrap()
+            .evidence_refs
+            .is_empty());
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn lifecycle_preserves_attempts_on_retry_and_records_artifact_lineage() {
+        let workspace = lifecycle_workspace("lineage");
+        let graph = persist_two_node_graph(&workspace);
+        checkout(&workspace, "build", "claude");
+        report_node_outcome(
+            None,
+            "build",
+            "claude",
+            &workspace,
+            &NodeOutcome::success(None, None),
+            "sha256:aaaabbbbccccddddeeeeffffaaaabbbb",
+            5,
+            &[],
+        );
+        let produced = crate::project_file::load(&workspace)
+            .unwrap()
+            .learning
+            .nodes["build"]
+            .artifacts_produced
+            .clone();
+        assert_eq!(produced.len(), 1);
+
+        mark_ready_frontier(&workspace, &graph, &BTreeSet::from(["build".to_owned()])).unwrap();
+        checkout(&workspace, "verify", "claude");
+        report_node_outcome(
+            None,
+            "verify",
+            "claude",
+            &workspace,
+            &NodeOutcome::success(Some(true), None),
+            "sha256:ffffeeeeddddccccbbbbaaaaffffeeee",
+            8,
+            &["build".to_owned()],
+        );
+        let document = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(document.learning.nodes["verify"].consumed_by, produced);
+        assert_eq!(
+            document.learning.nodes["verify"].outcome,
+            Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+        );
+        assert_eq!(
+            document.learning.nodes["verify"]
+                .verification
+                .as_ref()
+                .and_then(|v| v.passed),
+            Some(true)
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn lifecycle_human_completion_and_cancellation() {
+        let workspace = lifecycle_workspace("human");
+        let _graph = persist_two_node_graph(&workspace);
+        crate::project_file::checkout_start_node(&workspace, "build", "human", "human").unwrap();
+        complete_as_human(&workspace, "build", "human").unwrap();
+        let human = crate::project_file::load(&workspace).unwrap();
+        assert!(human.learning.nodes["build"].human_intervention);
+        assert_eq!(
+            human.learning.nodes["build"].outcome,
+            Some(crate::learning_data::NodeOutcome::HumanCompleted)
+        );
+
+        crate::project_file::checkout_start_node(&workspace, "verify", "codex", "codex").unwrap();
+        cancel_checked_out_node(&workspace, "verify", "codex").unwrap();
+        let cancelled = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(
+            cancelled.learning.nodes["verify"].outcome,
+            Some(crate::learning_data::NodeOutcome::Cancelled)
+        );
+        assert_eq!(
+            cancelled.learning.nodes["verify"].failure_code,
+            Some(crate::learning_data::FailureCode::PrematureCompletion)
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn cross_boundary_lifecycle_covers_controlled_paths_and_compact_evidence() {
+        let workspace = lifecycle_workspace("cross-boundary");
+        let graph = persist_two_node_graph(&workspace);
+
+        // Success path with artifact production.
+        mark_ready_frontier(&workspace, &graph, &BTreeSet::new()).unwrap();
+        checkout(&workspace, "build", "codex");
+        report_node_outcome(
+            None,
+            "build",
+            "codex",
+            &workspace,
+            &NodeOutcome::failure(None, false, Some("tool blew up".into())),
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            11,
+            &[],
+        );
+        let failed = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(
+            failed.learning.nodes["build"].outcome,
+            Some(crate::learning_data::NodeOutcome::FailedExecution)
+        );
+        assert_eq!(
+            failed.learning.nodes["build"].failure_code,
+            Some(crate::learning_data::FailureCode::ToolFailure)
+        );
+
+        // Retry preserves attempt history, then verified success + consumption.
+        reopen_for_retry(&workspace, "build").unwrap();
+        checkout(&workspace, "build", "codex");
+        report_node_outcome(
+            None,
+            "build",
+            "codex",
+            &workspace,
+            &NodeOutcome::success(None, None),
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            22,
+            &[],
+        );
+        let after_retry = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(after_retry.learning.nodes["build"].attempt_count, 2);
+        let produced = after_retry.learning.nodes["build"]
+            .artifacts_produced
+            .clone();
+        assert_eq!(produced.len(), 1);
+        assert!(produced[0].chars().all(|c| !c.is_whitespace()));
+        assert!(produced[0].len() <= 240);
+
+        mark_ready_frontier(&workspace, &graph, &BTreeSet::from(["build".to_owned()])).unwrap();
+        checkout(&workspace, "verify", "codex");
+        report_node_outcome(
+            None,
+            "verify",
+            "codex",
+            &workspace,
+            &NodeOutcome::success(Some(true), None),
+            "sha256:cccccccccccccccccccccccccccccccc",
+            33,
+            &["build".to_owned()],
+        );
+        let verified = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(
+            verified.learning.nodes["verify"].outcome,
+            Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+        );
+        assert_eq!(verified.learning.nodes["verify"].consumed_by, produced);
+        assert_eq!(
+            verified.learning.nodes["verify"]
+                .verification
+                .as_ref()
+                .and_then(|v| v.passed),
+            Some(true)
+        );
+        assert!(!verified.learning.nodes["verify"]
+            .verification
+            .as_ref()
+            .unwrap()
+            .evidence_refs
+            .is_empty());
+        for evidence in &verified.learning.nodes["verify"]
+            .verification
+            .as_ref()
+            .unwrap()
+            .evidence_refs
+        {
+            assert!(evidence.chars().all(|c| !c.is_whitespace()));
+            assert!(evidence.len() <= 240);
+        }
+
+        // Human intervention on a fresh node.
+        crate::project_file::checkout_start_node(&workspace, "build", "human", "human").ok();
+        // build already finished; exercise human completion API on a synthetic reopen.
+        reopen_for_retry(&workspace, "build").unwrap();
+        crate::project_file::checkout_start_node(&workspace, "build", "human", "human").unwrap();
+        complete_as_human(&workspace, "build", "human").unwrap();
+        let human = crate::project_file::load(&workspace).unwrap();
+        assert!(human.learning.nodes["build"].human_intervention);
+        assert_eq!(
+            human.learning.nodes["build"].outcome,
+            Some(crate::learning_data::NodeOutcome::HumanCompleted)
+        );
+
+        let round_trip: Value =
+            serde_json::from_slice(&fs::read(crate::project_file::path(&workspace)).unwrap())
+                .unwrap();
+        assert_eq!(round_trip["graph"], graph);
+        assert_eq!(
+            round_trip["learning"]["nodes"]["verify"]["outcome"],
+            json!("verified_success")
+        );
+        let _ = fs::remove_dir_all(workspace);
     }
 }

@@ -84,6 +84,7 @@ pub(crate) fn run(
         EventOptions {
             preview: args.preview,
             confirm: args.confirm,
+            amend: args.amend,
             managed_project: args.managed_project,
             project_name: args.project_name.as_deref(),
             repo: args.repo.as_deref(),
@@ -128,6 +129,7 @@ pub(crate) fn run_voice_transcript(
         EventOptions {
             preview: args.preview,
             confirm: args.confirm,
+            amend: false,
             managed_project: false,
             project_name: None,
             repo: args.repo.as_deref(),
@@ -142,6 +144,7 @@ pub(crate) fn run_voice_transcript(
 struct EventOptions<'a> {
     preview: bool,
     confirm: bool,
+    amend: bool,
     managed_project: bool,
     project_name: Option<&'a str>,
     repo: Option<&'a Path>,
@@ -169,6 +172,37 @@ fn process_event(event: InputEvent, options: EventOptions<'_>) -> Result<()> {
             "unsupported input mode {:?}; expected {DEFAULT_COMMAND_MODE:?} or {DICTATION_MODE:?}",
             event.mode
         );
+    }
+
+    // Explicit amendment transport is fail-closed. It either queues work on
+    // the active graph or returns an ordinary visible error; it can never reach
+    // the generic build path or its /dev/tty confirmation prompt.
+    if options.amend {
+        if matches!(risk, Risk::Destructive | Risk::ExternalSideEffect) {
+            bail!(
+                "{risk} graph amendment was not queued; use a dedicated governed command for high-risk effects; no build was started"
+            );
+        }
+        println!(
+            "Normalized {} {} input · explicit graph amendment",
+            event.source, event.modality
+        );
+        return match (options.repo, parse_graph_amendment(&event.content)) {
+            (Some(workspace), Some((task_ref, instruction))) => {
+                crate::run_control::queue_workspace_branch_amendment(
+                    workspace,
+                    &task_ref,
+                    &instruction,
+                )
+            }
+            (None, Some((task_ref, instruction))) => {
+                crate::run_control::queue_active_amendment(&task_ref, &instruction)
+            }
+            (Some(workspace), None) => {
+                crate::run_control::queue_workspace_project_amendment(workspace, &event.content)
+            }
+            (None, None) => crate::run_control::queue_active_project_amendment(&event.content),
+        };
     }
 
     // Visibility changes must use the dedicated two-step command. Do not let a
@@ -515,17 +549,13 @@ fn normalize_and_validate(event: &mut InputEvent) -> Result<()> {
 /// generic read verbs ("show and then delete" is destructive, never read-only).
 pub(crate) fn classify_risk(content: &str) -> Risk {
     let text = content.to_ascii_lowercase();
-    let external = [
+    let always_external = [
         "send ",
         "reply to ",
         "publish ",
         "post ",
         "deploy ",
         "push ",
-        "purchase ",
-        "buy ",
-        "pay ",
-        "transfer ",
         "submit ",
         "upload ",
         "open a pull request",
@@ -533,7 +563,13 @@ pub(crate) fn classify_risk(content: &str) -> Risk {
         "call the api",
         "call an api",
     ];
-    if external.iter().any(|term| text.contains(term)) {
+    if always_external.iter().any(|term| text.contains(term)) {
+        return Risk::ExternalSideEffect;
+    }
+    let economic_external = ["purchase ", "buy ", "pay ", "transfer "];
+    if economic_external.iter().any(|term| text.contains(term))
+        && !is_bounded_wallet_simulation(&text)
+    {
         return Risk::ExternalSideEffect;
     }
     let destructive = [
@@ -602,6 +638,58 @@ pub(crate) fn classify_risk(content: &str) -> Risk {
         // Unknown voice intent is never assumed harmless.
         Risk::ReversibleWrite
     }
+}
+
+/// Allows economic verbs to describe a local/internal simulation without
+/// granting authority for live settlement. The exemption is deliberately
+/// narrow: it needs both an explicit simulation marker and build/design intent,
+/// and any phrase suggesting real signing, broadcasting, funds, or a live chain
+/// restores the external-side-effect classification.
+fn is_bounded_wallet_simulation(text: &str) -> bool {
+    let simulation_markers = [
+        "simulated wallet",
+        "simulation-only wallet",
+        "wallet simulation",
+        "synthetic economy",
+        "simulated economy",
+        "mock wallet",
+        "mock blockchain",
+        "local simulation",
+    ];
+    let build_intent = [
+        "build ",
+        "create ",
+        "design ",
+        "implement ",
+        "prototype ",
+        "specify ",
+        "simulate ",
+    ];
+    let live_effect_markers = [
+        "send funds",
+        "move funds",
+        "transfer tokens",
+        "transfer funds",
+        "transfer assets",
+        "transfer real",
+        "pay real",
+        "buy real",
+        "purchase real",
+        "sign transaction",
+        "sign and broadcast",
+        "broadcast transaction",
+        "execute transfer",
+        "execute payment",
+        "on-chain transfer",
+        "onchain transfer",
+        "deploy contract",
+        "connect my wallet",
+        "connect to my wallet",
+    ];
+
+    simulation_markers.iter().any(|term| text.contains(term))
+        && build_intent.iter().any(|term| text.contains(term))
+        && !live_effect_markers.iter().any(|term| text.contains(term))
 }
 
 fn looks_like_rfc3339(value: &str) -> bool {
@@ -747,6 +835,53 @@ mod tests {
         );
         assert_eq!(classify_risk("Review email regressions"), Risk::ReadOnly);
         assert_eq!(classify_risk("Do the thing"), Risk::ReversibleWrite);
+    }
+
+    #[test]
+    fn simulated_internal_wallet_build_is_reversible() {
+        assert_eq!(
+            classify_risk(
+                "Build a synthetic economy with simulated wallets for my internal blockchain. \
+                 Agents purchase simulated inference and transfer simulated credits. \
+                 Do not sign or broadcast real transactions."
+            ),
+            Risk::ReversibleWrite
+        );
+        assert_eq!(
+            classify_risk(
+                "Design a local simulation where mock wallets buy tool services and pay \
+                 other test agents."
+            ),
+            Risk::ReversibleWrite
+        );
+        assert_eq!(
+            classify_risk(
+                "Build simulated wallets for my internal blockchain where agents purchase \
+                 simulated services and transfer simulated credits. No real funds, signing, \
+                 broadcasting, mainnet activity, custody, or irreversible transfers."
+            ),
+            Risk::ReversibleWrite
+        );
+    }
+
+    #[test]
+    fn wallet_simulation_exemption_fails_closed_for_live_effects() {
+        assert_eq!(
+            classify_risk(
+                "Build simulated wallets, then sign and broadcast a transfer on mainnet."
+            ),
+            Risk::ExternalSideEffect
+        );
+        assert_eq!(
+            classify_risk(
+                "Design a synthetic economy and send an email when agents purchase credits."
+            ),
+            Risk::ExternalSideEffect
+        );
+        assert_eq!(
+            classify_risk("Transfer tokens on my internal blockchain."),
+            Risk::ExternalSideEffect
+        );
     }
 
     #[test]

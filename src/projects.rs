@@ -42,6 +42,16 @@ fn now_ms() -> u64 {
 
 /// A short, human-friendly label — the workspace folder name.
 fn label_for(workspace: &Path) -> String {
+    validated_label_for(workspace).unwrap_or_else(|| fallback_label_for(workspace))
+}
+
+fn validated_label_for(workspace: &Path) -> Option<String> {
+    let document = crate::project_file::load(workspace).ok()?;
+    let title = document.project.title.trim();
+    (!title.is_empty()).then(|| title.chars().take(240).collect())
+}
+
+fn fallback_label_for(workspace: &Path) -> String {
     workspace
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -49,29 +59,39 @@ fn label_for(workspace: &Path) -> String {
 }
 
 pub(crate) fn load() -> Vec<Project> {
-    std::fs::read_to_string(registry_path())
+    load_from(&registry_path())
+}
+
+fn load_from(path: &Path) -> Vec<Project> {
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
 }
 
-fn save(projects: &[Project]) {
-    let _ = std::fs::create_dir_all(fractal_home());
+fn save_to(home: &Path, path: &Path, projects: &[Project]) {
+    let _ = std::fs::create_dir_all(home);
     if let Ok(text) = serde_json::to_string_pretty(projects) {
-        let _ = std::fs::write(registry_path(), text);
+        let _ = std::fs::write(path, text);
     }
 }
 
 /// Register `workspace` if new (assigning the next number) or refresh it; returns
 /// its stable number. Keyed by the same workspace string the checkpoint uses.
 pub(crate) fn register(workspace: &Path) -> u32 {
+    register_in(workspace, &fractal_home(), &registry_path())
+}
+
+fn register_in(workspace: &Path, home: &Path, registry: &Path) -> u32 {
     let key = workspace.to_string_lossy().into_owned();
-    let mut projects = load();
+    let mut projects = load_from(registry);
     if let Some(existing) = projects.iter_mut().find(|project| project.workspace == key) {
         existing.updated_at_ms = now_ms();
-        existing.label = label_for(workspace);
+        if let Some(label) = validated_label_for(workspace) {
+            existing.label = label;
+        }
         let number = existing.number;
-        save(&projects);
+        save_to(home, registry, &projects);
         return number;
     }
     let number = projects.iter().map(|p| p.number).max().unwrap_or(0) + 1;
@@ -81,7 +101,7 @@ pub(crate) fn register(workspace: &Path) -> u32 {
         label: label_for(workspace),
         updated_at_ms: now_ms(),
     });
-    save(&projects);
+    save_to(home, registry, &projects);
     number
 }
 
@@ -132,6 +152,106 @@ pub(crate) fn parse_resume_command(text: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn valid_graph() -> Value {
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_project_discovery",
+            "nodes": [{"id": "build", "capability": "code.generate", "instruction": "Build", "future_node_field": true}],
+            "edges": [],
+            "future_graph_field": {"must": "survive"}
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        graph
+    }
+
+    #[test]
+    fn register_refreshes_project_label_from_validated_current_project_file() -> anyhow::Result<()>
+    {
+        let home = temp_dir("fractal-projects-home");
+        let registry = home.join("projects.json");
+        let workspace = temp_dir("fractal-projects-workspace");
+        std::fs::create_dir_all(&workspace)?;
+
+        let graph = valid_graph();
+        crate::project_file::persist(&workspace, &graph, "Folder Label")?;
+        let number = register_in(&workspace, &home, &registry);
+        let mut raw: Value =
+            serde_json::from_slice(&std::fs::read(crate::project_file::path(&workspace))?)?;
+        raw["project"]["title"] = json!("Current Enriched Title");
+        raw["learning"]["nodes"]["build"]["outcome"] = json!("unverified_success");
+        raw["learning"]["nodes"]["build"]["finished_at"] = json!("2024-01-01T00:00:00Z");
+        std::fs::write(
+            crate::project_file::path(&workspace),
+            serde_json::to_vec_pretty(&raw)?,
+        )?;
+
+        assert_eq!(register_in(&workspace, &home, &registry), number);
+        let project = load_from(&registry)
+            .into_iter()
+            .find(|project| project.number == number)
+            .expect("registered project");
+        assert_eq!(project.label, "Current Enriched Title");
+        assert_eq!(
+            crate::project_file::load(&workspace)?.graph["future_graph_field"],
+            json!({"must": "survive"})
+        );
+        assert_eq!(
+            serde_json::to_value(crate::project_file::load(&workspace)?.learning)?["nodes"]
+                ["build"]["outcome"],
+            json!("unverified_success")
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(workspace);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_current_project_file_does_not_rewrite_registry_metadata() -> anyhow::Result<()> {
+        let home = temp_dir("fractal-projects-invalid-home");
+        let registry = home.join("projects.json");
+        let workspace = temp_dir("fractal-projects-invalid-workspace");
+        std::fs::create_dir_all(&workspace)?;
+
+        let graph = valid_graph();
+        crate::project_file::persist(&workspace, &graph, "Safe Title")?;
+        let number = register_in(&workspace, &home, &registry);
+        let mut raw: Value =
+            serde_json::from_slice(&std::fs::read(crate::project_file::path(&workspace))?)?;
+        raw["learning"]["nodes"]["build"]["notes"] = json!("x".repeat(1001));
+        raw["project"]["title"] = json!("Invalid Title Must Not Land");
+        std::fs::write(
+            crate::project_file::path(&workspace),
+            serde_json::to_vec_pretty(&raw)?,
+        )?;
+
+        assert_eq!(register_in(&workspace, &home, &registry), number);
+        assert_eq!(
+            load_from(&registry)
+                .into_iter()
+                .find(|project| project.number == number)
+                .expect("registered project")
+                .label,
+            "Safe Title"
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(workspace);
+        Ok(())
+    }
 
     #[test]
     fn parses_resume_commands_but_not_builds() {

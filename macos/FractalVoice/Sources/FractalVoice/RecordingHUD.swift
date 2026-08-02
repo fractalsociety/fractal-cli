@@ -57,36 +57,42 @@ final class RecordingHUD {
     func showPreparing() {
         model.phase = .preparing
         model.summary = "Starting Granite Speech and Kokoro locally…"
+        model.detail = nil
         showWindow(activate: true)
     }
 
     func showListening(summary: String = "Press ⌥Space again to stop") {
         model.phase = .listening
         model.summary = summary
+        model.detail = nil
         model.manualText = ""
     }
 
     func showManualRequest() {
         model.phase = .manualRequest
         model.summary = "Type exactly what you want Fractal to build."
+        model.detail = nil
         model.manualText = ""
         showWindow(activate: true)
         focusManualInput()
     }
 
-    func showBuilding(summary: String = "Finishing the local transcript…") {
+    func showBuilding(summary: String = "Finishing the local transcript…", detail: String? = nil) {
         model.phase = .building
         model.summary = summary
+        model.detail = detail
     }
 
     func showTranscribing() {
         model.phase = .transcribing
         model.summary = "Applying product vocabulary and accurate local transcription…"
+        model.detail = nil
     }
 
     func showQuestion(_ question: String) {
         model.phase = .question
         model.summary = question
+        model.detail = nil
         showWindow()
     }
 
@@ -94,6 +100,7 @@ final class RecordingHUD {
         let wasNaming = model.phase == .naming
         model.phase = .naming
         model.summary = summary
+        model.detail = nil
         if !wasNaming {
             model.manualText = ""
         }
@@ -106,20 +113,30 @@ final class RecordingHUD {
         model.summary = restarting
             ? "Pausing this attempt, then reopening the microphone…"
             : "Preserving completed graph waves and releasing active agents…"
+        // Keep any learning detail visible while pausing so operators retain context.
     }
 
     func showFailure(_ message: String) {
         model.phase = .failure
         model.summary = message
+        model.detail = nil
         showWindow()
     }
 
-    func updateBuilding(summary: String) {
+    func updateBuilding(summary: String, detail: String? = nil, updateDetail: Bool = false) {
         guard model.phase == .building || model.phase == .transcribing else {
             return
         }
         model.phase = .building
         model.summary = summary
+        if updateDetail {
+            model.detail = detail
+        }
+    }
+
+    func updateLearningDetail(_ detail: String?) {
+        guard model.phase == .building || model.phase == .stopping else { return }
+        model.detail = detail
     }
 
     func close() {
@@ -136,6 +153,10 @@ final class RecordingHUD {
 
     var summaryForTesting: String {
         model.summary
+    }
+
+    var detailForTesting: String? {
+        model.detail
     }
 
     var isShowingManualRequestForTesting: Bool {
@@ -204,6 +225,8 @@ private final class InputPanel: NSPanel {
 private final class HUDModel: ObservableObject {
     @Published var phase: HUDPhase = .preparing
     @Published var summary = "Starting offline voice…"
+    /// Optional learning projection (outcome / attempts / verification / graph).
+    @Published var detail: String?
     let onStop: () -> Void
     let onRestart: () -> Void
     let onYes: () -> Void
@@ -304,8 +327,16 @@ private struct RecordingHUDView: View {
                 Text(model.summary)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
-                    .lineLimit(3)
+                    .lineLimit(model.detail == nil ? 3 : 2)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                if let detail = model.detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityLabel("Learning status")
+                }
             }
         }
     }

@@ -145,6 +145,32 @@ pub(crate) struct Recorder {
     enabled: bool,
 }
 
+/// Prepare learning state so a resumed run can reclaim released/failed nodes and
+/// mark the dependency-ready frontier without inventing historical facts.
+pub(crate) fn prepare_resume(
+    workspace: &Path,
+    graph: &serde_json::Value,
+    completed: &BTreeSet<String>,
+) -> anyhow::Result<()> {
+    let document = crate::project_file::load(workspace)?;
+    for (node_id, record) in &document.learning.nodes {
+        if completed.contains(node_id) {
+            continue;
+        }
+        let released = document
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.assignments.get(node_id))
+            .is_some_and(|assignment| assignment.state == "released");
+        if record.outcome.is_some() || released {
+            // Preserve attempt_count; reopen clears terminal fields only.
+            let _ = crate::project_file::reopen_node(workspace, node_id);
+        }
+    }
+    crate::execute::mark_ready_frontier(workspace, graph, completed)?;
+    Ok(())
+}
+
 impl Recorder {
     pub(crate) fn new(workspace: &Path, graph_id: &str, request: &str) -> Self {
         Recorder {
@@ -184,5 +210,61 @@ impl Recorder {
         if self.enabled {
             discard(&self.key);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+
+    fn temp_workspace(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "fractal-checkpoint-{name}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn prepare_resume_reopens_released_failures_and_marks_ready_frontier() {
+        let workspace = temp_workspace("resume");
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_resume",
+            "nodes": [
+                {"id": "build", "capability": "code.generate", "instruction": "Build", "title": "Build"},
+                {"id": "test", "capability": "project.tests", "instruction": "Test", "title": "Test"}
+            ],
+            "edges": [{"from": "build", "to": "test"}]
+        });
+        graph["graph_hash"] =
+            serde_json::Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::project_file::persist(&workspace, &graph, "Resume").unwrap();
+        crate::project_file::checkout_start_node(&workspace, "build", "codex", "Codex").unwrap();
+        crate::project_file::release_node(
+            &workspace,
+            "build",
+            "codex",
+            Some((
+                crate::learning_data::NodeOutcome::FailedExecution,
+                crate::learning_data::FailureCode::ToolFailure,
+            )),
+        )
+        .unwrap();
+        let before = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(before.learning.nodes["build"].attempt_count, 1);
+        assert!(before.learning.nodes["build"].outcome.is_some());
+
+        prepare_resume(&workspace, &graph, &BTreeSet::new()).unwrap();
+        let after = crate::project_file::load(&workspace).unwrap();
+        assert!(after.learning.nodes["build"].outcome.is_none());
+        assert_eq!(after.learning.nodes["build"].attempt_count, 1);
+        assert!(after.learning.nodes["build"].reopen_count >= 1);
+        assert!(after.learning.nodes["build"].ready_at.is_some());
+        let _ = fs::remove_dir_all(workspace);
     }
 }
