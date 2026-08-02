@@ -12,6 +12,16 @@ function queryMode() {
 function setBoardMode(mode) {
   document.body.classList.toggle("master-active", mode === "master");
   document.getElementById("master-browser").classList.toggle("hidden", mode !== "master");
+  renderSharedModeToggle();
+}
+
+function renderSharedModeToggle() {
+  const host = document.getElementById("view-mode-toggle");
+  if (!host || !window.FractalMasterGraph) return;
+  FractalMasterGraph.renderModeToggle(document, host, queryMode(), mode => {
+    if (mode === "master") switchToMaster();
+    else switchToIndividual();
+  });
 }
 
 function individualUrl() {
@@ -34,18 +44,25 @@ function switchToMaster(push = true) {
   params.set("mode", "master");
   if (push) history.pushState(null, "", `${window.location.pathname}?${params}`);
   setBoardMode("master");
-  if (!masterBrowser) {
-    masterBrowser = FractalMasterGraph.createMasterGraphBrowser({
-      root: document.getElementById("master-browser"),
-      fetchImpl: window.fetch.bind(window),
-      history: window.history,
-      getSearch: () => window.location.search,
-      getViewportWidth: () => window.innerWidth
-    });
-    masterBrowser.init().finally(renderMasterMetrics);
-  } else {
-    masterBrowser.refresh().then(renderMasterMetrics);
+  /* Rebuild the modular controller when entering master so URL state (q,
+   * filters, selection, and view) is authoritative after an individual visit. */
+  if (masterBrowser) {
+    document.getElementById("master-browser").replaceChildren();
+    masterBrowser = null;
   }
+  masterBrowser = FractalMasterGraph.createMasterGraphBrowser({
+    root: document.getElementById("master-browser"),
+    fetchImpl: window.fetch.bind(window),
+    history: window.history,
+    getSearch: () => window.location.search,
+    getViewportWidth: () => window.innerWidth,
+    sharedModeToggle: true,
+    onModeChange: mode => {
+      setBoardMode(mode);
+      if (mode === "individual") loadGraph();
+    }
+  });
+  masterBrowser.init().finally(renderMasterMetrics);
 }
 
 function renderMasterMetrics() {
@@ -461,18 +478,6 @@ document.getElementById("refresh").addEventListener("click", () => {
 document.getElementById("back").addEventListener("click", showOverview);
 document.getElementById("pause-build").addEventListener("click", pauseBuild);
 
-/* The modular browser owns master controls. Capture the Individual action and
- * return to the established SVG renderer, preserving its progress/pause UX. */
-document.getElementById("master-browser").addEventListener("click", event => {
-  const control = event.target.closest("[data-mode], [data-project-key]");
-  if (!control) return;
-  if (control.getAttribute("data-mode") === "individual" || control.hasAttribute("data-project-key")) {
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    switchToIndividual();
-  }
-}, true);
-
 window.addEventListener("popstate", () => {
   if (queryMode() === "master") {
     /* The modular controller intentionally receives an injected history object;
@@ -490,6 +495,7 @@ window.addEventListener("popstate", () => {
 if (queryMode() === "master") switchToMaster();
 else {
   setBoardMode("individual");
+  renderSharedModeToggle();
   loadGraph();
 }
 setInterval(() => { if (queryMode() === "individual") loadGraph(); }, 2000);

@@ -161,13 +161,13 @@ footer { max-width: 1480px; margin: 0 auto; padding: 22px clamp(18px,4vw,72px) 3
 
 /* The modular master browser owns its chrome and stage. Keep the established
  * execution board intact while its alternate view is active. */
-.master-browser { max-width: 1480px; min-height: 750px; margin: 0 auto 32px; }
+.master-browser { width: 100%; max-width: none; min-height: 750px; margin: 0 auto 32px; }
 .master-active .hero, .master-active .workspace { display: none; }
 .master-active main { padding-top: 32px; }
 .master-active main + footer { display: none; }
 .master-browser > .mg-region { width: 100%; }
 .master-browser .mg-region-chrome { border: 1px solid var(--line); padding: 14px; background: rgba(3,9,8,.78); }
-.master-browser .mg-region-stage { min-height: 560px; border: 1px solid var(--line); border-top: 0; background: rgba(3,9,8,.78); }
+.master-browser .mg-region-stage { height: min(760px, calc(100vh - 280px)); min-height: 620px; border: 1px solid var(--line); border-top: 0; background: rgba(3,9,8,.78); }
 .master-browser .mg-region-inspector { border: 1px solid var(--line); border-top: 0; padding: 18px 22px; background: rgba(8,17,17,.78); }
 .master-browser .mg-region-diagnostics { margin-top: 12px; }
 .master-browser .mg-region-footer { padding: 16px 4px; }
@@ -179,10 +179,19 @@ footer { max-width: 1480px; margin: 0 auto; padding: 22px clamp(18px,4vw,72px) 3
 .master-browser .mg-search { flex: 1 1 180px; }
 .master-browser .mg-filter-group { max-width: 100%; }
 
+@media (max-width: 900px) {
+  .master-browser .mg-region-stage { height: calc(100vh - 230px); min-height: 560px; }
+}
+
 @media (max-width: 700px) {
   .master-browser { margin-left: -10px; margin-right: -10px; }
   .master-browser .mg-region-chrome { align-items: stretch; }
   .master-browser .mg-region-chrome > div { flex: 1 1 140px; }
+}
+
+@media (max-width: 560px) {
+  #view-mode-toggle { margin-left: auto; }
+  .master-browser .mg-region-stage { height: auto; min-height: 440px; }
 }
 
 .pause-build {
@@ -219,7 +228,12 @@ footer { max-width: 1480px; margin: 0 auto; padding: 22px clamp(18px,4vw,72px) 3
 }
 
 @media (max-width: 560px) {
-  .topbar { height: 70px; }.live-state { display: none; }.efficiency-counter { margin-left: auto; }.efficiency-counter summary { max-width: 155px; overflow: hidden; text-overflow: ellipsis; }.pause-build { display: none !important; }.icon-button { margin-left: 8px; }
+  .topbar { height: auto; min-height: 70px; flex-wrap: wrap; gap: 8px; padding-top: 12px; padding-bottom: 12px; }
+  .live-state { display: none; }
+  .efficiency-counter { margin-left: 0; order: 3; }
+  .efficiency-counter summary { max-width: 155px; overflow: hidden; text-overflow: ellipsis; }
+  .pause-build { display: none !important; }
+  .icon-button { margin-left: 0; order: 2; }
   .hero { padding-top: 65px; min-height: 430px; } h1 { font-size: 49px; }
   .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 26px; }
   .workspace { margin-left: -10px; margin-right: -10px; }

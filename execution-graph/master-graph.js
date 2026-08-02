@@ -324,13 +324,16 @@
   /* Combined predicate (contract §7.4). Returns per-node and per-edge
    * visibility; graph mode dims non-matches, list mode hides them. */
   function computeMasterVisibility(view, filters) {
-    var result = { nodeShown: {}, nodeDimmed: {}, projectShown: {}, edgeShown: {}, matchCount: 0 };
+    filters = filters || {};
+    var result = { nodeShown: {}, nodeDimmed: {}, projectShown: {}, edgeShown: {},
+      matchIds: {}, projectMatches: {}, query: normalizeText(filters && filters.q || ""), matchCount: 0 };
     if (!view) return result;
     var statusSet = sanitizeStatusTokens(filters.status || [], "master");
     var relSet = sanitizeRelTokens(filters.rel || []);
     var index = buildMasterSearchIndex(view);
     var match = searchMatches(index, filters.q);
     result.matchCount = match.count;
+    result.matchIds = match.ids;
 
     var projectsByKey = {};
     (view.projects || []).forEach(function (project) { projectsByKey[project.project_key] = project; });
@@ -344,6 +347,7 @@
           (project.catalog_state === "missing" ? "missing" : "available"));
       result.projectShown[projectId] = projectMatch &&
         (statusSet.length === 0 || statusSet.indexOf(projectStatus) !== -1);
+      result.projectMatches[projectId] = projectMatch;
     });
 
     (view.edges || []).forEach(function (edge) {
@@ -361,11 +365,12 @@
       var directMatch = match.empty ? true : Boolean(match.ids[node.id]);
       var statusOk = statusSet.length === 0 ||
         statusSet.indexOf(masterNodeStatusToken(node, projectsByKey)) !== -1;
-      var anchored = Boolean(incidentVisible[node.id]) ||
-        (filters.sel && filters.sel === node.id) || directMatch;
-      var shown = directMatch && statusOk && anchored;
+      /* In graph mode, search keeps every node mounted (the renderer may dim
+       * non-matches) so a hit cannot remain trapped in a collapsed card. List
+       * mode consumes nodeShown and therefore still shows only direct matches. */
+      var shown = directMatch && statusOk;
       result.nodeShown[node.id] = shown;
-      result.nodeDimmed[node.id] = !shown;
+      result.nodeDimmed[node.id] = Boolean(filters.q) && !directMatch;
     });
     return result;
   }
@@ -391,10 +396,13 @@
 
   function groupNodesByProject(nodes) {
     var groups = new Map();
-    (nodes || []).forEach(function (node) {
-      var key = node.project_key || (parseNamespacedId(node.id) || {}).rest || "(unassigned)";
+    (nodes || []).slice().sort(function (a, b) {
+      return String(a && a.id || "").localeCompare(String(b && b.id || ""));
+    }).forEach(function (node) {
+      var parsed = parseNamespacedId(node.id);
+      var key = node.project_key || (parsed && parsed.rest || "").split("/")[0] || "(unassigned)";
       if (node.kind === "project" && !node.project_key) {
-        key = (parseNamespacedId(node.id) || {}).rest || key;
+        key = (parsed && parsed.rest || key).split("/")[0];
       }
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(node);
@@ -402,13 +410,211 @@
     return groups;
   }
 
-  /* Decide what actually gets mounted. Over-budget graphs collapse to one
-   * cluster node per project (until expanded) and emit an explicit
-   * `graph_truncated` diagnostic — never a silent drop. */
+  function endpointProjectKey(endpoint, nodesById) {
+    var endpointInfo = edgeEndpoint(endpoint);
+    if (endpointInfo.project_key) return endpointInfo.project_key;
+    var node = nodesById && nodesById[endpointInfo.node_id];
+    if (node && node.project_key) return node.project_key;
+    var parsed = parseNamespacedId(endpointInfo.node_id);
+    return parsed && (parsed.namespace === "project" || parsed.namespace === "component" || parsed.namespace === "capability")
+      ? parsed.rest.split("/")[0]
+      : "";
+  }
+
+  function projectLabelForKey(projectsByKey, projectKey) {
+    var project = projectsByKey && projectsByKey[projectKey];
+    return projectPrimaryLabel(project) || projectKey || "(unassigned)";
+  }
+
+  function categoryLabel(kind) {
+    var labels = { project: "Projects", component: "Components", capability: "Capabilities" };
+    return labels[kind] || "Features";
+  }
+
+  function categorySummaries(nodes, projectKey) {
+    var byKind = new Map();
+    (nodes || []).filter(function (node) {
+      var parsed = parseNamespacedId(node.id);
+      var owner = node.project_key || (parsed && parsed.rest || "").split("/")[0];
+      return !projectKey || owner === projectKey;
+    }).forEach(function (node) {
+      var key = String(node.kind || "feature");
+      if (!byKind.has(key)) byKind.set(key, []);
+      byKind.get(key).push(node);
+    });
+    return Array.from(byKind.keys()).sort().map(function (key) {
+      var members = byKind.get(key).slice().sort(function (a, b) {
+        return String(a.id).localeCompare(String(b.id));
+      });
+      return {
+        key: key,
+        label: categoryLabel(key),
+        count: members.length,
+        nodeIds: members.map(function (node) { return node.id; }),
+        nodes: members
+      };
+    });
+  }
+
+  function unionFind(keys) {
+    var parent = {}, rank = {};
+    (keys || []).forEach(function (key) { parent[key] = key; rank[key] = 0; });
+    function find(key) {
+      if (parent[key] !== key) parent[key] = find(parent[key]);
+      return parent[key];
+    }
+    function union(a, b) {
+      if (!parent[a] || !parent[b]) return;
+      var rootA = find(a), rootB = find(b);
+      if (rootA === rootB) return;
+      if (rank[rootA] < rank[rootB]) parent[rootA] = rootB;
+      else if (rank[rootA] > rank[rootB]) parent[rootB] = rootA;
+      else { parent[rootB] = rootA; rank[rootA] += 1; }
+    }
+    return { find: find, union: union };
+  }
+
+  /* Build related application groups from resolved cross-project links only.
+   * Internal dependency edges deliberately do not connect projects: a visual
+   * relationship is never inferred from a shared component name or title. */
+  function buildMasterGroups(view) {
+    view = view || {};
+    var projects = (view.projects || []).slice().sort(function (a, b) {
+      return String(a.project_key || "").localeCompare(String(b.project_key || ""));
+    });
+    var projectsByKey = {};
+    projects.forEach(function (project) { projectsByKey[project.project_key] = project; });
+    var nodes = (view.nodes || []).slice().sort(function (a, b) {
+      return String(a.id || "").localeCompare(String(b.id || ""));
+    });
+    var nodesById = {};
+    nodes.forEach(function (node) { nodesById[node.id] = node; });
+    /* Fixtures and degraded payloads may omit a project entry while retaining
+     * namespaced nodes. Keep those nodes reachable without inventing labels. */
+    var projectKeys = projects.map(function (project) { return project.project_key; });
+    nodes.forEach(function (node) {
+      var parsed = parseNamespacedId(node.id);
+      var key = node.project_key || (parsed && parsed.rest || "").split("/")[0] || "";
+      if (key && projectKeys.indexOf(key) === -1) projectKeys.push(key);
+    });
+    (view.edges || []).forEach(function (edge) {
+      [edge && edge.origin_project_key, endpointProjectKey(edge && edge.from, nodesById),
+        endpointProjectKey(edge && edge.to, nodesById)].forEach(function (key) {
+        if (key && projectKeys.indexOf(key) === -1) projectKeys.push(key);
+      });
+    });
+    projectKeys.sort();
+    var uf = unionFind(projectKeys);
+    var crossLinks = [];
+    (view.edges || []).slice().sort(function (a, b) {
+      return String(a.id || "").localeCompare(String(b.id || ""));
+    }).forEach(function (edge) {
+      if (!edge || edge.resolution !== "resolved" || edge.type === "internal_dependency") return;
+      var fromProject = endpointProjectKey(edge.from, nodesById) || edge.origin_project_key || "";
+      var toProject = endpointProjectKey(edge.to, nodesById);
+      if (!fromProject || !toProject || fromProject === toProject) return;
+      if (projectKeys.indexOf(fromProject) === -1 || projectKeys.indexOf(toProject) === -1) return;
+      uf.union(fromProject, toProject);
+      crossLinks.push({ edge: edge, from: fromProject, to: toProject });
+    });
+    var components = new Map();
+    projectKeys.forEach(function (key) {
+      var root = uf.find(key);
+      if (!components.has(root)) components.set(root, []);
+      components.get(root).push(key);
+    });
+    var linkedProjectKeys = {};
+    crossLinks.forEach(function (link) {
+      linkedProjectKeys[link.from] = true;
+      linkedProjectKeys[link.to] = true;
+    });
+    var standalone = [];
+    var groups = [];
+    Array.from(components.values()).forEach(function (keys) {
+      keys.sort();
+      if (keys.length === 1 && !linkedProjectKeys[keys[0]]) standalone.push(keys[0]);
+      else groups.push(keys);
+    });
+    if (standalone.length) groups.push(standalone.sort());
+    groups.sort(function (a, b) { return String(a[0] || "").localeCompare(String(b[0] || "")); });
+    var nodesByProject = new Map();
+    nodes.forEach(function (node) {
+      var parsed = parseNamespacedId(node.id);
+      var key = node.project_key || (parsed && parsed.rest || "").split("/")[0] || "(unassigned)";
+      if (!nodesByProject.has(key)) nodesByProject.set(key, []);
+      nodesByProject.get(key).push(node);
+    });
+    return groups.map(function (keys) {
+      var memberNodes = [];
+      keys.forEach(function (key) {
+        memberNodes = memberNodes.concat((nodesByProject.get(key) || []).slice());
+      });
+      memberNodes.sort(function (a, b) { return String(a.id).localeCompare(String(b.id)); });
+      var links = crossLinks.filter(function (link) {
+        return keys.indexOf(link.from) !== -1 && keys.indexOf(link.to) !== -1;
+      });
+      /* A multi-project aggregate is still standalone when no resolved link
+       * supports a relationship; project count alone must not imply one. */
+      var linked = links.length > 0;
+      var labels = keys.map(function (key) { return projectLabelForKey(projectsByKey, key); });
+      var hasFractal = labels.some(function (label) {
+        return normalizeText(label).indexOf("fractal-cli") !== -1;
+      });
+      var title = linked ? (hasFractal ? "Fractal ecosystem" : "Connected applications") : "Standalone projects";
+      var categoryCounts = {};
+      categorySummaries(memberNodes).forEach(function (category) { categoryCounts[category.key] = category.count; });
+      var projectSummaries = keys.map(function (key) {
+        var projectNodes = (nodesByProject.get(key) || []).slice().sort(function (a, b) {
+          return String(a.id).localeCompare(String(b.id));
+        });
+        var categories = categorySummaries(projectNodes, key);
+        var counts = {};
+        categories.forEach(function (category) { counts[category.key] = category.count; });
+        return {
+          projectKey: key,
+          label: projectLabelForKey(projectsByKey, key),
+          project: projectsByKey[key] || null,
+          nodes: projectNodes,
+          nodeIds: projectNodes.map(function (node) { return node.id; }),
+          count: projectNodes.length,
+          categoryCounts: counts,
+          categories: categories
+        };
+      });
+      return {
+        id: "group:" + (keys[0] || "standalone"),
+        key: keys[0] || "standalone",
+        title: title,
+        label: labels.join(" · "),
+        linked: linked,
+        projectKeys: keys.slice(),
+        projects: projectSummaries,
+        nodes: memberNodes,
+        nodeIds: memberNodes.map(function (node) { return node.id; }),
+        count: memberNodes.length,
+        nodeCount: memberNodes.length,
+        projectCount: keys.length,
+        categoryCounts: categoryCounts,
+        categories: categorySummaries(memberNodes),
+        links: links.map(function (link) { return link.edge; })
+      };
+    });
+  }
+
+  /* Aliases make the evidence-based composition intent easy to consume from
+   * tests and future board integrations. */
+  function groupNodesByRelation(view) { return buildMasterGroups(view); }
+
+  /* Decide what actually gets mounted. Over-budget graphs show connected
+   * ecosystem cards, then project cards, then category summaries before
+   * mounting individual nodes. Every collapse has an explicit count and a
+   * list-view escape hatch — never silently drop data. */
   function planMasterRender(view, options) {
     options = options || {};
     var caps = options.caps || RENDER_BUDGET;
     var expanded = options.expandedProjects || [];
+    var expandedGroups = options.expandedGroups || [];
+    var expandedCategories = options.expandedCategories || [];
     var visibility = options.visibility || null;
     var allNodes = (view && view.nodes) || [];
     var allEdges = (view && view.edges) || [];
@@ -418,7 +624,7 @@
       ? allNodes.filter(function (node) { return visibility.nodeShown[node.id] !== false || options.keepDimmed; })
       : allNodes.slice();
 
-    if (candidateNodes.length <= caps.maxSvgNodes) {
+    if (candidateNodes.length <= caps.maxSvgNodes && !options.forceHierarchy) {
       var edgePlan = capEdgeList(allEdges, candidateNodes, caps.maxSvgEdgePaths, visibility);
       if (edgePlan.truncated > 0) {
         diagnostics.push(truncationDiagnostic("edges", edgePlan.truncated, allEdges.length));
@@ -427,45 +633,110 @@
         clusters: null, truncated: { nodes: 0, edges: edgePlan.truncated }, diagnostics: diagnostics };
     }
 
-    // Clustered fallback: one node per project_key, aggregate cross-project edges.
-    var groups = groupNodesByProject(candidateNodes);
-    var clusters = [];
-    var mountedNodes = 0;
-    groups.forEach(function (members, key) {
-      if (expanded.indexOf(key) !== -1) {
-        var room = Math.max(0, caps.maxSvgNodes - mountedNodes);
-        members.slice(0, room).forEach(function (node) {
-          clusters.push({ cluster: false, id: node.id, title: node.title,
-            kind: node.kind, node: node, project_key: key });
-          mountedNodes += 1;
+    var groups = buildMasterGroups(view);
+    var query = visibility && normalizeText(visibility.query || "");
+    var matchIds = visibility && visibility.matchIds || {};
+    var projectMatches = visibility && visibility.projectMatches || {};
+    var items = [];
+    var visualForNode = {};
+    var mountedDirectNodes = 0;
+    var groupIsMatched = function (group) {
+      if (!query) return false;
+      return group.projectKeys.some(function (key) {
+        return Boolean(projectMatches["project:" + key]) || group.projects.some(function (project) {
+          return project.projectKey === key && project.nodeIds.some(function (id) { return Boolean(matchIds[id]); });
         });
-      } else {
-        clusters.push({ cluster: true, project_key: key, count: members.length,
-          id: "cluster:" + key, title: key, kind: "cluster" });
-        mountedNodes += 1;
+      });
+    };
+    var projectIsMatched = function (project) {
+      if (!query) return false;
+      return Boolean(projectMatches["project:" + project.projectKey]) || project.nodeIds.some(function (id) {
+        return Boolean(matchIds[id]);
+      });
+    };
+    var categoryIsMatched = function (category) {
+      if (!query) return false;
+      return category.nodeIds.some(function (id) { return Boolean(matchIds[id]); });
+    };
+    var pushItem = function (item) {
+      if (items.length >= caps.maxSvgNodes) return false;
+      items.push(item);
+      return true;
+    };
+    groups.forEach(function (group) {
+      var matchedGroup = groupIsMatched(group);
+      var openGroup = expandedGroups.indexOf(group.id) !== -1 || matchedGroup;
+      if (!openGroup) {
+        pushItem({ cluster: true, level: "group", id: group.id, group_id: group.id,
+          title: group.title, subtitle: group.label, kind: "group", count: group.nodeCount,
+          project_count: group.projectCount, categoryCounts: group.categoryCounts,
+          project_keys: group.projectKeys.slice(), node_ids: group.nodeIds.slice(),
+          matched: matchedGroup });
+        group.nodeIds.forEach(function (id) { visualForNode[id] = group.id; });
+        return;
       }
+      group.projects.forEach(function (project) {
+        var matchedProject = projectIsMatched(project);
+        var openProject = expanded.indexOf(project.projectKey) !== -1 || matchedProject;
+        var projectId = "project-cluster:" + project.projectKey;
+        if (!openProject) {
+          pushItem({ cluster: true, level: "project", id: projectId, group_id: group.id,
+            project_key: project.projectKey, title: project.label, subtitle: group.title,
+            kind: "project", count: project.count, categoryCounts: project.categoryCounts,
+            project_keys: [project.projectKey], node_ids: project.nodeIds.slice(),
+            matched: matchedProject });
+          project.nodeIds.forEach(function (id) { visualForNode[id] = projectId; });
+          return;
+        }
+        project.categories.forEach(function (category) {
+          var categoryId = "category:" + project.projectKey + "/" + category.key;
+          var matchedCategory = categoryIsMatched(category);
+          var openCategory = expandedCategories.indexOf(categoryId) !== -1 || matchedCategory;
+          if (!openCategory) {
+            pushItem({ cluster: true, level: "category", id: categoryId, group_id: group.id,
+              project_key: project.projectKey, category: category.key, title: category.label,
+              subtitle: project.label, kind: category.key, count: category.count,
+              project_keys: [project.projectKey], node_ids: category.nodeIds.slice(),
+              matched: matchedCategory });
+            category.nodeIds.forEach(function (id) { visualForNode[id] = categoryId; });
+            return;
+          }
+          category.nodes.forEach(function (node) {
+            if (mountedDirectNodes >= caps.maxSvgNodes) return;
+            if (candidateNodes.indexOf(node) === -1) return;
+            var item = { cluster: false, level: "node", id: node.id, title: node.title,
+              kind: node.kind, node: node, project_key: project.projectKey,
+              group_id: group.id, category: category.key, matched: Boolean(matchIds[node.id]) };
+            if (!pushItem(item)) return;
+            mountedDirectNodes += 1;
+            visualForNode[node.id] = node.id;
+          });
+        });
+      });
     });
-    var projectOf = {};
-    candidateNodes.forEach(function (node) {
-      projectOf[node.id] = node.project_key || (parseNamespacedId(node.id) || {}).rest || "(unassigned)";
-    });
+    var visualNodes = items.map(function (item) { return { id: item.id }; });
     var aggregate = new Map();
-    allEdges.forEach(function (edge) {
-      var fromProject = projectOf[edgeEndpoint(edge.from).node_id];
-      var toProject = projectOf[edgeEndpoint(edge.to).node_id];
-      if (!fromProject || !toProject || fromProject === toProject) return;
-      var key = fromProject + "→" + toProject;
+    allEdges.slice().sort(function (a, b) { return String(a.id).localeCompare(String(b.id)); }).forEach(function (edge) {
+      var from = visualForNode[edgeEndpoint(edge.from).node_id];
+      var to = visualForNode[edgeEndpoint(edge.to).node_id];
+      if (!from || !to || from === to) return;
+      var key = from + "→" + to;
       if (!aggregate.has(key)) {
-        aggregate.set(key, { id: "cluster-edge:" + key, from: "cluster:" + fromProject,
-          to: "cluster:" + toProject, type: "related_to", count: 0 });
+        aggregate.set(key, { id: "cluster-edge:" + key, from: from, to: to,
+          type: edge.type || "related_to", resolution: edge.resolution, count: 0,
+          edge_ids: [] });
       }
-      aggregate.get(key).count += 1;
+      var aggregateEdge = aggregate.get(key);
+      aggregateEdge.count += 1;
+      aggregateEdge.edge_ids.push(edge.id);
+      if (aggregateEdge.edge_ids.length === 1) aggregateEdge.source_edge = edge;
     });
-    var clusterEdges = Array.from(aggregate.values()).slice(0, caps.maxSvgEdgePaths);
-    var hiddenNodes = Math.max(0, candidateNodes.length - clusters.length);
-    diagnostics.push(truncationDiagnostic("nodes", hiddenNodes, candidateNodes.length));
-    return { kind: "clustered", nodes: clusters, edges: clusterEdges, clusters: groups,
-      truncated: { nodes: hiddenNodes, edges: 0 }, diagnostics: diagnostics };
+    var edgePlan = capEdgeList(Array.from(aggregate.values()), visualNodes, caps.maxSvgEdgePaths);
+    if (edgePlan.truncated > 0) diagnostics.push(truncationDiagnostic("edges", edgePlan.truncated, aggregate.size));
+    var hiddenNodes = Math.max(0, candidateNodes.length - mountedDirectNodes);
+    if (hiddenNodes > 0) diagnostics.push(truncationDiagnostic("nodes", hiddenNodes, candidateNodes.length));
+    return { kind: "clustered", nodes: items, edges: edgePlan.edges, clusters: groups,
+      groups: groups, truncated: { nodes: hiddenNodes, edges: edgePlan.truncated }, diagnostics: diagnostics };
   }
 
   function capEdgeList(edges, nodes, maxPaths, visibility) {
@@ -902,8 +1173,8 @@
     attachActivation(opener, function () { if (handlers.onToggle) handlers.onToggle(); });
     container.addEventListener("keydown", function (event) {
       if (event.key === "Escape") {
-        if (handlers.onClose) handlers.onClose();
-        opener.focus();
+        if (handlers.onClose) handlers.onClose(opener);
+        else opener.focus();
         return;
       }
       if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
@@ -936,6 +1207,49 @@
       attachActivation(button, function () { if (candidate !== mode && onChange) onChange(candidate); });
       container.append(button);
     });
+  }
+
+  /* Master graph/list stage toggle. Buttons retain explicit accessible names
+   * even when their visible labels are compact, which makes the control easy
+   * to discover with a screen reader and in browser automation. */
+  function renderViewToggle(doc, container, view, onChange) {
+    container.replaceChildren();
+    container.classList.add("mg-view-toggle");
+    container.setAttribute("role", "radiogroup");
+    container.setAttribute("aria-label", "Master display");
+    [{ id: "graph", label: "Graph", name: "Show graph view" },
+      { id: "list", label: "List", name: "Show list view" }].forEach(function (candidate) {
+      var button = el(doc, "button", "mg-view-option" + (candidate.id === view ? " mg-active" : ""));
+      button.type = "button";
+      button.setAttribute("role", "radio");
+      button.setAttribute("aria-checked", candidate.id === view ? "true" : "false");
+      button.setAttribute("aria-label", candidate.name);
+      button.setAttribute("data-view", candidate.id);
+      button.textContent = candidate.label;
+      attachActivation(button, function () { if (candidate.id !== view && onChange) onChange(candidate.id); });
+      container.append(button);
+    });
+  }
+
+  function renderMasterHelp(doc, container, view) {
+    container.replaceChildren();
+    if (!view) return;
+    container.classList.add("mg-master-help");
+    var copy = el(doc, "span", "mg-help-copy",
+      "Related projects are grouped only when a resolved catalog link supports the connection. Select a card to drill into projects, categories, and nodes.");
+    container.append(copy);
+    var legend = el(doc, "span", "mg-help-legend");
+    legend.setAttribute("aria-label", "Master graph legend");
+    [{ className: "mg-help-swatch-group", text: "Ecosystem" },
+      { className: "mg-help-swatch-project", text: "Project" },
+      { className: "mg-help-swatch-category", text: "Category" },
+      { className: "mg-help-swatch-link", text: "Resolved link" }].forEach(function (entry) {
+      var item = el(doc, "span", "mg-help-item");
+      var swatch = el(doc, "i", entry.className);
+      item.append(swatch, el(doc, "span", "mg-help-label", entry.text));
+      legend.append(item);
+    });
+    container.append(legend);
   }
 
   /* Search control (contract §7.1). */
@@ -1009,11 +1323,11 @@
   /* Deterministic cluster-column layout grouped by project_key (§2.4). */
   function layoutMasterGraph(plan) {
     var positions = {};
-    var nodeWidth = 216, nodeHeight = 66, columnGap = 260, rowGap = 88, topPad = 70;
+    var nodeWidth = 258, nodeHeight = 82, columnGap = 330, rowGap = 104, topPad = 70;
     var groups = new Map();
     plan.nodes.forEach(function (item) {
-      var node = item.cluster ? item : item;
-      var key = item.cluster ? item.project_key : (item.project_key || (parseNamespacedId(item.id) || {}).rest || "(unassigned)");
+      var node = item;
+      var key = item.group_id || item.project_key || (parseNamespacedId(item.id) || {}).rest || "(unassigned)";
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(node);
     });
@@ -1044,10 +1358,19 @@
     var projectsByKey = {};
     (view && view.projects || []).forEach(function (project) { projectsByKey[project.project_key] = project; });
     var shortHash = String(view && view.inventory_hash || "").replace(/^sha256:/, "").slice(0, 8);
-    svg.setAttribute("role", "img");
+    /* Child cards and edges are keyboard-activable; `role=img` would hide
+     * those descendants from assistive technology. Keep the descriptive label
+     * on an interactive group instead. */
+    svg.setAttribute("role", "group");
     svg.setAttribute("aria-label", "Master graph" + (shortHash ? " · inventory " + shortHash : ""));
     var layout = layoutMasterGraph(plan);
     svg.setAttribute("viewBox", "0 0 " + layout.contentWidth + " " + layout.contentHeight);
+    /* Preserve the layout's pixel dimensions so the estate map remains
+     * readable and pannable instead of being compressed into the viewport. */
+    svg.setAttribute("width", String(layout.contentWidth));
+    svg.setAttribute("height", String(layout.contentHeight));
+    svg.style.width = layout.contentWidth + "px";
+    svg.style.height = layout.contentHeight + "px";
 
     var edgeLayer = svgEl(doc, "g", {});
     plan.edges.forEach(function (edge) {
@@ -1057,10 +1380,14 @@
       var x1 = from[0] + layout.nodeWidth / 2, x2 = to[0] - layout.nodeWidth / 2;
       var bend = Math.max(36, Math.abs(x2 - x1) * 0.45);
       var dimmed = state.visibility && state.visibility.edgeShown[edge.id] === false;
-      var selected = state.sel === edge.id;
+      var selected = state.sel === edge.id || (edge.edge_ids || []).indexOf(state.sel) !== -1;
+      var edgeNamespace = (parseNamespacedId(edge.id) || {}).namespace ||
+        (edge.source_edge && (parseNamespacedId(edge.source_edge.id) || {}).namespace) || "dep";
+      var edgeClass = "mg-edge mg-edge-" + edgeNamespace;
+      if (edge.type === "related_to" || edgeNamespace === "link") edgeClass += " mg-edge-link";
       var path = svgEl(doc, "path", {
         d: "M " + x1 + " " + from[1] + " C " + (x1 + bend) + " " + from[1] + ", " + (x2 - bend) + " " + to[1] + ", " + x2 + " " + to[1],
-        class: "mg-edge mg-edge-" + ((parseNamespacedId(edge.id) || {}).namespace || "dep") +
+        class: edgeClass +
           (dimmed ? " mg-dim" : "") + (selected ? " mg-selected" : ""),
         "data-node-id": edge.id, tabindex: "0", role: "button",
         "aria-label": edgeAccessibleName(edge)
@@ -1077,12 +1404,20 @@
       var statusToken = isCluster ? "available" : masterNodeStatusToken(node, projectsByKey);
       var dimmed = !isCluster && state.visibility && state.visibility.nodeDimmed[node.id];
       var selected = state.sel === node.id;
+      var levelLabel = node.level === "group" ? "ECOSYSTEM GROUP" :
+        node.level === "project" ? "PROJECT" : node.level === "category" ? categoryLabel(node.category || node.kind).toUpperCase() : String(node.kind || "node").toUpperCase();
+      var summary = isCluster
+        ? [node.count + " nodes", node.project_count ? node.project_count + " projects" : null,
+          Object.keys(node.categoryCounts || {}).map(function (key) {
+            return categoryLabel(key) + " " + node.categoryCounts[key];
+          }).join(" · ")].filter(Boolean).join(" · ")
+        : (STATUS_LABELS[statusToken] || statusToken).toUpperCase();
       var group = svgEl(doc, "g", {
-        class: "mg-node mg-status-" + statusToken + (dimmed ? " mg-dim" : "") + (selected ? " mg-selected" : ""),
+        class: "mg-node" + (isCluster ? " mg-cluster mg-cluster-" + (node.level || "group") : "") + " mg-status-" + statusToken + (dimmed ? " mg-dim" : "") + (selected ? " mg-selected" : ""),
         transform: "translate(" + position[0] + "," + position[1] + ")",
         tabindex: "0", role: "button", "data-node-id": node.id,
         "aria-label": isCluster
-          ? "cluster, " + node.project_key + ", " + node.count + " nodes, activate to expand"
+          ? (node.title || "group") + ", " + (node.count || 0) + " nodes, " + (node.project_count || 1) + " projects, activate to expand"
           : masterNodeAccessibleName(node, projectsByKey)
       });
       group.append(svgEl(doc, "rect", {
@@ -1090,18 +1425,19 @@
         width: layout.nodeWidth, height: layout.nodeHeight, rx: 5
       }));
       var kindText = svgEl(doc, "text", { class: "mg-node-kind", x: -layout.nodeWidth / 2 + 14, y: -layout.nodeHeight / 2 + 18 });
-      kindText.textContent = isCluster ? node.count + " NODES" : String(node.kind || "node").toUpperCase();
+      kindText.textContent = isCluster ? levelLabel : String(node.kind || "node").toUpperCase();
       group.append(kindText);
       var titleText = svgEl(doc, "text", { class: "mg-node-title", x: -layout.nodeWidth / 2 + 14, y: 4 });
       titleText.textContent = clampText(node.title || node.name || node.id, 26);
       group.append(titleText);
+      var subtitleText = svgEl(doc, "text", { class: "mg-node-subtitle", x: -layout.nodeWidth / 2 + 14, y: 22 });
+      subtitleText.textContent = clampText(node.subtitle || "", 34);
+      group.append(subtitleText);
       var statusText = svgEl(doc, "text", { class: "mg-node-status", x: -layout.nodeWidth / 2 + 14, y: layout.nodeHeight / 2 - 10 });
-      statusText.textContent = isCluster
-        ? "PROJECT CLUSTER"
-        : (STATUS_LABELS[statusToken] || statusToken).toUpperCase();
+      statusText.textContent = summary;
       group.append(statusText);
       attachActivation(group, function () {
-        if (isCluster) { if (handlers.onExpandCluster) handlers.onExpandCluster(node.project_key); }
+        if (isCluster) { if (handlers.onExpandCluster) handlers.onExpandCluster(node); }
         else if (handlers.onSelectNode) handlers.onSelectNode(node);
       });
       svg.append(group);
@@ -1468,6 +1804,8 @@
     var getViewportWidth = options.getViewportWidth || function () { return 1440; };
     var timers = options.timers || null;
     var caps = options.caps || RENDER_BUDGET;
+    var sharedModeToggle = Boolean(options.sharedModeToggle);
+    var onModeChange = typeof options.onModeChange === "function" ? options.onModeChange : null;
 
     var regions = {};
     ["chrome", "metrics", "stage", "inspector", "diagnostics", "footer", "live"].forEach(function (name) {
@@ -1487,7 +1825,9 @@
       master: null,
       breadcrumbs: [],
       switcherOpen: false,
+      expandedGroups: [],
       expandedProjects: [],
+      expandedCategories: [],
       error: null,
       loading: false,
       focusMemo: null
@@ -1533,15 +1873,24 @@
       var searchHost = el(doc, "div", "");
       var statusHost = el(doc, "div", "");
       var relHost = el(doc, "div", "");
+      var viewHost = el(doc, "div", "");
+      var helpHost = el(doc, "div", "");
       // Tab order per §11.1: switcher, mode, breadcrumb, search, status, rel.
-      chrome.append(switcherHost, modeHost, breadcrumbHost, searchHost, statusHost, relHost);
+      chrome.append(switcherHost);
+      if (!sharedModeToggle) chrome.append(modeHost);
+      chrome.append(breadcrumbHost, searchHost, statusHost, relHost, viewHost, helpHost);
 
       renderProjectSwitcher(doc, switcherHost, state.projects,
         { open: state.switcherOpen, currentProjectKey: state.query.project ||
           (state.projects && state.projects.bound_project_key) || "" },
         {
           onToggle: function () { state.switcherOpen = !state.switcherOpen; renderChrome(); },
-          onClose: function () { state.switcherOpen = false; renderChrome(); },
+          onClose: function () {
+            state.switcherOpen = false;
+            renderChrome();
+            var replacement = chrome.querySelector(".mg-switcher-opener");
+            if (replacement && typeof replacement.focus === "function") replacement.focus();
+          },
           onSelect: function (project, meta) {
             state.switcherOpen = false;
             if (!meta.available) { showDegraded(errorStateFor("unavailable_project")); return; }
@@ -1554,7 +1903,7 @@
           }
         });
 
-      renderModeToggle(doc, modeHost, state.query.mode, setMode);
+      if (!sharedModeToggle) renderModeToggle(doc, modeHost, state.query.mode, setMode);
       renderBreadcrumb(doc, breadcrumbHost, state.breadcrumbs, goBackToMaster);
       renderSearchControl(doc, searchHost, state.query.q, function (value) {
         debouncedSearch(function () { applySearch(value); });
@@ -1566,11 +1915,17 @@
         renderRelationshipFilter(doc, relHost, state.query.rel, function (token, on) {
           toggleRelToken(token, on);
         });
+        renderViewToggle(doc, viewHost, activeView(), setView);
+        renderMasterHelp(doc, helpHost, state.master);
+      } else {
+        viewHost.replaceChildren();
+        helpHost.replaceChildren();
       }
     }
 
     function renderStage() {
       var stage = regions.stage;
+      stage.classList.toggle("mg-explicit-graph", state.query.mode === "master" && state.query.view === "graph");
       if (state.loading) { renderSkeleton(doc, stage, "Loading graph…"); return; }
       setBusy(stage, false);
       if (state.error) { renderDegradedPanel(doc, stage, state.error, { onRetry: refresh }); return; }
@@ -1585,14 +1940,38 @@
           });
         } else {
           var plan = planMasterRender(state.master,
-            { caps: caps, visibility: vis, keepDimmed: true, expandedProjects: state.expandedProjects });
+            { caps: caps, visibility: vis, keepDimmed: true,
+              forceHierarchy: true,
+              expandedGroups: state.expandedGroups,
+              expandedProjects: state.expandedProjects,
+              expandedCategories: state.expandedCategories });
+          if (plan.diagnostics.length) {
+            var disclosure = el(doc, "div", "mg-truncation", "");
+            disclosure.setAttribute("role", "status");
+            var hiddenNodes = plan.truncated && plan.truncated.nodes || 0;
+            var hiddenEdges = plan.truncated && plan.truncated.edges || 0;
+            disclosure.append(el(doc, "strong", "mg-truncation-title", "Large graph summarized"));
+            disclosure.append(el(doc, "span", "mg-truncation-copy",
+              hiddenNodes > 0
+                ? hiddenNodes + " nodes remain available in List view, search, and filters."
+                : hiddenEdges + " relationships are summarized to keep the canvas responsive."));
+            var listButton = el(doc, "button", "mg-truncation-action", "Open list view");
+            listButton.type = "button";
+            listButton.setAttribute("aria-label", "Show list view");
+            attachActivation(listButton, function () { setView("list"); });
+            disclosure.append(listButton);
+            stage.append(disclosure);
+          }
           var svg = svgEl(doc, "svg", { class: "mg-master-svg" });
           stage.append(svg);
           renderMasterSvg(doc, svg, state.master, plan, { sel: state.query.sel, visibility: vis }, {
             onSelectNode: function (node) { select(node.id, true); },
             onSelectEdge: function (edge) { activateEdge(edge); },
-            onExpandCluster: function (projectKey) {
-              state.expandedProjects = uniq(state.expandedProjects.concat([projectKey]));
+            onExpandCluster: function (item) {
+              item = item || {};
+              if (item.level === "group") state.expandedGroups = uniq(state.expandedGroups.concat([item.group_id || item.id]));
+              else if (item.level === "project") state.expandedProjects = uniq(state.expandedProjects.concat([item.project_key]));
+              else if (item.level === "category") state.expandedCategories = uniq(state.expandedCategories.concat([item.id]));
               render();
             }
           });
@@ -1695,6 +2074,14 @@
       else announce("Search cleared");
     }
 
+    function setView(view) {
+      if (state.query.mode !== "master" || (view !== "graph" && view !== "list")) return;
+      state.query.view = view;
+      syncUrl(true);
+      render();
+      announce(view === "list" ? "List view" : "Graph view");
+    }
+
     function collectTasks() {
       var tasks = [];
       ((state.graph && state.graph.groups) || []).forEach(function (group) { tasks = tasks.concat(group.tasks || []); });
@@ -1731,6 +2118,7 @@
     }
 
     function activateEdge(edge) {
+      if (edge && edge.source_edge) edge = edge.source_edge;
       var outcome = resolveCrossLink(edge);
       if (outcome.action === "navigate" && (parseNamespacedId(edge.id) || {}).namespace === "link") {
         state.breadcrumbs = pushBreadcrumb(state.breadcrumbs, {
@@ -1740,6 +2128,7 @@
         state.query.project = outcome.target.project;
         state.query.sel = outcome.target.sel;
         syncUrl(true);
+        if (onModeChange) onModeChange("individual");
         announce("Following cross-link to project " + outcome.target.project);
         loadIndividual(outcome.target.project).then(render);
         return;
@@ -1762,6 +2151,7 @@
       restored.sel = popped.entry.edge_id || restored.sel;
       state.query = restored;
       syncUrl(true);
+      if (onModeChange) onModeChange("master");
       announce("Back to master view");
       loadMaster().then(render);
     }
@@ -1773,6 +2163,7 @@
       state.query.sel = "";
       state.error = null;
       syncUrl(true);
+      if (onModeChange) onModeChange(mode);
       announce(mode === "master" ? "Master view" : "Individual view");
       var pending = mode === "master" ? loadMaster() : loadIndividual(state.query.project);
       render();
@@ -1793,6 +2184,7 @@
       state.query.sel = "";
       state.error = null;
       syncUrl(true);
+      if (onModeChange) onModeChange("individual");
       announce("Project " + projectKey);
       var pending = loadIndividual(projectKey);
       render();
@@ -1935,6 +2327,9 @@
     computeMasterVisibility: computeMasterVisibility,
     computeIndividualVisibility: computeIndividualVisibility,
     groupNodesByProject: groupNodesByProject,
+    buildMasterGroups: buildMasterGroups,
+    groupNodesByRelation: groupNodesByRelation,
+    categorySummaries: categorySummaries,
     planMasterRender: planMasterRender,
     computeListWindow: computeListWindow,
     resolveCrossLink: resolveCrossLink,
@@ -1962,6 +2357,8 @@
     projectOptionName: projectOptionName,
     renderProjectSwitcher: renderProjectSwitcher,
     renderModeToggle: renderModeToggle,
+    renderViewToggle: renderViewToggle,
+    renderMasterHelp: renderMasterHelp,
     renderSearchControl: renderSearchControl,
     renderStatusFilter: renderStatusFilter,
     renderRelationshipFilter: renderRelationshipFilter,
