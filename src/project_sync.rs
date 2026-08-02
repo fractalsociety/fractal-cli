@@ -201,7 +201,7 @@ pub(crate) fn maybe_sync_planning(workspace: &Path) -> Option<String> {
     maybe_sync_with_options(workspace, false)
 }
 
-/// Refuse to start a new managed voice project when its profile URL already
+/// Refuse to start a new managed project when its profile URL already
 /// belongs to another project. A missing Fractal Society login means there is
 /// no profile publication to collide with, so local-only builds remain valid.
 pub(crate) fn ensure_new_project_name_available(name: &str) -> Result<()> {

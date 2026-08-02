@@ -542,7 +542,12 @@ pub(crate) fn prepare_managed_voice_workspace(name: &str, prompt: &str) -> Resul
     // Register immediately so desktop agents can resolve the spoken project
     // name while the lead is still planning, before the full graph exists.
     crate::projects::register(&workspace);
-    println!("Created managed voice project: {}", workspace.display());
+    let label = if std::env::var_os("FRACTAL_EXTERNAL_TEXT").is_some() {
+        "Created managed text project"
+    } else {
+        "Created managed voice project"
+    };
+    println!("{label}: {}", workspace.display());
     Ok(workspace)
 }
 

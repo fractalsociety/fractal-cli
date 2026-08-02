@@ -295,11 +295,15 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
 
     private func handleExternalBuild(at url: URL, reportFailure: Bool) -> Bool {
         guard setupComplete else {
-            showOnboarding()
             if reportFailure {
-                coordinator.reportExternalBuildFailure(
-                    ExternalBuildLaunchError.setupRequired.localizedDescription
+                let message = ExternalBuildLaunchError.setupRequired.localizedDescription
+                ExternalBuildHandoff.writeResult(
+                    to: ExternalBuildHandoff.resultURL(for: url),
+                    status: .failed,
+                    projectName: "",
+                    message: message
                 )
+                coordinator.reportExternalBuildFailure(message, showVoiceUI: false)
             }
             return false
         }
@@ -308,11 +312,24 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         }
         do {
             let external = try ExternalBuildHandoff.consume(url)
-            try coordinator.startExternalBuild(external)
+            try coordinator.startExternalBuild(
+                external,
+                resultURL: ExternalBuildHandoff.resultURL(for: url)
+            )
             return true
         } catch {
+            let resultURL = ExternalBuildHandoff.resultURL(for: url)
+            ExternalBuildHandoff.writeResult(
+                to: resultURL,
+                status: .failed,
+                projectName: "",
+                message: error.localizedDescription
+            )
             if reportFailure {
-                coordinator.reportExternalBuildFailure(error.localizedDescription)
+                coordinator.reportExternalBuildFailure(
+                    error.localizedDescription,
+                    showVoiceUI: false
+                )
             }
             return false
         }
@@ -340,16 +357,26 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         let detail = NSMenuItem(title: coordinator.latestActivity, action: nil, keyEquivalent: "")
         detail.isEnabled = false
         menu.addItem(detail)
-        let shortcut = NSMenuItem(
-            title: coordinator.shortcutStatus,
-            action: nil,
-            keyEquivalent: ""
-        )
-        shortcut.isEnabled = false
-        menu.addItem(shortcut)
+        if !coordinator.isExternalBuild {
+            let shortcut = NSMenuItem(
+                title: coordinator.shortcutStatus,
+                action: nil,
+                keyEquivalent: ""
+            )
+            shortcut.isEnabled = false
+            menu.addItem(shortcut)
+        }
         menu.addItem(.separator())
 
-        if selectedVoiceMode == .builtIn {
+        if coordinator.isExternalBuild {
+            let source = NSMenuItem(
+                title: "Text request active",
+                action: nil,
+                keyEquivalent: ""
+            )
+            source.isEnabled = false
+            menu.addItem(source)
+        } else if selectedVoiceMode == .builtIn {
             let toggleTitle = coordinator.state == .recording
                 ? "Stop Recording & Build"
                 : "Start Recording"
@@ -376,7 +403,7 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         }
 
         menu.addItem(item("Show Welcome", #selector(showOnboarding)))
-        if coordinator.microphoneDenied {
+        if !coordinator.isExternalBuild && coordinator.microphoneDenied {
             menu.addItem(item("Open Microphone Settings", #selector(openMicrophoneSettings)))
         }
         menu.addItem(item("Open Projects", #selector(openProjects)))
@@ -390,7 +417,9 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         menu.addItem(.separator())
         if coordinator.state == .building {
             menu.addItem(item("Stop Current Build", #selector(stopCurrentBuild)))
-            menu.addItem(item("Restart Voice Command", #selector(restartVoiceCommand)))
+            if !coordinator.isExternalBuild {
+                menu.addItem(item("Restart Voice Command", #selector(restartVoiceCommand)))
+            }
         }
         menu.addItem(item("Stop All Fractal Builds", #selector(stopBuilds)))
         menu.addItem(.separator())

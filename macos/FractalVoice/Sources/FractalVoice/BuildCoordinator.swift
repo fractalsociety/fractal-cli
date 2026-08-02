@@ -336,6 +336,12 @@ final class BuildCoordinator: ObservableObject {
     private var transcriptRetryCount = 0
     private var recordingTimeout: Task<Void, Never>?
     private var terminationAfterPause: (() -> Void)?
+    /// External desktop handoffs are text-native. Keep their result channel
+    /// separate from the voice dialogue state so duplicate-name responses can
+    /// return to the calling CLI without opening a microphone prompt.
+    private var externalBuildResultURL: URL?
+    private var externalBuildProjectName: String?
+    private(set) var isExternalBuild = false
 
     var projectsURL: URL { AppRuntime.projectsURL }
     let logURL = AppRuntime.logURL
@@ -638,9 +644,14 @@ final class BuildCoordinator: ObservableObject {
         }
     }
 
-    func reportExternalBuildFailure(_ message: String) {
+    func reportExternalBuildFailure(_ message: String, showVoiceUI: Bool = true) {
         state = .failed(message)
         latestActivity = message
+        guard showVoiceUI else {
+            hud?.close()
+            hud = nil
+            return
+        }
         if hud == nil {
             hud = RecordingHUD(
                 onStop: { [weak self] in self?.stopCurrentBuild() },
@@ -656,6 +667,10 @@ final class BuildCoordinator: ObservableObject {
     }
 
     func toggleRecording() {
+        guard !isExternalBuild else {
+            latestActivity = "A text request is active; microphone input is paused until it finishes."
+            return
+        }
         if state == .building, recorder == nil, transcriptionProcess == nil {
             switch dialogueStage {
             case .awaitingRequestAnswer:
@@ -750,7 +765,10 @@ final class BuildCoordinator: ObservableObject {
         beginRecording(with: recorder, purpose: .request)
     }
 
-    func startExternalBuild(_ external: ExternalBuildRequest) throws {
+    func startExternalBuild(
+        _ external: ExternalBuildRequest,
+        resultURL: URL? = nil
+    ) throws {
         guard canAcceptExternalBuild else {
             throw ExternalBuildStartError.busy
         }
@@ -759,19 +777,27 @@ final class BuildCoordinator: ObservableObject {
         }
 
         cancelDialogueInput()
+        externalBuildResultURL = resultURL
+        externalBuildProjectName = external.projectName
+        isExternalBuild = true
         pendingRequest = external.request
         pendingRequestWasTyped = true
         pendingProjectName = external.projectName
         stopRequested = false
         restartRequested = false
         state = .building
-        latestActivity = "External request received — starting \(external.projectName)…"
+        latestActivity = "Text request received — starting \(external.projectName)…"
         hud?.close()
-        hud = RecordingHUD(
-            onStop: { [weak self] in self?.stopCurrentBuild() },
-            onRestart: { [weak self] in self?.restartVoiceCommand() }
-        )
-        presentBuildingStatus("External request received — starting \(external.projectName)…")
+        hud = nil
+        if let resultURL {
+            ExternalBuildHandoff.writeResult(
+                to: resultURL,
+                status: .started,
+                projectName: external.projectName,
+                message: "Text request accepted; checking the project name."
+            )
+        }
+        presentBuildingStatus(latestActivity)
         startBuild(
             transcript: external.request,
             projectName: external.projectName,
@@ -1746,7 +1772,11 @@ final class BuildCoordinator: ObservableObject {
             "--managed-project",
             "--project-name", projectName,
         ] + Self.efficiencyCLIArguments(efficiencyControls)
-        task.environment = Self.processEnvironment()
+        var environment = Self.processEnvironment()
+        if isExternalBuild {
+            environment["FRACTAL_EXTERNAL_TEXT"] = "1"
+        }
+        task.environment = environment
         task.standardInput = stdin
         task.standardOutput = combinedOutput
         task.standardError = combinedOutput
@@ -1827,11 +1857,42 @@ final class BuildCoordinator: ObservableObject {
         activeAudioURL = nil
         recorder?.close()
         recorder = nil
+        if isExternalBuild {
+            finishExternalBuild(
+                status: .failed,
+                message: error.localizedDescription
+            )
+            state = .failed("Text build stopped")
+            latestActivity = error.localizedDescription
+            appendLog("[text] request failed: \(error.localizedDescription)\n")
+            notify(title: "Fractal text request needs attention", body: latestActivity)
+            return
+        }
         state = .failed("Voice command stopped")
         latestActivity = error.localizedDescription
         appendLog("[voice] command failed: \(error.localizedDescription)\n")
         hud?.showFailure(error.localizedDescription)
         notify(title: "Fractal Voice needs attention", body: latestActivity)
+    }
+
+    private func finishExternalBuild(
+        status: ExternalBuildResultStatus,
+        message: String
+    ) {
+        if let resultURL = externalBuildResultURL {
+            ExternalBuildHandoff.writeResult(
+                to: resultURL,
+                status: status,
+                projectName: externalBuildProjectName ?? pendingProjectName,
+                message: message
+            )
+        }
+        externalBuildResultURL = nil
+        externalBuildProjectName = nil
+        isExternalBuild = false
+        pendingRequest = ""
+        pendingRequestWasTyped = false
+        pendingProjectName = ""
     }
 
     private func consume(_ text: String) {
@@ -1854,7 +1915,9 @@ final class BuildCoordinator: ObservableObject {
     private func consumeLine(_ rawLine: String) {
         let line = Self.cleanTerminalLine(rawLine)
         guard !line.isEmpty else { return }
-        if let prefix = line.range(of: "Created managed voice project:") {
+        let projectPrefix = line.range(of: "Created managed text project:")
+            ?? line.range(of: "Created managed voice project:")
+        if let prefix = projectPrefix {
             let path = line[prefix.upperBound...].trimmingCharacters(in: .whitespaces)
             if !path.isEmpty {
                 activeWorkspace = URL(fileURLWithPath: path, isDirectory: true)
@@ -1862,6 +1925,15 @@ final class BuildCoordinator: ObservableObject {
                     let detail = refreshLearningDetail(force: true)
                     hud?.updateLearningDetail(detail)
                 }
+            }
+            if isExternalBuild, let resultURL = externalBuildResultURL {
+                ExternalBuildHandoff.writeResult(
+                    to: resultURL,
+                    status: .accepted,
+                    projectName: externalBuildProjectName ?? pendingProjectName,
+                    message: "Text request accepted; the managed execution graph is starting."
+                )
+                externalBuildResultURL = nil
             }
         }
         if let summary = Self.activitySummary(for: line) {
@@ -1910,9 +1982,15 @@ final class BuildCoordinator: ObservableObject {
         }
         stopRequested = true
         restartRequested = restart
-        let activity = restart
-            ? "Stopping this attempt — the microphone will reopen…"
-            : "Pausing this build and preserving its completed work…"
+        let activity: String
+        if isExternalBuild {
+            restartRequested = false
+            activity = "Stopping the text build and preserving its completed work…"
+        } else {
+            activity = restart
+                ? "Stopping this attempt — the microphone will reopen…"
+                : "Pausing this build and preserving its completed work…"
+        }
         latestActivity = activity
         hud?.showStopping(restarting: restart)
 
@@ -1975,6 +2053,15 @@ final class BuildCoordinator: ObservableObject {
             try? FileManager.default.removeItem(at: activeAudioURL)
         }
         activeAudioURL = nil
+        if isExternalBuild {
+            let message = "Text request cancelled before the build started."
+            finishExternalBuild(status: .failed, message: message)
+            hud?.close()
+            hud = nil
+            state = .idle
+            latestActivity = message
+            return
+        }
         if restart {
             hud?.close()
             hud = nil
@@ -2000,6 +2087,17 @@ final class BuildCoordinator: ObservableObject {
             clearLearningDetail()
             hud?.close()
             hud = nil
+            if isExternalBuild {
+                let message = "Text build stopped; completed graph work was preserved."
+                finishExternalBuild(status: .failed, message: message)
+                state = .idle
+                latestActivity = message
+                notify(title: "Fractal text build stopped", body: message)
+                let completion = terminationAfterPause
+                terminationAfterPause = nil
+                completion?()
+                return
+            }
             state = .idle
             if restart {
                 latestActivity = "Previous attempt stopped — listening again…"
@@ -2017,6 +2115,15 @@ final class BuildCoordinator: ObservableObject {
             activeWorkspace = nil
             clearLearningDetail()
             let takenName = pendingProjectName
+            if isExternalBuild {
+                let message =
+                    "Project name “\(takenName)” is already taken. Retry with a different project name."
+                finishExternalBuild(status: .projectNameTaken, message: message)
+                state = .failed("Project name already taken")
+                latestActivity = message
+                notify(title: "Choose a different project name", body: message)
+                return
+            }
             pendingProjectName = ""
             askForProjectName(
                 prompt: "You already have a project called \(takenName). What would you like to call this one?"
@@ -2026,6 +2133,7 @@ final class BuildCoordinator: ObservableObject {
         hud?.close()
         hud = nil
         if exitCode == 0 {
+            let wasExternalBuild = isExternalBuild
             state = .idle
             let projectFile = activeWorkspace?
                 .appendingPathComponent(".fractal/project.fractal")
@@ -2036,8 +2144,17 @@ final class BuildCoordinator: ObservableObject {
             learningDetail = presentation?.detailLine
             // Lifetime efficiency is secondary menu/detail only — never replace
             // the learning summary or claim Estimated totals are Realized.
-            latestActivity = learningSummary.map { "Build finished — \($0)" }
-                ?? "Build finished — press ⌥Space for another project"
+            latestActivity = wasExternalBuild
+                ? (learningSummary.map { "Text build finished — \($0)" }
+                    ?? "Text build finished — the project is ready")
+                : (learningSummary.map { "Build finished — \($0)" }
+                    ?? "Build finished — press ⌥Space for another project")
+            if wasExternalBuild {
+                finishExternalBuild(
+                    status: .accepted,
+                    message: "The managed execution graph started successfully."
+                )
+            }
             notify(title: "Fractal build finished", body: learningSummary ?? "Your project run completed.")
         } else {
             clearLearningDetail()
@@ -2045,7 +2162,12 @@ final class BuildCoordinator: ObservableObject {
                 .split(separator: "\n")
                 .suffix(3)
                 .joined(separator: " ")
-            state = .failed("Build stopped")
+            if isExternalBuild {
+                finishExternalBuild(status: .failed, message: detail)
+                state = .failed("Text build stopped")
+            } else {
+                state = .failed("Build stopped")
+            }
             latestActivity = detail.isEmpty ? "Open the log for details" : detail
             notify(title: "Fractal needs attention", body: latestActivity)
         }
@@ -2054,6 +2176,9 @@ final class BuildCoordinator: ObservableObject {
     nonisolated static func activitySummary(for rawLine: String) -> String? {
         let line = cleanTerminalLine(rawLine)
         guard !line.isEmpty else { return nil }
+        if line.contains("Created managed text project:") {
+            return "Text project created — lead agent is preparing the plan…"
+        }
         if line.contains("Created managed voice project:") {
             return "Project created — lead agent is preparing the plan…"
         }

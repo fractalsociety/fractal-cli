@@ -6,15 +6,15 @@
 //! launch, the running app discovers the private queued file itself. The request
 //! never becomes shell syntax or a URL query value.
 
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::cli::HandoffArgs;
@@ -24,6 +24,11 @@ const APP_BUNDLE_ID: &str = "com.fractalsociety.voice";
 const INSTALLED_APP_PATH: &str = "/Applications/Fractal Voice.app";
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_PROJECT_NAME_CHARS: usize = 80;
+const RESULT_SCHEMA: &str = "fractal.external_build_result.v1";
+const MAX_RESULT_BYTES: u64 = 16 * 1024;
+const RESULT_WAIT_ATTEMPTS: usize = 80;
+const QUEUED_RESULT_WAIT_ATTEMPTS: usize = 24;
+const RESULT_WAIT_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Serialize)]
 struct ExternalBuildHandoff<'a> {
@@ -31,6 +36,17 @@ struct ExternalBuildHandoff<'a> {
     request: &'a str,
     project_name: &'a str,
     created_at_ms: u128,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalBuildResult {
+    schema: String,
+    status: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    project_name: String,
 }
 
 pub(crate) fn run(args: &HandoffArgs) -> Result<()> {
@@ -53,16 +69,109 @@ pub(crate) fn run(args: &HandoffArgs) -> Result<()> {
     }
 
     let path = write_handoff(request, project_name)?;
-    if launch_fractal_voice(&path) {
-        println!(
-            "Sent “{project_name}” to Fractal Voice. The managed execution graph is starting."
-        );
+    let result_path = path.with_extension("result");
+    let launched = launch_fractal_voice(&path);
+    let wait_attempts = if launched {
+        RESULT_WAIT_ATTEMPTS
     } else {
-        println!(
+        // A sandbox can reject LaunchServices even while Fractal Voice is
+        // already running and watching /tmp. Give that queued receiver a
+        // bounded chance to return a duplicate-name result before we report
+        // the request as queued.
+        QUEUED_RESULT_WAIT_ATTEMPTS
+    };
+    match wait_for_result(&result_path, wait_attempts)? {
+        Some(result) if result.status == "project_name_taken" => {
+            let name = if result.project_name.trim().is_empty() {
+                project_name
+            } else {
+                result.project_name.trim()
+            };
+            let detail = project_name_taken_message(name, &result.message);
+            bail!("{detail}");
+        }
+        Some(result) if result.status == "failed" => {
+            let detail = if result.message.trim().is_empty() {
+                "Fractal Voice could not start the external build."
+            } else {
+                result.message.as_str()
+            };
+            bail!("{detail}");
+        }
+        Some(result) if result.status == "accepted" => {
+            println!(
+                "Sent “{project_name}” to Fractal Voice. The managed execution graph is starting."
+            );
+        }
+        Some(result) => {
+            fs::remove_file(&result_path).ok();
+            bail!(
+                "Fractal Voice returned an unsupported external-build result status `{}`",
+                result.status
+            );
+        }
+        None if launched => println!(
+            "Sent “{project_name}” to Fractal Voice. The managed execution graph is starting."
+        ),
+        None => println!(
             "Queued “{project_name}” for Fractal Voice. Keep the app running; it will pick up the secure request automatically."
-        );
+        ),
     }
     Ok(())
+}
+
+fn project_name_taken_message(project_name: &str, app_message: &str) -> String {
+    if app_message.trim().is_empty() {
+        format!(
+            "Project name “{project_name}” is already taken. Retry with a different project name."
+        )
+    } else {
+        app_message.trim().to_owned()
+    }
+}
+
+fn wait_for_result(path: &Path, attempts: usize) -> Result<Option<ExternalBuildResult>> {
+    for _ in 0..attempts {
+        match read_result(path) {
+            Ok(Some(result)) if result.schema != RESULT_SCHEMA => {
+                fs::remove_file(path).ok();
+                bail!("Fractal Voice returned an unsupported external-build result schema");
+            }
+            Ok(Some(result)) if result.status == "started" => {
+                std::thread::sleep(RESULT_WAIT_INTERVAL);
+            }
+            Ok(Some(result)) => {
+                fs::remove_file(path).ok();
+                return Ok(Some(result));
+            }
+            Ok(None) => std::thread::sleep(RESULT_WAIT_INTERVAL),
+            Err(error) => {
+                fs::remove_file(path).ok();
+                return Err(error);
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn read_result(path: &Path) -> Result<Option<ExternalBuildResult>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect Fractal Voice external-build result"),
+    };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::getuid() }
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.len() == 0
+        || metadata.len() > MAX_RESULT_BYTES
+    {
+        bail!("Fractal Voice external-build result is not a private regular file");
+    }
+    let bytes = fs::read(path).context("read Fractal Voice external-build result")?;
+    let result =
+        serde_json::from_slice(&bytes).context("decode Fractal Voice external-build result")?;
+    Ok(Some(result))
 }
 
 fn launch_fractal_voice(path: &Path) -> bool {
@@ -171,5 +280,38 @@ mod tests {
     fn installed_receiver_is_tried_before_bundle_discovery() {
         assert_eq!(INSTALLED_APP_PATH, "/Applications/Fractal Voice.app");
         assert_eq!(APP_BUNDLE_ID, "com.fractalsociety.voice");
+    }
+
+    #[test]
+    fn result_channel_accepts_only_private_terminal_result() {
+        let path = std::env::temp_dir().join(format!(
+            "fractal-build-result-test-{}-{}.result",
+            std::process::id(),
+            UNIX_EPOCH.elapsed().unwrap().as_nanos()
+        ));
+        let bytes = serde_json::json!({
+            "schema": RESULT_SCHEMA,
+            "status": "project_name_taken",
+            "project_name": "Hello World",
+            "message": "Project name “Hello World” is already taken. Retry with a different project name."
+        });
+        write_owner_only(&path, &serde_json::to_vec(&bytes).unwrap()).unwrap();
+        let result = read_result(&path).unwrap().unwrap();
+        assert_eq!(result.schema, RESULT_SCHEMA);
+        assert_eq!(result.status, "project_name_taken");
+        assert_eq!(result.project_name, "Hello World");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn duplicate_project_result_tells_text_callers_to_retry() {
+        assert_eq!(
+            project_name_taken_message("link", ""),
+            "Project name “link” is already taken. Retry with a different project name."
+        );
+        assert_eq!(
+            project_name_taken_message("link", "Retry with another name."),
+            "Retry with another name."
+        );
     }
 }
