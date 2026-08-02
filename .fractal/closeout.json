@@ -1,0 +1,62 @@
+{
+  "schema": "fractal.closeout.v1",
+  "status": "approved",
+  "summary": "Portable, backward-compatible execution-graph learning records are implemented across Rust graph production, lifecycle recording, graph edits, aggregation, persistence/sync, and Fractal Voice display. Final repository gates pass with 247 Rust tests, warning-free Clippy, rustfmt, and 68 Swift tests; excluded Apple release and generated dist scope was not changed.",
+  "acceptance": [
+    {
+      "id": "AC-1",
+      "passed": true,
+      "evidence": "Producer and lifecycle fixtures in compile, decompose, work_builder, execute, project_file, orchestrate, and supervise assert stable structural fields, normalized dependencies, timestamps, executor metadata, attempts, outcomes, verification, artifact lineage, intervention, and truthful optional costs; final Rust suite passed 247/247."
+    },
+    {
+      "id": "AC-2",
+      "passed": true,
+      "evidence": "learning_data controlled-enum and invariant tests cover the seven outcomes, twelve failure codes, unknown-value rejection, success/failure incompatibilities, terminal timestamps, verification consistency, and produced-before-consumed artifact validation; final Rust suite passed."
+    },
+    {
+      "id": "AC-3",
+      "passed": true,
+      "evidence": "project_file and graph_store legacy migration and enriched round-trip fixtures preserve graph topology, identity, unknown compatible fields, and graph hashes while safely defaulting absent learning data; final Rust suite passed."
+    },
+    {
+      "id": "AC-4",
+      "passed": true,
+      "evidence": "execute, project_file, run_control, checkpoint, and cross-boundary fixtures cover ready/checkout/start, retry/reopen, execution and verification failures, timeout, success, cancellation, stale release/resume, artifact production/consumption, and human completion with monotonic timestamps and preserved attempts; final Rust suite passed."
+    },
+    {
+      "id": "AC-5",
+      "passed": true,
+      "evidence": "amendments 8/8, harness_evolution 2/2, and supervise 7/7 focused tests passed, covering split, reroute, cancel, dependency edits, autonomous evolution, verified before-hashes, ordered compact events, structural retirement, and downstream eventual-effect updates."
+    },
+    {
+      "id": "AC-6",
+      "passed": true,
+      "evidence": "Deterministic learning_data 4/4 and project_file 15/15 aggregation fixtures passed for sequential, parallel, retry, reopen, failure, cancellation, dead/unused nodes, human completion, PRD criterion IDs, critical path, concurrency, costs, coverage denominator, and evidence-based early-stop/expansion flags."
+    },
+    {
+      "id": "AC-7",
+      "passed": true,
+      "evidence": "learning_data, project_file, and graph_store boundary tests reject forbidden credential/chain-of-thought-style fields and oversized strings while serialized fixtures retain only bounded notes, evidence_refs, and compact artifact IDs; final Rust suite passed."
+    },
+    {
+      "id": "AC-8",
+      "passed": true,
+      "evidence": "project_file, graph_store, project_sync, checkpoint, harness_evolution, and cross-boundary fixtures verify local persistence, evolved-child hashes, resume recovery, canonical validation, and upload payload preservation without dropping enriched learning records; final Rust suite passed."
+    },
+    {
+      "id": "AC-9",
+      "passed": true,
+      "evidence": "swift test --package-path macos/FractalVoice passed 68/68 tests, including legacy, fully enriched, partial, unknown-forward-compatible, BuildCoordinator, HUD, node attempt/outcome/verification, and graph completion-summary fixtures without false corruption states."
+    },
+    {
+      "id": "AC-10",
+      "passed": true,
+      "evidence": "Final gates passed: cargo fmt --all -- --check; cargo test --no-fail-fast (247 passed); cargo clippy --all-targets -- -D warnings; swift test --package-path macos/FractalVoice (68 passed). git diff --name-only contains no dist-* release bundle, signing/notarization, archive, DMG, ZIP, or Apple submission path."
+    }
+  ],
+  "risks": [
+    "The workspace contained substantial unrelated pre-existing modifications and untracked dist directories; the acceptance audit relied on the final diff path inventory and scoped tests, and no dist-* path appears in the tracked diff.",
+    "Fractal's scheduler briefly launched downstream repair workers before an externally checked-out dependency completed; conflicting processes were stopped through Fractal pause, ownership was restored atomically, and the final full Rust and Swift gates validate the reconciled workspace.",
+    "No signing, notarization, packaging, release archive generation, or Apple submission was performed, so those excluded deployment paths remain unvalidated by design."
+  ]
+}
