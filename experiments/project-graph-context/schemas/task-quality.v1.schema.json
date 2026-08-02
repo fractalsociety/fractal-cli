@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fractalmaster.invalid/project-graph-context/task-quality.v1.schema.json",
+  "title": "Project-graph-context corpus v2 task quality report",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "task_id", "clauses", "baseline", "gold", "mutations", "determinism", "gates", "quarantined", "quality_report_hash"],
+  "properties": {
+    "schema_version": {"const": "project-graph-context.task-quality.v1"},
+    "task_id": {"type": "string", "minLength": 1},
+    "pair_id": {"type": "string", "minLength": 1},
+    "split": {"enum": ["public", "holdout"]},
+    "seed_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "checker": {"const": "external-private-sanitized"},
+    "clauses": {
+      "type": "object",
+      "required": ["total", "passed_on_gold", "minimum"],
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "passed_on_gold": {"type": "integer", "minimum": 0},
+        "minimum": {"type": "integer", "minimum": 8}
+      }
+    },
+    "baseline": {"$ref": "#/$defs/check"},
+    "gold": {"$ref": "#/$defs/check"},
+    "mutations": {
+      "type": "object",
+      "required": ["total", "detected", "detection_rate", "minimum_rate", "cases"],
+      "properties": {
+        "total": {"type": "integer", "minimum": 1},
+        "detected": {"type": "integer", "minimum": 0},
+        "detection_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "minimum_rate": {"const": 0.8},
+        "cases": {"type": "array", "minItems": 5, "items": {"$ref": "#/$defs/mutation"}}
+      }
+    },
+    "determinism": {"type": "object", "required": ["passed", "runs", "hash"], "properties": {"passed": {"type": "boolean"}, "runs": {"const": 3}, "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}},
+    "gates": {"type": "object", "additionalProperties": {"type": "boolean"}, "minProperties": 8},
+    "saturation_warning": {"type": "boolean"},
+    "quarantined": {"type": "boolean"},
+    "duration_ms": {"type": "number", "minimum": 0},
+    "quality_report_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "check": {"type": "object", "required": ["passed"], "properties": {"passed": {"type": "boolean"}, "failure_code": {"type": ["string", "null"]}}},
+    "mutation": {"type": "object", "required": ["name", "detected", "checker_passed", "scope_severe", "changed_paths"], "properties": {"name": {"type": "string"}, "detected": {"type": "boolean"}, "checker_passed": {"type": "boolean"}, "scope_severe": {"type": "integer", "minimum": 0}, "changed_paths": {"type": "array", "items": {"type": "string"}}}}
+  }
+}

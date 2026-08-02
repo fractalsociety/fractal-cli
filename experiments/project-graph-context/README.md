@@ -70,6 +70,15 @@ conservative `inconclusive`/no-go decision for missing telemetry or fewer than
 * `tests/` — unit/integration checks for isolation, scope, telemetry,
   determinism, timeout/checker behavior, and threshold/no-go analysis.
 
+## Corpus v2
+
+The sanitized v2 corpus is documented in [CORPUS_V2.md](CORPUS_V2.md).  It is
+kept separate from the preregistered four-task v1 pilot: use `corpus-v2` to
+inspect public/holdout metadata and `quality-v2` to run the local baseline,
+gold, mutation, determinism, leakage, and scope gate.  A failing task is
+quarantined rather than silently included, and holdout checker contents remain
+external to episode contexts/results.
+
 The runner records token/cost fields as unavailable unless the worker writes a
 valid `project-graph-context.usage-receipt.v1` receipt with non-negative input,
 output, total (`input + output`) and cost values.  A checker or script cannot
