@@ -17,6 +17,7 @@ mod efficiency_detector;
 mod efficiency_policy;
 mod evolve;
 mod execute;
+mod failure_cli;
 mod failure_graph;
 mod graph_store;
 mod handoff;
@@ -90,7 +91,7 @@ fn uses_stable_json_diagnostics(cli: &Cli) -> bool {
     matches!(
         cli.command,
         Some(Command::Graph(crate::cli::GraphArgs {
-            command: GraphCommand::Audit(_) | GraphCommand::Compose(_),
+            command: GraphCommand::Audit(_) | GraphCommand::Compose(_) | GraphCommand::Failure(_),
         }))
     )
 }
@@ -157,6 +158,7 @@ fn run(cli: Cli) -> Result<()> {
             ),
             GraphCommand::Status(args) => board::status(&args.url, args.json),
             GraphCommand::Show(args) => graph_store::show(&args.graph_hash, args.json),
+            GraphCommand::Failure(args) => failure_cli::run(&args),
             GraphCommand::Audit(args) => run_graph_audit(&args),
             GraphCommand::Compose(args) => run_graph_compose(&args),
             GraphCommand::Master(args) => {

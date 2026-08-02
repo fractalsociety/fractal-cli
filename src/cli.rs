@@ -610,6 +610,8 @@ pub(crate) enum GraphCommand {
     Status(GraphStatusArgs),
     /// Load a committed execution graph from the local store.
     Show(GraphShowArgs),
+    /// Inspect and compare the additive failure/lesson graph.
+    Failure(GraphFailureArgs),
     /// Audit projects from a frozen repository inventory shard.
     Audit(GraphAuditArgs),
     /// Compose a read-only master graph from a frozen repository inventory.
@@ -621,6 +623,94 @@ pub(crate) enum GraphCommand {
     /// Internal foreground Rust board server.
     #[command(hide = true)]
     Serve(GraphServeArgs),
+}
+
+/// Arguments accepted by `fractal graph failure`.
+#[derive(Debug, Args)]
+pub(crate) struct GraphFailureArgs {
+    #[command(subcommand)]
+    pub(crate) command: GraphFailureCommand,
+}
+
+/// Read-only failure graph inspection operations.
+#[derive(Debug, Subcommand)]
+pub(crate) enum GraphFailureCommand {
+    /// Show a bounded failure graph summary or one record and its related edges.
+    Show(GraphFailureShowArgs),
+    /// Validate the canonical failure graph envelope and references.
+    Validate(GraphFailureValidateArgs),
+    /// Select the same evidence-backed lessons supplied to a future worker.
+    Lessons(GraphFailureLessonsArgs),
+    /// Compare failure graph records between a git revision and the workspace.
+    Diff(GraphFailureDiffArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GraphFailureShowArgs {
+    /// Project workspace containing `.fractal/project.fractal`.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+
+    /// Failure, lesson, or edge key to inspect in detail.
+    #[arg(long, value_name = "KEY")]
+    pub(crate) id: Option<String>,
+
+    /// Print the stable JSON response instead of a human summary.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GraphFailureValidateArgs {
+    /// Project workspace containing `.fractal/project.fractal`.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+
+    /// Print the stable JSON validation response.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GraphFailureLessonsArgs {
+    /// Project workspace containing `.fractal/project.fractal`.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+
+    /// Graph node ID used as the primary lesson selector.
+    #[arg(long, value_name = "ID")]
+    pub(crate) node: String,
+
+    /// Optional capability selector used by the worker lesson ranker.
+    #[arg(long, value_name = "VALUE")]
+    pub(crate) capability: Option<String>,
+
+    /// Optional failure-code selector used by the worker lesson ranker.
+    #[arg(long = "failure-code", value_name = "VALUE")]
+    pub(crate) failure_code: Option<String>,
+
+    /// Print the stable JSON response.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GraphFailureDiffArgs {
+    /// Project workspace containing `.fractal/project.fractal`.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+
+    /// Safe git revision containing `.fractal/project.fractal` to use as base.
+    #[arg(long, value_name = "REF")]
+    pub(crate) base: String,
+
+    /// Safe git revision for the head; defaults to the workspace file.
+    #[arg(long, value_name = "REF")]
+    pub(crate) head: Option<String>,
+
+    /// Print the stable JSON response.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 /// Arguments accepted by `fractal graph board`.
@@ -1196,6 +1286,120 @@ mod tests {
                     validate_only: true,
                 })
             })) if inventory == std::path::Path::new("/tmp/inventory.json")
+        ));
+
+        let failure_show = Cli::try_parse_from([
+            "fractal",
+            "graph",
+            "failure",
+            "show",
+            "--repo",
+            "/tmp/project",
+            "--id",
+            "failure:build:tool_failure",
+            "--json",
+        ])
+        .unwrap();
+        let Some(Command::Graph(GraphArgs {
+            command:
+                GraphCommand::Failure(GraphFailureArgs {
+                    command:
+                        GraphFailureCommand::Show(GraphFailureShowArgs {
+                            repo,
+                            id,
+                            json: true,
+                        }),
+                }),
+        })) = failure_show.command
+        else {
+            panic!("expected graph failure show command");
+        };
+        assert_eq!(repo, PathBuf::from("/tmp/project"));
+        assert_eq!(id.as_deref(), Some("failure:build:tool_failure"));
+
+        let failure_validate = Cli::try_parse_from([
+            "fractal",
+            "graph",
+            "failure",
+            "validate",
+            "--repo",
+            "/tmp/project",
+        ])
+        .unwrap();
+        assert!(matches!(
+            failure_validate.command,
+            Some(Command::Graph(GraphArgs {
+                command: GraphCommand::Failure(GraphFailureArgs {
+                    command: GraphFailureCommand::Validate(GraphFailureValidateArgs {
+                        repo,
+                        json: false,
+                    })
+                })
+            })) if repo == std::path::Path::new("/tmp/project")
+        ));
+
+        let failure_lessons = Cli::try_parse_from([
+            "fractal",
+            "graph",
+            "failure",
+            "lessons",
+            "--repo",
+            "/tmp/project",
+            "--node",
+            "build",
+            "--capability",
+            "verify",
+            "--failure-code",
+            "tool_failure",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            failure_lessons.command,
+            Some(Command::Graph(GraphArgs {
+                command: GraphCommand::Failure(GraphFailureArgs {
+                    command: GraphFailureCommand::Lessons(GraphFailureLessonsArgs {
+                        repo,
+                        node,
+                        capability: Some(capability),
+                        failure_code: Some(failure_code),
+                        json: true,
+                    })
+                })
+            })) if repo == std::path::Path::new("/tmp/project")
+                && node == "build"
+                && capability == "verify"
+                && failure_code == "tool_failure"
+        ));
+
+        let failure_diff = Cli::try_parse_from([
+            "fractal",
+            "graph",
+            "failure",
+            "diff",
+            "--repo",
+            "/tmp/project",
+            "--base",
+            "HEAD",
+            "--head",
+            "main",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            failure_diff.command,
+            Some(Command::Graph(GraphArgs {
+                command: GraphCommand::Failure(GraphFailureArgs {
+                    command: GraphFailureCommand::Diff(GraphFailureDiffArgs {
+                        repo,
+                        base,
+                        head: Some(head),
+                        json: true,
+                    })
+                })
+            })) if repo == std::path::Path::new("/tmp/project")
+                && base == "HEAD"
+                && head == "main"
         ));
     }
 
