@@ -35,6 +35,7 @@ mod mobile;
 mod node;
 mod orchestrate;
 mod pipeline;
+mod policy_executor;
 mod project_audit;
 mod project_file;
 mod project_sync;
