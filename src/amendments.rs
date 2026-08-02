@@ -392,7 +392,7 @@ fn apply_one(
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(900_000);
-    let run = crate::execute::run_agent_prompt(lead_agent, &prompt, workspace, timeout)
+    let run = crate::execute::run_lead_agent_prompt(lead_agent, &prompt, workspace, timeout)
         .with_context(|| format!("launch lead planner `{lead_agent}`"))?;
     if !run.ok {
         bail!(
