@@ -759,13 +759,24 @@ def audit_task(task_id: str, *, keep_worktrees: bool = False) -> dict[str, Any]:
         "quarantined": not passed,
         "duration_ms": round((time.monotonic() - started) * 1000, 3),
     }
-    canonical = json.dumps(report, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    report["quality_report_hash"] = hashlib.sha256(canonical).hexdigest()
+    report["quality_report_hash"] = _stable_report_hash(report)
     return report
 
 
 def _split_hash(entries: list[Mapping[str, Any]]) -> str:
     return hashlib.sha256(json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _stable_report_hash(payload: Mapping[str, Any]) -> str:
+    """Hash semantic quality facts while excluding wall-clock durations."""
+
+    normalized = json.loads(json.dumps(payload, sort_keys=True))
+    normalized.pop("quality_report_hash", None)
+    normalized.pop("duration_ms", None)
+    for report in normalized.get("reports", []):
+        if isinstance(report, dict):
+            report.pop("duration_ms", None)
+    return hashlib.sha256(json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def audit_corpus(*, task_ids: Iterable[str] | None = None, output: str | os.PathLike[str] | None = None) -> dict[str, Any]:
@@ -793,8 +804,7 @@ def audit_corpus(*, task_ids: Iterable[str] | None = None, output: str | os.Path
         "holdout_checker_contents": "sealed-external",
         "paid_llm_episodes": False,
     }
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    payload["quality_report_hash"] = hashlib.sha256(canonical).hexdigest()
+    payload["quality_report_hash"] = _stable_report_hash(payload)
     if output is not None:
         destination = Path(output); destination.parent.mkdir(parents=True, exist_ok=True); destination.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return payload
