@@ -9,6 +9,25 @@
 //! `fractal-harnessc`); until then the family→harness map here is the source of
 //! truth and is deterministic so the same intent always selects the same harness.
 
+use std::path::Path;
+
+use anyhow::Result;
+
+use crate::harness_policy::LoadedHarnessPolicy;
+
+/// Resolve the repository policy before selecting or compiling a harness.
+pub(crate) fn load_policy(repo: &Path) -> Result<LoadedHarnessPolicy> {
+    crate::harness_policy::load_for_repo(repo)
+}
+
+/// Return the immutable contract attached to one compiled node.
+pub(crate) fn node_policy_contract(
+    policy: &LoadedHarnessPolicy,
+    capability: &str,
+) -> serde_json::Value {
+    crate::harness_policy::resolve_node_contract(policy, capability)
+}
+
 /// A deterministically selected harness for an intent family.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HarnessSelection {

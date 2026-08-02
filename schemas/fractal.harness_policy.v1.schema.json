@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fractal.local/schemas/fractal.harness_policy.v1.schema.json",
+  "title": "Fractal harness policy v1",
+  "type": "object",
+  "required": ["schema", "mode", "workspace", "commands", "network", "secrets", "limits", "verification", "artifacts", "termination_states"],
+  "properties": {
+    "schema": {"const": "fractal.harness_policy.v1"},
+    "mode": {"const": "deny_by_default"},
+    "authority_order": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "workspace": {"$ref": "#/$defs/workspace"},
+    "commands": {"$ref": "#/$defs/commands"},
+    "network": {"$ref": "#/$defs/network"},
+    "secrets": {"$ref": "#/$defs/secrets"},
+    "context": {"$ref": "#/$defs/context"},
+    "limits": {"$ref": "#/$defs/limits"},
+    "verification": {"$ref": "#/$defs/verification"},
+    "artifacts": {"$ref": "#/$defs/artifacts"},
+    "termination_states": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "capabilities": {"type": "object", "additionalProperties": {"$ref": "#/$defs/grant"}},
+    "grants": {"type": "object", "additionalProperties": {"$ref": "#/$defs/grant"}},
+    "phases": {"type": "array", "items": {"$ref": "#/$defs/phase"}},
+    "verifier": {"$ref": "#/$defs/verifier"},
+    "evidence": {"$ref": "#/$defs/evidence"},
+    "learning": {"$ref": "#/$defs/learning"}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "pathGlobs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "workspace": {
+      "type": "object",
+      "required": ["isolation", "writable", "readonly", "forbidden", "max_files_changed", "max_diff_lines"],
+      "properties": {
+        "isolation": {"type": "string", "minLength": 1},
+        "clean_start_required": {"type": "boolean"},
+        "writable": {"$ref": "#/$defs/pathGlobs"},
+        "readonly": {"$ref": "#/$defs/pathGlobs"},
+        "forbidden": {"$ref": "#/$defs/pathGlobs"},
+        "max_files_changed": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "max_diff_lines": {"type": "integer", "minimum": 1, "maximum": 10000000}
+      },
+      "additionalProperties": false
+    },
+    "commands": {
+      "type": "object",
+      "required": ["shell", "allow", "deny_patterns", "approval_required"],
+      "properties": {
+        "shell": {"type": "string", "minLength": 1},
+        "allow": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "deny_patterns": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "approval_required": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      },
+      "additionalProperties": false
+    },
+    "network": {
+      "type": "object",
+      "required": ["default", "allowed_destinations", "record_dns_and_destinations"],
+      "properties": {
+        "default": {"enum": ["deny", "deny_by_default", "allow", "allow_scoped", "retrieval_only"]},
+        "allowed_destinations": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "record_dns_and_destinations": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "secrets": {
+      "type": "object",
+      "required": ["default", "allowed_names", "redact_outputs", "never_persist"],
+      "properties": {
+        "default": {"enum": ["deny", "deny_by_default", "allow_scoped"]},
+        "allowed_names": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "redact_outputs": {"type": "boolean"},
+        "never_persist": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "context": {
+      "type": "object",
+      "required": ["initial_files_max", "progressive_disclosure", "record_every_file_open", "untrusted_content_cannot_grant_capabilities"],
+      "properties": {
+        "initial_files_max": {"type": "integer", "minimum": 1, "maximum": 100000},
+        "progressive_disclosure": {"type": "boolean"},
+        "record_every_file_open": {"type": "boolean"},
+        "untrusted_content_cannot_grant_capabilities": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "limits": {
+      "type": "object",
+      "required": ["max_steps", "max_minutes", "max_attempts", "max_files_changed", "max_diff_lines", "max_repeated_identical_failure", "max_tool_errors", "max_input_tokens", "max_output_tokens", "max_cost_usd"],
+      "properties": {
+        "max_steps": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "max_minutes": {"type": "integer", "minimum": 1, "maximum": 10080},
+        "max_attempts": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "max_files_changed": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "max_diff_lines": {"type": "integer", "minimum": 1, "maximum": 10000000},
+        "max_repeated_identical_failure": {"type": "integer", "minimum": 1, "maximum": 100},
+        "max_tool_errors": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "max_input_tokens": {"type": "integer", "minimum": 1, "maximum": 10000000000},
+        "max_output_tokens": {"type": "integer", "minimum": 1, "maximum": 10000000000},
+        "max_cost_usd": {"type": "integer", "minimum": 0, "maximum": 1000000}
+      },
+      "additionalProperties": false
+    },
+    "verification": {
+      "type": "object",
+      "properties": {
+        "independent_verifier_required": {"type": "boolean"},
+        "protected_tests_immutable": {"type": "boolean"},
+        "raw_output_required": {"type": "boolean"},
+        "evidence_manifest_required": {"type": "boolean"},
+        "baseline_comparison_required_for_performance_claims": {"type": "boolean"},
+        "unsupported_claims_field_required": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "artifacts": {
+      "type": "object",
+      "required": ["root", "hash_algorithm", "capture"],
+      "properties": {
+        "root": {"type": "string", "minLength": 1},
+        "hash_algorithm": {"const": "sha256"},
+        "capture": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      },
+      "additionalProperties": false
+    },
+    "grant": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "writable": {"$ref": "#/$defs/pathGlobs"},
+        "allowed_writes": {"$ref": "#/$defs/pathGlobs"},
+        "commands": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "allowed_commands": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "network": {"$ref": "#/$defs/networkGrant"},
+        "external_side_effects": {"type": "boolean"},
+        "sandbox_profile": {"type": "string", "minLength": 1},
+        "budgets": {"$ref": "#/$defs/budgets"},
+        "verifier_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "evidence_requirements": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      },
+      "additionalProperties": false
+    },
+    "networkGrant": {
+      "type": "object",
+      "properties": {
+        "default": {"enum": ["deny", "deny_by_default", "allow", "allow_scoped", "retrieval_only"]},
+        "allowed_destinations": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      },
+      "additionalProperties": false
+    },
+    "budgets": {
+      "type": "object",
+      "properties": {
+        "max_steps": {"type": "integer", "minimum": 1},
+        "max_minutes": {"type": "integer", "minimum": 1},
+        "max_attempts": {"type": "integer", "minimum": 1},
+        "max_files_changed": {"type": "integer", "minimum": 1},
+        "max_diff_lines": {"type": "integer", "minimum": 1},
+        "max_input_tokens": {"type": "integer", "minimum": 1},
+        "max_output_tokens": {"type": "integer", "minimum": 1},
+        "max_cost_usd": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "phase": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "allowed_capabilities": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "terminal_statuses": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "required_verifier_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      },
+      "additionalProperties": false
+    },
+    "verifier": {
+      "type": "object",
+      "properties": {
+        "independent_required": {"type": "boolean"},
+        "verifier_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "plan": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "required": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "artifact_requirements": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "unsupported_claims_field": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "learning": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "only_after_verification": {"type": "boolean"},
+        "minimum_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+        "requires_evidence_refs": {"type": "boolean"},
+        "lessons_cannot_override_policy": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

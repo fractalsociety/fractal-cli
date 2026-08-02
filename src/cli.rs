@@ -57,6 +57,8 @@ pub(crate) enum Command {
     Dictate(VoiceArgs),
     /// Open or inspect the live execution-graph board.
     Graph(GraphArgs),
+    /// Validate or inspect the repository harness policy without writing.
+    Harness(HarnessArgs),
     /// Run a compiled graph through Coordinate (stub).
     Run(RunArgs),
     /// Run the graph morphogenesis loop (stub).
@@ -102,6 +104,32 @@ pub(crate) enum Command {
     Bridge(BridgeArgs),
     /// Print the Fractal CLI version.
     Version,
+}
+
+/// Arguments accepted by `fractal harness`.
+#[derive(Debug, Args)]
+pub(crate) struct HarnessArgs {
+    /// Harness policy operation.
+    #[command(subcommand)]
+    pub(crate) command: HarnessCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum HarnessCommand {
+    /// Parse, normalize, validate, and hash the repository policy.
+    Validate(HarnessPolicyArgs),
+    /// Show the normalized policy, provenance, and canonical hash.
+    Show(HarnessPolicyArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct HarnessPolicyArgs {
+    /// Project workspace containing `.fractal/harness.yaml` or JSON.
+    #[arg(long, default_value = ".", value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+    /// Print a stable JSON report.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1768,5 +1796,32 @@ mod tests {
             .expect_err("unknown graph command must fail");
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
         assert!(error.to_string().contains("unrecognized subcommand"));
+    }
+
+    #[test]
+    fn parses_harness_validate_and_show_commands() {
+        let validate = Cli::try_parse_from([
+            "fractal",
+            "harness",
+            "validate",
+            "--repo",
+            "/tmp/project",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            validate.command,
+            Some(Command::Harness(HarnessArgs {
+                command: HarnessCommand::Validate(HarnessPolicyArgs { ref repo, json: true })
+            })) if repo == &PathBuf::from("/tmp/project")
+        ));
+
+        let show = Cli::try_parse_from(["fractal", "harness", "show"]).unwrap();
+        assert!(matches!(
+            show.command,
+            Some(Command::Harness(HarnessArgs {
+                command: HarnessCommand::Show(HarnessPolicyArgs { ref repo, json: false })
+            })) if repo == &PathBuf::from(".")
+        ));
     }
 }
