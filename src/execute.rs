@@ -172,11 +172,25 @@ fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> 
                 c.arg("--model").arg(model);
             }
             // Keep Claude's permission checks enabled in print mode; the
-            // dangerous bypass flag is intentionally never used.
-            c.arg("--permission-mode")
-                .arg("acceptEdits")
-                .arg("--no-session-persistence")
-                .arg(prompt);
+            // dangerous bypass flag is intentionally never used.  The
+            // fallback path has no immutable contract, so keep it file-only
+            // instead of silently granting a shell/network escape hatch.
+            c.args([
+                "--bare",
+                "--safe-mode",
+                "--strict-mcp-config",
+                "--no-chrome",
+                "--permission-mode",
+                "acceptEdits",
+                "--no-session-persistence",
+                "--tools",
+                "Read,Edit,Glob,Grep",
+                "--disallowedTools",
+                "WebFetch",
+                "WebSearch",
+                "Bash",
+                prompt,
+            ]);
             c
         }
         "codex" | "codex-luna" => {
@@ -218,9 +232,10 @@ fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> 
             c
         }
         "hermes" => {
-            // Hermes one-shot (`-z`) with tools auto-approved (`--yolo`). A pinned
-            // model routes through OpenRouter (where the free nemotron models live)
-            // unless $FRACTAL_HERMES_PROVIDER overrides the provider.
+            // Hermes `-z` is deliberately not used: the installed CLI documents
+            // it as auto-approving shell/tool requests (equivalent to yolo).
+            // `chat -q` is the documented noninteractive form; file-only
+            // toolsets keep this legacy/no-contract route least privilege.
             let mut c = Command::new("hermes");
             if let Some(model) = model_for("hermes") {
                 let provider = std::env::var("FRACTAL_HERMES_PROVIDER")
@@ -229,7 +244,16 @@ fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> 
                     .unwrap_or_else(|| "openrouter".to_owned());
                 c.arg("-m").arg(model).arg("--provider").arg(provider);
             }
-            c.arg("-z").arg(prompt);
+            c.args([
+                "chat",
+                "-q",
+                prompt,
+                "-Q",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--toolsets",
+                "file",
+            ]);
             c
         }
         other => bail!("unknown worker: {other} (use claude|codex|codex-luna|cursor|hermes)"),
@@ -398,7 +422,11 @@ fn run_agent_prompt_with_role(
     let network_denied = policy.is_some_and(|policy| {
         matches!(policy.network.default.as_str(), "deny" | "deny_by_default")
     });
-    let child_env = crate::policy_executor::sanitized_environment(kind, network_denied);
+    let child_env = crate::policy_executor::sanitized_environment_for_workspace(
+        kind,
+        network_denied,
+        workspace,
+    );
     command
         .current_dir(workspace)
         .env_clear()
@@ -706,6 +734,8 @@ fn run_node_with_graph(
                 policy_hash: policy.policy_hash.clone(),
                 controls,
                 limits: policy.limits.clone(),
+                provider_version: None,
+                provider_reason: None,
                 violations: Vec::new(),
                 pre_snapshot_hash: snapshot.digest.clone(),
                 post_snapshot_hash: None,
@@ -2957,6 +2987,31 @@ mod tests {
         assert!(!args
             .iter()
             .any(|arg| arg == "gpt-5.6-sol" || arg == "model_reasoning_effort=\"high\""));
+    }
+
+    #[test]
+    fn legacy_noninteractive_provider_commands_do_not_use_bypass_modes() {
+        let claude = worker_command("claude", "edit", AgentRole::Worker).unwrap();
+        let claude_args: Vec<String> = claude
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(claude_args.iter().any(|arg| arg == "--permission-mode"));
+        assert!(!claude_args
+            .iter()
+            .any(|arg| { arg.contains("dangerously") || arg == "--yolo" || arg == "--force" }));
+
+        let hermes = worker_command("hermes", "edit", AgentRole::Worker).unwrap();
+        let hermes_args: Vec<String> = hermes
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(hermes_args
+            .windows(2)
+            .any(|pair| pair == ["chat".to_owned(), "-q".to_owned()]));
+        assert!(!hermes_args.iter().any(|arg| {
+            arg == "-z" || arg == "--yolo" || arg == "--force" || arg.contains("dangerously")
+        }));
     }
 
     #[test]

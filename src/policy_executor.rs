@@ -97,6 +97,13 @@ pub(crate) struct PolicyEnforcementReport {
     pub(crate) policy_hash: String,
     pub(crate) controls: BTreeMap<String, ControlStatus>,
     pub(crate) limits: EffectiveLimits,
+    /// Sanitized provider identity from the read-only `--version` probe.  The
+    /// version is evidence, not authority: eligibility still requires the
+    /// provider's documented controls to match the immutable contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) violations: Vec<PolicyViolation>,
     pub(crate) pre_snapshot_hash: String,
@@ -128,6 +135,8 @@ impl PolicyEnforcementReport {
             policy_hash: policy.policy_hash.clone(),
             controls,
             limits: policy.limits.clone(),
+            provider_version: None,
+            provider_reason: None,
             violations: Vec::new(),
             pre_snapshot_hash,
             post_snapshot_hash: None,
@@ -237,6 +246,10 @@ pub(crate) struct Postflight {
 pub(crate) struct ProviderEligibility {
     pub(crate) status: ControlStatus,
     pub(crate) reason: Option<String>,
+    /// Control-level evidence is kept separate from the aggregate route
+    /// status so reports can say exactly which provider guarantee is missing.
+    pub(crate) controls: BTreeMap<String, ControlStatus>,
+    pub(crate) version: Option<String>,
 }
 
 /// Parse and validate one immutable node contract.  This deliberately rejects
@@ -470,13 +483,6 @@ pub(crate) fn preflight(
             None,
         ));
     }
-    if capability_is_worker && policy.allowed_commands.is_empty() {
-        return Err(policy_error(
-            PolicyFailure::ProviderUnavailable,
-            "worker capability has no command allowlist that can be enforced",
-            None,
-        ));
-    }
     enforce_limits(&policy, node, workspace, steps_used)?;
     let snapshot = snapshot_workspace(workspace).map_err(|error| {
         policy_error(
@@ -494,9 +500,14 @@ pub(crate) fn preflight(
     }
     let mut report = PolicyEnforcementReport::new(&policy, snapshot.digest.clone());
     let eligibility = provider_eligibility(agent, &policy);
+    for (control, status) in &eligibility.controls {
+        report.controls.insert(control.clone(), status.clone());
+    }
     report
         .controls
         .insert("provider_route".to_owned(), eligibility.status.clone());
+    report.provider_version = eligibility.version.clone();
+    report.provider_reason = eligibility.reason.clone();
     if let Some(reason) = eligibility.reason {
         report.finalize();
         return Err(policy_error(
@@ -663,37 +674,175 @@ pub(crate) fn postflight(
 /// Construct the least-privilege invocation route for a provider.  A route is
 /// ineligible if the provider cannot make the contract's controls real; callers
 /// must not replace this with a bypass flag.
+///
+/// The v1 contract has no value that means "all shell commands are allowed".
+/// Consequently a non-empty `allowed_commands` list is a bounded shell grant,
+/// and providers without a native command allowlist remain ineligible.  An
+/// empty list is an intentional no-shell grant and enables the file-only
+/// routes for Claude and Hermes.
 pub(crate) fn provider_eligibility(agent: &str, policy: &EffectivePolicy) -> ProviderEligibility {
-    let kind = agent.trim().to_ascii_lowercase();
-    let network_denied = matches!(policy.network.default.as_str(), "deny" | "deny_by_default");
+    let kind = canonical_provider(agent);
+    let mut controls = provider_control_defaults();
+    let (version, version_reason) = provider_version(&kind);
+    if let Some(reason) = version_reason {
+        controls.insert("provider_version".to_owned(), ControlStatus::Unavailable);
+        return ProviderEligibility {
+            status: ControlStatus::Unavailable,
+            reason: Some(reason),
+            controls,
+            version,
+        };
+    }
+    controls.insert("provider_version".to_owned(), ControlStatus::Enforced);
+
+    let shell_allowed = !policy.allowed_commands.is_empty();
+    let network = policy.network.default.as_str();
+    let network_denied = matches!(network, "deny" | "deny_by_default");
+    let network_bounded = matches!(network, "allow_scoped" | "retrieval_only")
+        || !policy.network.allowed_destinations.is_empty();
+
+    // Network destinations are never inferred from an environment variable or
+    // from a provider's generic "sandbox enabled" switch.  Only a provider
+    // with a documented destination control could satisfy a bounded grant;
+    // none of the installed worker CLIs has one.
+    if network_bounded {
+        controls.insert("network".to_owned(), ControlStatus::Unavailable);
+        return ProviderEligibility {
+            status: ControlStatus::Unavailable,
+            reason: Some(format!(
+                "provider `{agent}` cannot enforce scoped network destinations `{}`",
+                if policy.network.allowed_destinations.is_empty() {
+                    network
+                } else {
+                    "allowlist"
+                }
+            )),
+            controls,
+            version,
+        };
+    }
+
     match kind.as_str() {
-        "codex" | "codex-luna" => ProviderEligibility {
-            status: ControlStatus::Enforced,
-            reason: if network_denied {
-                None
+        "codex" | "codex-luna" => {
+            // Codex's workspace-write profile has a documented network toggle
+            // but no command-name allowlist.  Existing Fractal policy execution
+            // keeps Codex as the compatibility route for bounded test/build
+            // grants; the command and diff guards remain authoritative outside
+            // the provider process.
+            controls.insert("approval".to_owned(), ControlStatus::Enforced);
+            controls.insert("network".to_owned(), ControlStatus::Enforced);
+            controls.insert("workspace_paths".to_owned(), ControlStatus::Detected);
+            if shell_allowed {
+                controls.insert("command_allowlist".to_owned(), ControlStatus::Detected);
             } else {
-                Some("Codex route cannot enforce scoped network destinations".to_owned())
-            },
-        },
-        "claude" | "cursor" | "cursor-agent" | "hermes" => {
-            // These installed clients expose either no network sandbox or only
-            // a permissive/noninteractive bypass.  They are safe for a pure
-            // read-only route only when no worker process is required; a build
-            // route therefore fails closed here.
-            let reason = if network_denied {
-                format!("provider `{agent}` has no verified network-deny sandbox")
+                controls.insert("command_allowlist".to_owned(), ControlStatus::Unavailable);
+                return ProviderEligibility {
+                    status: ControlStatus::Unavailable,
+                    reason: Some(
+                        "Codex cannot disable its shell tool for a no-shell policy contract"
+                            .to_owned(),
+                    ),
+                    controls,
+                    version,
+                };
+            }
+            ProviderEligibility {
+                status: ControlStatus::Enforced,
+                reason: None,
+                controls,
+                version,
+            }
+        }
+        "claude" => {
+            controls.insert("approval".to_owned(), ControlStatus::Enforced);
+            controls.insert("workspace_paths".to_owned(), ControlStatus::Detected);
+            if shell_allowed && !contract_allows_unrestricted_shell(policy) {
+                controls.insert("command_allowlist".to_owned(), ControlStatus::Unavailable);
+                controls.insert("network".to_owned(), ControlStatus::Unavailable);
+                return ProviderEligibility {
+                    status: ControlStatus::Unavailable,
+                    reason: Some(
+                        "Claude has Bash but the v1 contract has no unrestricted-command sentinel; bounded shell grants fail closed"
+                            .to_owned(),
+                    ),
+                    controls,
+                    version,
+                };
+            }
+            // `--tools` plus `--disallowedTools` removes Bash and web tools,
+            // so a network-deny contract is real even though Claude has no
+            // host-level network firewall switch.
+            controls.insert("command_allowlist".to_owned(), ControlStatus::Enforced);
+            controls.insert("network".to_owned(), ControlStatus::Enforced);
+            if !network_denied {
+                controls.insert("network".to_owned(), ControlStatus::Detected);
+            }
+            ProviderEligibility {
+                status: ControlStatus::Enforced,
+                reason: None,
+                controls,
+                version,
+            }
+        }
+        "cursor-agent" => {
+            controls.insert("approval".to_owned(), ControlStatus::Unavailable);
+            controls.insert("workspace_paths".to_owned(), ControlStatus::Enforced);
+            controls.insert("command_allowlist".to_owned(), ControlStatus::Unavailable);
+            controls.insert("network".to_owned(), ControlStatus::Unavailable);
+            // Cursor's `--sandbox enabled` does not document whether network
+            // is denied, nor does the CLI expose a shell/tool allowlist.  It is
+            // therefore never used for a bounded v1 contract.  Future policy
+            // versions may add an explicit unrestricted-shell grant; until
+            // then fail closed rather than guessing.
+            let reason = if !shell_allowed && network_denied {
+                "Cursor cannot disable its shell tool for a no-shell/network-deny policy contract"
             } else {
-                format!("provider `{agent}` cannot prove required noninteractive sandbox/approval controls")
+                "Cursor has no documented command allowlist or network control for this policy contract"
             };
             ProviderEligibility {
                 status: ControlStatus::Unavailable,
-                reason: Some(reason),
+                reason: Some(reason.to_owned()),
+                controls,
+                version,
             }
         }
-        _ => ProviderEligibility {
-            status: ControlStatus::Unavailable,
-            reason: Some(format!("unknown provider `{agent}`")),
-        },
+        "hermes" => {
+            controls.insert("workspace_paths".to_owned(), ControlStatus::Enforced);
+            controls.insert("approval".to_owned(), ControlStatus::Detected);
+            if shell_allowed {
+                controls.insert("command_allowlist".to_owned(), ControlStatus::Unavailable);
+                controls.insert("network".to_owned(), ControlStatus::Unavailable);
+                return ProviderEligibility {
+                    status: ControlStatus::Unavailable,
+                    reason: Some(
+                        "Hermes terminal has no enforceable command allowlist; the v1 bounded shell grant fails closed"
+                            .to_owned(),
+                    ),
+                    controls,
+                    version,
+                };
+            }
+            controls.insert("command_allowlist".to_owned(), ControlStatus::Enforced);
+            controls.insert("network".to_owned(), ControlStatus::Enforced);
+            if !network_denied {
+                controls.insert("network".to_owned(), ControlStatus::Detected);
+            }
+            ProviderEligibility {
+                status: ControlStatus::Enforced,
+                reason: None,
+                controls,
+                version,
+            }
+        }
+        _ => {
+            controls.insert("provider_version".to_owned(), ControlStatus::Unavailable);
+            ProviderEligibility {
+                status: ControlStatus::Unavailable,
+                reason: Some(format!("unknown provider `{agent}`")),
+                controls,
+                version: None,
+            }
+        }
     }
 }
 
@@ -705,7 +854,7 @@ pub(crate) fn worker_command(
     role: &str,
     policy: &EffectivePolicy,
 ) -> Result<Command> {
-    let kind = kind.trim().to_ascii_lowercase();
+    let kind = canonical_provider(kind);
     if let Some(reason) = provider_eligibility(&kind, policy).reason {
         bail!("{reason}");
     }
@@ -726,21 +875,254 @@ pub(crate) fn worker_command(
             // Current Codex uses `approval_policy` as the config equivalent of
             // the older --ask-for-approval flag.  Workspace-write is explicit;
             // network access stays disabled in that profile.
-            command.args([
-                "--config",
-                "approval_policy=\"never\"",
-                "--config",
-                "sandbox_workspace_write.network_access=false",
-                "--sandbox",
-                "workspace-write",
-                "--color",
-                "never",
-            ]);
+            command.args(["--config", "approval_policy=\"never\""]);
+            command.arg("--config").arg(format!(
+                "sandbox_workspace_write.network_access={}",
+                if matches!(policy.network.default.as_str(), "deny" | "deny_by_default") {
+                    "false"
+                } else {
+                    "true"
+                }
+            ));
+            command.args(["--sandbox", "workspace-write", "--color", "never"]);
         }
-        _ => unreachable!("provider eligibility rejected non-Codex route"),
+        "claude" => {
+            command.args([
+                "-p",
+                "--bare",
+                "--safe-mode",
+                "--strict-mcp-config",
+                "--no-chrome",
+                "--permission-mode",
+                "acceptEdits",
+                "--no-session-persistence",
+                "--tools",
+                "Read,Edit,Glob,Grep",
+                "--disallowedTools",
+                "WebFetch",
+                "WebSearch",
+                "Bash",
+            ]);
+            if let Some(model) = model_for_provider("claude") {
+                command.arg("--model").arg(model);
+            }
+        }
+        "hermes" => {
+            command.args([
+                "chat",
+                "-q",
+                prompt,
+                "-Q",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--toolsets",
+                "file",
+            ]);
+            if let Some(model) = model_for_provider("hermes") {
+                let provider = env::var("FRACTAL_HERMES_PROVIDER")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "openrouter".to_owned());
+                command.args(["--model", &model, "--provider", &provider]);
+            }
+            // Prompt is already passed as `-q`; do not append it again below.
+            return Ok(command);
+        }
+        "cursor-agent" => {
+            command.args(["-p", "--sandbox", "enabled", "--workspace", "."]);
+            if let Some(model) = model_for_provider("cursor") {
+                command.args(["--model", &model]);
+            }
+        }
+        _ => unreachable!("provider eligibility rejected unknown route"),
     }
     command.arg(prompt);
     Ok(command)
+}
+
+fn provider_control_defaults() -> BTreeMap<String, ControlStatus> {
+    BTreeMap::from([
+        ("approval".to_owned(), ControlStatus::Unavailable),
+        ("command_allowlist".to_owned(), ControlStatus::Unavailable),
+        ("network".to_owned(), ControlStatus::Unavailable),
+        ("workspace_paths".to_owned(), ControlStatus::Unavailable),
+        ("provider_version".to_owned(), ControlStatus::Unavailable),
+    ])
+}
+
+fn canonical_provider(agent: &str) -> String {
+    match agent.trim().to_ascii_lowercase().as_str() {
+        "cursor" | "cursor-agent" | "agent" => "cursor-agent".to_owned(),
+        "codex" | "codex-luna" => agent.trim().to_ascii_lowercase(),
+        other => other.to_owned(),
+    }
+}
+
+fn model_for_provider(kind: &str) -> Option<String> {
+    let key = format!(
+        "FRACTAL_{}_MODEL",
+        kind.to_ascii_uppercase().replace('-', "_")
+    );
+    env::var(key).ok().filter(|value| !value.trim().is_empty())
+}
+
+/// The v1 schema intentionally has no unrestricted-shell sentinel.  Keep this
+/// false until a future contract version adds one and it is validated by the
+/// compiler; accepting `*` here would silently widen a bounded grant.
+fn contract_allows_unrestricted_shell(_policy: &EffectivePolicy) -> bool {
+    false
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProviderVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+fn provider_minimum(kind: &str) -> Option<ProviderVersion> {
+    match kind {
+        "claude" => Some(ProviderVersion {
+            major: 2,
+            minor: 0,
+            patch: 0,
+        }),
+        "cursor-agent" => Some(ProviderVersion {
+            major: 2026,
+            minor: 7,
+            patch: 23,
+        }),
+        "hermes" => Some(ProviderVersion {
+            major: 0,
+            minor: 13,
+            patch: 0,
+        }),
+        "codex" | "codex-luna" => Some(ProviderVersion {
+            major: 0,
+            minor: 145,
+            patch: 0,
+        }),
+        _ => None,
+    }
+}
+
+fn provider_binary(kind: &str) -> Option<&'static str> {
+    match kind {
+        "codex" | "codex-luna" => Some("codex"),
+        "cursor-agent" => Some("cursor-agent"),
+        "claude" => Some("claude"),
+        "hermes" => Some("hermes"),
+        _ => None,
+    }
+}
+
+fn parse_provider_version(text: &str) -> Option<ProviderVersion> {
+    for token in text.split_whitespace() {
+        let token = token.trim_matches(|ch: char| !ch.is_ascii_digit() && ch != '.');
+        let mut parts = token.split('.');
+        let (Some(major), Some(minor), Some(patch)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let Ok(major) = major.parse::<u64>() else {
+            continue;
+        };
+        let Ok(minor) = minor.parse::<u64>() else {
+            continue;
+        };
+        let patch = patch
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        let Ok(patch) = patch.parse::<u64>() else {
+            continue;
+        };
+        return Some(ProviderVersion {
+            major,
+            minor,
+            patch,
+        });
+    }
+    None
+}
+
+fn provider_version(kind: &str) -> (Option<String>, Option<String>) {
+    let Some(binary) = provider_binary(kind) else {
+        return (None, Some(format!("unknown provider `{kind}`")));
+    };
+    if !binary_on_path(binary) {
+        return (
+            None,
+            Some(format!(
+                "provider `{kind}` is unavailable: `{binary}` is not on PATH"
+            )),
+        );
+    }
+    // Version probing is an audit operation, not a worker launch.  Do not
+    // expose the parent process's API keys or arbitrary environment values to
+    // provider startup code while checking its installed capability surface.
+    let mut version_command = Command::new(binary);
+    version_command.arg("--version").env_clear();
+    if let Some(path) = env::var_os("PATH") {
+        version_command.env("PATH", path);
+    }
+    // A few provider wrapper scripts require HOME just to resolve their own
+    // installation; use the system temp directory rather than the operator's
+    // home so version startup cannot discover credential/config files.
+    version_command.env("HOME", env::temp_dir());
+    let output = match version_command.output() {
+        Ok(output) => output,
+        Err(error) => {
+            return (
+                None,
+                Some(format!("provider `{kind}` version probe failed: {error}")),
+            )
+        }
+    };
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let Some(version) = parse_provider_version(&text) else {
+        return (
+            None,
+            Some(format!("provider `{kind}` reported an unparseable version")),
+        );
+    };
+    let rendered = format!("{}.{}.{}", version.major, version.minor, version.patch);
+    if !output.status.success() {
+        return (
+            Some(rendered),
+            Some(format!(
+                "provider `{kind}` version probe exited unsuccessfully"
+            )),
+        );
+    }
+    let Some(minimum) = provider_minimum(kind) else {
+        return (Some(rendered), None);
+    };
+    if version < minimum || version.major != minimum.major {
+        return (
+            Some(rendered.clone()),
+            Some(format!(
+                "provider `{kind}` version `{rendered}` is unsupported; tested minimum is `{}.{}.{}`",
+                minimum.major, minimum.minor, minimum.patch
+            )),
+        );
+    }
+    (Some(rendered), None)
+}
+
+fn binary_on_path(binary: &str) -> bool {
+    env::var_os("PATH")
+        .map(|paths| {
+            env::split_paths(&paths).any(|dir| {
+                let candidate = dir.join(binary);
+                candidate.is_file() || candidate.with_extension("exe").is_file()
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Return a sanitized child environment.  Values are intentionally kept out
@@ -787,6 +1169,42 @@ pub(crate) fn sanitized_environment(kind: &str, network_denied: bool) -> BTreeMa
     if network_denied {
         output.insert("FRACTAL_OFFLINE".to_owned(), "1".to_owned());
         output.insert("NO_PROXY".to_owned(), "*".to_owned());
+    }
+    output
+}
+
+/// Extend the sanitized environment with provider-specific workspace roots.
+/// Hermes otherwise reads `~/.hermes/.env` and can persist sessions/logs in a
+/// user's home directory; an isolated HERMES_HOME prevents that ambient state
+/// from becoming part of a Fractal run.  Its file tool receives the same root
+/// through HERMES_WRITE_SAFE_ROOT.  The helper keeps the two-argument function
+/// above stable for callers/tests that only need the generic environment.
+pub(crate) fn sanitized_environment_for_workspace(
+    kind: &str,
+    network_denied: bool,
+    workspace: &Path,
+) -> BTreeMap<String, String> {
+    let mut output = sanitized_environment(kind, network_denied);
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    output.insert(
+        "TERMINAL_CWD".to_owned(),
+        workspace.to_string_lossy().into_owned(),
+    );
+    if canonical_provider(kind) == "hermes" {
+        let root_key = sha256_bytes(workspace.to_string_lossy().as_bytes());
+        let isolated_home = env::temp_dir()
+            .join("fractal-hermes")
+            .join(root_key.trim_start_matches(SHA256_PREFIX));
+        output.insert(
+            "HERMES_HOME".to_owned(),
+            isolated_home.to_string_lossy().into_owned(),
+        );
+        output.insert(
+            "HERMES_WRITE_SAFE_ROOT".to_owned(),
+            workspace.to_string_lossy().into_owned(),
+        );
     }
     output
 }
@@ -1188,6 +1606,168 @@ mod tests {
         let report = PolicyEnforcementReport::new(&policy, hash());
         let rendered = serde_json::to_string(&report).unwrap();
         assert!(!rendered.contains("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn provider_matrix_keeps_file_only_routes_and_rejects_bounded_shell() {
+        let mut no_shell = node("code.generate");
+        no_shell["policy_contract"]["allowed_commands"] = json!([]);
+        let file_policy = parse_contract(&no_shell, None).unwrap();
+
+        let claude = provider_eligibility("claude", &file_policy);
+        assert_eq!(claude.status, ControlStatus::Enforced);
+        assert_eq!(
+            claude.controls.get("network"),
+            Some(&ControlStatus::Enforced)
+        );
+        assert_eq!(
+            claude.controls.get("command_allowlist"),
+            Some(&ControlStatus::Enforced)
+        );
+
+        let hermes = provider_eligibility("hermes", &file_policy);
+        assert_eq!(hermes.status, ControlStatus::Enforced);
+        assert_eq!(
+            hermes.controls.get("network"),
+            Some(&ControlStatus::Enforced)
+        );
+
+        let cursor = provider_eligibility("cursor", &file_policy);
+        assert_eq!(cursor.status, ControlStatus::Unavailable);
+        assert!(cursor
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("cannot disable its shell"));
+
+        let bounded = parse_contract(&node("code.generate"), None).unwrap();
+        for provider in ["claude", "cursor", "hermes"] {
+            let result = provider_eligibility(provider, &bounded);
+            assert_eq!(result.status, ControlStatus::Unavailable, "{provider}");
+            assert!(
+                result.reason.is_some(),
+                "{provider} must explain the denial"
+            );
+        }
+        let codex = provider_eligibility("codex-luna", &bounded);
+        assert_eq!(codex.status, ControlStatus::Enforced);
+        assert_eq!(
+            codex.controls.get("command_allowlist"),
+            Some(&ControlStatus::Detected)
+        );
+    }
+
+    #[test]
+    fn provider_matrix_allows_only_broad_network_without_destinations() {
+        let mut value = node("code.generate");
+        value["policy_contract"]["allowed_commands"] = json!([]);
+        value["policy_contract"]["network"] =
+            json!({"default": "allow", "allowed_destinations": []});
+        let policy = parse_contract(&value, None).unwrap();
+        let claude = provider_eligibility("claude", &policy);
+        assert_eq!(claude.status, ControlStatus::Enforced);
+        assert_eq!(
+            claude.controls.get("network"),
+            Some(&ControlStatus::Detected)
+        );
+        let hermes = provider_eligibility("hermes", &policy);
+        assert_eq!(hermes.status, ControlStatus::Enforced);
+        assert_eq!(
+            hermes.controls.get("network"),
+            Some(&ControlStatus::Detected)
+        );
+
+        value["policy_contract"]["network"] =
+            json!({"default": "allow_scoped", "allowed_destinations": ["api.example.com"]});
+        let scoped = parse_contract(&value, None).unwrap();
+        let result = provider_eligibility("claude", &scoped);
+        assert_eq!(result.status, ControlStatus::Unavailable);
+        assert!(result
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("scoped network"));
+    }
+
+    #[test]
+    fn provider_commands_use_documented_noninteractive_flags_only() {
+        let mut value = node("code.generate");
+        value["policy_contract"]["allowed_commands"] = json!([]);
+        let policy = parse_contract(&value, None).unwrap();
+        let claude = worker_command("claude", "edit files", "worker", &policy).unwrap();
+        let claude_args: Vec<String> = claude
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(claude_args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode".to_owned(), "acceptEdits".to_owned()]));
+        assert!(claude_args
+            .windows(2)
+            .any(|pair| pair == ["--tools".to_owned(), "Read,Edit,Glob,Grep".to_owned()]));
+        assert!(claude_args.iter().any(|arg| arg == "WebFetch"));
+        assert!(claude_args.iter().any(|arg| arg == "WebSearch"));
+        assert!(claude_args.iter().any(|arg| arg == "Bash"));
+        assert!(!claude_args
+            .iter()
+            .any(|arg| { arg.contains("dangerously") || arg == "--yolo" || arg == "--force" }));
+
+        let hermes = worker_command("hermes", "edit files", "worker", &policy).unwrap();
+        let hermes_args: Vec<String> = hermes
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(hermes_args
+            .windows(2)
+            .any(|pair| pair == ["--toolsets".to_owned(), "file".to_owned()]));
+        assert!(hermes_args
+            .windows(2)
+            .any(|pair| pair == ["-q".to_owned(), "edit files".to_owned()]));
+        assert!(!hermes_args
+            .iter()
+            .any(|arg| { arg.contains("dangerously") || arg == "--yolo" || arg == "--force" }));
+    }
+
+    #[test]
+    fn hermes_environment_isolated_to_workspace_and_does_not_pass_unknown_secrets() {
+        let root = workspace();
+        let environment = sanitized_environment_for_workspace("hermes", true, &root);
+        assert_eq!(
+            environment.get("HERMES_WRITE_SAFE_ROOT"),
+            Some(&root.canonicalize().unwrap().to_string_lossy().into_owned())
+        );
+        assert!(environment
+            .get("HERMES_HOME")
+            .is_some_and(|value| value.contains("fractal-hermes")));
+        assert_eq!(
+            environment.get("TERMINAL_CWD"),
+            environment.get("HERMES_WRITE_SAFE_ROOT")
+        );
+        assert_eq!(environment.get("FRACTAL_OFFLINE"), Some(&"1".to_owned()));
+        assert!(!environment.contains_key("DATABASE_URL"));
+        assert!(!environment.contains_key("AWS_SECRET_ACCESS_KEY"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_version_parser_rejects_unparseable_and_normalizes_supported_output() {
+        assert_eq!(
+            parse_provider_version("Claude Code 2.1.220 (stable)"),
+            Some(ProviderVersion {
+                major: 2,
+                minor: 1,
+                patch: 220,
+            })
+        );
+        assert_eq!(
+            parse_provider_version("Hermes Agent v0.13.0 (2026.5.7)"),
+            Some(ProviderVersion {
+                major: 0,
+                minor: 13,
+                patch: 0,
+            })
+        );
+        assert_eq!(parse_provider_version("not a version"), None);
     }
 
     #[test]

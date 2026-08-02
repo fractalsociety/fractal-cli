@@ -103,3 +103,29 @@ These sources motivate immutable environment/policy provenance, explicit
 solver capability grants, bounded sandboxes, fresh evaluation inputs, and an
 independent verifier/evidence floor. They do not grant this runtime additional
 permissions.
+
+## Worker-provider compatibility
+
+Runtime provider eligibility is fail-closed and is based only on controls the
+installed CLI documents. A read-only `--version` probe records a sanitized
+version in the enforcement report; missing, unparseable, or older-than-tested
+versions are unavailable. Worker commands never use dangerous bypass flags
+(`--dangerously-*`, `--yolo`, or blanket `--force`).
+
+The v1 contract has no unrestricted-shell sentinel. A non-empty
+`allowed_commands` list is therefore a bounded shell grant, not permission to
+run arbitrary commands. Providers without a native command allowlist cannot
+claim that route:
+
+| Provider | Network-deny + no shell (`allowed_commands: []`) | Bounded shell commands | Network scope |
+| --- | --- | --- | --- |
+| Codex Sol/Luna | unavailable (cannot disable shell) | eligible with workspace-write/network config | deny or broad allow only |
+| Claude | eligible: `-p`, `acceptEdits`, `Read/Edit/Glob/Grep`, and explicit WebFetch/WebSearch/Bash denials | unavailable until a future unrestricted-shell contract | deny; broad allow is detected when no shell is granted |
+| Cursor Agent | unavailable (no documented shell/tool deny) | unavailable | never inferred from `--sandbox enabled` |
+| Hermes | eligible through `chat -q -Q` with the `file` toolset, isolated `HERMES_HOME`, and `HERMES_WRITE_SAFE_ROOT` | unavailable (terminal has no enforceable command allowlist) | deny; broad allow is detected when no shell is granted |
+
+Scoped destinations (`allow_scoped`, `retrieval_only`, or a non-empty
+`allowed_destinations`) are unavailable for these worker CLIs because none
+exposes a destination-level network control. The report preserves each
+control's `enforced`, `detected`, or `unavailable` status and includes the
+reason when the aggregate provider route fails.
