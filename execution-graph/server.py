@@ -994,6 +994,7 @@ class GraphHandler(SimpleHTTPRequestHandler):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--legacy-mac-runtime", action="store_true")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8090)
     parser.add_argument("--prd", type=Path, default=DEFAULT_PRD)
@@ -1002,6 +1003,11 @@ def main() -> None:
     parser.add_argument("--fractal-bin", type=Path)
     parser.add_argument("--workspace", type=Path)
     args = parser.parse_args()
+    if not args.legacy_mac_runtime:
+        parser.error(
+            "archived Python board; use `fractal graph board GRAPH_HASH`, or pass "
+            "--legacy-mac-runtime only for the old Mac Runtime"
+        )
     GraphHandler.prd_path = args.prd.resolve()
     GraphHandler.state_path = args.state.resolve()
     GraphHandler.graph_path = args.graph.resolve() if args.graph is not None else None

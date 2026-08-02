@@ -20,6 +20,12 @@ Treat that file and the other controller files under `.fractal/` as
 Fractal-owned state. Do not manually edit graph nodes, edges, assignments,
 timestamps, hashes, checkpoints, sync state, or closeout state.
 
+The Rust CLI is the only supported transition boundary. Never run
+`execution-graph/task-state.py`, mutate `graph-state*.json`, call Python task
+action endpoints, or derive dependencies from PRD markdown. Operators inspect
+and transition through `fractal node`; Fractal-launched workers never write
+their own transitions.
+
 ## Determine your mode first
 
 ### Fractal-launched worker
@@ -213,13 +219,25 @@ graph:
 ```sh
 printf '%s\n' \
   'Add to task 1.2 another branch that adds CSV export with tests.' |
-  fractal ingest --source codex --format text --stdin
+  fractal ingest --source codex --format text --stdin --amend
+```
+
+For a bounded project-level addition that does not need a task anchor, pass the
+instruction through the same explicit amendment transport. Fractal inserts one
+peer task into the earliest unfinished build wave:
+
+```sh
+printf '%s\n' \
+  'Inventory prior project graphs and build a linked master graph before downstream work.' |
+  fractal ingest --source codex --format text --stdin --amend
 ```
 
 Fractal must print `Accepted` before you tell the user it succeeded. The lead
 planner consumes accepted amendments at the next safe boundary between
 execution waves, recompiles the graph, publishes the new branch, and lets
-workers claim its nodes. Never edit `.fractal/project.fractal` directly.
+workers claim its nodes. Explicit amendment mode never opens a typed
+confirmation prompt and never falls through into creating a new project. Never
+edit `.fractal/project.fractal` directly.
 
 Use `fractal stop --all` only when the user explicitly wants every running
 Fractal build stopped.
