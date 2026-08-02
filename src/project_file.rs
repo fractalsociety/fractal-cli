@@ -81,6 +81,11 @@ pub(crate) struct ExecutionAssignment {
 
 static PROJECT_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const MANAGED_IDENTITY_SCHEMA: &str = "fractal.managed-project-identity.v1";
+// A writer creates the lock and writes its PID immediately.  An empty or
+// malformed lock therefore indicates a crash during creation, but it must not
+// be removed immediately: another process could still be between create and
+// write.  Keep the recovery window deliberately conservative.
+const STALE_LOCK_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 struct ProjectWriteGuard {
     path: PathBuf,
@@ -122,22 +127,46 @@ impl ProjectWriteGuard {
 }
 
 fn stale_lock(path: &Path) -> bool {
+    stale_lock_at(path, SystemTime::now())
+}
+
+fn stale_lock_at(path: &Path, now: SystemTime) -> bool {
     let Ok(contents) = fs::read_to_string(path) else {
         return false;
     };
-    let Ok(pid) = contents.trim().parse::<i32>() else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc::kill(pid, 0) };
-        result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    if let Ok(pid) = contents.trim().parse::<i32>() {
+        if pid > 0 {
+            #[cfg(unix)]
+            {
+                let result = unsafe { libc::kill(pid, 0) };
+                if result == 0 {
+                    // A live owner always wins, even when the lock file is
+                    // old.  This also protects against PID reuse races.
+                    return false;
+                }
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+                    // The process exists but cannot be inspected by us.
+                    return false;
+                }
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if errno == Some(libc::ESRCH) {
+                    return true;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = pid;
+            }
+        }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
+    // Invalid/empty/non-positive PID contents are only recoverable after a
+    // conservative age threshold.  If metadata or the clock is unavailable,
+    // fail closed and retain the lock.
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= STALE_LOCK_AGE)
 }
 
 impl Drop for ProjectWriteGuard {
@@ -1724,6 +1753,54 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn temp_lock_path() -> PathBuf {
+        let workspace = temp_workspace();
+        let directory = workspace.join(".fractal");
+        fs::create_dir_all(&directory).unwrap();
+        directory.join("project.fractal.lock")
+    }
+
+    #[test]
+    fn empty_old_lock_is_recoverable_after_the_conservative_age_window() {
+        let path = temp_lock_path();
+        fs::write(&path, b"").unwrap();
+        let old_now = SystemTime::now() + STALE_LOCK_AGE + std::time::Duration::from_secs(1);
+        assert!(stale_lock_at(&path, old_now));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fresh_empty_lock_is_retained() {
+        let path = temp_lock_path();
+        fs::write(&path, b"").unwrap();
+        assert!(!stale_lock_at(&path, SystemTime::now()));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_owned_by_a_dead_pid_is_recoverable() -> Result<()> {
+        let path = temp_lock_path();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()?;
+        let pid = child.id();
+        child.wait()?;
+        fs::write(&path, pid.to_string())?;
+        assert!(stale_lock_at(&path, SystemTime::now()));
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn lock_owned_by_a_live_pid_is_never_recovered() {
+        let path = temp_lock_path();
+        fs::write(&path, std::process::id().to_string()).unwrap();
+        let old_now = SystemTime::now() + STALE_LOCK_AGE + std::time::Duration::from_secs(1);
+        assert!(!stale_lock_at(&path, old_now));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
