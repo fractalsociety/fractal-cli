@@ -682,7 +682,7 @@
   },
   "execution": {
     "schema": "fractal.execution_state.v1",
-    "phase": "halted",
+    "phase": "executing",
     "assignments": {
       "add_swift_graph_models": {
         "agent_id": "cursor",
@@ -699,11 +699,10 @@
         "completed_at": "2026-07-29T10:04:02Z"
       },
       "enrich_graph_producers": {
-        "agent_id": "claude",
-        "agent_label": "claude",
-        "state": "released",
-        "checked_out_at": "2026-07-29T10:04:03Z",
-        "released_at": "2026-07-29T13:32:06Z"
+        "agent_id": "codex/luna-enrich",
+        "agent_label": "Codex Luna · Enrich Graph Producers",
+        "state": "checked_out",
+        "checked_out_at": "2026-07-29T10:04:03Z"
       },
       "integrate_portable_persistence": {
         "agent_id": "hermes",
@@ -727,7 +726,7 @@
         "completed_at": "2026-07-29T13:31:53Z"
       }
     },
-    "updated_at": "2026-07-29T13:32:06Z"
+    "updated_at": "2026-08-02T08:22:23Z"
   },
   "learning": {
     "schema": "fractal.learning.v1",
@@ -843,7 +842,12 @@
           "define_learning_contract"
         ],
         "created_at": "2026-07-29T13:32:06Z",
-        "attempt_count": 0,
+        "started_at": "2026-08-02T08:22:23Z",
+        "executor": {
+          "agent": "Codex Luna · Enrich Graph Producers",
+          "version": "0.1.0"
+        },
+        "attempt_count": 1,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -1015,5 +1019,5 @@
       "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c"
     }
   },
-  "updated_at": "2026-08-02T08:05:19Z"
+  "updated_at": "2026-08-02T08:22:39Z"
 }
