@@ -21,6 +21,8 @@ from analysis import analyze  # noqa: E402
 from corpus import materialize_task_repo, task_ids, task_manifest
 from runner import EpisodeSpec, RunnerConfig, run_episode
 from scorer import load_ledgers
+from task_quality import audit_corpus as audit_corpus_v2
+from corpus_v2 import split_metadata as split_metadata_v2
 
 
 ARMS = ("A", "B", "C", "D")
@@ -127,6 +129,31 @@ def cmd_live_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_quality_v2(args: argparse.Namespace) -> int:
+    """Run the offline v2 corpus quality gate; no LLM episodes are started."""
+
+    report = audit_corpus_v2(task_ids=args.task_id or None, output=args.output)
+    summary = {
+        "schema_version": report["schema_version"],
+        "corpus_version": report["corpus_version"],
+        "included_tasks": report["included_tasks"],
+        "quarantined_tasks": report["quarantined_tasks"],
+        "split_hashes": report["split_hashes"],
+        "quality_report_hash": report["quality_report_hash"],
+        "paid_llm_episodes": False,
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0 if not report["quarantined_tasks"] else 1
+
+
+def cmd_corpus_v2(args: argparse.Namespace) -> int:
+    payload = split_metadata_v2()
+    if args.split:
+        payload = {**payload, "selected_split": args.split, "tasks": payload["splits"][args.split]}
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -152,10 +179,16 @@ def main(argv: list[str] | None = None) -> int:
     live.add_argument("--replicates", type=int, default=10)
     live.add_argument("--offline", action="store_true", default=True)
     live.set_defaults(func=cmd_live_plan)
+    quality = sub.add_parser("quality-v2", help="audit the offline sanitized corpus v2")
+    quality.add_argument("--task-id", nargs="*", choices=__import__("corpus_v2").task_ids())
+    quality.add_argument("--output", type=Path)
+    quality.set_defaults(func=cmd_quality_v2)
+    v2 = sub.add_parser("corpus-v2", help="print public/holdout corpus v2 metadata")
+    v2.add_argument("--split", choices=("public", "holdout"))
+    v2.set_defaults(func=cmd_corpus_v2)
     args = parser.parse_args(argv)
     return args.func(args)
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
