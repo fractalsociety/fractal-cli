@@ -1,0 +1,35 @@
+{
+  "schema_version": "project-graph-context.cd-live-manifest.v1",
+  "experiment_id": "pgc-live-cd-pilot-20260802",
+  "harness_commit": "04db2c3f86c269917ae16be38c0e3c8efa555370",
+  "tasks": ["calculator-add", "calculator-subtract", "text-slugify", "text-slugify-edge"],
+  "arms": ["C", "D"],
+  "replicates": 3,
+  "cells": 24,
+  "paired_observations": 12,
+  "seed": 20260802,
+  "planner": {
+    "model": "gpt-5.6-sol",
+    "reasoning_effort": "high",
+    "new_calls": 0,
+    "reuse": "four arm-blind plans copied byte-for-byte from the verified A-vs-D run"
+  },
+  "worker": {
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "high",
+    "timeout_seconds": 180,
+    "max_parallel": 4,
+    "token_cap_per_cell": 80000,
+    "aggregate_worker_cap": 1920000,
+    "all_agent_hard_cap": 2250000
+  },
+  "contexts": {
+    "C": "three-layer behavior/source/execution graph",
+    "D": "C plus frozen UTC time-sliced paired-task evidence/outcomes/lessons; no current outcomes or hidden-checker details"
+  },
+  "offline": true,
+  "web_search": "disabled",
+  "external_side_effects": false,
+  "stop_rules": ["aggregate actual tokens over cap", "leakage/safety/git mutation", "infrastructure failures over 20 percent"],
+  "status": "completed; threshold decision inconclusive/no-go"
+}
