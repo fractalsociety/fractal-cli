@@ -27,6 +27,7 @@ mod intent;
 mod interactive;
 mod learning_data;
 mod legacy_import;
+mod lessons;
 mod master_graph;
 mod mobile;
 mod node;
