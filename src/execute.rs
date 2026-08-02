@@ -226,21 +226,55 @@ fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> 
 pub(crate) struct AgentRun {
     pub ok: bool,
     pub timed_out: bool,
+    /// IDs of prior verified lessons injected into this worker's prompt.  The
+    /// IDs are carried to the final lifecycle transition so reuse is recorded
+    /// as an additive typed edge, never as a mutable weight.
+    pub lesson_ids: Vec<String>,
 }
 
+#[allow(dead_code)]
 fn run_worker_as(
     kind: &str,
     instruction: &str,
     workspace: &Path,
     timeout_ms: u64,
 ) -> Result<AgentRun> {
+    run_worker_as_for_node(kind, instruction, workspace, timeout_ms, None)
+}
+
+fn run_worker_as_for_node(
+    kind: &str,
+    instruction: &str,
+    workspace: &Path,
+    timeout_ms: u64,
+    node: Option<&Value>,
+) -> Result<AgentRun> {
+    let (lesson_section, lesson_ids) = node
+        .map(|node| {
+            crate::project_file::load(workspace)
+                .map(|document| {
+                    crate::lessons::render_for_node(
+                        &crate::project_file::failure_graph(&document),
+                        node,
+                    )
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let lesson_section = if lesson_section.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{lesson_section}")
+    };
     let prompt = format!(
         "You are one agent on a coordinated team; a lead has planned the project (read INTERFACE.md \
          if it exists). Do exactly this assigned task and nothing else:\n\n{instruction}\n\nWork \
          entirely in the current directory. Create or edit only the files this task needs and make \
-         any tests pass. Do not ask questions; make reasonable choices."
+         any tests pass. Do not ask questions; make reasonable choices.{lesson_section}"
     );
-    run_agent_prompt(kind, &prompt, workspace, timeout_ms)
+    let mut run = run_agent_prompt(kind, &prompt, workspace, timeout_ms)?;
+    run.lesson_ids = lesson_ids;
+    Ok(run)
 }
 
 fn run_lead_agent_as(
@@ -324,6 +358,7 @@ fn run_agent_prompt_with_role(
                 return Ok(AgentRun {
                     ok: status.success(),
                     timed_out: false,
+                    lesson_ids: Vec::new(),
                 });
             }
             None => {
@@ -334,6 +369,7 @@ fn run_agent_prompt_with_role(
                     return Ok(AgentRun {
                         ok: false,
                         timed_out: true,
+                        lesson_ids: Vec::new(),
                     });
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -455,6 +491,9 @@ struct NodeOutcome {
     timed_out: bool,
     /// A human-readable note (e.g. the evidence-floor verdict) to surface.
     note: Option<String>,
+    /// Prior verified lesson IDs that were injected into this node's worker
+    /// prompt.  This is bookkeeping only; lesson confidence is never updated.
+    lessons: Vec<String>,
 }
 
 impl NodeOutcome {
@@ -464,6 +503,7 @@ impl NodeOutcome {
             verified,
             timed_out: false,
             note,
+            lessons: Vec::new(),
         }
     }
 
@@ -473,7 +513,13 @@ impl NodeOutcome {
             verified,
             timed_out,
             note,
+            lessons: Vec::new(),
         }
+    }
+
+    fn with_lessons(mut self, lessons: Vec<String>) -> Self {
+        self.lessons = lessons;
+        self
     }
 }
 
@@ -491,7 +537,7 @@ fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> 
         run_lead_closeout(node, agent, workspace)
     } else if is_build(capability) {
         let timeout_ms = agent_timeout_ms(node);
-        let run = run_worker_as(agent, instruction, workspace, timeout_ms)?;
+        let run = run_worker_as_for_node(agent, instruction, workspace, timeout_ms, Some(node))?;
         let note = run.timed_out.then(|| {
             format!(
                 "agent hung — killed after {}s; failing the task so it is repaired",
@@ -499,9 +545,9 @@ fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> 
             )
         });
         if run.ok {
-            Ok(NodeOutcome::success(None, note))
+            Ok(NodeOutcome::success(None, note).with_lessons(run.lesson_ids))
         } else {
-            Ok(NodeOutcome::failure(None, run.timed_out, note))
+            Ok(NodeOutcome::failure(None, run.timed_out, note).with_lessons(run.lesson_ids))
         }
     } else if is_verify(capability) {
         // Genuine governance: judge the suite with the real deny-by-default floor.
@@ -615,6 +661,15 @@ fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str, works
         other => other,
     };
     crate::run_control::node_transition(board, node, board_action, agent);
+    if action == "checkout" {
+        // A direct checkout can implicitly clear a prior terminal learning
+        // outcome.  Capture that typed failure before the overwrite; this is
+        // diagnostic-only on legacy/corrupt projects so the checkout itself
+        // remains governed by the canonical project-file seam.
+        if let Err(error) = capture_existing_failure_before_overwrite(workspace, node) {
+            eprintln!("  failure graph capture note: {error:#}");
+        }
+    }
     let result = match action {
         "checkout" => crate::project_file::checkout_start_node(workspace, node, agent, agent),
         "complete" => finish_learning_success(workspace, node, agent, None, None, false),
@@ -671,6 +726,31 @@ fn report_node_outcome(
     latency_ms: u64,
     predecessors: &[String],
 ) {
+    report_node_outcome_with_lessons(
+        board,
+        node,
+        agent,
+        workspace,
+        outcome,
+        evidence_hex,
+        latency_ms,
+        predecessors,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report_node_outcome_with_lessons(
+    board: Option<&str>,
+    node: &str,
+    agent: &str,
+    workspace: &Path,
+    outcome: &NodeOutcome,
+    evidence_hex: &str,
+    latency_ms: u64,
+    predecessors: &[String],
+    provided_lessons: &[String],
+) {
     if outcome.ok {
         let human = agent.eq_ignore_ascii_case("human");
         let board_action = "complete";
@@ -688,6 +768,7 @@ fn report_node_outcome(
         } else {
             crate::project_sync::maybe_sync_runtime(workspace);
         }
+        record_lesson_reuse(workspace, node, provided_lessons, outcome, evidence_hex);
         return;
     }
 
@@ -722,6 +803,7 @@ fn report_node_outcome(
     } else {
         crate::project_sync::maybe_sync_runtime(workspace);
     }
+    record_lesson_reuse(workspace, node, provided_lessons, outcome, evidence_hex);
 }
 
 fn compact_evidence_ref(node: &str, evidence_hex: &str) -> String {
@@ -744,6 +826,249 @@ fn compact_artifact_ref(node: &str, evidence_hex: &str) -> String {
     } else {
         format!("artifact:{node}")
     }
+}
+
+fn failure_code_name(code: crate::learning_data::FailureCode) -> &'static str {
+    match code {
+        crate::learning_data::FailureCode::MissingDependency => "missing_dependency",
+        crate::learning_data::FailureCode::NodeTooBroad => "node_too_broad",
+        crate::learning_data::FailureCode::NodeTooNarrow => "node_too_narrow",
+        crate::learning_data::FailureCode::IncorrectAgent => "incorrect_agent",
+        crate::learning_data::FailureCode::InsufficientContext => "insufficient_context",
+        crate::learning_data::FailureCode::ToolFailure => "tool_failure",
+        crate::learning_data::FailureCode::ConflictingParallelEdits => "conflicting_parallel_edits",
+        crate::learning_data::FailureCode::InvalidOutputSchema => "invalid_output_schema",
+        crate::learning_data::FailureCode::WeakVerifier => "weak_verifier",
+        crate::learning_data::FailureCode::Timeout => "timeout",
+        crate::learning_data::FailureCode::BudgetExceeded => "budget_exceeded",
+        crate::learning_data::FailureCode::PrematureCompletion => "premature_completion",
+    }
+}
+
+fn learning_outcome_name(outcome: crate::learning_data::NodeOutcome) -> &'static str {
+    match outcome {
+        crate::learning_data::NodeOutcome::VerifiedSuccess => "verified_success",
+        crate::learning_data::NodeOutcome::UnverifiedSuccess => "unverified_success",
+        crate::learning_data::NodeOutcome::FailedExecution => "failed_execution",
+        crate::learning_data::NodeOutcome::FailedVerification => "failed_verification",
+        crate::learning_data::NodeOutcome::Cancelled => "cancelled",
+        crate::learning_data::NodeOutcome::Superseded => "superseded",
+        crate::learning_data::NodeOutcome::HumanCompleted => "human_completed",
+    }
+}
+
+fn node_metadata(
+    document: &crate::project_file::FractalProject,
+    node: &str,
+) -> (String, String, String) {
+    let graph_node = document
+        .graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|value| value.get("id").and_then(Value::as_str) == Some(node));
+    let capability = graph_node
+        .and_then(|value| value.get("capability"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let objective = graph_node
+        .and_then(|value| value.get("title").or_else(|| value.get("instruction")))
+        .and_then(Value::as_str)
+        .unwrap_or(node)
+        .to_owned();
+    let component = document
+        .learning
+        .nodes
+        .get(node)
+        .map(|record| record.node_type.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "node".to_owned());
+    (capability, objective, component)
+}
+
+fn evidence_ref_for_digest(
+    node: &str,
+    evidence_hex: Option<&str>,
+) -> Option<crate::failure_graph::EvidenceRef> {
+    let value = evidence_hex?.trim();
+    let digest = value.strip_prefix("sha256:").unwrap_or(value);
+    if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Some(crate::failure_graph::EvidenceRef {
+            sha256: Some(format!("sha256:{digest}")),
+            kind: Some("workspace_state".to_owned()),
+            ..crate::failure_graph::EvidenceRef::default()
+        });
+    }
+    let reference = compact_evidence_ref(node, value);
+    (!reference.trim().is_empty()).then(|| crate::failure_graph::EvidenceRef {
+        legacy_ref: Some(reference),
+        kind: Some("workspace_state".to_owned()),
+        ..crate::failure_graph::EvidenceRef::default()
+    })
+}
+
+fn safe_legacy_evidence(reference: &str) -> bool {
+    let value = reference.trim();
+    !value.is_empty()
+        && value.chars().count() <= crate::failure_graph::MAX_STRING_CHARS
+        && !value.chars().any(char::is_control)
+        && !value.chars().any(char::is_whitespace)
+        && !value.starts_with('/')
+        && !value.starts_with('~')
+        && !value.contains("../")
+        && !value.contains('\\')
+}
+
+fn structured_failure_summary(
+    node: &str,
+    outcome: crate::learning_data::NodeOutcome,
+    failure_code: crate::learning_data::FailureCode,
+) -> String {
+    // Keep this projection intentionally boring: it is derived only from typed
+    // runtime outcome labels and the node ID, never from prompts, logs, or
+    // verifier output excerpts.
+    crate::failure_graph::redact_summary(&format!(
+        "node {node} reported {} with failure code {}",
+        learning_outcome_name(outcome),
+        failure_code_name(failure_code)
+    ))
+}
+
+/// Append a bounded, structured failure observation before the learning
+/// lifecycle releases a failed checkout.  Existing observations for the same
+/// attempt/evidence are not duplicated when an operator subsequently reopens
+/// that checkout.
+fn capture_failure_observation(
+    workspace: &Path,
+    node: &str,
+    agent: &str,
+    outcome: crate::learning_data::NodeOutcome,
+    failure_code: crate::learning_data::FailureCode,
+    evidence_hex: Option<&str>,
+) -> Result<String> {
+    let document = crate::project_file::load(workspace)?;
+    let record = document
+        .learning
+        .nodes
+        .get(node)
+        .with_context(|| format!("learning node `{node}` missing before failure capture"))?;
+    let (capability, objective, component) = node_metadata(&document, node);
+    let code = failure_code_name(failure_code).to_owned();
+    let id = crate::failure_graph::failure_id(node, &code);
+    let mut evidence = evidence_ref_for_digest(node, evidence_hex)
+        .into_iter()
+        .collect::<Vec<_>>();
+    for reference in record
+        .verification
+        .as_ref()
+        .into_iter()
+        .flat_map(|verification| verification.evidence_refs.iter())
+        .filter(|reference| safe_legacy_evidence(reference))
+    {
+        let candidate = crate::failure_graph::EvidenceRef {
+            legacy_ref: Some(reference.clone()),
+            kind: Some("verification".to_owned()),
+            ..crate::failure_graph::EvidenceRef::default()
+        };
+        let duplicate = evidence.iter().any(|existing| {
+            existing.sha256 == candidate.sha256 && existing.legacy_ref == candidate.legacy_ref
+        });
+        if !duplicate {
+            evidence.push(candidate);
+        }
+    }
+    let attempt = record.attempt_count.max(1);
+    let already_observed = crate::project_file::failure_graph(&document)
+        .failures
+        .get(&id)
+        .is_some_and(|failure| {
+            failure.observations.iter().any(|observation| {
+                observation.attempt == attempt
+                    && (evidence.is_empty()
+                        || observation.evidence.iter().any(|existing| {
+                            evidence.iter().any(|incoming| {
+                                existing.sha256 == incoming.sha256
+                                    && existing.legacy_ref == incoming.legacy_ref
+                            })
+                        }))
+            })
+        });
+    if already_observed {
+        return Ok(id);
+    }
+    let executor = record.executor.clone().unwrap_or_default();
+    let extra = [(
+        "objective_fingerprint".to_owned(),
+        Value::String(crate::lessons::objective_fingerprint(&objective)),
+    )]
+    .into_iter()
+    .collect();
+    let failure = crate::failure_graph::FailureRecord {
+        id: id.clone(),
+        node_id: node.to_owned(),
+        attempt,
+        failure_code: code,
+        outcome: learning_outcome_name(outcome).to_owned(),
+        state: crate::failure_graph::FailureState::Unresolved,
+        summary: structured_failure_summary(node, outcome, failure_code),
+        capability: Some(capability),
+        component: Some(component),
+        evidence,
+        agent: executor.agent.or_else(|| Some(agent.to_owned())),
+        model: executor.model,
+        version: executor.version,
+        observed: crate::failure_graph::GraphGitProvenance {
+            graph_hash: Some(document.graph_hash.clone()),
+            ..crate::failure_graph::GraphGitProvenance::default()
+        },
+        extra,
+        ..crate::failure_graph::FailureRecord::default()
+    };
+    crate::project_file::append_failure(workspace, failure)
+}
+
+fn capture_existing_failure_before_overwrite(
+    workspace: &Path,
+    node: &str,
+) -> Result<Option<String>> {
+    let document = crate::project_file::load(workspace)?;
+    let Some(record) = document.learning.nodes.get(node) else {
+        return Ok(None);
+    };
+    let Some(outcome) = record.outcome else {
+        return Ok(None);
+    };
+    let Some(failure_code) = record.failure_code else {
+        return Ok(None);
+    };
+    if !matches!(
+        outcome,
+        crate::learning_data::NodeOutcome::FailedExecution
+            | crate::learning_data::NodeOutcome::FailedVerification
+            | crate::learning_data::NodeOutcome::Cancelled
+    ) {
+        return Ok(None);
+    }
+    let evidence = record
+        .verification
+        .as_ref()
+        .and_then(|verification| verification.evidence_refs.first())
+        .map(String::as_str);
+    capture_failure_observation(
+        workspace,
+        node,
+        record
+            .executor
+            .as_ref()
+            .and_then(|executor| executor.agent.as_deref())
+            .unwrap_or("runtime"),
+        outcome,
+        failure_code,
+        evidence,
+    )
+    .map(Some)
 }
 
 fn finish_learning_success(
@@ -789,6 +1114,19 @@ fn finish_learning_success(
         _ => crate::learning_data::NodeOutcome::UnverifiedSuccess,
     };
     crate::project_file::finish_node(workspace, node, agent, outcome)?;
+    if verified == Some(true) {
+        if let Some((evidence_hex, _, _)) = measured {
+            // Lesson persistence is additive diagnostics.  A verified task has
+            // already completed through the guarded lifecycle seam; if a
+            // lesson write fails, retain the successful task result and report
+            // the issue without attempting a compensating graph transition.
+            if let Err(error) =
+                resolve_failures_and_create_lessons(workspace, node, agent, evidence_hex)
+            {
+                eprintln!("  failure graph resolution note: {error:#}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -800,18 +1138,209 @@ fn release_learning_failure(
     failure_code: crate::learning_data::FailureCode,
     measured: Option<(&str, u64)>,
 ) -> Result<()> {
-    crate::project_file::release_node(workspace, node, agent, Some((outcome, failure_code)))?;
+    // Capture first.  The policy is diagnostic fail-closed for the task result:
+    // a capture error is returned after release, so callers cannot interpret
+    // it as success, while the checked-out assignment is still safely closed.
+    let capture = capture_failure_observation(
+        workspace,
+        node,
+        agent,
+        outcome,
+        failure_code,
+        measured.map(|(evidence, _)| evidence),
+    );
+    let release =
+        crate::project_file::release_node(workspace, node, agent, Some((outcome, failure_code)));
     if let Some((evidence, _latency_ms)) = measured {
         if outcome == crate::learning_data::NodeOutcome::FailedVerification {
-            let _ = crate::project_file::record_verification_result(
+            let verification = crate::project_file::record_verification_result(
                 workspace,
                 node,
                 false,
                 vec![evidence.to_owned()],
             );
+            if let Err(error) = verification {
+                eprintln!("  verification evidence note: {error:#}");
+            }
         }
     }
+    release?;
+    capture.map(|_| ())
+}
+
+/// Resolve unresolved observations only after a later, evidence-backed
+/// verified success for the same node/capability.  Each resolution adopts one
+/// deterministic lesson and adds typed failure→lesson→applicability edges.
+fn resolve_failures_and_create_lessons(
+    workspace: &Path,
+    node: &str,
+    agent: &str,
+    evidence_hex: &str,
+) -> Result<()> {
+    let document = crate::project_file::load(workspace)?;
+    let learning = document
+        .learning
+        .nodes
+        .get(node)
+        .with_context(|| format!("learning node `{node}` missing after verified success"))?;
+    let (capability, objective, component) = node_metadata(&document, node);
+    let evidence = evidence_ref_for_digest(node, Some(evidence_hex))
+        .context("verified success is missing compact evidence")?;
+    let graph = crate::project_file::failure_graph(&document);
+    let unresolved = graph
+        .failures
+        .values()
+        .filter(|failure| {
+            failure.state == crate::failure_graph::FailureState::Unresolved
+                && failure.node_id == node
+                && (failure.capability.is_none()
+                    || failure.capability.as_deref() == Some(capability.as_str()))
+        })
+        .map(|failure| (failure.id.clone(), failure.failure_code.clone()))
+        .collect::<Vec<_>>();
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+    let executor = learning.executor.clone().unwrap_or_default();
+    for (failure_id, failure_code) in unresolved {
+        let resolution_summary = crate::failure_graph::redact_summary(&format!(
+            "verified success for node {node} and capability {capability} after prior {failure_code} observation"
+        ));
+        let resolution = crate::failure_graph::FailureResolution {
+            success: true,
+            summary: resolution_summary,
+            evidence: vec![evidence.clone()],
+            resolved_by: Some(agent.to_owned()),
+            observed: crate::failure_graph::GraphGitProvenance {
+                graph_hash: Some(document.graph_hash.clone()),
+                ..crate::failure_graph::GraphGitProvenance::default()
+            },
+            ..crate::failure_graph::FailureResolution::default()
+        };
+        crate::project_file::resolve_failure(workspace, &failure_id, resolution)?;
+
+        let lesson_summary = crate::failure_graph::redact_summary(&format!(
+            "Verified evidence shows node {node} can complete capability {capability} after a prior {failure_code} observation; validate current source before reuse"
+        ));
+        let lesson_id = crate::failure_graph::lesson_id(
+            &lesson_summary,
+            Some(capability.as_str()),
+            Some(component.as_str()),
+        );
+        let mut lesson_extra =
+            crate::lessons::applicability_fields(node, &capability, &failure_code, &objective);
+        lesson_extra.insert("failure_id".to_owned(), Value::String(failure_id.clone()));
+        lesson_extra.insert(
+            "created_at".to_owned(),
+            Value::String(crate::project_file::project_timestamp()),
+        );
+        let candidate = crate::failure_graph::LessonRecord {
+            id: lesson_id.clone(),
+            summary: lesson_summary,
+            status: crate::failure_graph::LessonStatus::Adopted,
+            capability: Some(capability.clone()),
+            component: Some(component.clone()),
+            evidence: vec![evidence.clone()],
+            agent: executor.agent.clone().or_else(|| Some(agent.to_owned())),
+            model: executor.model.clone(),
+            version: executor.version.clone(),
+            observed: crate::failure_graph::GraphGitProvenance {
+                graph_hash: Some(document.graph_hash.clone()),
+                ..crate::failure_graph::GraphGitProvenance::default()
+            },
+            extra: lesson_extra,
+            ..crate::failure_graph::LessonRecord::default()
+        };
+
+        // Do not resurrect an operator-rejected or superseded lesson with the
+        // same deterministic key.  Existing adopted lessons remain intact so
+        // repeated verified retries retain their evidence history.
+        let current_graph = crate::project_file::load_failure_graph(workspace)?;
+        let lesson_exists = current_graph.lessons.get(&lesson_id);
+        if !lesson_exists.is_some_and(|lesson| {
+            matches!(
+                lesson.status,
+                crate::failure_graph::LessonStatus::Rejected
+                    | crate::failure_graph::LessonStatus::Superseded
+            )
+        }) {
+            crate::project_file::upsert_lesson(workspace, candidate)?;
+        }
+
+        let edge_evidence = Some(evidence.clone());
+        for edge_type in [
+            crate::failure_graph::FailureEdgeType::ResolvedBy,
+            crate::failure_graph::FailureEdgeType::LessonFrom,
+        ] {
+            let (from, to) = if edge_type == crate::failure_graph::FailureEdgeType::ResolvedBy {
+                (failure_id.clone(), lesson_id.clone())
+            } else {
+                (lesson_id.clone(), failure_id.clone())
+            };
+            let _ = crate::project_file::add_failure_edge(
+                workspace,
+                crate::failure_graph::EdgeRecord {
+                    id: crate::failure_graph::edge_id(edge_type, &from, &to),
+                    edge_type,
+                    from,
+                    to,
+                    evidence: edge_evidence.clone(),
+                    ..crate::failure_graph::EdgeRecord::default()
+                },
+            )?;
+        }
+        let _ = crate::project_file::add_failure_edge(
+            workspace,
+            crate::failure_graph::EdgeRecord {
+                edge_type: crate::failure_graph::FailureEdgeType::AppliesTo,
+                from: lesson_id,
+                to: node.to_owned(),
+                evidence: Some(evidence.clone()),
+                ..crate::failure_graph::EdgeRecord::default()
+            },
+        )?;
+    }
     Ok(())
+}
+
+/// Record that a lesson was supplied to a worker after the final result is
+/// known.  The edge carries evidence and outcome metadata but never modifies a
+/// confidence weight; later selector ranking is derived from these facts.
+fn record_lesson_reuse(
+    workspace: &Path,
+    node: &str,
+    lesson_ids: &[String],
+    outcome: &NodeOutcome,
+    evidence_hex: &str,
+) {
+    if lesson_ids.is_empty() {
+        return;
+    }
+    let evidence = evidence_ref_for_digest(node, Some(evidence_hex));
+    for lesson_id in lesson_ids {
+        let mut edge = crate::failure_graph::EdgeRecord {
+            edge_type: crate::failure_graph::FailureEdgeType::ReusedIn,
+            from: lesson_id.clone(),
+            to: node.to_owned(),
+            evidence: evidence.clone(),
+            ..crate::failure_graph::EdgeRecord::default()
+        };
+        edge.extra.insert(
+            "outcome".to_owned(),
+            Value::String(if outcome.ok {
+                "success".to_owned()
+            } else {
+                "failure".to_owned()
+            }),
+        );
+        edge.extra.insert(
+            "verified".to_owned(),
+            outcome.verified.map(Value::Bool).unwrap_or(Value::Null),
+        );
+        if let Err(error) = crate::project_file::add_failure_edge(workspace, edge) {
+            eprintln!("  lesson reuse note: {error:#}");
+        }
+    }
 }
 
 fn record_predecessor_consumption(workspace: &Path, node: &str, predecessors: &[String]) {
@@ -849,6 +1378,9 @@ pub(crate) fn mark_ready_frontier(
 /// Reopen a previously failed/released node so a retry can start cleanly while
 /// preserving attempt_count from earlier runs.
 pub(crate) fn reopen_for_retry(workspace: &Path, node: &str) -> Result<()> {
+    if let Err(error) = capture_existing_failure_before_overwrite(workspace, node) {
+        eprintln!("  failure graph capture note: {error:#}");
+    }
     crate::project_file::reopen_node(workspace, node)
 }
 
@@ -873,7 +1405,17 @@ pub(crate) fn complete_as_human(workspace: &Path, node: &str, agent: &str) -> Re
 /// Cancel an in-flight checkout with a controlled Cancelled outcome.
 #[allow(dead_code)]
 pub(crate) fn cancel_checked_out_node(workspace: &Path, node: &str, agent: &str) -> Result<()> {
-    crate::project_file::release_node(
+    // Cancellation is a controlled terminal failure and must be observed before
+    // the assignment is released.
+    let capture = capture_failure_observation(
+        workspace,
+        node,
+        agent,
+        crate::learning_data::NodeOutcome::Cancelled,
+        crate::learning_data::FailureCode::PrematureCompletion,
+        None,
+    );
+    let release = crate::project_file::release_node(
         workspace,
         node,
         agent,
@@ -881,7 +1423,9 @@ pub(crate) fn cancel_checked_out_node(workspace: &Path, node: &str, agent: &str)
             crate::learning_data::NodeOutcome::Cancelled,
             crate::learning_data::FailureCode::PrematureCompletion,
         )),
-    )?;
+    );
+    release?;
+    capture?;
     crate::project_sync::maybe_sync_runtime(workspace);
     Ok(())
 }
@@ -1086,6 +1630,7 @@ pub(crate) fn run_multi_agent(
                             verified,
                             timed_out: _,
                             note,
+                            lessons,
                         } = &outcome;
                         if is_build(capability) && *ok {
                             state.built = true;
@@ -1101,7 +1646,7 @@ pub(crate) fn run_multi_agent(
                         if *ok {
                             state.completed.insert(id.clone());
                             mine += 1;
-                            report_node_outcome(
+                            report_node_outcome_with_lessons(
                                 board,
                                 &id,
                                 &agent,
@@ -1110,6 +1655,7 @@ pub(crate) fn run_multi_agent(
                                 &evidence_hex,
                                 latency_ms,
                                 &preds,
+                                lessons,
                             );
                             let _ = mark_ready_frontier(workspace, graph, &state.completed);
                             if is_planning {
@@ -1119,7 +1665,7 @@ pub(crate) fn run_multi_agent(
                             }
                         } else {
                             state.failed = Some(id.clone());
-                            report_node_outcome(
+                            report_node_outcome_with_lessons(
                                 board,
                                 &id,
                                 &agent,
@@ -1128,6 +1674,7 @@ pub(crate) fn run_multi_agent(
                                 &evidence_hex,
                                 latency_ms,
                                 &preds,
+                                lessons,
                             );
                             println!("{clr}  [{agent}] ✗ {id}{suffix}");
                         }
@@ -1843,7 +2390,7 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
                 .as_deref()
                 .map(|note| format!(" — {note}"))
                 .unwrap_or_default();
-            report_node_outcome(
+            report_node_outcome_with_lessons(
                 board,
                 &id,
                 agent,
@@ -1852,6 +2399,7 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
                 &evidence_hex,
                 latency_ms,
                 &predecessors,
+                &outcome.lessons,
             );
             if outcome.ok {
                 println!("{clr}  [{agent}] ✓ {id}{suffix}");
@@ -2529,6 +3077,109 @@ mod tests {
             .unwrap()
             .evidence_refs
             .is_empty());
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn failure_graph_captures_retry_observations_and_verified_resolution() {
+        let workspace = lifecycle_workspace("failure-graph-resolution");
+        let graph = persist_two_node_graph(&workspace);
+        let graph_hash = crate::project_file::load(&workspace).unwrap().graph_hash;
+
+        checkout(&workspace, "build", "codex");
+        report_node_outcome(
+            None,
+            "build",
+            "codex",
+            &workspace,
+            &NodeOutcome::failure(None, false, Some("raw output must not persist".into())),
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            12,
+            &[],
+        );
+        let failed = crate::project_file::load(&workspace).unwrap();
+        let failure_id = crate::failure_graph::failure_id("build", "tool_failure");
+        let first_graph = failed
+            .failure_graph
+            .as_ref()
+            .expect("captured failure graph");
+        let first = first_graph.failures.get(&failure_id).expect("failure");
+        assert_eq!(first.state, crate::failure_graph::FailureState::Unresolved);
+        assert_eq!(first.observations.len(), 1);
+        assert!(!first.summary.contains("raw output"));
+        assert_eq!(first.observations[0].attempt, 1);
+        assert_eq!(failed.graph_hash, graph_hash);
+        assert_eq!(failed.graph, graph);
+
+        reopen_for_retry(&workspace, "build").unwrap();
+        checkout(&workspace, "build", "codex");
+        report_node_outcome(
+            None,
+            "build",
+            "codex",
+            &workspace,
+            &NodeOutcome::failure(None, true, Some("timeout log must not persist".into())),
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            15,
+            &[],
+        );
+        let retried = crate::project_file::load(&workspace).unwrap();
+        let retried_graph = retried.failure_graph.as_ref().unwrap();
+        let retried_failure = retried_graph.failures.get(&failure_id).unwrap();
+        assert_eq!(
+            retried_failure.state,
+            crate::failure_graph::FailureState::Unresolved
+        );
+        assert_eq!(retried_failure.observations.len(), 1);
+        assert_eq!(retried_failure.attempt, 1);
+        let timeout_id = crate::failure_graph::failure_id("build", "timeout");
+        let timeout_failure = retried_graph.failures.get(&timeout_id).unwrap();
+        assert_eq!(timeout_failure.observations.len(), 1);
+        assert_eq!(timeout_failure.attempt, 2);
+
+        reopen_for_retry(&workspace, "build").unwrap();
+        checkout(&workspace, "build", "codex");
+        report_node_outcome(
+            None,
+            "build",
+            "codex",
+            &workspace,
+            &NodeOutcome::success(Some(true), None),
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            20,
+            &[],
+        );
+        let resolved = crate::project_file::load(&workspace).unwrap();
+        let failure_graph = resolved.failure_graph.as_ref().expect("failure graph");
+        let resolved_failure = failure_graph.failures.get(&failure_id).unwrap();
+        assert_eq!(
+            resolved_failure.state,
+            crate::failure_graph::FailureState::Resolved
+        );
+        assert_eq!(resolved_failure.observations.len(), 1);
+        assert!(resolved_failure
+            .resolution
+            .as_ref()
+            .is_some_and(|resolution| resolution.success && !resolution.evidence.is_empty()));
+        assert_eq!(
+            failure_graph.failures.get(&timeout_id).unwrap().state,
+            crate::failure_graph::FailureState::Resolved
+        );
+        assert_eq!(resolved.graph_hash, graph_hash);
+        assert_eq!(resolved.graph, graph);
+        assert!(failure_graph.lessons.values().any(|lesson| {
+            lesson.status == crate::failure_graph::LessonStatus::Adopted
+                && !lesson.evidence.is_empty()
+                && lesson.summary.contains("validate current source")
+        }));
+        assert!(failure_graph.edges.values().any(|edge| {
+            edge.edge_type == crate::failure_graph::FailureEdgeType::ResolvedBy
+                && edge.from == failure_id
+        }));
+        assert!(failure_graph
+            .edges
+            .values()
+            .any(|edge| { edge.edge_type == crate::failure_graph::FailureEdgeType::LessonFrom }));
         let _ = fs::remove_dir_all(workspace);
     }
 
