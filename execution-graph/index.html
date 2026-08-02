@@ -7,6 +7,7 @@
     <title>Fractal Execution Graph</title>
     <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="master-graph.css">
   </head>
   <body>
     <div class="ambient" aria-hidden="true"></div>
@@ -34,6 +35,7 @@
     </header>
 
     <main>
+      <section id="master-browser" class="master-browser hidden" aria-label="Master graph browser"></section>
       <section class="hero">
         <div class="eyebrow"><span>WORK /</span> FRACTAL-MAC-RUNTIME-PRD</div>
         <h1>Build intelligence<br><em>you can inspect.</em></h1>
@@ -98,6 +100,7 @@
       <span id="source-label">SOURCE · LOADING</span>
       <span>Native MLX thinks · Containers act · Policy controls · Verifiers decide</span>
     </footer>
+    <script src="master-graph.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

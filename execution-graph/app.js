@@ -3,6 +3,69 @@
 const NS = "http://www.w3.org/2000/svg";
 const state = { data: null, view: "overview", selected: null, initialized: false, pausing: false, estimatedSaved: 0 };
 const statusNames = { complete: "Complete", active: "In progress", incomplete: "Incomplete" };
+let masterBrowser = null;
+
+function queryMode() {
+  return new URLSearchParams(window.location.search).get("mode") === "master" ? "master" : "individual";
+}
+
+function setBoardMode(mode) {
+  document.body.classList.toggle("master-active", mode === "master");
+  document.getElementById("master-browser").classList.toggle("hidden", mode !== "master");
+}
+
+function individualUrl() {
+  const params = new URLSearchParams(window.location.search);
+  params.delete("mode");
+  params.delete("view");
+  params.delete("sel");
+  params.delete("panel");
+  return `${window.location.pathname}${params.toString() ? `?${params}` : ""}`;
+}
+
+function switchToIndividual(push = true) {
+  if (push) history.pushState(null, "", individualUrl());
+  setBoardMode("individual");
+  loadGraph();
+}
+
+function switchToMaster(push = true) {
+  const params = new URLSearchParams(window.location.search);
+  params.set("mode", "master");
+  if (push) history.pushState(null, "", `${window.location.pathname}?${params}`);
+  setBoardMode("master");
+  if (!masterBrowser) {
+    masterBrowser = FractalMasterGraph.createMasterGraphBrowser({
+      root: document.getElementById("master-browser"),
+      fetchImpl: window.fetch.bind(window),
+      history: window.history,
+      getSearch: () => window.location.search,
+      getViewportWidth: () => window.innerWidth
+    });
+    masterBrowser.init().finally(renderMasterMetrics);
+  } else {
+    masterBrowser.refresh().then(renderMasterMetrics);
+  }
+}
+
+function renderMasterMetrics() {
+  if (!masterBrowser) return;
+  const view = masterBrowser.getState().master;
+  if (!view) return;
+  const host = document.querySelector("#master-browser .mg-region-metrics");
+  if (!host) return;
+  host.replaceChildren();
+  FractalMasterGraph.masterHeroMetrics(view).forEach(metric => {
+    const article = document.createElement("article");
+    const value = document.createElement("span");
+    value.className = "mg-metric-value";
+    value.textContent = metric.value;
+    const label = document.createElement("small");
+    label.textContent = metric.label;
+    article.append(value, label);
+    host.append(article);
+  });
+}
 
 const overviewPositions = {
   M0: [145, 375], M1: [390, 125], M2: [390, 375], M3: [390, 625],
@@ -349,10 +412,13 @@ async function pauseBuild() {
 }
 
 async function loadGraph() {
+  if (queryMode() === "master") return;
   const button = document.getElementById("refresh");
   button.disabled = true;
   try {
-    const response = await fetch(`/api/graph?t=${Date.now()}`);
+    const params = new URLSearchParams(window.location.search);
+    const project = params.get("project");
+    const response = await fetch(`/api/graph${project ? `?project=${encodeURIComponent(project)}&` : "?"}t=${Date.now()}`);
     if (!response.ok) throw new Error(`Graph API returned ${response.status}`);
     state.data = await response.json();
     renderRunControl();
@@ -387,8 +453,43 @@ async function loadGraph() {
   }
 }
 
-document.getElementById("refresh").addEventListener("click", loadGraph);
+document.getElementById("refresh").addEventListener("click", () => {
+  if (queryMode() === "master") {
+    if (masterBrowser) masterBrowser.refresh();
+  } else loadGraph();
+});
 document.getElementById("back").addEventListener("click", showOverview);
 document.getElementById("pause-build").addEventListener("click", pauseBuild);
-loadGraph();
-setInterval(loadGraph, 2000);
+
+/* The modular browser owns master controls. Capture the Individual action and
+ * return to the established SVG renderer, preserving its progress/pause UX. */
+document.getElementById("master-browser").addEventListener("click", event => {
+  const control = event.target.closest("[data-mode], [data-project-key]");
+  if (!control) return;
+  if (control.getAttribute("data-mode") === "individual" || control.hasAttribute("data-project-key")) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    switchToIndividual();
+  }
+}, true);
+
+window.addEventListener("popstate", () => {
+  if (queryMode() === "master") {
+    /* The modular controller intentionally receives an injected history object;
+     * rebuild its mounted regions on browser Back/Forward so every query field
+     * (search, filters, selection, panel) is restored from the URL. */
+    if (masterBrowser) {
+      document.getElementById("master-browser").replaceChildren();
+      masterBrowser = null;
+    }
+    switchToMaster(false);
+  }
+  else switchToIndividual(false);
+});
+
+if (queryMode() === "master") switchToMaster();
+else {
+  setBoardMode("individual");
+  loadGraph();
+}
+setInterval(() => { if (queryMode() === "individual") loadGraph(); }, 2000);

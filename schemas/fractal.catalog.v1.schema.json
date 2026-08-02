@@ -1,0 +1,1023 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fractalsociety.dev/schemas/fractal.catalog.v1.schema.json",
+  "title": "fractal.catalog.v1",
+  "description": "Additive, evidence-backed catalog envelope stored under the top-level 'catalog' key of a fractal.project.v1 document (FractalProject.extra[\"catalog\"]). The envelope never replaces or rewrites the sibling graph, graph_hash, execution, learning, efficiency, or unknown top-level fields; producers and rewriters MUST preserve those byte-for-byte. Normative rules that JSON Schema cannot express (secret-key rejection, status invariants, canonical hashing, size ceiling in bytes, ordering) are defined in docs/project-catalog-contract.md and enforced by the Rust validator in src/project_catalog.rs.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema",
+    "project_key",
+    "generated_at",
+    "catalog_hash",
+    "source",
+    "audit",
+    "capabilities",
+    "components",
+    "dependencies",
+    "tests",
+    "decisions",
+    "cross_graph_links",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema": {
+      "const": "fractal.catalog.v1",
+      "description": "Exact schema identifier. Readers finding any other value MUST NOT partially parse for mutation; composers report diagnostic 'unsupported_catalog_schema'."
+    },
+    "project_key": {
+      "$ref": "#/$defs/projectKey",
+      "description": "Stable identity: '<slug>-<first 12 hex of workspace_fingerprint>'. Derived per contract section 3; never from display titles or registry numbers."
+    },
+    "generated_at": {
+      "$ref": "#/$defs/rfc3339Utc",
+      "description": "Audit completion time. Excluded from no field's hash except catalog_hash itself covers it; the master view carries no wall-clock fields."
+    },
+    "catalog_hash": {
+      "$ref": "#/$defs/hash256",
+      "description": "'sha256:<64 hex>' over the canonical JSON bytes of this envelope with the 'catalog_hash' key removed (sorted keys, compact separators, UTF-8)."
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "canonical_workspace",
+        "workspace_fingerprint",
+        "registry_numbers",
+        "labels",
+        "git"
+      ],
+      "properties": {
+        "canonical_workspace": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^/",
+          "description": "The only absolute path allowed anywhere in the envelope: the canonicalized workspace root from the frozen inventory."
+        },
+        "workspace_fingerprint": {
+          "$ref": "#/$defs/hash256",
+          "description": "'sha256:' + hex SHA-256 of the UTF-8 bytes of canonical_workspace."
+        },
+        "registry_numbers": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "description": "Informational only; never part of identity derivation."
+        },
+        "labels": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "description": "Registry labels observed at audit time; informational aliases, never identity."
+        },
+        "git": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "is_git_repository",
+            "commit",
+            "dirty",
+            "dirty_fingerprint",
+            "unavailable_reason"
+          ],
+          "properties": {
+            "is_git_repository": {
+              "type": "boolean"
+            },
+            "commit": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/gitCommit"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "HEAD commit observed at audit time; null when absent or unavailable."
+            },
+            "dirty": {
+              "type": [
+                "boolean",
+                "null"
+              ],
+              "description": "null only when git state is unavailable."
+            },
+            "dirty_fingerprint": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/hash256"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required non-null whenever dirty is true or commit is null while evidence exists; 'sha256:' over the canonical JSON array of all evidence {path, sha256} pairs in the envelope, deduplicated and sorted by (path, sha256). MUST be null when dirty is false and commit is present."
+            },
+            "unavailable_reason": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 512
+            },
+            "remotes": {
+              "type": "array",
+              "maxItems": 8,
+              "items": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "name",
+                  "fingerprint_sha256"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "fingerprint_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                    "description": "Bare 64-hex to match fractal.repository_inventory.v1 remote fingerprints (no 'sha256:' prefix)."
+                  },
+                  "sanitized_url": {
+                    "type": "string",
+                    "maxLength": 512
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "auditor",
+        "inventory_hash",
+        "started_at",
+        "finished_at",
+        "bounds",
+        "truncated"
+      ],
+      "properties": {
+        "auditor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "cli_version": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "inventory_hash": {
+          "$ref": "#/$defs/hash256",
+          "description": "inventory_hash of the frozen fractal.repository_inventory.v1 artifact this audit ran against."
+        },
+        "started_at": {
+          "$ref": "#/$defs/rfc3339Utc"
+        },
+        "finished_at": {
+          "$ref": "#/$defs/rfc3339Utc"
+        },
+        "bounds": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "The limits that were actually applied, so truncation is auditable.",
+          "properties": {
+            "max_catalog_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_evidence_per_claim": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_log_excerpt_chars": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "max_string_chars": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "test_timeout_ms": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "true when any bound dropped or shortened material; details belong in diagnostics with code 'catalog_bound_exceeded'."
+        },
+        "evidence_counts": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "$ref": "#/$defs/capability"
+      },
+      "description": "Implemented features. Sorted ascending by key; keys unique."
+    },
+    "components": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "$ref": "#/$defs/component"
+      },
+      "description": "Sorted ascending by key; keys unique."
+    },
+    "dependencies": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "$ref": "#/$defs/dependency"
+      },
+      "description": "Internal component-to-component dependencies. Sorted by (from_component, to_component, kind)."
+    },
+    "tests": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "$ref": "#/$defs/testRecord"
+      },
+      "description": "Sorted ascending by key; keys unique."
+    },
+    "decisions": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "$ref": "#/$defs/decision"
+      },
+      "description": "Sorted ascending by key; keys unique."
+    },
+    "cross_graph_links": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "$ref": "#/$defs/crossGraphLink"
+      },
+      "description": "Typed outbound relationship claims. Sorted ascending by key; keys unique within this catalog."
+    },
+    "diagnostics": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "$ref": "#/$defs/catalogDiagnostic"
+      },
+      "description": "Audit-time diagnostics (truncation, unreadable inputs, redactions). Sorted by (code, context)."
+    }
+  },
+  "$defs": {
+    "hash256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "gitCommit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "rfc3339Utc": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+    },
+    "keySlug": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+      "description": "Local key: lowercase alphanumerics and hyphens, 1-64 chars, no leading hyphen."
+    },
+    "projectKey": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,47}-[0-9a-f]{12}$"
+    },
+    "relPath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[^/\\\\~]",
+      "not": {
+        "pattern": "(^|/)\\.\\.(/|$)"
+      },
+      "description": "Repository-relative path: no leading '/', '\\\\', or '~', and no '..' segment. Absolute evidence paths are invalid."
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "verified",
+        "implemented_unverified",
+        "partial",
+        "unknown"
+      ]
+    },
+    "testClassification": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "fail",
+        "timeout",
+        "missing_tool",
+        "skipped",
+        "not_run"
+      ],
+      "description": "Only 'pass' can support a verified claim."
+    },
+    "evidenceRef": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "path",
+        "sha256",
+        "kind",
+        "observed_commit"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/relPath"
+        },
+        "sha256": {
+          "$ref": "#/$defs/hash256",
+          "description": "'sha256:' + hex SHA-256 of the exact file bytes as read at audit time."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "source",
+            "manifest",
+            "test_log",
+            "graph",
+            "document"
+          ]
+        },
+        "observed_commit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/gitCommit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "HEAD at observation time; null when git state was unavailable. When null or when source.git.dirty is true, source.git.dirty_fingerprint anchors the observation instead."
+        },
+        "spans": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "[start_line, end_line], 1-indexed inclusive, start <= end."
+          }
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 512
+        }
+      }
+    },
+    "evidenceList": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "$ref": "#/$defs/evidenceRef"
+      },
+      "description": "Sorted by (path, sha256)."
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "key",
+        "title",
+        "status",
+        "evidence",
+        "test_keys",
+        "component_keys"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/keySlug"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidenceList"
+        },
+        "test_keys": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "$ref": "#/$defs/keySlug"
+          },
+          "description": "Keys into tests[]. A 'verified' capability MUST reference at least one test whose classification is 'pass' (normative invariant)."
+        },
+        "component_keys": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "$ref": "#/$defs/keySlug"
+          }
+        }
+      }
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "key",
+        "name",
+        "kind",
+        "paths",
+        "status",
+        "evidence"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/keySlug"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "binary",
+            "library",
+            "module",
+            "service",
+            "app",
+            "ui",
+            "schema",
+            "docs",
+            "config",
+            "test_suite",
+            "other"
+          ]
+        },
+        "paths": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/relPath"
+          },
+          "description": "Sorted ascending."
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidenceList"
+        }
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "from_component",
+        "to_component",
+        "kind",
+        "evidence"
+      ],
+      "properties": {
+        "from_component": {
+          "$ref": "#/$defs/keySlug"
+        },
+        "to_component": {
+          "$ref": "#/$defs/keySlug"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "build",
+            "runtime",
+            "dev",
+            "test",
+            "data",
+            "other"
+          ]
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidenceList"
+        }
+      }
+    },
+    "testRecord": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "key",
+        "command",
+        "classification",
+        "exit_code",
+        "duration_ms",
+        "log_sha256",
+        "evidence"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/keySlug"
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "The exact allowlisted native test command that was run (or would run, for 'not_run')."
+        },
+        "classification": {
+          "$ref": "#/$defs/testClassification"
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "duration_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "log_sha256": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/hash256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "SHA-256 of the bounded, redacted captured output bytes. Raw logs are never stored."
+        },
+        "log_excerpt": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Redacted excerpt of the captured output; secret-like lines replaced with '[redacted]'."
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidenceList"
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "key",
+        "title",
+        "status",
+        "evidence"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/keySlug"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "adopted",
+            "proposed",
+            "superseded",
+            "rejected"
+          ]
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidenceList"
+        }
+      }
+    },
+    "crossGraphLink": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "key",
+        "type",
+        "from",
+        "to",
+        "confidence",
+        "evidence"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/keySlug"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "depends_on",
+            "uses_component",
+            "derived_from",
+            "forked_from",
+            "supersedes",
+            "shares_component",
+            "related_to"
+          ]
+        },
+        "from": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "component_key"
+          ],
+          "properties": {
+            "component_key": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/keySlug"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Origin component within this catalog; null means the link originates from the project itself. The origin project is always this catalog's project_key."
+            }
+          }
+        },
+        "to": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "project_key",
+            "alias",
+            "component_key"
+          ],
+          "anyOf": [
+            {
+              "properties": {
+                "project_key": {
+                  "$ref": "#/$defs/projectKey"
+                }
+              },
+              "required": [
+                "project_key"
+              ]
+            },
+            {
+              "properties": {
+                "alias": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                }
+              },
+              "required": [
+                "alias"
+              ]
+            }
+          ],
+          "properties": {
+            "project_key": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/projectKey"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Preferred: the stable target project_key. At least one of project_key/alias MUST be a non-null string."
+            },
+            "alias": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 256,
+              "description": "Fallback: a registry label, bare 64-hex remote fingerprint, or 'sha256:'-prefixed workspace fingerprint for the composer to resolve."
+            },
+            "component_key": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/keySlug"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Target component within the target catalog; null targets the project node."
+            }
+          }
+        },
+        "confidence": {
+          "type": "string",
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "rationale": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidenceList"
+        }
+      }
+    },
+    "catalogDiagnostic": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "code",
+        "severity",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "catalog_bound_exceeded",
+            "manifest_unreadable",
+            "redacted_content",
+            "symlink_escape_skipped",
+            "test_unavailable"
+          ]
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "info"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "context": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "schema": "fractal.catalog.v1",
+      "project_key": "fractal-cli-bbbfd315b970",
+      "generated_at": "2026-08-02T14:05:00Z",
+      "source": {
+        "canonical_workspace": "/workspace/fractal-cli",
+        "workspace_fingerprint": "sha256:bbbfd315b97032d8324f48b8ab1b9c749b26fffcb3b2680d26b2df797b29a0de",
+        "registry_numbers": [
+          18
+        ],
+        "labels": [
+          "fractal-cli"
+        ],
+        "git": {
+          "is_git_repository": true,
+          "commit": "56df19ed4dd0f19b56fc2c10faaa40278dc07936",
+          "dirty": true,
+          "dirty_fingerprint": "sha256:1d37ac05c6ba35babc75f38d674716dc6e313a970f864297ebcecc479196d258",
+          "unavailable_reason": null,
+          "remotes": [
+            {
+              "name": "origin",
+              "fingerprint_sha256": "f1057ab13991aac2f870f5e8a03e76b7f40c7e6ea63a5130d2296458d36164fa",
+              "sanitized_url": "https://github.com/fractalsociety/fractal-cli.git"
+            }
+          ]
+        }
+      },
+      "audit": {
+        "auditor": "fractal graph audit",
+        "cli_version": "0.9.4",
+        "inventory_hash": "sha256:a0bbf8551226effda0186e95c0c2a0ae7efb5edc67d77b992f2b4ec5342b7baa",
+        "started_at": "2026-08-02T14:03:12Z",
+        "finished_at": "2026-08-02T14:05:00Z",
+        "bounds": {
+          "max_catalog_bytes": 262144,
+          "max_evidence_per_claim": 20,
+          "max_log_excerpt_chars": 1024,
+          "max_string_chars": 2048,
+          "test_timeout_ms": 600000
+        },
+        "truncated": false,
+        "evidence_counts": {
+          "document": 1,
+          "manifest": 3,
+          "source": 3
+        }
+      },
+      "capabilities": [
+        {
+          "key": "canonical-project-persistence",
+          "title": "Locked, validated, atomic persistence of .fractal/project.fractal",
+          "description": "Canonical project documents are written through an in-process mutex, a cross-process lock file, full validation, and atomic tmp-file rename.",
+          "status": "verified",
+          "evidence": [
+            {
+              "path": "src/project_file.rs",
+              "sha256": "sha256:9995a3cab75478c9b31048a286f7306e900f28a2b9287a5fe4a5d0c4c7ee3ffa",
+              "kind": "source",
+              "observed_commit": "56df19ed4dd0f19b56fc2c10faaa40278dc07936",
+              "spans": [
+                [
+                  82,
+                  147
+                ],
+                [
+                  1692,
+                  1709
+                ]
+              ]
+            }
+          ],
+          "test_keys": [
+            "cargo-test"
+          ],
+          "component_keys": [
+            "fractal-cli-bin"
+          ]
+        }
+      ],
+      "components": [
+        {
+          "key": "fractal-chain",
+          "name": "fractal-chain",
+          "kind": "library",
+          "paths": [
+            "crates/fractal-chain"
+          ],
+          "description": "Workspace member crate consumed by the CLI binary.",
+          "status": "implemented_unverified",
+          "evidence": [
+            {
+              "path": "crates/fractal-chain/Cargo.toml",
+              "sha256": "sha256:3b2ae8deb4e2d8180d66ea39487fa918f3b36f8b3e15a5d528866bebf94efa1a",
+              "kind": "manifest",
+              "observed_commit": "56df19ed4dd0f19b56fc2c10faaa40278dc07936"
+            }
+          ]
+        },
+        {
+          "key": "fractal-cli-bin",
+          "name": "fractal-cli",
+          "kind": "binary",
+          "paths": [
+            "src"
+          ],
+          "description": "The fractal CLI binary: project persistence, sync, graph board.",
+          "status": "verified",
+          "evidence": [
+            {
+              "path": "Cargo.toml",
+              "sha256": "sha256:ef8fc612f76a9d498c83f355ed5c8de77544102887a806dbed110ac89f78fccc",
+              "kind": "manifest",
+              "observed_commit": "56df19ed4dd0f19b56fc2c10faaa40278dc07936"
+            },
+            {
+              "path": "src/main.rs",
+              "sha256": "sha256:cc6f2fade9c857e73bfd1d1dcb2d9c93eb48ef376c75e19c180294b59d95b7e9",
+              "kind": "source",
+              "observed_commit": "56df19ed4dd0f19b56fc2c10faaa40278dc07936"
+            }
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "from_component": "fractal-cli-bin",
+          "to_component": "fractal-chain",
+          "kind": "build",
+          "evidence": [
+            {
+              "path": "Cargo.toml",
+              "sha256": "sha256:ef8fc612f76a9d498c83f355ed5c8de77544102887a806dbed110ac89f78fccc",
+              "kind": "manifest",
+              "observed_commit": "56df19ed4dd0f19b56fc2c10faaa40278dc07936",
+              "spans": [
+                [
+                  12,
+                  25
+                ]
+              ]
+            }
+          ]
+        }
+      ],
+      "tests": [
+        {
+          "key": "cargo-test",
+          "command": "cargo test --no-fail-fast",
+          "classification": "pass",
+          "exit_code": 0,
+          "duration_ms": 41250,
+          "log_sha256": "sha256:1a46b67449e33a32d4f3335cc7072442d774a058db25255a3240579d45c9a0e1",
+          "log_excerpt": "test result: ok. 212 passed; 0 failed; 0 ignored",
+          "evidence": [
+            {
+              "path": "Cargo.toml",
+              "sha256": "sha256:ef8fc612f76a9d498c83f355ed5c8de77544102887a806dbed110ac89f78fccc",
+              "kind": "manifest",
+              "observed_commit": "56df19ed4dd0f19b56fc2c10faaa40278dc07936",
+              "note": "declares the cargo test suite"
+            }
+          ]
+        }
+      ],
+      "decisions": [
+        {
+          "key": "additive-catalog-envelope",
+          "title": "Catalog data lives additively under the top-level extra map",
+          "summary": "The catalog is stored beside graph/execution/learning/efficiency, never inside graph, so graph_hash and execution history are untouched.",
+          "status": "adopted",
+          "evidence": [
+            {
+              "path": "AGENTS.md",
+              "sha256": "sha256:427b8d1fec3e96272c50caa265186ff003be37f01b71043b127a6075d476b920",
+              "kind": "document",
+              "observed_commit": "56df19ed4dd0f19b56fc2c10faaa40278dc07936"
+            }
+          ]
+        }
+      ],
+      "cross_graph_links": [
+        {
+          "key": "shares-fractal-chain",
+          "type": "shares_component",
+          "from": {
+            "component_key": "fractal-chain"
+          },
+          "to": {
+            "project_key": "fractal-efficiency-yfzdff-fe96f21dda82",
+            "alias": "fractal-efficiency.yFzdFF",
+            "component_key": "fractal-chain"
+          },
+          "confidence": "high",
+          "rationale": "Both workspaces vendor the same fractal-chain crate at crates/fractal-chain.",
+          "evidence": [
+            {
+              "path": "crates/fractal-chain/Cargo.toml",
+              "sha256": "sha256:3b2ae8deb4e2d8180d66ea39487fa918f3b36f8b3e15a5d528866bebf94efa1a",
+              "kind": "manifest",
+              "observed_commit": "56df19ed4dd0f19b56fc2c10faaa40278dc07936"
+            }
+          ]
+        }
+      ],
+      "diagnostics": [],
+      "catalog_hash": "sha256:7996e73720de288102cb1b0af161830086f2f09ed38449c01a3a087b99dd913d"
+    }
+  ]
+}
