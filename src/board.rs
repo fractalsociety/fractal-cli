@@ -370,7 +370,9 @@ pub(crate) fn serve_master(
     exec_graph_dir: Option<&Path>,
     no_open: bool,
 ) -> Result<()> {
-    let url = format!("http://127.0.0.1:{port}/");
+    // Master mode is explicit in the URL so the same board server can keep
+    // bare-root compatibility for individual project graphs.
+    let url = master_board_url(port);
     if !no_open {
         let open_url_owned = url.clone();
         std::thread::spawn(move || {
@@ -381,6 +383,10 @@ pub(crate) fn serve_master(
     println!("Serving master board {url}");
     println!("Inventory: {}", inventory_path.display());
     serve_master_foreground(inventory_path, port, exec_graph_dir)
+}
+
+fn master_board_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/?mode=master")
 }
 
 /// Foreground master-board server entry point (inventory-backed, GET-only APIs).
@@ -1545,6 +1551,11 @@ mod tests {
         assert!(js.contains("master-graph"));
         assert!(!js.is_empty());
         assert!(!css.is_empty());
+    }
+
+    #[test]
+    fn master_board_launch_url_selects_master_mode() {
+        assert_eq!(master_board_url(8093), "http://127.0.0.1:8093/?mode=master");
     }
 
     #[test]

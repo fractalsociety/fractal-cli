@@ -41,6 +41,11 @@
   outline: 2px solid var(--green, #54f49a);
   outline-offset: 2px;
 }
+.mg-view-option:focus-visible,
+.mg-truncation-action:focus-visible {
+  outline: 2px solid var(--green, #54f49a);
+  outline-offset: 2px;
+}
 
 .mg-node:focus-visible .mg-node-body,
 .mg-edge:focus-visible {
@@ -153,6 +158,54 @@
   color: var(--green, #54f49a);
 }
 
+/* Shared header control: the same Individual/Master affordance stays visible
+ * while either board mode is active. */
+#view-mode-toggle { display: inline-flex; margin-left: 8px; }
+#view-mode-toggle .mg-mode-toggle { min-height: 34px; }
+
+.mg-view-toggle {
+  display: inline-flex;
+  align-items: center;
+  margin-left: auto;
+  border: 1px solid var(--line, rgba(179, 214, 199, .13));
+  border-radius: 5px;
+  overflow: hidden;
+}
+.mg-view-option {
+  min-height: 34px;
+  padding: 0 13px;
+  border: 0;
+  background: transparent;
+  color: #b8c8c1;
+  font: 700 9px/1 "SFMono-Regular", Consolas, monospace;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.mg-view-option.mg-active {
+  background: rgba(84, 244, 154, .12);
+  color: var(--green, #54f49a);
+}
+
+.mg-master-help {
+  display: flex;
+  flex: 1 1 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 9px 2px 1px;
+  color: #8fa39a;
+  font: 500 10px/1.45 "SFMono-Regular", Consolas, monospace;
+}
+.mg-help-copy { max-width: 760px; }
+.mg-help-legend { display: flex; flex-wrap: wrap; gap: 10px; }
+.mg-help-item { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.mg-help-item i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; border: 1px solid currentColor; }
+.mg-help-swatch-group { color: var(--green, #54f49a); }
+.mg-help-swatch-project { color: #72bd97; }
+.mg-help-swatch-category { color: #91a69d; }
+.mg-help-swatch-link { color: #b4d4c3; border-style: dashed !important; }
+
 /* ---------------------------------------------------------------- *
  * Search + filters (contract §7)
  * ---------------------------------------------------------------- */
@@ -221,7 +274,13 @@
  * Master SVG stage (contract §14: no edge-flow, capped mounts)
  * ---------------------------------------------------------------- */
 
-.mg-master-svg { display: block; min-width: 100%; min-height: 100%; }
+.mg-master-svg {
+  display: block;
+  min-width: 100%;
+  min-height: 100%;
+  width: 100%;
+  height: 100%;
+}
 
 .mg-edge {
   fill: none;
@@ -248,8 +307,13 @@
 .mg-node.mg-status-invalid .mg-node-body { stroke: rgba(255, 95, 103, .6); }
 .mg-node:hover .mg-node-body, .mg-node.mg-selected .mg-node-body { stroke-width: 1.8; filter: brightness(1.18); }
 .mg-node .mg-node-kind { fill: #aebdb7; font: 600 9px "SFMono-Regular", Consolas, monospace; letter-spacing: .12em; }
-.mg-node .mg-node-title { fill: #e7f0ec; font: 500 13px "Avenir Next", "Helvetica Neue", sans-serif; }
+.mg-node .mg-node-title { fill: #e7f0ec; font: 600 15px "Avenir Next", "Helvetica Neue", sans-serif; }
+.mg-node .mg-node-subtitle { fill: #9aada4; font: 500 10px "SFMono-Regular", Consolas, monospace; letter-spacing: .02em; }
 .mg-node .mg-node-status { fill: #8fa39a; font: 600 8px "SFMono-Regular", Consolas, monospace; letter-spacing: .08em; }
+.mg-node.mg-cluster .mg-node-body { fill: rgba(12, 31, 25, .95); stroke-width: 1.6; }
+.mg-node.mg-cluster-group .mg-node-body { stroke: rgba(84, 244, 154, .85); }
+.mg-node.mg-cluster-project .mg-node-body { stroke: rgba(114, 189, 151, .7); }
+.mg-node.mg-cluster-category .mg-node-body { stroke: rgba(145, 166, 157, .62); }
 
 /* Dimmed non-matches (contract §7.1 / §12): stay perceptible, never the only
  * status channel; readable ids stay ≥3:1 against the stage. */
@@ -300,6 +364,37 @@
   color: #8ca098;
   font: 500 9px/1.5 "SFMono-Regular", Consolas, monospace;
   letter-spacing: .06em;
+}
+
+.mg-truncation {
+  position: sticky;
+  z-index: 4;
+  top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: fit-content;
+  max-width: calc(100% - 16px);
+  margin: 8px;
+  padding: 9px 11px;
+  border: 1px solid rgba(255, 196, 91, .36);
+  border-radius: 6px;
+  background: rgba(21, 20, 13, .92);
+  color: #d6c49e;
+  font: 500 10px/1.35 "SFMono-Regular", Consolas, monospace;
+}
+.mg-truncation-title { color: var(--amber, #ffc45b); letter-spacing: .04em; text-transform: uppercase; }
+.mg-truncation-copy { color: #acaa99; }
+.mg-truncation-action {
+  margin-left: auto;
+  padding: 5px 8px;
+  border: 1px solid rgba(84, 244, 154, .4);
+  border-radius: 4px;
+  background: rgba(84, 244, 154, .08);
+  color: var(--green, #54f49a);
+  font: 700 8px/1 "SFMono-Regular", Consolas, monospace;
+  text-transform: uppercase;
+  cursor: pointer;
 }
 
 /* ---------------------------------------------------------------- *
@@ -457,15 +552,20 @@
  * ---------------------------------------------------------------- */
 
 @media (max-width: 560px) {
+  #view-mode-toggle .mg-mode-option { min-height: 30px; padding: 0 8px; font-size: 8px; }
   .mg-region-chrome { flex-direction: column; align-items: stretch; }
   .mg-switcher-list { width: calc(100vw - 32px); max-width: 340px; }
   .mg-search-input { width: 100%; }
   .mg-region-stage { overflow-x: hidden; }
   .mg-master-svg { display: none; }             /* list/detail takes over */
+  .mg-region-stage.mg-explicit-graph { overflow-x: auto; }
+  .mg-region-stage.mg-explicit-graph .mg-master-svg { display: block; min-width: 920px; }
   .mg-list-row { grid-template-columns: minmax(0, 1fr) auto; }
   .mg-list-kind { display: none; }
   .mg-panel-tabs { overflow-x: auto; flex-wrap: nowrap; }
   .mg-degraded { margin: 24px 8px; }
+  .mg-master-help { align-items: flex-start; flex-direction: column; }
+  .mg-help-legend { gap: 7px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
