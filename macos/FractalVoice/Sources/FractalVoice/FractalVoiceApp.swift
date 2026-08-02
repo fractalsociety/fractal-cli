@@ -723,8 +723,13 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         }
         statusItem.button?.image = NSImage(
             systemSymbolName: symbol,
-            accessibilityDescription: state.label
+            accessibilityDescription: coordinator.isExternalBuild
+                ? "Fractal text request"
+                : state.label
         )
+        statusItem.button?.toolTip = coordinator.isExternalBuild
+            ? "Fractal — text request active"
+            : "Fractal Voice — \(GlobalHotKey.displayName)"
     }
 
     private func activate(_ mode: VoiceInputMode) {
