@@ -3,6 +3,19 @@ import XCTest
 @testable import FractalVoice
 
 final class FractalVoiceTests: XCTestCase {
+    func testStartupAndExternalTextHandoffNeverRequestPermissions() {
+        XCTAssertFalse(PermissionPolicy.shouldRequestMicrophone(in: .appLaunch))
+        XCTAssertFalse(PermissionPolicy.shouldRequestNotifications(in: .appLaunch))
+        XCTAssertFalse(PermissionPolicy.shouldRequestMicrophone(in: .externalTextHandoff))
+        XCTAssertFalse(PermissionPolicy.shouldRequestNotifications(in: .externalTextHandoff))
+    }
+
+    func testPermissionRequestsRequireExplicitFeatureAction() {
+        XCTAssertTrue(PermissionPolicy.shouldRequestMicrophone(in: .explicitVoiceRecording))
+        XCTAssertTrue(PermissionPolicy.shouldRequestNotifications(in: .explicitNotificationOptIn))
+        XCTAssertFalse(PermissionPolicy.shouldRequestNotifications(in: .backgroundBuildStatus))
+    }
+
     func testShortcutIsVisibleAndStable() {
         XCTAssertEqual(GlobalHotKey.displayName, "⌥Space")
         XCTAssertEqual(GlobalHotKey.keyCode, UInt32(kVK_Space))

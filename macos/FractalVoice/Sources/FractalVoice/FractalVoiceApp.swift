@@ -409,6 +409,7 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         menu.addItem(item("Open Projects", #selector(openProjects)))
         menu.addItem(item("Change Project Location…", #selector(showProjectLocation)))
         menu.addItem(item("Open Activity Log", #selector(openLog)))
+        menu.addItem(item("Enable Build Notifications…", #selector(enableBuildNotifications)))
         menu.addItem(item("Support", #selector(openSupport)))
         menu.addItem(item("Privacy Policy", #selector(openPrivacyPolicy)))
         menu.addItem(.separator())
@@ -688,6 +689,10 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         coordinator.openLog()
     }
 
+    @objc private func enableBuildNotifications() {
+        coordinator.requestBuildNotifications()
+    }
+
     @objc private func openSupport() {
         NSWorkspace.shared.open(URL(string: "https://fractalsociety.com/support")!)
     }
@@ -738,7 +743,6 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         case .builtIn:
             coordinator.activateBuiltInVoice()
             installGlobalHotKey()
-            coordinator.requestMicrophonePermission()
         case .chatGPTDesktop, .superwhisper:
             hotKey = nil
             coordinator.activateExternalVoice(mode)
