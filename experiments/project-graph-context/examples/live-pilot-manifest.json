@@ -1,0 +1,38 @@
+{
+  "schema_version": "project-graph-context.experiment-manifest.v1",
+  "experiment_id": "pgc-live-pilot-calculator-pair",
+  "protocol_version": "1.0",
+  "source_repo": "generated corpus seed repositories (per task)",
+  "frozen_harness_commit": "efa0833a4fd82fc527fde0f166e76d1b91a34cb1",
+  "planner": {
+    "model": "gpt-5.6-sol",
+    "reasoning_effort": "high",
+    "calls": 2,
+    "arm_blind": true,
+    "reused_across_arms": true
+  },
+  "worker": {
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "high",
+    "cells": 8,
+    "replicates": 1,
+    "max_parallel": 4,
+    "timeout_seconds": 120,
+    "max_total_tokens_per_cell": 20000,
+    "max_aggregate_worker_tokens": 160000
+  },
+  "arms": [
+    {"arm_id": "A", "label": "no-curated-map", "context_kind": "none", "read_only": true},
+    {"arm_id": "B", "label": "behavior-source-handbook", "context_kind": "behavior_source_handbook", "read_only": true},
+    {"arm_id": "C", "label": "three-layer-graph", "context_kind": "three_layer_graph", "read_only": true},
+    {"arm_id": "D", "label": "three-layer-graph-plus-paired-prior", "context_kind": "three_layer_graph_prior", "read_only": true}
+  ],
+  "task_ids": ["calculator-add", "calculator-subtract"],
+  "seed": 20260802,
+  "offline": true,
+  "web_search": "disabled",
+  "external_side_effects": false,
+  "projected_total_token_gate": 210000,
+  "pilot_status": "blocked_after_calibration_budget_overrun",
+  "notes": "Run --calibrate-only, inspect the sanitized calibration summary, then resume only when the actual CLI usage is at or below the per-cell ceiling."
+}
