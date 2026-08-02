@@ -171,6 +171,7 @@ fn wait_until_board_identity(
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
+            let _ = child.wait();
             bail!(
                 "execution board on 127.0.0.1:{port} did not publish the expected project identity"
             );
