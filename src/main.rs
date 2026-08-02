@@ -17,6 +17,7 @@ mod efficiency_detector;
 mod efficiency_policy;
 mod evolve;
 mod execute;
+mod failure_graph;
 mod graph_store;
 mod handoff;
 mod harness;

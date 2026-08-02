@@ -29,6 +29,11 @@ pub(crate) struct FractalProject {
     /// Optional efficiency ledger stored beside execution and learning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) efficiency: Option<crate::efficiency::EfficiencyData>,
+    /// Additive failure/lesson graph. This field is intentionally outside the
+    /// immutable execution graph and therefore never contributes to
+    /// `graph_hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) failure_graph: Option<crate::failure_graph::FailureGraph>,
     pub(crate) updated_at: String,
     #[serde(default, flatten)]
     pub(crate) extra: BTreeMap<String, Value>,
@@ -303,6 +308,9 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
         execution,
         learning,
         efficiency,
+        failure_graph: current
+            .as_ref()
+            .and_then(|document| document.failure_graph.clone()),
         updated_at: now,
         extra: current
             .as_ref()
@@ -1430,6 +1438,16 @@ fn validate(document: &FractalProject) -> Result<()> {
         reject_secret_fields(&encoded)
             .context("efficiency envelope contains forbidden credential-shaped fields")?;
     }
+    if let Some(failure_graph) = &document.failure_graph {
+        crate::failure_graph::validate(failure_graph)
+            .context("invalid fractal.failure_graph.v1 document")?;
+        let encoded =
+            serde_json::to_value(failure_graph).context("encode fractal.failure_graph.v1")?;
+        reject_secret_fields(&encoded)
+            .context("failure graph contains forbidden credential-shaped fields")?;
+        crate::failure_graph::validate_unknown_fields(failure_graph)
+            .context("failure graph unknown fields contain forbidden credentials")?;
+    }
     if let Some(catalog) = document.extra.get("catalog") {
         let schema = catalog.get("schema").and_then(Value::as_str).unwrap_or("");
         if schema == project_catalog::CATALOG_SCHEMA {
@@ -1583,6 +1601,262 @@ pub(crate) fn replace_catalog(
         document.extra.insert("catalog".to_owned(), encoded.clone());
         Ok(())
     })
+}
+
+/// Return the stored failure graph, or a pure projection of legacy learning
+/// failures when older projects do not yet contain the additive key. Reading
+/// never materializes or rewrites the projection.
+#[allow(dead_code)]
+pub(crate) fn load_failure_graph(workspace: &Path) -> Result<crate::failure_graph::FailureGraph> {
+    let document = load(workspace)?;
+    Ok(document.failure_graph.unwrap_or_else(|| {
+        crate::failure_graph::project_legacy_failures(
+            &document.learning,
+            Some(document.graph_hash.as_str()),
+        )
+    }))
+}
+
+/// Alias used by display/runtime consumers that already hold a decoded
+/// project document. This is intentionally pure and does not write.
+#[allow(dead_code)]
+pub(crate) fn failure_graph(document: &FractalProject) -> crate::failure_graph::FailureGraph {
+    document.failure_graph.clone().unwrap_or_else(|| {
+        crate::failure_graph::project_legacy_failures(
+            &document.learning,
+            Some(document.graph_hash.as_str()),
+        )
+    })
+}
+
+/// Append one failure observation under the canonical project lock. A stable
+/// node/code key groups retries into one record while retaining every
+/// observation in append order.
+#[allow(dead_code)]
+pub(crate) fn append_failure(
+    workspace: &Path,
+    failure: crate::failure_graph::FailureRecord,
+) -> Result<String> {
+    let mut incoming = crate::failure_graph::FailureGraph::empty();
+    incoming.failures.insert(failure.id.clone(), failure);
+    crate::failure_graph::normalize(&mut incoming).context("normalize failure before append")?;
+    let incoming = incoming
+        .failures
+        .into_values()
+        .next()
+        .context("normalized failure was missing")?;
+    let mut incoming = incoming;
+    if incoming.observations.is_empty() {
+        incoming
+            .observations
+            .push(failure_observation_from_record(&incoming));
+    }
+    let id = incoming.id.clone();
+    mutate_document(workspace, |document| {
+        let mut graph = document.failure_graph.clone().unwrap_or_else(|| {
+            crate::failure_graph::project_legacy_failures(
+                &document.learning,
+                Some(document.graph_hash.as_str()),
+            )
+        });
+        crate::failure_graph::normalize(&mut graph).context("normalize existing failure graph")?;
+        if let Some(existing) = graph.failures.get_mut(&id) {
+            if existing.state != crate::failure_graph::FailureState::Unresolved {
+                bail!(
+                    "cannot append a retry to {} failure `{id}`",
+                    format_state(existing.state)
+                );
+            }
+            existing.attempt = existing.attempt.max(incoming.attempt);
+            existing.outcome = incoming.outcome.clone();
+            existing.summary = incoming.summary.clone();
+            existing.capability = incoming.capability.clone().or(existing.capability.clone());
+            existing.component = incoming.component.clone().or(existing.component.clone());
+            existing.source_ref = incoming.source_ref.clone().or(existing.source_ref.clone());
+            existing.agent = incoming.agent.clone().or(existing.agent.clone());
+            existing.model = incoming.model.clone().or(existing.model.clone());
+            existing.version = incoming.version.clone().or(existing.version.clone());
+            existing.observed = incoming.observed.clone();
+            existing.evidence = incoming.evidence.clone();
+            if incoming.observations.is_empty() {
+                existing
+                    .observations
+                    .push(failure_observation_from_record(&incoming));
+            } else {
+                existing.observations.extend(incoming.observations.clone());
+            }
+        } else {
+            graph.failures.insert(id.clone(), incoming.clone());
+        }
+        crate::failure_graph::normalize(&mut graph).context("normalize appended failure graph")?;
+        document.failure_graph = Some(graph);
+        Ok(())
+    })
+    .map(|_| id)
+}
+
+/// Resolve a failure only when the caller supplies an explicit successful
+/// resolution and compact evidence. Existing retry observations remain intact.
+#[allow(dead_code)]
+pub(crate) fn resolve_failure(
+    workspace: &Path,
+    failure_id: &str,
+    resolution: crate::failure_graph::FailureResolution,
+) -> Result<()> {
+    let failure_id = failure_id.to_owned();
+    mutate_document(workspace, |document| {
+        let mut graph = document.failure_graph.clone().unwrap_or_else(|| {
+            crate::failure_graph::project_legacy_failures(
+                &document.learning,
+                Some(document.graph_hash.as_str()),
+            )
+        });
+        let failure = graph
+            .failures
+            .get_mut(&failure_id)
+            .with_context(|| format!("unknown failure `{failure_id}`"))?;
+        if !resolution.success || resolution.evidence.is_empty() {
+            bail!("resolving failure requires successful resolution evidence");
+        }
+        failure.state = crate::failure_graph::FailureState::Resolved;
+        failure.superseded_by = None;
+        failure.resolution = Some(resolution);
+        crate::failure_graph::normalize(&mut graph).context("normalize resolved failure graph")?;
+        document.failure_graph = Some(graph);
+        Ok(())
+    })
+}
+
+/// Mark a failure superseded by another stable failure key. The target must
+/// already exist so status and references cannot drift into a dangling state.
+#[allow(dead_code)]
+pub(crate) fn supersede_failure(
+    workspace: &Path,
+    failure_id: &str,
+    superseded_by: &str,
+) -> Result<()> {
+    let failure_id = failure_id.to_owned();
+    let superseded_by = superseded_by.to_owned();
+    mutate_document(workspace, |document| {
+        let mut graph = document.failure_graph.clone().unwrap_or_else(|| {
+            crate::failure_graph::project_legacy_failures(
+                &document.learning,
+                Some(document.graph_hash.as_str()),
+            )
+        });
+        if !graph.failures.contains_key(&superseded_by) {
+            bail!("superseding failure `{superseded_by}` does not exist");
+        }
+        let failure = graph
+            .failures
+            .get_mut(&failure_id)
+            .with_context(|| format!("unknown failure `{failure_id}`"))?;
+        failure.state = crate::failure_graph::FailureState::Superseded;
+        failure.resolution = None;
+        failure.superseded_by = Some(superseded_by);
+        crate::failure_graph::normalize(&mut graph)
+            .context("normalize superseded failure graph")?;
+        document.failure_graph = Some(graph);
+        Ok(())
+    })
+}
+
+/// Insert or replace one deterministic lesson record. This is the sole lesson
+/// mutation seam; arbitrary JSON updates are intentionally unavailable.
+#[allow(dead_code)]
+pub(crate) fn upsert_lesson(
+    workspace: &Path,
+    lesson: crate::failure_graph::LessonRecord,
+) -> Result<String> {
+    let mut incoming = crate::failure_graph::FailureGraph::empty();
+    incoming.lessons.insert(lesson.id.clone(), lesson);
+    crate::failure_graph::normalize(&mut incoming).context("normalize lesson before upsert")?;
+    let lesson = incoming
+        .lessons
+        .into_values()
+        .next()
+        .context("normalized lesson was missing")?;
+    let id = lesson.id.clone();
+    mutate_document(workspace, |document| {
+        let mut graph = document.failure_graph.clone().unwrap_or_else(|| {
+            crate::failure_graph::project_legacy_failures(
+                &document.learning,
+                Some(document.graph_hash.as_str()),
+            )
+        });
+        graph.lessons.insert(id.clone(), lesson.clone());
+        crate::failure_graph::normalize(&mut graph).context("normalize lesson graph")?;
+        document.failure_graph = Some(graph);
+        Ok(())
+    })
+    .map(|_| id)
+}
+
+/// Add or replace one typed edge. Endpoint and status invariants are checked
+/// by the failure graph validator before the atomic write.
+#[allow(dead_code)]
+pub(crate) fn add_failure_edge(
+    workspace: &Path,
+    mut edge: crate::failure_graph::EdgeRecord,
+) -> Result<String> {
+    if edge.id.trim().is_empty() {
+        edge.id = crate::failure_graph::edge_id(edge.edge_type, &edge.from, &edge.to);
+    }
+    let id = edge.id.clone();
+    mutate_document(workspace, |document| {
+        let mut graph = document.failure_graph.clone().unwrap_or_else(|| {
+            crate::failure_graph::project_legacy_failures(
+                &document.learning,
+                Some(document.graph_hash.as_str()),
+            )
+        });
+        graph.edges.insert(id.clone(), edge.clone());
+        crate::failure_graph::normalize(&mut graph).context("normalize edge graph")?;
+        document.failure_graph = Some(graph);
+        Ok(())
+    })
+    .map(|_| id)
+}
+
+/// Replace the complete typed failure graph through the guarded atomic seam.
+/// Identity, graph, graph_hash, execution, learning, catalog, efficiency,
+/// and every unknown sibling field remain untouched.
+#[allow(dead_code)]
+pub(crate) fn replace_failure_graph(
+    workspace: &Path,
+    mut graph: crate::failure_graph::FailureGraph,
+) -> Result<()> {
+    crate::failure_graph::normalize(&mut graph).context("normalize replacement failure graph")?;
+    mutate_document(workspace, |document| {
+        document.failure_graph = Some(graph.clone());
+        Ok(())
+    })
+}
+
+#[allow(dead_code)]
+fn failure_observation_from_record(
+    record: &crate::failure_graph::FailureRecord,
+) -> crate::failure_graph::FailureObservation {
+    crate::failure_graph::FailureObservation {
+        attempt: record.attempt,
+        outcome: record.outcome.clone(),
+        summary: record.summary.clone(),
+        evidence: record.evidence.clone(),
+        agent: record.agent.clone(),
+        model: record.model.clone(),
+        version: record.version.clone(),
+        observed: record.observed.clone(),
+        ..crate::failure_graph::FailureObservation::default()
+    }
+}
+
+#[allow(dead_code)]
+fn format_state(state: crate::failure_graph::FailureState) -> &'static str {
+    match state {
+        crate::failure_graph::FailureState::Unresolved => "unresolved",
+        crate::failure_graph::FailureState::Resolved => "resolved",
+        crate::failure_graph::FailureState::Superseded => "superseded",
+    }
 }
 
 pub(crate) fn project_timestamp() -> String {
@@ -2563,6 +2837,118 @@ mod tests {
             replace_catalog(&workspace, &catalog).expect_err("secret catalog must be refused");
         assert!(error.to_string().contains("forbidden credential field"));
         assert_eq!(before_bytes, fs::read(path(&workspace))?);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn failure_graph_apis_append_retry_resolve_and_preserve_siblings() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [{"id": "build", "capability": "code.generate", "instruction": "Build"}],
+            "edges": [],
+            "future_graph_field": {"keep": true}
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        persist(&workspace, &graph, "Failure graph")?;
+        mutate_document(&workspace, |document| {
+            document
+                .extra
+                .insert("future_sibling".to_owned(), json!({"keep": true}));
+            Ok(())
+        })?;
+        let original_hash = load(&workspace)?.graph_hash;
+        let first = crate::failure_graph::FailureRecord {
+            node_id: "build".to_owned(),
+            attempt: 1,
+            failure_code: "tool_failure".to_owned(),
+            outcome: "failed_execution".to_owned(),
+            summary: "compiler failed".to_owned(),
+            ..crate::failure_graph::FailureRecord::default()
+        };
+        let failure_id = append_failure(&workspace, first)?;
+        let retry = crate::failure_graph::FailureRecord {
+            node_id: "build".to_owned(),
+            attempt: 2,
+            failure_code: "tool_failure".to_owned(),
+            outcome: "failed_execution".to_owned(),
+            summary: "compiler failed again".to_owned(),
+            ..crate::failure_graph::FailureRecord::default()
+        };
+        append_failure(&workspace, retry)?;
+        let document = load(&workspace)?;
+        let stored = document.failure_graph.as_ref().expect("failure graph");
+        assert_eq!(stored.failures[&failure_id].observations.len(), 2);
+        assert_eq!(stored.failures[&failure_id].attempt, 2);
+        assert_eq!(document.graph_hash, original_hash);
+        assert_eq!(document.extra["future_sibling"], json!({"keep": true}));
+        assert_eq!(document.graph["future_graph_field"], json!({"keep": true}));
+        resolve_failure(
+            &workspace,
+            &failure_id,
+            crate::failure_graph::FailureResolution {
+                success: true,
+                summary: "compiler fixed".to_owned(),
+                evidence: vec![crate::failure_graph::EvidenceRef::legacy("test:build")],
+                ..crate::failure_graph::FailureResolution::default()
+            },
+        )?;
+        assert_eq!(
+            load(&workspace)?.failure_graph.unwrap().failures[&failure_id].state,
+            crate::failure_graph::FailureState::Resolved
+        );
+        let lesson_id = upsert_lesson(
+            &workspace,
+            crate::failure_graph::LessonRecord {
+                summary: "Use a focused compiler check".to_owned(),
+                status: crate::failure_graph::LessonStatus::Adopted,
+                ..crate::failure_graph::LessonRecord::default()
+            },
+        )?;
+        let edge_id = add_failure_edge(
+            &workspace,
+            crate::failure_graph::EdgeRecord {
+                edge_type: crate::failure_graph::FailureEdgeType::ResolvedBy,
+                from: failure_id.clone(),
+                to: lesson_id.clone(),
+                ..crate::failure_graph::EdgeRecord::default()
+            },
+        )?;
+        let final_graph = load(&workspace)?.failure_graph.unwrap();
+        assert!(final_graph.edges.contains_key(&edge_id));
+        assert_eq!(final_graph.edges[&edge_id].to, lesson_id);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_failure_projection_is_read_only() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [{"id": "build", "capability": "code.generate", "instruction": "Build"}],
+            "edges": []
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        persist(&workspace, &graph, "Legacy failure")?;
+        let before = fs::read(path(&workspace))?;
+        mutate_document(&workspace, |document| {
+            let record = document.learning.nodes.get_mut("build").unwrap();
+            record.attempt_count = 1;
+            record.failure_code = Some(crate::learning_data::FailureCode::ToolFailure);
+            record.outcome = Some(crate::learning_data::NodeOutcome::FailedExecution);
+            record.finished_at = Some("2024-01-01T00:00:00Z".to_owned());
+            Ok(())
+        })?;
+        let before_read = fs::read(path(&workspace))?;
+        let projection = load_failure_graph(&workspace)?;
+        assert_eq!(projection.failures.len(), 1);
+        assert!(load(&workspace)?.failure_graph.is_none());
+        assert_eq!(before_read, fs::read(path(&workspace))?);
+        assert_ne!(before, before_read);
         fs::remove_dir_all(workspace)?;
         Ok(())
     }
