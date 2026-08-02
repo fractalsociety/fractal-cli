@@ -1065,7 +1065,10 @@ final class BuildCoordinator: ObservableObject {
         } else {
             hud?.showBuilding()
         }
-        NSSound(named: "Pop")?.play()
+        // Keep the recording-stop acknowledgement on the system beep path.
+        // Looking up a named system sound can cross into media services even
+        // though Fractal Voice has no need for Apple Music or a media library.
+        NSSound.beep()
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
@@ -2365,7 +2368,7 @@ final class BuildCoordinator: ObservableObject {
                 explanation.addButton(withTitle: "Enable")
                 explanation.addButton(withTitle: "Not Now")
                 guard explanation.runModal() == .alertFirstButtonReturn else { return }
-                let granted = (try? await center.requestAuthorization(options: [.alert, .sound])) == true
+                let granted = (try? await center.requestAuthorization(options: [.alert])) == true
                 latestActivity = granted
                     ? "Build notifications enabled"
                     : "Build notifications were not enabled"
@@ -2383,7 +2386,6 @@ final class BuildCoordinator: ObservableObject {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
-        content.sound = .default
         center.add(UNNotificationRequest(
             identifier: UUID().uuidString,
             content: content,
