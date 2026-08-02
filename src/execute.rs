@@ -147,8 +147,18 @@ fn model_for(kind: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentRole {
+    Worker,
+    LeadPlanner,
+}
+
 /// Build the headless worker command for `kind`, honoring a pinned model.
-fn worker_command(kind: &str, prompt: &str) -> Result<Command> {
+///
+/// Lead planning is deliberately a separate invocation role.  In particular,
+/// selecting Codex as the lead must not make its implementation-worker command
+/// inherit the planner's high-effort Sol configuration.
+fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> {
     let mut command = match kind {
         "claude" => {
             let mut c = Command::new("claude");
@@ -162,7 +172,12 @@ fn worker_command(kind: &str, prompt: &str) -> Result<Command> {
         "codex" => {
             let mut c = Command::new("codex");
             c.arg("exec");
-            if let Some(model) = model_for("codex") {
+            if role == AgentRole::LeadPlanner {
+                // Keep the lead's planning model and reasoning effort explicit,
+                // independent of ~/.codex/config.toml or worker routing pins.
+                c.arg("--model").arg("gpt-5.6-sol");
+                c.arg("--config").arg("model_reasoning_effort=\"high\"");
+            } else if let Some(model) = model_for("codex") {
                 c.arg("--model").arg(model);
             }
             c.arg("--dangerously-bypass-approvals-and-sandbox")
@@ -223,6 +238,21 @@ fn run_worker_as(
     run_agent_prompt(kind, &prompt, workspace, timeout_ms)
 }
 
+fn run_lead_agent_as(
+    kind: &str,
+    instruction: &str,
+    workspace: &Path,
+    timeout_ms: u64,
+) -> Result<AgentRun> {
+    let prompt = format!(
+        "You are the lead planner/orchestrator for a coordinated team. Do exactly this assigned \
+         lead task and nothing else:\n\n{instruction}\n\nWork entirely in the current directory. \
+         Preserve the team's graph contract and make any required verification pass. Do not ask \
+         questions; make reasonable choices."
+    );
+    run_lead_agent_prompt(kind, &prompt, workspace, timeout_ms)
+}
+
 /// Run an agent with a verbatim prompt (no team-task wrapper) under a hard time
 /// budget: if it does not finish within `timeout_ms`, the process is killed and
 /// reported as a (timed-out) failure — so a hung agent never stalls the whole
@@ -233,9 +263,45 @@ pub(crate) fn run_agent_prompt(
     workspace: &Path,
     timeout_ms: u64,
 ) -> Result<AgentRun> {
+    run_agent_prompt_with_role(
+        kind,
+        prompt,
+        workspace,
+        timeout_ms,
+        AgentRole::Worker,
+        "worker",
+    )
+}
+
+/// Run a lead planner/orchestrator with its role-specific model configuration.
+/// Generic implementation workers continue through [`run_agent_prompt`].
+pub(crate) fn run_lead_agent_prompt(
+    kind: &str,
+    prompt: &str,
+    workspace: &Path,
+    timeout_ms: u64,
+) -> Result<AgentRun> {
+    run_agent_prompt_with_role(
+        kind,
+        prompt,
+        workspace,
+        timeout_ms,
+        AgentRole::LeadPlanner,
+        "lead planner",
+    )
+}
+
+fn run_agent_prompt_with_role(
+    kind: &str,
+    prompt: &str,
+    workspace: &Path,
+    timeout_ms: u64,
+    role: AgentRole,
+    label: &str,
+) -> Result<AgentRun> {
     // Detach the worker's stdin: headless agents (e.g. `claude -p`) otherwise
     // inherit the CLI's piped stdin and block reading it instead of exiting.
-    let mut command = worker_command(kind, prompt)?;
+    let mut command = worker_command(kind, prompt, role)?;
     command
         .current_dir(workspace)
         .stdin(std::process::Stdio::null());
@@ -243,7 +309,7 @@ pub(crate) fn run_agent_prompt(
     command.process_group(0);
     let mut child = command
         .spawn()
-        .with_context(|| format!("failed to launch worker `{kind}` (is it on PATH?)"))?;
+        .with_context(|| format!("failed to launch {label} `{kind}` (is it on PATH?)"))?;
     let worker = crate::run_control::WorkerGuard::register(child.id());
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
@@ -433,7 +499,7 @@ fn run_lead_closeout(node: &Value, agent: &str, workspace: &Path) -> Result<Node
         .and_then(Value::as_str)
         .unwrap_or("Review and close out the project.");
     let timeout_ms = agent_timeout_ms(node);
-    let run = run_worker_as(agent, instruction, workspace, timeout_ms)?;
+    let run = run_lead_agent_as(agent, instruction, workspace, timeout_ms)?;
     if !run.ok {
         return Ok(NodeOutcome::failure(
             Some(false),
@@ -1857,6 +1923,33 @@ mod tests {
     use std::fs;
     use std::sync::{Arc, Barrier};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn codex_lead_planner_is_pinned_to_sol_high_without_changing_workers() {
+        let lead = worker_command("codex", "plan", AgentRole::LeadPlanner).unwrap();
+        let lead_args: Vec<String> = lead
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(lead_args
+            .windows(2)
+            .any(|pair| { pair == ["--model".to_owned(), "gpt-5.6-sol".to_owned()] }));
+        assert!(lead_args.windows(2).any(|pair| {
+            pair == [
+                "--config".to_owned(),
+                "model_reasoning_effort=\"high\"".to_owned(),
+            ]
+        }));
+
+        let worker = worker_command("codex", "build", AgentRole::Worker).unwrap();
+        let worker_args: Vec<String> = worker
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(!worker_args
+            .iter()
+            .any(|arg| arg == "model_reasoning_effort=\"high\""));
+    }
 
     #[test]
     fn closeout_requires_evidence_for_every_acceptance_criterion() {
