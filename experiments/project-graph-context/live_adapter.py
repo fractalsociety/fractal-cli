@@ -15,6 +15,7 @@ cost or token estimate is inferred from wall time, output bytes, or text.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -206,6 +207,32 @@ def _offline_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
         }
     )
     return env
+
+
+@contextmanager
+def _fresh_codex_home(env: Mapping[str, str]):
+    """Give each planner/worker process an isolated home with auth only.
+
+    ``--ephemeral`` prevents rollout persistence, while this temporary home
+    prevents config, plugin, and thread state from crossing cells.  The sole
+    file copied from the caller's home is the authentication material needed
+    by the agent service; it is never written to a run artifact or committed.
+    """
+
+    source_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).resolve()
+    auth_source = source_home / "auth.json"
+    if not auth_source.is_file():
+        raise AdapterError("Codex auth.json is unavailable; refusing a non-authenticated live call")
+    with tempfile.TemporaryDirectory(prefix="pgc-codex-home-") as temporary:
+        home = Path(temporary)
+        shutil.copy2(auth_source, home / "auth.json")
+        (home / "auth.json").chmod(0o600)
+        isolated = dict(env)
+        isolated["CODEX_HOME"] = str(home)
+        isolated["HOME"] = str(home)
+        isolated["XDG_CONFIG_HOME"] = str(home / "config")
+        isolated["XDG_CACHE_HOME"] = str(home / "cache")
+        yield isolated
 
 
 def _usage_rows(events: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
@@ -450,7 +477,8 @@ def run_planner(task_id: str, output_dir: Path) -> dict[str, Any]:
         env = _offline_env()
         env["FRACTAL_ADAPTER_CWD"] = str(cwd)
         started = time.monotonic()
-        exit_code, timed_out, events, raw_stdout = _run_codex(argv, _planner_prompt(task_id, intent), env=env, timeout_seconds=float(os.environ.get("FRACTAL_SOL_TIMEOUT_SECONDS", "120")))
+        with _fresh_codex_home(env) as isolated_env:
+            exit_code, timed_out, events, raw_stdout = _run_codex(argv, _planner_prompt(task_id, intent), env=isolated_env, timeout_seconds=float(os.environ.get("FRACTAL_SOL_TIMEOUT_SECONDS", "120")))
         if timed_out:
             raise AdapterError(f"Sol planner timed out for {task_id}")
         final_texts = [
@@ -596,12 +624,13 @@ def run_worker() -> int:
         }
     )
     started = time.monotonic()
-    exit_code, timed_out, events, raw_stdout = _run_codex(
-        argv,
-        _worker_prompt(intent, plan, context, arm_id),
-        env=env,
-        timeout_seconds=float(os.environ.get("FRACTAL_LIVE_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS))),
-    )
+    with _fresh_codex_home(env) as isolated_env:
+        exit_code, timed_out, events, raw_stdout = _run_codex(
+            argv,
+            _worker_prompt(intent, plan, context, arm_id),
+            env=isolated_env,
+            timeout_seconds=float(os.environ.get("FRACTAL_LIVE_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS))),
+        )
     _write_jsonl(event_path, events, prefix=prefix)
     trace = _trace_from_events(events, intent.get("allowed_paths", []))
     trace["timed_out"] = timed_out

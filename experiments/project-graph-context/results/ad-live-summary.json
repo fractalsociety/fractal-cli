@@ -1,0 +1,85 @@
+{
+  "schema_version": "project-graph-context.ad-live-summary.v1",
+  "experiment_id": "pgc-live-ad-pilot-20260802",
+  "harness_commit": "571e65cc4069b049254889a6cec262ca2c6810c9",
+  "scope": {
+    "tasks": ["calculator-add", "calculator-subtract", "text-slugify", "text-slugify-edge"],
+    "arms": ["A", "D"],
+    "replicates": 3,
+    "cells": 24,
+    "paired_observations": 12,
+    "completed_cells": 24
+  },
+  "randomization": {
+    "seed": 20260802,
+    "a_first_pairs": 6,
+    "d_first_pairs": 6,
+    "schedule_sha256": "7325b38df04d003a6e55f7d09d26f6cb4a9ecc2d53a6512cafef142c235ab057"
+  },
+  "planner": {
+    "model": "gpt-5.6-sol",
+    "reasoning_effort": "high",
+    "calls": 4,
+    "usage_total_tokens": 44100,
+    "plans": {
+      "calculator-add": {"sha256": "59eb24b48ed29d62420dd1587a04a1d81bf2aa15b5929e9cf2211a7e7f0bd03c", "input_tokens": 10846, "output_tokens": 170, "total_tokens": 11016},
+      "calculator-subtract": {"sha256": "d1f5ad0d18c79680103a05d8b6d12f5f96f48b8d744f28b82c36a7fb8c78b12b", "input_tokens": 10849, "output_tokens": 156, "total_tokens": 11005},
+      "text-slugify": {"sha256": "aa192998dd7ce8f59591cab1af389fbfce0a80e51e5b974a8226e71f2fcadbb4", "input_tokens": 10843, "output_tokens": 176, "total_tokens": 11019},
+      "text-slugify-edge": {"sha256": "c8ec6c546c11f315c9a1556b60d985cb7e3e790523f61fa8da4640c317a51048", "input_tokens": 10856, "output_tokens": 204, "total_tokens": 11060}
+    }
+  },
+  "worker": {"model": "gpt-5.6-luna", "reasoning_effort": "high", "timeout_seconds": 180, "max_parallel": 4, "token_cap_per_cell": 80000, "aggregate_worker_cap": 1920000, "actual_worker_tokens": 1352354, "all_agent_hard_cap": 2250000, "actual_all_agent_tokens": 1396454},
+  "per_arm_metrics": {
+    "A": {"n": 12, "success_rate": 0.9166666667, "complete_task_success_rate": 0.9166666667, "intent_violations_weighted_mean": 0.0, "irrelevant_opens_mean": 0.0, "tokens_mean": 55265.25, "wall_time_ms_mean": 30173.9001, "repeated_failure_codes_mean": 0.0, "repair_iterations": null, "routing_quality": null, "tool_quality": null, "cost_usd": null},
+    "D": {"n": 12, "success_rate": 1.0, "complete_task_success_rate": 1.0, "intent_violations_weighted_mean": 0.0, "irrelevant_opens_mean": 0.0, "tokens_mean": 57430.9167, "wall_time_ms_mean": 29492.572, "repeated_failure_codes_mean": 0.0, "repair_iterations": null, "routing_quality": null, "tool_quality": null, "cost_usd": null}
+  },
+  "paired_D_minus_A": {
+    "success": {"n": 12, "delta_mean": 0.0833333333, "delta_ci_95": [0.0, 0.25], "aggregate_rate_ratio": 1.0909090909, "ratio_ci": "small_n_aggregate_only"},
+    "complete_task_success": {"n": 12, "delta_mean": 0.0833333333, "delta_ci_95": [0.0, 0.25], "aggregate_rate_ratio": 1.0909090909, "ratio_ci": "small_n_aggregate_only"},
+    "tokens": {"n": 12, "delta_mean": 2165.6667, "delta_ci_95": [-2855.4396, 6240.5083], "ratio_mean": 1.0513643, "ratio_ci_95": [0.9797908, 1.1164076]},
+    "wall_time_ms": {"n": 12, "delta_mean": -681.3281, "delta_ci_95": [-3944.2399, 2796.5261], "ratio_mean": 0.9996011, "ratio_ci_95": [0.8852689, 1.1359348]},
+    "intent_violations_weighted": {"n": 12, "delta_mean": 0.0, "delta_ci_95": [0.0, 0.0], "ratio_mean": 1.0, "ratio_ci_95": [1.0, 1.0]},
+    "irrelevant_opens": {"n": 12, "delta_mean": 0.0, "delta_ci_95": [0.0, 0.0], "ratio_mean": 1.0, "ratio_ci_95": [1.0, 1.0]},
+    "repeated_failure_codes": {"n": 12, "delta_mean": 0.0, "delta_ci_95": [0.0, 0.0], "ratio_mean": 1.0, "ratio_ci_95": [1.0, 1.0]},
+    "cost_usd": {"n": 0, "unavailable": true},
+    "repair_iterations": {"n": 0, "unavailable": true},
+    "routing_quality": {"n": 0, "unavailable": true},
+    "tool_quality": {"n": 0, "unavailable": true}
+  },
+  "failure_patterns": {"checker_failure_codes": {"oracle_assertion_failed": 1}, "infrastructure_failures": 0, "changed_paths": {"src/calculator.py": 12, "src/text_utils.py": 12}, "stop_reason": null},
+  "safety": {"hidden_checker_exposed": false, "d_current_outcomes_leaked": false, "git_mutation_detected": false, "context_mounts_read_only": true, "token_receipts_available": 24, "raw_prompts_or_traces_committed": false},
+  "raw_result_hashes": {
+    "ledger_count": 24,
+    "sorted_ledger_hashes_sha256": "fa06920497fd8e929e81ab72813cd3bfc4f921f4a2aa5ebb171762b3fde80c4a",
+    "ledger_hashes": [
+      {"id": "A-calculator-add-0", "sha256": "08da6f695039c6d624725cf9e9dab529d71b3f922d314364091d1ced0d62d1ca", "tokens": 52282, "success": true},
+      {"id": "A-calculator-add-1", "sha256": "9a649a2ca891c6da65146f35cbde8990de87262d825ef044699ed178b6b54382", "tokens": 52170, "success": true},
+      {"id": "A-calculator-add-2", "sha256": "4452ef3c5e844cfd4c15c2dffab189a0cc8c4f14350e9316a00bf0811aa8ba11", "tokens": 52216, "success": true},
+      {"id": "A-calculator-subtract-0", "sha256": "19bec09867d38ed505cd37e1ff17aa88f1a3b6414726150f85639e2e33e28070", "tokens": 51995, "success": true},
+      {"id": "A-calculator-subtract-1", "sha256": "a83700895efe536beef41a3cc91ee2efc5829e37f2594f03d343b6d8cd584bf2", "tokens": 51835, "success": true},
+      {"id": "A-calculator-subtract-2", "sha256": "a788324e6bb168a97d2f354dff0a966a0764ab96ea84cc6e5a0085b33aa6850c", "tokens": 52120, "success": true},
+      {"id": "A-text-slugify-0", "sha256": "d06743a83030e08de650be8ffafcd1ca5d0a29006d6c130391bae5b5250f61e7", "tokens": 53196, "success": true},
+      {"id": "A-text-slugify-1", "sha256": "019ee3e9031fcdad49407b50a0626bfb84dc138c71584dbbd3f138f69d7f5bb7", "tokens": 54298, "success": true},
+      {"id": "A-text-slugify-2", "sha256": "12a602fe1cbb272169f0b070ce1fe8962fa822482528751008c533d0bf7c9eca", "tokens": 52892, "success": true},
+      {"id": "A-text-slugify-edge-0", "sha256": "953aad03230acbf69d4a02bb41069a42ad3653ba0c885dce86a760c1c9be397b", "tokens": 78315, "success": true},
+      {"id": "A-text-slugify-edge-1", "sha256": "3191c55213fe02c5ba206107e9343870aecd1a50001953bbb25e7f426d14e419", "tokens": 55299, "success": false, "checker_failure_code": "oracle_assertion_failed"},
+      {"id": "A-text-slugify-edge-2", "sha256": "611445b88bea7c7cfac0f6fdc27cbb665f852a8683e8d1995192f6355bf07e6d", "tokens": 56565, "success": true},
+      {"id": "D-calculator-add-0", "sha256": "8dd366d695205f299b6ee8bd3e9020e553afd265d2e49e77c7ae879ff81c5bdd", "tokens": 54230, "success": true},
+      {"id": "D-calculator-add-1", "sha256": "d694fddfbab52afba9f40b794e67d90a50b7b660f8969a74e74b8869e7346748", "tokens": 54185, "success": true},
+      {"id": "D-calculator-add-2", "sha256": "74d62844f032fda2b88303524ba2df9d5d7469e2817fd306ab37dc04ebc6f128", "tokens": 54415, "success": true},
+      {"id": "D-calculator-subtract-0", "sha256": "77e1484ac3549c13ba13ee5089af3d3958cea91bce39cb9cf95acf2f37604dad", "tokens": 54276, "success": true},
+      {"id": "D-calculator-subtract-1", "sha256": "1fdd1327f066251e7321a7c909253378213f869dbfb53d8571d0815c830774aa", "tokens": 53979, "success": true},
+      {"id": "D-calculator-subtract-2", "sha256": "a98a71954feef7d21a44d5d6bdcf638810db5752227c8d71e8cbcae7dbfcffe6", "tokens": 65429, "success": true},
+      {"id": "D-text-slugify-0", "sha256": "75994365b1c0aa57a633928ab2bd841c1737339e0dfcbf4b3ce5217754c620fe", "tokens": 56712, "success": true},
+      {"id": "D-text-slugify-1", "sha256": "7cf6a1b69f51f6c834ef21632e5ef1c40ac4f165701c51c9feadc340e20294fa", "tokens": 56283, "success": true},
+      {"id": "D-text-slugify-2", "sha256": "eb014edbbe2034655c62e98db2755424884e8e299026150cab4082dd65fb9b8c", "tokens": 55545, "success": true},
+      {"id": "D-text-slugify-edge-0", "sha256": "b55b59efe931f531ce5b8749f1ca2678c2e8c9a060f2452d481abd4c55d22c4e", "tokens": 56625, "success": true},
+      {"id": "D-text-slugify-edge-1", "sha256": "8f1f86a795659d9491cb5a61e34ab95eda101b7c45704131ca0d4d7f4347ecc4", "tokens": 69267, "success": true},
+      {"id": "D-text-slugify-edge-2", "sha256": "e27a7b1d63d5df59760c4bf296b8f7404744ce4a571d6186df975c7f344064c1", "tokens": 58225, "success": true}
+    ],
+    "source_commits": {"calculator-add": "605ecdfcd76541a2d4873fe18b2e3cb7350dcada", "calculator-subtract": "a11cc7e1289ae9464a5f625bacc0b0687dd67adb", "text-slugify": "fc9bf7f655b15b598d3008742c4be0ab8c3ef92e", "text-slugify-edge": "dff906c74e97e4d693c5303df8f46956f9a051dc"},
+    "context_hashes": {"A": "4808aa76ae8f4a10e6702f173ca69a27425f82a5a3afc963413c93cf59ca702b", "D_calculator_add": "7e581c5677b1062a8786e813044c8a9b85481bb00912c40267dc5864ef2f5c5e", "D_calculator_subtract": "26eedcf2feb218da22f32d3b6cffb8b79456ff55b989e2818d4a01a9c36b6d9c", "D_text_slugify": "8d69e19f3699c43c085bb8e93e51c4bd287a9642fdbfd7980c518a48907dfa0f", "D_text_slugify_edge": "34053b07aba62d81a2835bc5cb852302655c5afa11bb560df90ac13c571fbe91"}
+  },
+  "decision": {"direct_A_vs_D": "descriptive_only_inconclusive", "continuing_to_C_D_decomposition": true, "production_go": false, "reason": "A-vs-D cannot separate graph exposure from prior/learning exposure; missing cost/repair/routing/tool telemetry also prevents a complete threshold decision."},
+  "limitations": ["One direct contrast does not identify the graph or prior component separately.", "No CLI cost field was emitted; cost remains unavailable.", "Repair, routing, and tool-selection traces were absent and are not imputed.", "The single A failure was text-slugify-edge replicate 1; D had no checker failures.", "Raw prompts, JSONL traces, receipts, and detached worktrees are excluded; only hashes/scalars are retained."]
+}

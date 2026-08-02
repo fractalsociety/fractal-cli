@@ -1,0 +1,19 @@
+{
+  "schema_version": "project-graph-context.ad-live-manifest.v1",
+  "experiment_id": "pgc-live-ad-pilot-20260802",
+  "harness_commit": "571e65cc4069b049254889a6cec262ca2c6810c9",
+  "tasks": ["calculator-add", "calculator-subtract", "text-slugify", "text-slugify-edge"],
+  "arms": ["A", "D"],
+  "replicates": 3,
+  "cells": 24,
+  "paired_observations": 12,
+  "seed": 20260802,
+  "planner": {"model": "gpt-5.6-sol", "reasoning_effort": "high", "calls": 4, "arm_blind": true, "reuse": "unchanged across A/D and repetitions"},
+  "worker": {"model": "gpt-5.6-luna", "reasoning_effort": "high", "timeout_seconds": 180, "max_parallel": 4, "token_cap_per_cell": 80000, "aggregate_worker_cap": 1920000, "all_agent_hard_cap": 2250000},
+  "offline": true,
+  "web_search": "disabled",
+  "external_side_effects": false,
+  "d_prior": "frozen time-sliced paired-task examples only; no evaluation outcomes or hidden oracle details",
+  "stop_rules": ["aggregate actual tokens > 2250000", "leakage/safety/git mutation", "infrastructure failures > 20 percent"],
+  "status": "completed; descriptive A-vs-D only"
+}
