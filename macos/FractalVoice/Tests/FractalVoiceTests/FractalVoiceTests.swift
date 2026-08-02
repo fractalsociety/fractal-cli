@@ -1,8 +1,80 @@
 import Carbon.HIToolbox
+import Foundation
 import XCTest
 @testable import FractalVoice
 
 final class FractalVoiceTests: XCTestCase {
+    private var packageRoot: URL {
+        // `#filePath` points at Tests/FractalVoiceTests/FractalVoiceTests.swift.
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
+    func testAppMetadataDoesNotRequestMediaLibraryAccess() throws {
+        let metadataURLs = [
+            packageRoot.appendingPathComponent("Info.plist"),
+            packageRoot.appendingPathComponent("AppStore/FractalVoice.entitlements"),
+            packageRoot.appendingPathComponent("AppStore/FractalVoiceChild.entitlements"),
+            packageRoot.appendingPathComponent("DeveloperID.entitlements"),
+        ]
+        let forbiddenKeys = [
+            "NSAppleMusicUsageDescription",
+            "NSMediaLibraryUsageDescription",
+            "com.apple.security.media-library",
+            "com.apple.security.media-library.read-write",
+        ]
+
+        for url in metadataURLs {
+            let data = try Data(contentsOf: url)
+            let propertyList = try XCTUnwrap(
+                PropertyListSerialization.propertyList(
+                    from: data,
+                    options: [],
+                    format: nil
+                ) as? [String: Any]
+            )
+            for key in forbiddenKeys {
+                XCTAssertNil(
+                    propertyList[key],
+                    "\(url.lastPathComponent) must not declare media-library access (\(key))"
+                )
+            }
+        }
+    }
+
+    func testMacOSSourcesAvoidMediaLibraryAndNamedSoundLookups() throws {
+        let sourceRoot = packageRoot.appendingPathComponent("Sources/FractalVoice")
+        let forbiddenFragments = [
+            "import MediaPlayer",
+            "import MusicKit",
+            "MPMediaLibrary",
+            "MPNowPlaying",
+            "SKCloudServiceController",
+            "ITLibrary",
+            "NSSound(named:",
+            "UNNotificationSound",
+            "requestAuthorization(options: [.alert, .sound])",
+        ]
+        let enumerator = try XCTUnwrap(
+            FileManager.default.enumerator(
+                at: sourceRoot,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            )
+        )
+        for case let url as URL in enumerator where url.pathExtension == "swift" {
+            let source = try String(contentsOf: url, encoding: .utf8)
+            for fragment in forbiddenFragments {
+                XCTAssertFalse(
+                    source.contains(fragment),
+                    "\(url.lastPathComponent) must not reference \(fragment)"
+                )
+            }
+        }
+    }
+
     func testStartupAndExternalTextHandoffNeverRequestPermissions() {
         XCTAssertFalse(PermissionPolicy.shouldRequestMicrophone(in: .appLaunch))
         XCTAssertFalse(PermissionPolicy.shouldRequestNotifications(in: .appLaunch))

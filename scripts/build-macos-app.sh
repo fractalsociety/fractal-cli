@@ -93,6 +93,37 @@ for resource_bundle in "$XCODE_PRODUCTS"/*.bundle; do
     && cp -R "$resource_bundle" "$CONTENTS/Resources/"
 done
 
+# Fractal Voice uses AVFoundation/AVFAudio only for its explicit microphone
+# recorder and local Kokoro TTS.  A media-library declaration or framework
+# would make macOS attribute an Apple Music / Media & Apple Music request to
+# the app, so reject either one before signing a distributable bundle.
+MEDIA_PERMISSION_KEYS=(
+  NSAppleMusicUsageDescription
+  NSMediaLibraryUsageDescription
+  com.apple.security.media-library
+  com.apple.security.media-library.read-write
+)
+while IFS= read -r -d '' plist; do
+  for key in "${MEDIA_PERMISSION_KEYS[@]}"; do
+    if /usr/libexec/PlistBuddy -c "Print :$key" "$plist" >/dev/null 2>&1; then
+      echo "Media-library permission declaration is not allowed: $plist ($key)" >&2
+      exit 1
+    fi
+  done
+done < <(find "$CONTENTS" -type f -name Info.plist -print0)
+
+MEDIA_FRAMEWORKS="$({
+  otool -L "$CONTENTS/MacOS/FractalVoice"
+  otool -L "$CONTENTS/Resources/fractal"
+  find "$CONTENTS" -type f -perm -111 -print0 \
+    | xargs -0 -n1 otool -L 2>/dev/null || true
+} | grep -E '/(MediaPlayer|MusicKit|iTunesLibrary|MediaLibraryServices)\.framework/' || true)"
+if [[ -n "$MEDIA_FRAMEWORKS" ]]; then
+  echo "Media-library framework linkage is not allowed in Fractal Voice:" >&2
+  echo "$MEDIA_FRAMEWORKS" >&2
+  exit 1
+fi
+
 # Release builds from Swift packages can retain local object-file paths in their
 # symbol tables even when compiler path remapping is enabled. Strip those
 # non-runtime symbols before signing so distributed bundles do not disclose the
