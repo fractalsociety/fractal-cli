@@ -271,8 +271,13 @@ fn process_event(event: InputEvent, options: EventOptions<'_>) -> Result<()> {
 
     let managed_workspace = if options.managed_project {
         if !managed_project_risk_allowed(risk) {
+            let modality = if event.modality == "text" {
+                "text"
+            } else {
+                "voice"
+            };
             bail!(
-                "{risk} voice input cannot run automatically from the Fractal Voice app; \
+                "{risk} {modality} input cannot run automatically from the Fractal Voice app; \
                  review and run it from a terminal"
             );
         }

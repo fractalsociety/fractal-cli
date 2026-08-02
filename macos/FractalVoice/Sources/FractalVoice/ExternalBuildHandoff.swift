@@ -6,9 +6,17 @@ struct ExternalBuildRequest: Equatable {
     let projectName: String
 }
 
+enum ExternalBuildResultStatus: String {
+    case started
+    case accepted
+    case projectNameTaken = "project_name_taken"
+    case failed
+}
+
 enum ExternalBuildHandoff {
     private static let queuedFilePrefix = "fractal-build-"
     private static let schema = "fractal.external_build.v1"
+    private static let resultSchema = "fractal.external_build_result.v1"
     private static let maximumBytes = 40 * 1024
     private static let maximumAgeMilliseconds: UInt64 = 2 * 60 * 1_000
 
@@ -125,6 +133,76 @@ enum ExternalBuildHandoff {
             let right = (try? rhs.resourceValues(forKeys: [.creationDateKey]).creationDate)
                 ?? .distantFuture
             return left < right
+        }
+    }
+
+    static func resultURL(for sourceURL: URL) -> URL {
+        sourceURL.deletingPathExtension().appendingPathExtension("result")
+    }
+
+    /// Write an owner-only, atomically replaced result for the external text
+    /// caller. The CLI treats `started` as non-terminal while it waits for the
+    /// authoritative project-name check to complete.
+    static func writeResult(
+        to url: URL,
+        status: ExternalBuildResultStatus,
+        projectName: String,
+        message: String
+    ) {
+        let fileManager = FileManager.default
+        let resolvedParent = url.deletingLastPathComponent()
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let allowedParents = [
+            URL(fileURLWithPath: "/tmp", isDirectory: true),
+            fileManager.temporaryDirectory,
+        ].map { $0.resolvingSymlinksInPath().standardizedFileURL }
+        guard
+            url.pathExtension == "result",
+            url.lastPathComponent.hasPrefix("fractal-build-"),
+            allowedParents.contains(where: {
+                resolvedParent.path == $0.path
+                    || resolvedParent.path.hasPrefix($0.path + "/")
+            })
+        else {
+            return
+        }
+        let payload: [String: Any] = [
+            "schema": resultSchema,
+            "status": status.rawValue,
+            "project_name": projectName,
+            "message": message,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+            return
+        }
+        let temporary = url
+            .deletingLastPathComponent()
+            .appendingPathComponent(
+                ".\(url.lastPathComponent).\(UUID().uuidString).tmp"
+            )
+        guard fileManager.createFile(
+            atPath: temporary.path,
+            contents: data,
+            attributes: [.posixPermissions: 0o600]
+        ) else {
+            return
+        }
+        // A rename is atomic on the same filesystem and avoids exposing a
+        // partially written JSON document to the waiting CLI.
+        guard rename(temporary.path, url.path) == 0 else {
+            try? fileManager.removeItem(at: temporary)
+            return
+        }
+        try? fileManager.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
+        // A caller that timed out while the app was queued should not leave
+        // a durable response in /tmp. Give the normal CLI reader ample time,
+        // then remove terminal results automatically.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 120) {
+            try? fileManager.removeItem(at: url)
         }
     }
 }

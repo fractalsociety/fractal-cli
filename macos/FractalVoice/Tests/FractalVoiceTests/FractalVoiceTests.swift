@@ -579,6 +579,50 @@ final class FractalVoiceTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
+    func testExternalBuildResultChannelIsPrivateAndStructured() throws {
+        let requestURL = URL(fileURLWithPath: "/tmp").appendingPathComponent(
+            "fractal-build-result-\(UUID().uuidString).fractalbuild"
+        )
+        let resultURL = ExternalBuildHandoff.resultURL(for: requestURL)
+        defer { try? FileManager.default.removeItem(at: resultURL) }
+
+        ExternalBuildHandoff.writeResult(
+            to: resultURL,
+            status: .projectNameTaken,
+            projectName: "Hello World",
+            message: "Project name is already taken. Retry with a different project name."
+        )
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: resultURL.path)
+        let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        XCTAssertEqual(permissions & 0o777, 0o600)
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: resultURL)) as? [String: Any]
+        )
+        XCTAssertEqual(payload["schema"] as? String, "fractal.external_build_result.v1")
+        XCTAssertEqual(payload["status"] as? String, "project_name_taken")
+        XCTAssertEqual(payload["project_name"] as? String, "Hello World")
+    }
+
+    func testExternalBuildResultRejectsPathsOutsideTemporaryDirectory() {
+        let unsafeURL = URL(fileURLWithPath: "/tmp/../fractal-build-unsafe.result")
+        try? FileManager.default.removeItem(at: unsafeURL)
+        ExternalBuildHandoff.writeResult(
+            to: unsafeURL,
+            status: .failed,
+            projectName: "Unsafe",
+            message: "must not be written"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: unsafeURL.path))
+    }
+
+    func testTextProjectActivityDoesNotUseVoiceLabel() {
+        XCTAssertEqual(
+            BuildCoordinator.activitySummary(for: "Created managed text project: /tmp/demo"),
+            "Text project created — lead agent is preparing the plan…"
+        )
+    }
+
     func testExternalVisibilityHandoffIsPrivateFreshAndSingleUse() throws {
         let url = URL(fileURLWithPath: "/tmp").appendingPathComponent(
             "fractal-visibility-\(UUID().uuidString).fractalvisibility"
