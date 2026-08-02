@@ -134,6 +134,7 @@ struct RuntimeSync {
 static UPLOAD_SCHEDULER: OnceLock<UploadScheduler> = OnceLock::new();
 static RUNTIME_SYNCS: OnceLock<Mutex<BTreeMap<PathBuf, RuntimeSync>>> = OnceLock::new();
 pub(crate) const PROJECT_NAME_TAKEN_MARKER: &str = "FRACTAL_PROJECT_NAME_TAKEN";
+const MAX_PROJECT_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 
 fn preference_path(workspace: &Path) -> PathBuf {
     workspace.join(".fractal").join("sync.json")
@@ -529,21 +530,7 @@ fn upload(
             }
         }
     }
-    let mut body = serde_json::to_value(&document)?;
-    if let Some(repository) = repository {
-        let object = body
-            .as_object_mut()
-            .context("fractal project must encode as an object")?;
-        object.insert(
-            "repository_url".to_owned(),
-            repository.repository_url.clone().into(),
-        );
-        object.insert(
-            "github_graph_url".to_owned(),
-            repository.github_graph_url.clone().into(),
-        );
-    }
-    let encoded = serde_json::to_string(&body)?;
+    let encoded = encode_upload_body_from_document(&document, repository)?;
     let prior_hash = hosted_hash.or_else(|| {
         load_state(workspace)
             .filter(|state| {
@@ -622,6 +609,41 @@ fn upload(
         },
     )?;
     Ok(result)
+}
+
+#[cfg(test)]
+fn encode_upload_body(workspace: &Path, repository: Option<&RepositoryLink>) -> Result<String> {
+    let document = crate::project_file::load(workspace)?;
+    encode_upload_body_from_document(&document, repository)
+}
+
+fn encode_upload_body_from_document(
+    document: &crate::project_file::FractalProject,
+    repository: Option<&RepositoryLink>,
+) -> Result<String> {
+    let mut body = serde_json::to_value(document)?;
+    if let Some(repository) = repository {
+        let object = body
+            .as_object_mut()
+            .context("fractal project must encode as an object")?;
+        object.insert(
+            "repository_url".to_owned(),
+            repository.repository_url.clone().into(),
+        );
+        object.insert(
+            "github_graph_url".to_owned(),
+            repository.github_graph_url.clone().into(),
+        );
+    }
+    let encoded = serde_json::to_string(&body)?;
+    if encoded.len() > MAX_PROJECT_UPLOAD_BYTES {
+        bail!(
+            "project graph upload payload is too large ({} bytes > {} bytes)",
+            encoded.len(),
+            MAX_PROJECT_UPLOAD_BYTES
+        );
+    }
+    Ok(encoded)
 }
 
 pub(crate) fn publish_visibility(workspace: &Path) -> Result<()> {
@@ -948,6 +970,278 @@ fn save_state(workspace: &Path, state: &SyncState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
+
+    fn temp_workspace(prefix: &str) -> Result<PathBuf> {
+        let workspace = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir_all(&workspace)?;
+        Ok(workspace)
+    }
+
+    fn valid_graph() -> Value {
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_sync_boundary",
+            "nodes": [
+                {"id": "build", "capability": "code.generate", "instruction": "Build", "future_node_field": {"keep": true}},
+                {"id": "verify", "capability": "project.tests.execute", "instruction": "Verify"}
+            ],
+            "edges": [{"from": "build", "to": "verify"}],
+            "future_graph_field": {"preserve": ["complete", "graph"]}
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        graph
+    }
+
+    #[test]
+    fn mocked_upload_payload_preserves_enriched_current_project_document() -> Result<()> {
+        let workspace = temp_workspace("fractal-sync-enriched-payload")?;
+        let graph = valid_graph();
+        crate::project_file::persist(&workspace, &graph, "Sync enriched graph")?;
+        crate::project_file::mark_node_ready(&workspace, "build")?;
+        crate::project_file::checkout_start_node(&workspace, "build", "agent-1", "Agent One")?;
+        crate::project_file::record_artifact_produced(&workspace, "build", "artifact:log")?;
+        crate::project_file::record_artifact_consumed(&workspace, "build", "artifact:spec")?;
+        crate::project_file::record_verification_result(
+            &workspace,
+            "build",
+            true,
+            vec!["artifact:log".to_owned()],
+        )?;
+        crate::project_file::finish_node(
+            &workspace,
+            "build",
+            "agent-1",
+            crate::learning_data::NodeOutcome::VerifiedSuccess,
+        )?;
+        crate::project_file::record_graph_edit(
+            &workspace,
+            graph["graph_hash"].as_str().unwrap(),
+            "add_branch",
+            Some("build"),
+            vec!["verify".to_owned()],
+            "operator requested verifier",
+            "lead",
+        )?;
+        let outcome =
+            crate::learning_data::aggregate(&crate::project_file::load(&workspace)?.learning);
+        crate::project_file::store_graph_outcome(&workspace, outcome)?;
+
+        let payload: Value = serde_json::from_str(&encode_upload_body(&workspace, None)?)?;
+
+        assert_eq!(payload["graph"], graph);
+        assert_eq!(
+            payload["graph"]["future_graph_field"],
+            json!({"preserve": ["complete", "graph"]})
+        );
+        assert_eq!(
+            payload["learning"]["nodes"]["build"]["outcome"],
+            json!("verified_success")
+        );
+        assert_eq!(
+            payload["learning"]["nodes"]["build"]["artifacts_produced"],
+            json!(["artifact:log"])
+        );
+        assert_eq!(
+            payload["learning"]["nodes"]["build"]["consumed_by"],
+            json!(["artifact:spec"])
+        );
+        assert_eq!(
+            payload["learning"]["nodes"]["build"]["verification"]["passed"],
+            json!(true)
+        );
+        assert_eq!(
+            payload["learning"]["graph_edits"][0]["action"]["type"],
+            json!("add_branch")
+        );
+        assert!(payload["learning"]["outcome"].is_object());
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mocked_upload_payload_normalizes_legacy_project_without_stripping_graph() -> Result<()> {
+        let workspace = temp_workspace("fractal-sync-legacy-payload")?;
+        fs::create_dir_all(workspace.join(".fractal"))?;
+        let graph = valid_graph();
+        let legacy = json!({
+            "schema": "fractal.project.v1",
+            "project": {"slug": "legacy-sync", "title": "Legacy Sync", "visibility": "private"},
+            "graph_hash": graph["graph_hash"],
+            "graph": graph,
+            "updated_at": "2024-01-01T00:00:00Z",
+            "future_project_field": {"kept": true}
+        });
+        fs::write(
+            crate::project_file::path(&workspace),
+            serde_json::to_vec_pretty(&legacy)?,
+        )?;
+
+        let payload: Value = serde_json::from_str(&encode_upload_body(&workspace, None)?)?;
+
+        assert_eq!(
+            payload["graph"]["future_graph_field"],
+            json!({"preserve": ["complete", "graph"]})
+        );
+        assert_eq!(payload["future_project_field"], json!({"kept": true}));
+        assert_eq!(payload["learning"]["schema"], json!("fractal.learning.v1"));
+        assert_eq!(
+            payload["learning"]["nodes"]["verify"]["depends_on"],
+            json!(["build"])
+        );
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_or_oversized_project_data_is_refused_before_upload_payload_exists() -> Result<()> {
+        let workspace = temp_workspace("fractal-sync-invalid-payload")?;
+        let graph = valid_graph();
+        crate::project_file::persist(&workspace, &graph, "Invalid upload")?;
+        let mut raw: Value =
+            serde_json::from_slice(&fs::read(crate::project_file::path(&workspace))?)?;
+        raw["learning"]["nodes"]["build"]["notes"] = json!("x".repeat(1001));
+        fs::write(
+            crate::project_file::path(&workspace),
+            serde_json::to_vec_pretty(&raw)?,
+        )?;
+        assert!(encode_upload_body(&workspace, None)
+            .expect_err("oversized learning data must not be encoded for upload")
+            .to_string()
+            .contains("notes exceed"));
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cross_boundary_sync_payload_preserves_ac1_through_ac8_fields() -> Result<()> {
+        std::env::set_var("FRACTAL_OFFLINE", "1");
+        let workspace = temp_workspace("fractal-sync-cross-boundary")?;
+        fs::create_dir_all(workspace.join(".fractal"))?;
+        fs::write(
+            workspace.join(".fractal").join("lead-prd.json"),
+            serde_json::to_vec(&json!({
+                "schema": "fractal.prd.v1",
+                "acceptance_criteria": [{"id": "AC-1"}, {"id": "AC-2"}]
+            }))?,
+        )?;
+        let graph = valid_graph();
+        let before_hash = graph["graph_hash"].as_str().unwrap().to_owned();
+        crate::project_file::persist(&workspace, &graph, "Sync cross-boundary")?;
+        crate::project_file::mark_node_ready(&workspace, "build")?;
+        crate::project_file::checkout_start_node(&workspace, "build", "agent-1", "Agent One")?;
+        crate::project_file::record_artifact_produced(&workspace, "build", "artifact:build")?;
+        crate::project_file::record_artifact_consumed(&workspace, "build", "artifact:spec")?;
+        crate::project_file::set_node_costs(&workspace, "build", Some(1.0), Some(1.25))?;
+        crate::project_file::record_human_intervention(
+            &workspace,
+            "build",
+            Some("operator nudged"),
+        )?;
+        crate::project_file::record_verification_result(
+            &workspace,
+            "build",
+            true,
+            vec!["evidence:ac-1".to_owned()],
+        )?;
+        crate::project_file::finish_node(
+            &workspace,
+            "build",
+            "agent-1",
+            crate::learning_data::NodeOutcome::VerifiedSuccess,
+        )?;
+        crate::project_file::record_graph_edit(
+            &workspace,
+            &before_hash,
+            "add_branch",
+            Some("build"),
+            vec!["verify".to_owned()],
+            "operator requested verifier",
+            "lead",
+        )?;
+        let document = crate::project_file::load(&workspace)?;
+        let outcome =
+            crate::learning_data::aggregate_for_graph(&document.learning, &document.graph);
+        crate::project_file::store_graph_outcome(&workspace, outcome)?;
+
+        let payload: Value = serde_json::from_str(&encode_upload_body(&workspace, None)?)?;
+        assert_eq!(payload["graph"], graph);
+        assert_eq!(payload["graph_hash"], json!(before_hash));
+        let build = &payload["learning"]["nodes"]["build"];
+        assert_eq!(build["node_id"], json!("build"));
+        assert_eq!(build["node_type"], json!("implementation"));
+        assert!(!build["objective"].as_str().unwrap_or("").is_empty());
+        assert_eq!(build["depends_on"], json!([]));
+        assert!(build["created_at"].as_str().is_some());
+        assert!(build["ready_at"].as_str().is_some());
+        assert!(build["started_at"].as_str().is_some());
+        assert!(build["finished_at"].as_str().is_some());
+        assert_eq!(build["executor"]["agent"], json!("Agent One"));
+        assert_eq!(build["attempt_count"], json!(1));
+        assert_eq!(build["outcome"], json!("verified_success"));
+        assert!(build.get("failure_code").is_none());
+        assert_eq!(build["verification"]["passed"], json!(true));
+        assert_eq!(
+            build["verification"]["evidence_refs"],
+            json!(["evidence:ac-1"])
+        );
+        assert_eq!(build["artifacts_produced"], json!(["artifact:build"]));
+        assert_eq!(build["consumed_by"], json!(["artifact:spec"]));
+        assert_eq!(build["human_intervention"], json!(true));
+        assert_eq!(build["estimated_cost"], json!(1.0));
+        assert_eq!(build["actual_cost"], json!(1.25));
+        assert_eq!(
+            payload["learning"]["graph_edits"][0]["action"]["type"],
+            json!("add_branch")
+        );
+        assert_eq!(
+            payload["learning"]["graph_edits"][0]["graph_before_hash"],
+            json!(before_hash)
+        );
+        let outcome = &payload["learning"]["outcome"];
+        assert!(outcome.is_object());
+        assert!(outcome["acceptance_criteria"].is_array());
+        assert!(outcome["maximum_parallelism"].as_u64().is_some());
+        assert!(outcome["retry_count"].as_u64().is_some());
+        assert!(outcome["reopened_node_count"].as_u64().is_some());
+        assert!(outcome["dead_or_unused_node_count"].as_u64().is_some());
+        assert!(outcome["human_intervention_count"].as_u64().is_some());
+        assert!(outcome["verification_coverage"].as_f64().is_some());
+        assert!(outcome["verification_coverage_denominator"]
+            .as_u64()
+            .is_some());
+        for optional in [
+            "final_verified_success",
+            "total_duration_seconds",
+            "critical_path_duration_seconds",
+            "total_agent_time_seconds",
+            "total_cost",
+            "stopped_too_early",
+            "expanded_unnecessarily",
+        ] {
+            if let Some(value) = outcome.get(optional) {
+                assert!(
+                    value.is_null() || value.is_boolean() || value.is_number(),
+                    "{optional} must be null, bool, or number when present"
+                );
+            }
+        }
+        let typed = crate::project_file::load(&workspace)?
+            .learning
+            .outcome
+            .unwrap();
+        assert!(typed.human_intervention_count >= 1);
+        assert!(typed.verification_coverage_denominator >= 1);
+        let encoded = serde_json::to_string(&payload)?;
+        assert!(!encoded.contains("chain_of_thought"));
+        assert!(!encoded.contains("api_key"));
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
 
     #[test]
     fn disabled_preference_never_requests_sync() -> Result<()> {

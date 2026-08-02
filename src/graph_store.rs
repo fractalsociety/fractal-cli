@@ -86,6 +86,7 @@ pub(crate) fn load_source(graph_hash: &str) -> Option<(Value, Value, String)> {
 pub(crate) fn commit_graph(graph: &Value) -> Result<CommitRecord> {
     let graph_hash = claimed_hash(graph)?;
     verify_graph_hash(graph, graph_hash)?;
+    reject_forbidden_graph_content(graph)?;
     validate_graph_hash(graph_hash)?;
     let root = graph_root()?;
     ensure_store_root(&root)?;
@@ -122,6 +123,7 @@ pub(crate) fn load_graph(graph_hash: &str) -> Result<Value> {
             path.display()
         )
     })?;
+    reject_forbidden_graph_content(&graph)?;
     Ok(graph)
 }
 
@@ -229,6 +231,43 @@ fn verify_graph_hash(graph: &Value, claimed: &str) -> Result<()> {
 pub(crate) fn verify_graph_document(graph: &Value) -> Result<()> {
     let claimed = claimed_hash(graph)?;
     verify_graph_hash(graph, claimed)
+}
+
+fn reject_forbidden_graph_content(value: &Value) -> Result<()> {
+    const MAX_STRING_BYTES: usize = 1_000_000;
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                let normalized = key.to_ascii_lowercase().replace('-', "_");
+                if matches!(
+                    normalized.as_str(),
+                    "access_token"
+                        | "api_key"
+                        | "authorization"
+                        | "credentials"
+                        | "password"
+                        | "private_key"
+                        | "refresh_token"
+                        | "secret"
+                        | "secrets"
+                        | "token"
+                ) {
+                    bail!("execution graph contains forbidden credential field `{key}`");
+                }
+                reject_forbidden_graph_content(child)?;
+            }
+        }
+        Value::Array(array) => {
+            for child in array {
+                reject_forbidden_graph_content(child)?;
+            }
+        }
+        Value::String(text) if text.len() > MAX_STRING_BYTES => {
+            bail!("execution graph string content exceeds {MAX_STRING_BYTES} bytes");
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Recompute a graph's canonical content hash after an authorized structural
@@ -386,6 +425,44 @@ mod tests {
     }
 
     #[test]
+    fn rejects_secret_and_oversized_graph_content() -> Result<()> {
+        let _lock = ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow!("environment lock poisoned"))?;
+        let _home = TestHome::new("secret-content")?;
+        let mut secret = valid_graph()?;
+        secret["nodes"][0]["api_key"] = Value::String("must-not-leak".to_owned());
+        secret.as_object_mut().unwrap().remove("graph_hash");
+        secret["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&secret).unwrap());
+        let error = commit_graph(&secret).expect_err("secret graph fields must fail");
+        assert!(error.to_string().contains("forbidden credential field"));
+
+        let mut oversized = valid_graph()?;
+        oversized["nodes"][0]["instruction"] = Value::String("x".repeat(1_000_001));
+        oversized.as_object_mut().unwrap().remove("graph_hash");
+        oversized["graph_hash"] =
+            Value::String(fractal_contracts::canonical_sha256(&oversized).unwrap());
+        let error = commit_graph(&oversized).expect_err("oversized graph strings must fail");
+        assert!(error.to_string().contains("exceeds 1000000 bytes"));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_execution_graph_with_unknown_learning_field_round_trips() -> Result<()> {
+        let _lock = ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow!("environment lock poisoned"))?;
+        let _home = TestHome::new("legacy-learning-field")?;
+        let mut graph = valid_graph()?;
+        graph["learning"] = json!({"schema": "fractal.learning.v0", "legacy": true});
+        graph.as_object_mut().unwrap().remove("graph_hash");
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        let record = commit_graph(&graph)?;
+        assert_eq!(load_graph(&record.graph_hash)?, graph);
+        Ok(())
+    }
+
+    #[test]
     fn absent_hash_errors() -> Result<()> {
         let _lock = ENV_LOCK
             .lock()
@@ -428,6 +505,61 @@ mod tests {
         let entries =
             fs::read_dir(home.path.join("graphs"))?.collect::<std::io::Result<Vec<_>>>()?;
         assert_eq!(entries.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cross_boundary_legacy_and_enriched_round_trip_preserve_hash() -> Result<()> {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home = TestHome::new("cross-boundary-store")?;
+
+        let mut legacy = valid_graph()?;
+        legacy["future_compatible_field"] = json!({"kept": true});
+        legacy.as_object_mut().unwrap().remove("graph_hash");
+        legacy["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&legacy).unwrap());
+        let legacy_record = commit_graph(&legacy)?;
+        assert_eq!(load_graph(&legacy_record.graph_hash)?, legacy);
+        verify_graph_document(&legacy)?;
+
+        let mut enriched = valid_graph()?;
+        enriched["learning_hint"] = json!({
+            "schema": "fractal.learning.v1",
+            "nodes": {
+                "analyze": {
+                    "node_id": "analyze",
+                    "node_type": "implementation",
+                    "objective": "Analyze",
+                    "depends_on": [],
+                    "attempt_count": 0,
+                    "artifacts_produced": ["artifact:spec"],
+                    "consumed_by": [],
+                    "human_intervention": false,
+                    "reopen_count": 0
+                }
+            },
+            "graph_edits": [],
+            "outcome": null
+        });
+        enriched.as_object_mut().unwrap().remove("graph_hash");
+        enriched["graph_hash"] =
+            Value::String(fractal_contracts::canonical_sha256(&enriched).unwrap());
+        let enriched_record = commit_graph(&enriched)?;
+        let reloaded = load_graph(&enriched_record.graph_hash)?;
+        assert_eq!(reloaded, enriched);
+        assert_eq!(
+            reloaded["learning_hint"]["nodes"]["analyze"]["artifacts_produced"],
+            json!(["artifact:spec"])
+        );
+        verify_graph_document(&reloaded)?;
+
+        let mut forbidden = valid_graph()?;
+        forbidden["nodes"][0]["api_key"] = Value::String("secret".to_owned());
+        forbidden.as_object_mut().unwrap().remove("graph_hash");
+        forbidden["graph_hash"] =
+            Value::String(fractal_contracts::canonical_sha256(&forbidden).unwrap());
+        assert!(commit_graph(&forbidden).is_err());
         Ok(())
     }
 }

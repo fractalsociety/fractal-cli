@@ -25,7 +25,9 @@ mod ingest;
 mod intent;
 mod interactive;
 mod learning_data;
+mod legacy_import;
 mod mobile;
+mod node;
 mod orchestrate;
 mod pipeline;
 mod project_file;
@@ -124,6 +126,12 @@ fn run(cli: Cli) -> Result<()> {
             ),
             GraphCommand::Status(args) => board::status(&args.url, args.json),
             GraphCommand::Show(args) => graph_store::show(&args.graph_hash, args.json),
+            GraphCommand::ImportLegacy(args) => legacy_import::run(&args.state, &args.repo),
+            GraphCommand::Serve(args) => board::serve_project_foreground(
+                &args.repo,
+                args.port,
+                args.exec_graph_dir.as_deref(),
+            ),
         },
         (None, Some(Command::Run(args))) if args.local => {
             let efficiency = efficiency_config::resolve(&args.efficiency)?;
@@ -150,10 +158,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         (None, Some(Command::Evolve(args))) => evolve::run_evolve(&args),
         (None, Some(Command::Efficiency(args))) => efficiency_config::run(&args),
-        (None, Some(Command::Node(args))) => {
-            pipeline::print_node_stub(&args.id, args.show, args.retry, args.cancel);
-            Ok(())
-        }
+        (None, Some(Command::Node(args))) => node::run(&args),
         (None, Some(Command::Clean(args))) => {
             let removed = safety::guarded_clear(&args.dir, args.yes)?;
             println!("Cleared {removed} item(s) from {}", args.dir.display());
@@ -338,6 +343,7 @@ fn run_local(
     if let Err(error) = board::serve_graph_file(&graph_file, port, None, args.dry_run) {
         eprintln!("(board unavailable: {error:#})");
     }
+    efficiency_accounting::ensure_envelope(&workspace, efficiency.mode, &efficiency.config_hash())?;
     std::thread::sleep(std::time::Duration::from_millis(1500));
 
     println!("{}", efficiency_config::banner(efficiency));

@@ -455,6 +455,10 @@ pub(crate) struct IngestArgs {
     #[arg(long)]
     pub(crate) confirm: bool,
 
+    /// Amend the active execution graph; never fall through to a new build.
+    #[arg(long, conflicts_with_all = ["confirm", "managed_project"])]
+    pub(crate) amend: bool,
+
     /// Normalize, classify, and print the event without compiling or executing.
     #[arg(long)]
     pub(crate) preview: bool,
@@ -606,6 +610,11 @@ pub(crate) enum GraphCommand {
     Status(GraphStatusArgs),
     /// Load a committed execution graph from the local store.
     Show(GraphShowArgs),
+    /// Import a legacy graph-state JSON file into .fractal/project.fractal once.
+    ImportLegacy(GraphImportLegacyArgs),
+    /// Internal foreground Rust board server.
+    #[command(hide = true)]
+    Serve(GraphServeArgs),
 }
 
 /// Arguments accepted by `fractal graph board`.
@@ -625,6 +634,32 @@ pub(crate) struct GraphBoardArgs {
     /// Do not open the served board in the default macOS browser.
     #[arg(long)]
     pub(crate) no_open: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GraphImportLegacyArgs {
+    /// Legacy graph-state.json or graph-state-*.json file.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) state: PathBuf,
+
+    /// Project workspace containing .fractal/project.fractal.
+    #[arg(long, default_value = ".", value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GraphServeArgs {
+    /// Project workspace containing .fractal/project.fractal.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+
+    /// Port on which to serve the board.
+    #[arg(long, default_value_t = DEFAULT_GRAPH_PORT)]
+    pub(crate) port: u16,
+
+    /// Directory containing the board's static frontend assets.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) exec_graph_dir: Option<PathBuf>,
 }
 
 /// Arguments accepted by `fractal graph show`.
@@ -823,23 +858,47 @@ pub(crate) struct EvolveArgs {
     pub(crate) json: bool,
 }
 
-/// Arguments accepted by future per-node controls.
+/// Rust-owned execution-node controls.
 #[derive(Debug, Args)]
 pub(crate) struct NodeArgs {
     /// Stable graph-node identifier.
     pub(crate) id: String,
 
-    /// Show the node.
-    #[arg(long, conflicts_with_all = ["retry", "cancel"])]
+    /// Show the node's current canonical assignment.
+    #[arg(long, visible_alias = "status", conflicts_with_all = ["retry", "cancel", "checkout", "complete", "release"])]
     pub(crate) show: bool,
 
     /// Retry the node.
-    #[arg(long, conflicts_with = "cancel")]
+    #[arg(long, conflicts_with_all = ["cancel", "checkout", "complete", "release"])]
     pub(crate) retry: bool,
 
     /// Cancel the node.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["checkout", "complete", "release"])]
     pub(crate) cancel: bool,
+
+    /// Atomically claim a dependency-ready node.
+    #[arg(long, conflicts_with_all = ["complete", "release"])]
+    pub(crate) checkout: bool,
+
+    /// Complete a node owned by this agent.
+    #[arg(long, conflicts_with = "release")]
+    pub(crate) complete: bool,
+
+    /// Release a node owned by this agent.
+    #[arg(long)]
+    pub(crate) release: bool,
+
+    /// Project workspace containing .fractal/project.fractal.
+    #[arg(long, default_value = ".", value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+
+    /// Stable agent identity (defaults to FRACTAL_AGENT_ID).
+    #[arg(long, env = "FRACTAL_AGENT_ID", default_value = "codex/root")]
+    pub(crate) agent_id: String,
+
+    /// Human-readable agent label (defaults to FRACTAL_AGENT_LABEL).
+    #[arg(long, env = "FRACTAL_AGENT_LABEL", default_value = "Codex")]
+    pub(crate) agent_label: String,
 }
 
 #[cfg(test)]
@@ -979,6 +1038,23 @@ mod tests {
         );
         assert!(args.no_open);
         assert!(args.graph_hash.starts_with("sha256:"));
+
+        let import = Cli::try_parse_from([
+            "fractal",
+            "graph",
+            "import-legacy",
+            "--state",
+            "graph-state.json",
+            "--repo",
+            "/tmp/project",
+        ])
+        .unwrap();
+        assert!(matches!(
+            import.command,
+            Some(Command::Graph(GraphArgs {
+                command: GraphCommand::ImportLegacy(GraphImportLegacyArgs { .. })
+            }))
+        ));
     }
 
     #[test]
@@ -999,6 +1075,23 @@ mod tests {
         assert!(matches!(
             node.command,
             Some(Command::Node(NodeArgs { retry: true, .. }))
+        ));
+        let checkout = Cli::try_parse_from([
+            "fractal",
+            "node",
+            "P2.3",
+            "--checkout",
+            "--repo",
+            "/tmp/project",
+            "--agent-id",
+            "codex/root",
+            "--agent-label",
+            "Codex",
+        ])
+        .unwrap();
+        assert!(matches!(
+            checkout.command,
+            Some(Command::Node(NodeArgs { checkout: true, .. }))
         ));
 
         let version = Cli::try_parse_from(["fractal", "version"]).unwrap();
@@ -1025,6 +1118,32 @@ mod tests {
         assert_eq!(args.format, InputFormat::Text);
         assert!(args.stdin);
         assert!(args.preview);
+
+        let amendment = Cli::try_parse_from(["fractal", "ingest", "--stdin", "--amend"]).unwrap();
+        assert!(matches!(
+            amendment.command,
+            Some(Command::Ingest(IngestArgs { amend: true, .. }))
+        ));
+        assert!(
+            Cli::try_parse_from(["fractal", "ingest", "--stdin", "--amend", "--confirm"]).is_err()
+        );
+        let completed_project = Cli::try_parse_from([
+            "fractal",
+            "ingest",
+            "--stdin",
+            "--amend",
+            "--repo",
+            "/tmp/project",
+        ])
+        .unwrap();
+        assert!(matches!(
+            completed_project.command,
+            Some(Command::Ingest(IngestArgs {
+                amend: true,
+                repo: Some(ref repo),
+                ..
+            })) if repo == &PathBuf::from("/tmp/project")
+        ));
 
         let json = Cli::try_parse_from(["fractal", "ingest", "--json"]).unwrap();
         assert!(matches!(

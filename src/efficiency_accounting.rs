@@ -232,6 +232,35 @@ pub(crate) fn record_episode(workspace: &Path, draft: EpisodeDraft) -> Result<Up
     Ok(outcome)
 }
 
+/// Ensure every real build has an honest efficiency envelope, even when no
+/// avoidable work has been detected yet. Existing lifetime episodes are
+/// retained while the current-build configuration is advanced.
+pub(crate) fn ensure_envelope(
+    workspace: &Path,
+    mode: EfficiencyMode,
+    config_hash: &str,
+) -> Result<()> {
+    project_file::mutate_document(workspace, |document| {
+        match document.efficiency.as_mut() {
+            Some(envelope) => {
+                envelope.mode = mode;
+                envelope.config_hash = config_hash.to_owned();
+                refresh_aggregates(envelope);
+            }
+            None => {
+                document.efficiency = Some(EfficiencyData::for_config(mode, config_hash));
+            }
+        }
+        let envelope = document
+            .efficiency
+            .as_ref()
+            .context("efficiency envelope initialization failed")?;
+        validate(envelope).map_err(|error| anyhow::anyhow!(error))?;
+        reject_efficiency_secrets(envelope)?;
+        Ok(())
+    })
+}
+
 /// Apply follow-up / override / evidence updates to an existing episode by id.
 #[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn update_episode(
@@ -472,20 +501,7 @@ fn rank_intervention(current: Option<RepairAction>, candidate: RepairAction) -> 
 }
 
 fn empty_envelope(mode: EfficiencyMode, config_hash: &str) -> EfficiencyData {
-    let aggregate = EfficiencyAggregate {
-        aggregation_version: AGGREGATION_VERSION,
-        config_hash: config_hash.to_owned(),
-        ..EfficiencyAggregate::default()
-    };
-    EfficiencyData {
-        schema: EFFICIENCY_SCHEMA.to_owned(),
-        mode,
-        aggregation_version: AGGREGATION_VERSION,
-        config_hash: config_hash.to_owned(),
-        episodes: Vec::new(),
-        build: aggregate.clone(),
-        lifetime: aggregate,
-    }
+    EfficiencyData::for_config(mode, config_hash)
 }
 
 fn validate_draft_bounds(draft: &EpisodeDraft) -> Result<(), String> {
@@ -890,7 +906,11 @@ mod tests {
             .collect();
         let error = record_episode(&workspace, draft).expect_err("evidence count");
         assert!(error.to_string().contains("count bound"));
-        assert!(load_efficiency(&workspace)?.is_none());
+        let efficiency = load_efficiency(&workspace)?.expect("zero baseline");
+        assert!(efficiency.episodes.is_empty());
+        assert_eq!(efficiency.build.episode_count, 0);
+        assert_eq!(efficiency.build.gross_estimated_tokens_avoided, 0);
+        assert_eq!(efficiency.build.realized_tokens_saved, 0);
         fs::remove_dir_all(workspace)?;
         Ok(())
     }
@@ -909,6 +929,26 @@ mod tests {
         assert_eq!(document.graph_hash, graph_hash);
         assert_eq!(document.learning.schema, "fractal.learning.v1");
         assert!(document.learning.nodes.contains_key("node_a"));
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_envelope_backfills_zero_without_inventing_savings() -> Result<()> {
+        let workspace = temp_workspace();
+        seed_project(&workspace)?;
+        let path = project_file::path(&workspace);
+        let mut raw: Value = serde_json::from_slice(&fs::read(&path)?)?;
+        raw.as_object_mut().unwrap().remove("efficiency");
+        fs::write(&path, serde_json::to_vec_pretty(&raw)?)?;
+
+        let config = crate::efficiency_config::EfficiencyConfig::default();
+        ensure_envelope(&workspace, config.mode, &config.config_hash())?;
+        let data = load_efficiency(&workspace)?.expect("backfilled efficiency");
+        assert!(data.episodes.is_empty());
+        assert_eq!(data.build.gross_estimated_tokens_avoided, 0);
+        assert_eq!(data.build.realized_tokens_saved, 0);
+        assert_eq!(data.config_hash, config.config_hash());
         fs::remove_dir_all(workspace)?;
         Ok(())
     }

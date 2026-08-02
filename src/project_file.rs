@@ -25,6 +25,8 @@ pub(crate) struct FractalProject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) efficiency: Option<crate::efficiency::EfficiencyData>,
     pub(crate) updated_at: String,
+    #[serde(default, flatten)]
+    pub(crate) extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -34,6 +36,8 @@ pub(crate) struct ProjectIdentity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) prompt: Option<String>,
     pub(crate) visibility: String,
+    #[serde(default, flatten)]
+    pub(crate) extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -44,6 +48,8 @@ pub(crate) struct ExecutionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) progress: Option<PlanningProgress>,
     pub(crate) updated_at: String,
+    #[serde(default, flatten)]
+    pub(crate) extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -55,6 +61,8 @@ pub(crate) struct PlanningProgress {
     pub(crate) agent_label: String,
     pub(crate) source: String,
     pub(crate) updated_at: String,
+    #[serde(default, flatten)]
+    pub(crate) extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -67,10 +75,76 @@ pub(crate) struct ExecutionAssignment {
     pub(crate) completed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) released_at: Option<String>,
+    #[serde(default, flatten)]
+    pub(crate) extra: BTreeMap<String, Value>,
 }
 
 static PROJECT_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const MANAGED_IDENTITY_SCHEMA: &str = "fractal.managed-project-identity.v1";
+
+struct ProjectWriteGuard {
+    path: PathBuf,
+}
+
+impl ProjectWriteGuard {
+    fn acquire(workspace: &Path) -> Result<Self> {
+        let directory = workspace.join(".fractal");
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("create {}", directory.display()))?;
+        let path = directory.join("project.fractal.lock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    writeln!(file, "{}", std::process::id())?;
+                    file.sync_all()?;
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if stale_lock(&path) {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        bail!(
+                            "timed out waiting for canonical project lock {}",
+                            path.display()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("lock {}", path.display()))
+                }
+            }
+        }
+    }
+}
+
+fn stale_lock(path: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(pid) = contents.trim().parse::<i32>() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(pid, 0) };
+        result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+impl Drop for ProjectWriteGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ManagedProjectIdentity {
@@ -105,6 +179,7 @@ pub(crate) fn configure_managed_identity(workspace: &Path, name: &str, prompt: &
 
 pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<PathBuf> {
     let _guard = project_file_lock();
+    let _file_guard = ProjectWriteGuard::acquire(workspace)?;
     let graph_hash = graph
         .get("graph_hash")
         .and_then(Value::as_str)
@@ -139,7 +214,6 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
                 .as_ref()
                 .and_then(|current| execution_from_parent(current, graph, &now))
         })
-        .or_else(|| execution_from_local_board(graph_hash, graph, &now))
         .or_else(|| {
             Some(ExecutionState {
                 schema: "fractal.execution_state.v1".to_owned(),
@@ -152,15 +226,29 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
                 assignments: BTreeMap::new(),
                 progress: None,
                 updated_at: now.clone(),
+                extra: BTreeMap::new(),
             })
         });
-    let learning = current
+    let mut learning = current
         .as_ref()
         .map(|document| merge_learning(&document.learning, graph, &now))
         .unwrap_or_else(|| learning_from_graph(graph, &now));
+    if let Some(criteria) = load_acceptance_criteria(workspace) {
+        learning.extra.insert(
+            "acceptance_criteria".to_owned(),
+            Value::Array(criteria.into_iter().map(Value::String).collect()),
+        );
+    }
     let efficiency = current
         .as_ref()
-        .and_then(|document| document.efficiency.clone());
+        .and_then(|document| document.efficiency.clone())
+        .or_else(|| {
+            let config = crate::efficiency_config::EfficiencyConfig::default();
+            Some(crate::efficiency::EfficiencyData::for_config(
+                config.mode,
+                &config.config_hash(),
+            ))
+        });
     let document = FractalProject {
         schema: "fractal.project.v1".to_owned(),
         project: ProjectIdentity {
@@ -171,6 +259,10 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
                 .as_ref()
                 .map(|document| document.project.visibility.clone())
                 .unwrap_or_else(|| "private".to_owned()),
+            extra: current
+                .as_ref()
+                .map(|document| document.project.extra.clone())
+                .unwrap_or_default(),
         },
         graph_hash: graph_hash.to_owned(),
         graph: graph.clone(),
@@ -178,6 +270,10 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
         learning,
         efficiency,
         updated_at: now,
+        extra: current
+            .as_ref()
+            .map(|document| document.extra.clone())
+            .unwrap_or_default(),
     };
     let destination = path(workspace);
     let directory = destination.parent().expect("project file has parent");
@@ -222,46 +318,557 @@ fn execution_from_parent(
     Some(execution)
 }
 
-fn execution_from_local_board(
-    graph_hash: &str,
-    graph: &Value,
-    updated_at: &str,
-) -> Option<ExecutionState> {
-    let hash = graph_hash.strip_prefix("sha256:")?;
-    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
+#[allow(dead_code)]
+pub(crate) fn mark_node_ready(workspace: &Path, node: &str) -> Result<()> {
+    mutate_execution_document(workspace, |document, now| {
+        ensure_known_node(document, node)?;
+        let record = document
+            .learning
+            .nodes
+            .get_mut(node)
+            .context("learning data is missing graph node after normalization")?;
+        if record.started_at.is_some() || record.finished_at.is_some() {
+            bail!("graph node `{node}` is already started or terminal");
+        }
+        record.ready_at.get_or_insert_with(|| now.to_owned());
+        Ok(())
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn checkout_start_node(
+    workspace: &Path,
+    node: &str,
+    agent_id: &str,
+    agent_label: &str,
+) -> Result<()> {
+    mutate_execution_document(workspace, |document, now| {
+        checkout_start_node_in_document(document, node, agent_id, agent_label, now)
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn finish_node(
+    workspace: &Path,
+    node: &str,
+    agent_id: &str,
+    outcome: crate::learning_data::NodeOutcome,
+) -> Result<()> {
+    mutate_execution_document(workspace, |document, now| {
+        finish_node_in_document(document, node, agent_id, outcome, now)
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn release_node(
+    workspace: &Path,
+    node: &str,
+    agent_id: &str,
+    failure: Option<(
+        crate::learning_data::NodeOutcome,
+        crate::learning_data::FailureCode,
+    )>,
+) -> Result<()> {
+    mutate_execution_document(workspace, |document, now| {
+        release_node_in_document(document, node, agent_id, failure, now)
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn reopen_node(workspace: &Path, node: &str) -> Result<()> {
+    mutate_execution_document(workspace, |document, now| {
+        ensure_known_node(document, node)?;
+        if let Some(assignment) = document
+            .execution
+            .as_mut()
+            .and_then(|e| e.assignments.get_mut(node))
+        {
+            if assignment.state == "checked_out" {
+                bail!("graph node `{node}` cannot be reopened while checked out");
+            }
+            assignment.state = "released".to_owned();
+            assignment.completed_at = None;
+            assignment.released_at = Some(now.to_owned());
+        }
+        let record = document
+            .learning
+            .nodes
+            .get_mut(node)
+            .context("learning node missing")?;
+        record.outcome = None;
+        record.failure_code = None;
+        record.verification = None;
+        record.finished_at = None;
+        record.reopen_count += 1;
+        Ok(())
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn record_verification_result(
+    workspace: &Path,
+    node: &str,
+    passed: bool,
+    evidence_refs: Vec<String>,
+) -> Result<()> {
+    mutate_execution_document(workspace, |document, _now| {
+        ensure_known_node(document, node)?;
+        let record = document
+            .learning
+            .nodes
+            .get_mut(node)
+            .context("learning node missing")?;
+        record.verification = Some(crate::learning_data::Verification {
+            kind: Some("automated".to_owned()),
+            passed: Some(passed),
+            evidence_refs,
+            ..crate::learning_data::Verification::default()
+        });
+        Ok(())
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn record_artifact_produced(
+    workspace: &Path,
+    node: &str,
+    reference: &str,
+) -> Result<()> {
+    mutate_execution_document(workspace, |document, _now| {
+        ensure_known_node(document, node)?;
+        let record = document
+            .learning
+            .nodes
+            .get_mut(node)
+            .context("learning node missing")?;
+        push_unique(&mut record.artifacts_produced, reference);
+        Ok(())
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn record_artifact_consumed(
+    workspace: &Path,
+    node: &str,
+    reference: &str,
+) -> Result<()> {
+    mutate_execution_document(workspace, |document, _now| {
+        ensure_known_node(document, node)?;
+        let record = document
+            .learning
+            .nodes
+            .get_mut(node)
+            .context("learning node missing")?;
+        push_unique(&mut record.consumed_by, reference);
+        Ok(())
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn record_human_intervention(
+    workspace: &Path,
+    node: &str,
+    note: Option<&str>,
+) -> Result<()> {
+    mutate_execution_document(workspace, |document, _now| {
+        ensure_known_node(document, node)?;
+        let record = document
+            .learning
+            .nodes
+            .get_mut(node)
+            .context("learning node missing")?;
+        record.human_intervention = true;
+        if let Some(note) = note {
+            record.notes = Some(note.chars().take(1_000).collect());
+        }
+        Ok(())
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn set_node_costs(
+    workspace: &Path,
+    node: &str,
+    estimated_cost: Option<f64>,
+    actual_cost: Option<f64>,
+) -> Result<()> {
+    mutate_execution_document(workspace, |document, _now| {
+        ensure_known_node(document, node)?;
+        let record = document
+            .learning
+            .nodes
+            .get_mut(node)
+            .context("learning node missing")?;
+        record.estimated_cost = estimated_cost;
+        record.actual_cost = actual_cost;
+        Ok(())
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn append_graph_edit_event(
+    workspace: &Path,
+    event: crate::learning_data::GraphEditEvent,
+) -> Result<()> {
+    mutate_execution_document(workspace, |document, now| {
+        let mut event = event;
+        if event.timestamp.trim().is_empty() || event.timestamp.as_str() < now {
+            event.timestamp = now.to_owned();
+        }
+        document.learning.graph_edits.push(event);
+        Ok(())
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn update_graph_edit_event_effect(
+    workspace: &Path,
+    index: usize,
+    effect: crate::learning_data::EventualEffect,
+) -> Result<()> {
+    mutate_execution_document(workspace, |document, _now| {
+        let event = document
+            .learning
+            .graph_edits
+            .get_mut(index)
+            .context("graph edit event index is out of range")?;
+        event.eventual_effect = effect;
+        Ok(())
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn store_graph_outcome(
+    workspace: &Path,
+    outcome: crate::learning_data::GraphOutcome,
+) -> Result<()> {
+    mutate_execution_document(workspace, |document, _now| {
+        document.learning.outcome = Some(outcome);
+        Ok(())
+    })
+}
+
+fn mutate_execution_document(
+    workspace: &Path,
+    update: impl FnOnce(&mut FractalProject, &str) -> Result<()>,
+) -> Result<()> {
+    let _guard = project_file_lock();
+    let _file_guard = ProjectWriteGuard::acquire(workspace)?;
+    let mut document = load(workspace)?;
+    let now = monotonic_timestamp(&document, timestamp());
+    update(&mut document, &now)?;
+    refresh_terminal_outcome(&mut document);
+    if let Some(execution) = document.execution.as_mut() {
+        execution.updated_at = now.clone();
     }
-    let home = std::env::var_os("FRACTAL_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".fractal")))
-        .unwrap_or_else(|| PathBuf::from(".fractal"));
-    let board_path = home.join("graphs").join(format!("{hash}.board-state.json"));
-    let value: Value = serde_json::from_slice(&fs::read(board_path).ok()?).ok()?;
-    let assignments: BTreeMap<String, ExecutionAssignment> =
-        serde_json::from_value(value.get("assignments")?.clone()).ok()?;
-    if assignments.is_empty() {
-        return None;
+    document.updated_at = now;
+    write_document(workspace, &document)
+}
+
+#[allow(dead_code)]
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|current| current == value) {
+        values.push(value.to_owned());
     }
-    let node_count = graph
+}
+
+fn ensure_known_node(document: &FractalProject, node: &str) -> Result<()> {
+    let known_node = document
+        .graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|value| value.get("id").and_then(Value::as_str) == Some(node));
+    if !known_node {
+        bail!("execution mutation references unknown graph node `{node}`");
+    }
+    Ok(())
+}
+
+fn execution_state<'a>(document: &'a mut FractalProject, now: &str) -> &'a mut ExecutionState {
+    document.execution.get_or_insert_with(|| ExecutionState {
+        schema: "fractal.execution_state.v1".to_owned(),
+        phase: "executing".to_owned(),
+        assignments: BTreeMap::new(),
+        progress: None,
+        updated_at: now.to_owned(),
+        extra: BTreeMap::new(),
+    })
+}
+
+#[allow(dead_code)]
+fn checkout_start_node_in_document(
+    document: &mut FractalProject,
+    node: &str,
+    agent_id: &str,
+    agent_label: &str,
+    now: &str,
+) -> Result<()> {
+    ensure_known_node(document, node)?;
+    let blocked = dependency_blockers(document, node);
+    if !blocked.is_empty() {
+        bail!(
+            "graph node `{node}` is not dependency-ready; incomplete: {}",
+            blocked.join(", ")
+        );
+    }
+    let execution = execution_state(document, now);
+    execution.phase = "executing".to_owned();
+    execution.progress = None;
+    if let Some(current) = execution.assignments.get(node) {
+        if current.state == "completed" {
+            bail!("graph node `{node}` is already completed");
+        }
+        if current.state == "checked_out" && current.agent_id != agent_id {
+            bail!(
+                "graph node `{node}` is checked out by {} ({})",
+                current.agent_label,
+                current.agent_id
+            );
+        }
+    }
+    let checked_out_at = execution
+        .assignments
+        .get(node)
+        .map(|assignment| assignment.checked_out_at.clone())
+        .unwrap_or_else(|| now.to_owned());
+    execution.assignments.insert(
+        node.to_owned(),
+        ExecutionAssignment {
+            agent_id: agent_id.to_owned(),
+            agent_label: agent_label.to_owned(),
+            state: "checked_out".to_owned(),
+            checked_out_at,
+            completed_at: None,
+            released_at: None,
+            extra: BTreeMap::new(),
+        },
+    );
+    if let Some(record) = document.learning.nodes.get_mut(node) {
+        if record.outcome.take().is_some() {
+            record.reopen_count += 1;
+            record.finished_at = None;
+            record.failure_code = None;
+            record.verification = None;
+        }
+        record.ready_at.get_or_insert_with(|| now.to_owned());
+        record.started_at = Some(now.to_owned());
+        record.attempt_count += 1;
+        record.executor = Some(crate::learning_data::Executor {
+            agent: Some(agent_label.to_owned()),
+            model: std::env::var("FRACTAL_MODEL").ok(),
+            version: option_env!("CARGO_PKG_VERSION").map(str::to_owned),
+            ..crate::learning_data::Executor::default()
+        });
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn finish_node_in_document(
+    document: &mut FractalProject,
+    node: &str,
+    agent_id: &str,
+    outcome: crate::learning_data::NodeOutcome,
+    now: &str,
+) -> Result<()> {
+    if matches!(
+        outcome,
+        crate::learning_data::NodeOutcome::FailedExecution
+            | crate::learning_data::NodeOutcome::FailedVerification
+    ) {
+        bail!("finish_node requires a non-failure terminal outcome");
+    }
+    ensure_known_node(document, node)?;
+    let execution = execution_state(document, now);
+    let current = execution
+        .assignments
+        .get(node)
+        .context("graph node must be checked out before completion")?;
+    if current.state != "checked_out" {
+        bail!("graph node `{node}` is not checked out");
+    }
+    if current.agent_id != agent_id {
+        bail!(
+            "graph node `{node}` is owned by {} ({})",
+            current.agent_label,
+            current.agent_id
+        );
+    }
+    let checked_out_at = current.checked_out_at.clone();
+    let agent_label = current.agent_label.clone();
+    execution.assignments.insert(
+        node.to_owned(),
+        ExecutionAssignment {
+            agent_id: agent_id.to_owned(),
+            agent_label,
+            state: "completed".to_owned(),
+            checked_out_at,
+            completed_at: Some(now.to_owned()),
+            released_at: None,
+            extra: BTreeMap::new(),
+        },
+    );
+    if let Some(record) = document.learning.nodes.get_mut(node) {
+        record.finished_at = Some(now.to_owned());
+        record.outcome = Some(outcome);
+    }
+    complete_graph_if_terminal(document);
+    Ok(())
+}
+
+fn release_node_in_document(
+    document: &mut FractalProject,
+    node: &str,
+    agent_id: &str,
+    failure: Option<(
+        crate::learning_data::NodeOutcome,
+        crate::learning_data::FailureCode,
+    )>,
+    now: &str,
+) -> Result<()> {
+    ensure_known_node(document, node)?;
+    let execution = execution_state(document, now);
+    let current = execution
+        .assignments
+        .get(node)
+        .context("graph node must be checked out before release")?;
+    if current.state != "checked_out" {
+        bail!("graph node `{node}` is not checked out");
+    }
+    if current.agent_id != agent_id {
+        bail!(
+            "graph node `{node}` is owned by {} ({})",
+            current.agent_label,
+            current.agent_id
+        );
+    }
+    let checked_out_at = current.checked_out_at.clone();
+    let agent_label = current.agent_label.clone();
+    execution.assignments.insert(
+        node.to_owned(),
+        ExecutionAssignment {
+            agent_id: agent_id.to_owned(),
+            agent_label,
+            state: "released".to_owned(),
+            checked_out_at,
+            completed_at: None,
+            released_at: Some(now.to_owned()),
+            extra: BTreeMap::new(),
+        },
+    );
+    if let Some((outcome, failure_code)) = failure {
+        if !matches!(
+            outcome,
+            crate::learning_data::NodeOutcome::FailedExecution
+                | crate::learning_data::NodeOutcome::FailedVerification
+                | crate::learning_data::NodeOutcome::Cancelled
+        ) {
+            bail!("release_node failure outcome must be controlled terminal failure/cancel state");
+        }
+        if let Some(record) = document.learning.nodes.get_mut(node) {
+            record.finished_at = Some(now.to_owned());
+            record.outcome = Some(outcome);
+            record.failure_code = Some(failure_code);
+            if outcome == crate::learning_data::NodeOutcome::FailedVerification {
+                record.verification = Some(crate::learning_data::Verification {
+                    kind: Some("automated".to_owned()),
+                    passed: Some(false),
+                    evidence_refs: Vec::new(),
+                    ..crate::learning_data::Verification::default()
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn dependency_blockers(document: &FractalProject, node: &str) -> Vec<String> {
+    document
+        .graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|edge| edge.get("to").and_then(Value::as_str) == Some(node))
+        .filter(|edge| {
+            edge.get("condition")
+                .and_then(Value::as_str)
+                .is_none_or(|condition| condition != "failure")
+        })
+        .filter_map(|edge| edge.get("from").and_then(Value::as_str))
+        .filter(|dependency| {
+            document
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.assignments.get(*dependency))
+                .is_none_or(|assignment| assignment.state != "completed")
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+#[allow(dead_code)]
+fn complete_graph_if_terminal(document: &mut FractalProject) {
+    let node_count = document
+        .graph
         .get("nodes")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
-    let completed = assignments
-        .values()
-        .filter(|assignment| assignment.state == "completed")
-        .count();
-    Some(ExecutionState {
-        schema: "fractal.execution_state.v1".to_owned(),
-        phase: if node_count > 0 && completed == node_count {
-            "completed"
-        } else {
-            "executing"
+    let completed = document.execution.as_ref().is_some_and(|execution| {
+        execution.assignments.len() == node_count
+            && execution
+                .assignments
+                .values()
+                .all(|assignment| assignment.state == "completed")
+    });
+    if completed {
+        if let Some(execution) = document.execution.as_mut() {
+            execution.phase = "completed".to_owned();
         }
-        .to_owned(),
-        assignments,
-        progress: None,
-        updated_at: updated_at.to_owned(),
-    })
+    }
+    refresh_terminal_outcome(document);
+}
+
+/// Recompute the graph-level outcome whenever a terminal state is observed.
+/// Replacing the prior value is intentional: event eventual effects and late
+/// lifecycle facts may arrive after the first terminal write, and aggregation
+/// reads only source records so it cannot double-count a refresh.
+fn refresh_terminal_outcome(document: &mut FractalProject) {
+    let Some(execution) = document.execution.as_ref() else {
+        return;
+    };
+    let node_count = document
+        .graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let all_terminal_assignments = node_count > 0
+        && execution.assignments.len() == node_count
+        && execution
+            .assignments
+            .values()
+            .all(|assignment| matches!(assignment.state.as_str(), "completed" | "released"));
+    let terminal_phase = matches!(execution.phase.as_str(), "completed" | "halted");
+    if terminal_phase || all_terminal_assignments {
+        if all_terminal_assignments
+            && !terminal_phase
+            && execution
+                .assignments
+                .values()
+                .any(|assignment| assignment.state == "released")
+        {
+            if let Some(execution) = document.execution.as_mut() {
+                execution.phase = "halted".to_owned();
+            }
+        }
+        document.learning.outcome = Some(crate::learning_data::aggregate_for_graph(
+            &document.learning,
+            &document.graph,
+        ));
+    }
 }
 
 pub(crate) fn transition(
@@ -272,6 +879,7 @@ pub(crate) fn transition(
     agent_label: &str,
 ) -> Result<()> {
     let _guard = project_file_lock();
+    let _file_guard = ProjectWriteGuard::acquire(workspace)?;
     let mut document = load(workspace)?;
     let known_node = document
         .graph
@@ -290,11 +898,51 @@ pub(crate) fn transition(
         assignments: BTreeMap::new(),
         progress: None,
         updated_at: now.clone(),
+        extra: BTreeMap::new(),
     });
     execution.phase = "executing".to_owned();
     execution.progress = None;
     match action {
         "checkout" => {
+            if let Some(current) = execution.assignments.get(node) {
+                if current.state == "completed" {
+                    bail!("graph node `{node}` is already completed");
+                }
+                if current.state == "checked_out" && current.agent_id != agent_id {
+                    bail!(
+                        "graph node `{node}` is checked out by {} ({})",
+                        current.agent_label,
+                        current.agent_id
+                    );
+                }
+            }
+            let blocked: Vec<String> = document
+                .graph
+                .get("edges")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|edge| edge.get("to").and_then(Value::as_str) == Some(node))
+                .filter(|edge| {
+                    edge.get("condition")
+                        .and_then(Value::as_str)
+                        .is_none_or(|condition| condition != "failure")
+                })
+                .filter_map(|edge| edge.get("from").and_then(Value::as_str))
+                .filter(|dependency| {
+                    execution
+                        .assignments
+                        .get(*dependency)
+                        .is_none_or(|assignment| assignment.state != "completed")
+                })
+                .map(str::to_owned)
+                .collect();
+            if !blocked.is_empty() {
+                bail!(
+                    "graph node `{node}` is not dependency-ready; incomplete: {}",
+                    blocked.join(", ")
+                );
+            }
             let checked_out_at = execution
                 .assignments
                 .get(node)
@@ -309,6 +957,7 @@ pub(crate) fn transition(
                     checked_out_at,
                     completed_at: None,
                     released_at: None,
+                    extra: BTreeMap::new(),
                 },
             );
             if let Some(record) = document.learning.nodes.get_mut(node) {
@@ -324,10 +973,25 @@ pub(crate) fn transition(
                     agent: Some(agent_label.to_owned()),
                     model: std::env::var("FRACTAL_MODEL").ok(),
                     version: option_env!("CARGO_PKG_VERSION").map(str::to_owned),
+                    ..crate::learning_data::Executor::default()
                 });
             }
         }
         "complete" => {
+            let current = execution
+                .assignments
+                .get(node)
+                .context("graph node must be checked out before completion")?;
+            if current.state != "checked_out" {
+                bail!("graph node `{node}` is not checked out");
+            }
+            if current.agent_id != agent_id {
+                bail!(
+                    "graph node `{node}` is owned by {} ({})",
+                    current.agent_label,
+                    current.agent_id
+                );
+            }
             let checked_out_at = execution
                 .assignments
                 .get(node)
@@ -342,6 +1006,7 @@ pub(crate) fn transition(
                     checked_out_at,
                     completed_at: Some(now.clone()),
                     released_at: None,
+                    extra: BTreeMap::new(),
                 },
             );
             if let Some(record) = document.learning.nodes.get_mut(node) {
@@ -357,11 +1022,26 @@ pub(crate) fn transition(
                         kind: Some("automated".to_owned()),
                         passed: Some(true),
                         evidence_refs: Vec::new(),
+                        ..crate::learning_data::Verification::default()
                     });
                 }
             }
         }
         "release" | "failed_execution" | "failed_verification" => {
+            let current = execution
+                .assignments
+                .get(node)
+                .context("graph node must be checked out before release")?;
+            if current.state != "checked_out" {
+                bail!("graph node `{node}` is not checked out");
+            }
+            if current.agent_id != agent_id {
+                bail!(
+                    "graph node `{node}` is owned by {} ({})",
+                    current.agent_label,
+                    current.agent_id
+                );
+            }
             let checked_out_at = execution
                 .assignments
                 .get(node)
@@ -376,6 +1056,7 @@ pub(crate) fn transition(
                     checked_out_at,
                     completed_at: None,
                     released_at: Some(now.clone()),
+                    extra: BTreeMap::new(),
                 },
             );
             if action != "release" {
@@ -396,6 +1077,7 @@ pub(crate) fn transition(
                             kind: Some("automated".to_owned()),
                             passed: Some(false),
                             evidence_refs: Vec::new(),
+                            ..crate::learning_data::Verification::default()
                         });
                     }
                 }
@@ -415,11 +1097,73 @@ pub(crate) fn transition(
         .count();
     if node_count > 0 && completed == node_count {
         execution.phase = "completed".to_owned();
-        document.learning.outcome = Some(crate::learning_data::aggregate(&document.learning));
+    } else if node_count > 0
+        && execution.assignments.len() == node_count
+        && execution
+            .assignments
+            .values()
+            .all(|assignment| matches!(assignment.state.as_str(), "completed" | "released"))
+    {
+        execution.phase = "halted".to_owned();
     }
     execution.updated_at = now.clone();
+    refresh_terminal_outcome(&mut document);
     document.updated_at = now;
     write_document(workspace, &document)
+}
+
+pub(crate) fn assignment(workspace: &Path, node: &str) -> Result<Option<ExecutionAssignment>> {
+    let document = load(workspace)?;
+    let known = document
+        .graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|value| value.get("id").and_then(Value::as_str) == Some(node));
+    if !known {
+        bail!("unknown graph node `{node}`");
+    }
+    Ok(document
+        .execution
+        .and_then(|execution| execution.assignments.get(node).cloned()))
+}
+
+pub(crate) fn import_legacy_assignments(
+    workspace: &Path,
+    assignments: BTreeMap<String, ExecutionAssignment>,
+) -> Result<usize> {
+    let _guard = project_file_lock();
+    let _file_guard = ProjectWriteGuard::acquire(workspace)?;
+    let mut document = load(workspace)?;
+    let known: BTreeSet<String> = document
+        .graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| node.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let execution = document.execution.get_or_insert_with(|| ExecutionState {
+        schema: "fractal.execution_state.v1".to_owned(),
+        phase: "executing".to_owned(),
+        assignments: BTreeMap::new(),
+        progress: None,
+        updated_at: timestamp(),
+        extra: BTreeMap::new(),
+    });
+    let mut imported = 0;
+    for (node, assignment) in assignments {
+        if known.contains(&node) && !execution.assignments.contains_key(&node) {
+            execution.assignments.insert(node, assignment);
+            imported += 1;
+        }
+    }
+    let now = timestamp();
+    execution.updated_at = now.clone();
+    document.updated_at = now;
+    write_document(workspace, &document)?;
+    Ok(imported)
 }
 
 /// Completed assignments persisted by workers themselves. This is the recovery
@@ -441,16 +1185,20 @@ pub(crate) fn completed_nodes(workspace: &Path) -> BTreeSet<String> {
 
 pub(crate) fn backfill_execution(workspace: &Path) -> Result<bool> {
     let _guard = project_file_lock();
+    let _file_guard = ProjectWriteGuard::acquire(workspace)?;
     let mut document = load(workspace)?;
     if document.execution.is_some() {
         return Ok(false);
     }
     let now = timestamp();
-    let Some(execution) = execution_from_local_board(&document.graph_hash, &document.graph, &now)
-    else {
-        return Ok(false);
-    };
-    document.execution = Some(execution);
+    document.execution = Some(ExecutionState {
+        schema: "fractal.execution_state.v1".to_owned(),
+        phase: "executing".to_owned(),
+        assignments: BTreeMap::new(),
+        progress: None,
+        updated_at: now.clone(),
+        extra: BTreeMap::new(),
+    });
     document.updated_at = now;
     write_document(workspace, &document)?;
     Ok(true)
@@ -458,6 +1206,7 @@ pub(crate) fn backfill_execution(workspace: &Path) -> Result<bool> {
 
 pub(crate) fn release_stale_assignments(workspace: &Path) -> Result<bool> {
     let _guard = project_file_lock();
+    let _file_guard = ProjectWriteGuard::acquire(workspace)?;
     let mut document = load(workspace)?;
     let Some(execution) = document.execution.as_mut() else {
         return Ok(false);
@@ -477,6 +1226,7 @@ pub(crate) fn release_stale_assignments(workspace: &Path) -> Result<bool> {
     execution.phase = "halted".to_owned();
     execution.progress = None;
     execution.updated_at = now.clone();
+    refresh_terminal_outcome(&mut document);
     document.updated_at = now;
     write_document(workspace, &document)?;
     Ok(true)
@@ -487,6 +1237,7 @@ pub(crate) fn set_execution_phase(workspace: &Path, phase: &str) -> Result<()> {
         bail!("unsupported execution phase `{phase}`");
     }
     let _guard = project_file_lock();
+    let _file_guard = ProjectWriteGuard::acquire(workspace)?;
     let mut document = load(workspace)?;
     let now = timestamp();
     let execution = document.execution.get_or_insert_with(|| ExecutionState {
@@ -495,12 +1246,14 @@ pub(crate) fn set_execution_phase(workspace: &Path, phase: &str) -> Result<()> {
         assignments: BTreeMap::new(),
         progress: None,
         updated_at: now.clone(),
+        extra: BTreeMap::new(),
     });
     execution.phase = phase.to_owned();
     if phase != "planning" {
         execution.progress = None;
     }
     execution.updated_at = now.clone();
+    refresh_terminal_outcome(&mut document);
     document.updated_at = now;
     write_document(workspace, &document)
 }
@@ -528,6 +1281,7 @@ pub(crate) fn record_graph_edit(
         bail!("unsupported graph edit action `{action}`");
     }
     let _guard = project_file_lock();
+    let _file_guard = ProjectWriteGuard::acquire(workspace)?;
     let mut document = load(workspace)?;
     document
         .learning
@@ -538,15 +1292,18 @@ pub(crate) fn record_graph_edit(
                 kind: action.to_owned(),
                 target: target.map(str::to_owned),
                 created_nodes,
+                ..crate::learning_data::GraphEditAction::default()
             },
             trigger: trigger.chars().take(240).collect(),
             actor: actor.chars().take(120).collect(),
             timestamp: timestamp(),
             eventual_effect: crate::learning_data::EventualEffect::default(),
+            ..crate::learning_data::GraphEditEvent::default()
         });
     if let Some(record) = target.and_then(|id| document.learning.nodes.get_mut(id)) {
         record.human_intervention = true;
     }
+    refresh_terminal_outcome(&mut document);
     document.updated_at = timestamp();
     write_document(workspace, &document)
 }
@@ -560,6 +1317,7 @@ pub(crate) fn update_planning_progress(
     source: &str,
 ) -> Result<()> {
     let _guard = project_file_lock();
+    let _file_guard = ProjectWriteGuard::acquire(workspace)?;
     let mut document = load(workspace)?;
     let now = timestamp();
     let execution = document.execution.get_or_insert_with(|| ExecutionState {
@@ -568,6 +1326,7 @@ pub(crate) fn update_planning_progress(
         assignments: BTreeMap::new(),
         progress: None,
         updated_at: now.clone(),
+        extra: BTreeMap::new(),
     });
     if execution.phase != "planning" {
         return Ok(());
@@ -580,6 +1339,7 @@ pub(crate) fn update_planning_progress(
         agent_label: agent_label.chars().take(120).collect(),
         source: source.chars().take(240).collect(),
         updated_at: now.clone(),
+        extra: BTreeMap::new(),
     });
     execution.updated_at = now.clone();
     document.updated_at = now;
@@ -592,9 +1352,8 @@ pub(crate) fn load(workspace: &Path) -> Result<FractalProject> {
         &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
     )
     .with_context(|| format!("decode {}", path.display()))?;
-    if document.learning.nodes.is_empty() {
-        document.learning = learning_from_graph(&document.graph, &document.updated_at);
-    }
+    document.learning =
+        crate::learning_data::normalize(document.learning, &document.graph, &document.updated_at);
     validate(&document)?;
     Ok(document)
 }
@@ -604,6 +1363,7 @@ pub(crate) fn set_visibility(workspace: &Path, visibility: &str) -> Result<()> {
         bail!("unsupported project visibility `{visibility}`");
     }
     let _guard = project_file_lock();
+    let _file_guard = ProjectWriteGuard::acquire(workspace)?;
     let mut document = load(workspace)?;
     document.project.visibility = visibility.to_owned();
     document.updated_at = timestamp();
@@ -624,6 +1384,10 @@ fn validate(document: &FractalProject) -> Result<()> {
     reject_secret_fields(&document.graph)?;
     crate::learning_data::validate(&document.learning)
         .map_err(|error| anyhow::anyhow!("invalid fractal.learning.v1 document: {error}"))?;
+    let learning = serde_json::to_value(&document.learning)
+        .map_err(|error| anyhow::anyhow!("encode fractal.learning.v1: {error}"))?;
+    reject_secret_fields(&learning)
+        .context("learning envelope contains forbidden credential-shaped fields")?;
     if let Some(efficiency) = &document.efficiency {
         crate::efficiency::validate(efficiency)
             .map_err(|error| anyhow::anyhow!("invalid fractal.efficiency.v1 document: {error}"))?;
@@ -679,68 +1443,7 @@ fn validate(document: &FractalProject) -> Result<()> {
 }
 
 fn learning_from_graph(graph: &Value, now: &str) -> crate::learning_data::LearningData {
-    let mut learning = crate::learning_data::LearningData::default();
-    let mut dependencies: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for edge in graph
-        .get("edges")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if let (Some(from), Some(to)) = (
-            edge.get("from").and_then(Value::as_str),
-            edge.get("to").and_then(Value::as_str),
-        ) {
-            dependencies
-                .entry(to.to_owned())
-                .or_default()
-                .push(from.to_owned());
-        }
-    }
-    for node in graph
-        .get("nodes")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let Some(id) = node.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        let capability = node
-            .get("capability")
-            .and_then(Value::as_str)
-            .unwrap_or("implementation");
-        let depends_on = dependencies.remove(id).unwrap_or_default();
-        let node_type = if capability.starts_with("project.tests") || capability.contains("verify")
-        {
-            "verification"
-        } else if capability.starts_with("control.") {
-            "control"
-        } else {
-            "implementation"
-        };
-        let objective = node
-            .get("title")
-            .or_else(|| node.get("instruction"))
-            .and_then(Value::as_str)
-            .unwrap_or(id)
-            .chars()
-            .take(1_000)
-            .collect();
-        learning.nodes.insert(
-            id.to_owned(),
-            crate::learning_data::NodeRecord {
-                node_id: id.to_owned(),
-                node_type: node_type.to_owned(),
-                objective,
-                ready_at: depends_on.is_empty().then(|| now.to_owned()),
-                depends_on,
-                created_at: Some(now.to_owned()),
-                ..crate::learning_data::NodeRecord::default()
-            },
-        );
-    }
-    learning
+    crate::learning_data::normalize(crate::learning_data::LearningData::default(), graph, now)
 }
 
 fn merge_learning(
@@ -758,6 +1461,7 @@ fn merge_learning(
     }
     merged.graph_edits = current.graph_edits.clone();
     merged.outcome = current.outcome.clone();
+    merged.extra = current.extra.clone();
     merged
 }
 
@@ -767,6 +1471,31 @@ fn is_planning_preview(graph: &Value) -> bool {
         nodes.len() == 1
             && nodes[0].get("capability").and_then(Value::as_str) == Some("control.plan")
     })
+}
+
+/// Keep the lead PRD's compact criterion IDs beside learning data so the
+/// terminal aggregator can report per-criterion results without embedding the
+/// full PRD or any large evidence payload in the portable project file.
+fn load_acceptance_criteria(workspace: &Path) -> Option<Vec<String>> {
+    let path = workspace.join(".fractal").join("lead-prd.json");
+    let value: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let mut ids = value
+        .get("acceptance_criteria")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|criterion| {
+            criterion
+                .get("id")
+                .and_then(Value::as_str)
+                .or_else(|| criterion.as_str())
+        })
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| id.trim().chars().take(120).collect::<String>())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    (!ids.is_empty()).then_some(ids)
 }
 
 fn write_document(workspace: &Path, document: &FractalProject) -> Result<()> {
@@ -785,6 +1514,7 @@ pub(crate) fn mutate_document(
     update: impl FnOnce(&mut FractalProject) -> Result<()>,
 ) -> Result<()> {
     let _guard = project_file_lock();
+    let _file_guard = ProjectWriteGuard::acquire(workspace)?;
     let mut document = load(workspace)?;
     update(&mut document)?;
     document.updated_at = timestamp();
@@ -904,6 +1634,40 @@ fn timestamp() -> String {
     rfc3339_utc(seconds)
 }
 
+fn monotonic_timestamp(document: &FractalProject, candidate: String) -> String {
+    let mut maximum = candidate;
+    maximum = maximum.max(document.updated_at.clone());
+    if let Some(execution) = &document.execution {
+        maximum = maximum.max(execution.updated_at.clone());
+        for assignment in execution.assignments.values() {
+            maximum = maximum.max(assignment.checked_out_at.clone());
+            if let Some(value) = &assignment.completed_at {
+                maximum = maximum.max(value.clone());
+            }
+            if let Some(value) = &assignment.released_at {
+                maximum = maximum.max(value.clone());
+            }
+        }
+    }
+    for record in document.learning.nodes.values() {
+        for value in [
+            record.created_at.as_ref(),
+            record.ready_at.as_ref(),
+            record.started_at.as_ref(),
+            record.finished_at.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            maximum = maximum.max(value.clone());
+        }
+    }
+    for event in &document.learning.graph_edits {
+        maximum = maximum.max(event.timestamp.clone());
+    }
+    maximum
+}
+
 fn rfc3339_utc(seconds: u64) -> String {
     let days = (seconds / 86_400) as i64;
     let seconds_of_day = seconds % 86_400;
@@ -950,8 +1714,11 @@ mod tests {
     use serde_json::json;
 
     fn temp_workspace() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "My Expense App {}",
+            "My Expense App {}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -962,7 +1729,7 @@ mod tests {
     #[test]
     fn persists_portable_standard_document() -> Result<()> {
         let workspace = temp_workspace();
-        fs::create_dir_all(&workspace)?;
+        fs::create_dir_all(workspace.join(".fractal"))?;
         let mut graph = json!({
             "schema": "fractal.execution_graph.v1",
             "nodes": [],
@@ -1049,8 +1816,8 @@ mod tests {
         persist(&workspace, &graph, "Build app")?;
         let original_hash = load(&workspace)?.graph_hash;
         transition(&workspace, "build", "checkout", "cursor", "Cursor")?;
-        transition(&workspace, "test", "checkout", "codex", "Codex")?;
         transition(&workspace, "build", "complete", "cursor", "Cursor")?;
+        transition(&workspace, "test", "checkout", "codex", "Codex")?;
         let document = load(&workspace)?;
         assert_eq!(document.graph_hash, original_hash);
         let execution = document.execution.expect("execution state");
@@ -1124,6 +1891,7 @@ mod tests {
                 .map_err(|error| anyhow::anyhow!("hash fixture: {error}"))?,
         );
         persist(&workspace, &parent, "Build app")?;
+        transition(&workspace, "build", "checkout", "cursor", "Cursor")?;
         transition(&workspace, "build", "complete", "cursor", "Cursor")?;
 
         let parent_hash = parent["graph_hash"].as_str().unwrap().to_owned();
@@ -1179,6 +1947,301 @@ mod tests {
         let error = persist(&workspace, &graph, "unsafe")
             .expect_err("credential-shaped fields must be refused");
         assert!(error.to_string().contains("forbidden credential field"));
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_project_without_learning_is_normalized_on_load() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(workspace.join(".fractal"))?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_legacy",
+            "nodes": [
+                {"id": "plan", "capability": "control.plan", "title": "Plan"},
+                {"id": "build", "capability": "code.generate", "instruction": "Build"}
+            ],
+            "edges": [{"from": "plan", "to": "build"}],
+            "future_graph_field": {"kept": true}
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        let legacy = json!({
+            "schema": "fractal.project.v1",
+            "project": {"slug": "legacy", "title": "Legacy", "visibility": "private"},
+            "graph_hash": graph["graph_hash"],
+            "graph": graph,
+            "updated_at": "2024-01-01T00:00:00Z",
+            "future_project_field": {"kept": true}
+        });
+        fs::write(path(&workspace), serde_json::to_vec_pretty(&legacy)?)?;
+
+        let document = load(&workspace)?;
+
+        assert_eq!(document.learning.schema, "fractal.learning.v1");
+        assert_eq!(document.learning.nodes["build"].depends_on, vec!["plan"]);
+        assert_eq!(
+            document.extra["future_project_field"],
+            json!({"kept": true})
+        );
+        assert_eq!(document.graph["future_graph_field"], json!({"kept": true}));
+        crate::graph_store::verify_graph_document(&document.graph)?;
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn central_mutation_apis_round_trip_enriched_learning() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_enriched",
+            "nodes": [{"id": "build", "capability": "code.generate", "instruction": "Build"}],
+            "edges": []
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        persist(&workspace, &graph, "Build")?;
+        mark_node_ready(&workspace, "build")?;
+        checkout_start_node(&workspace, "build", "agent-1", "Agent One")?;
+        record_artifact_produced(&workspace, "build", "artifact:build-log")?;
+        record_artifact_consumed(&workspace, "build", "artifact:input-spec")?;
+        record_human_intervention(&workspace, "build", Some("operator approved repair"))?;
+        set_node_costs(&workspace, "build", Some(1.25), Some(1.50))?;
+        record_verification_result(
+            &workspace,
+            "build",
+            true,
+            vec!["artifact:build-log".to_owned()],
+        )?;
+        finish_node(
+            &workspace,
+            "build",
+            "agent-1",
+            crate::learning_data::NodeOutcome::VerifiedSuccess,
+        )?;
+        store_graph_outcome(
+            &workspace,
+            crate::learning_data::aggregate(&load(&workspace)?.learning),
+        )?;
+
+        let document = load(&workspace)?;
+        let record = &document.learning.nodes["build"];
+        assert_eq!(
+            record.outcome,
+            Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+        );
+        assert_eq!(record.artifacts_produced, vec!["artifact:build-log"]);
+        assert_eq!(record.consumed_by, vec!["artifact:input-spec"]);
+        assert!(record.human_intervention);
+        assert_eq!(record.estimated_cost, Some(1.25));
+        assert_eq!(record.actual_cost, Some(1.50));
+        assert_eq!(document.graph_hash, graph["graph_hash"]);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_transitions_persist_and_refresh_graph_outcomes() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(workspace.join(".fractal"))?;
+        fs::write(
+            workspace.join(".fractal").join("lead-prd.json"),
+            serde_json::to_vec(&json!({
+                "schema": "fractal.prd.v1",
+                "acceptance_criteria": [{"id": "AC-1"}]
+            }))?,
+        )?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [{"id": "build", "capability": "project.tests.execute", "instruction": "Build"}],
+            "edges": []
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        persist(&workspace, &graph, "Build")?;
+
+        checkout_start_node(&workspace, "build", "agent-1", "Agent One")?;
+        record_verification_result(&workspace, "build", true, vec!["evidence:ac-1".to_owned()])?;
+        finish_node(
+            &workspace,
+            "build",
+            "agent-1",
+            crate::learning_data::NodeOutcome::HumanCompleted,
+        )?;
+        let completed = load(&workspace)?;
+        assert_eq!(
+            completed
+                .execution
+                .as_ref()
+                .map(|execution| execution.phase.as_str()),
+            Some("completed")
+        );
+        assert_eq!(
+            completed
+                .learning
+                .outcome
+                .as_ref()
+                .map(|outcome| outcome.acceptance_criteria.len()),
+            Some(1)
+        );
+        assert_eq!(
+            completed
+                .learning
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.final_verified_success),
+            Some(true)
+        );
+
+        append_graph_edit_event(
+            &workspace,
+            crate::learning_data::GraphEditEvent {
+                graph_before_hash: completed.graph_hash.clone(),
+                action: crate::learning_data::GraphEditAction {
+                    kind: "add_branch".to_owned(),
+                    ..crate::learning_data::GraphEditAction::default()
+                },
+                trigger: "late repair".to_owned(),
+                actor: "operator".to_owned(),
+                timestamp: String::new(),
+                eventual_effect: crate::learning_data::EventualEffect::default(),
+                ..crate::learning_data::GraphEditEvent::default()
+            },
+        )?;
+        update_graph_edit_event_effect(
+            &workspace,
+            0,
+            crate::learning_data::EventualEffect {
+                success: Some(false),
+                rework_reduced: Some(false),
+                ..crate::learning_data::EventualEffect::default()
+            },
+        )?;
+        assert_eq!(
+            load(&workspace)?
+                .learning
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.expanded_unnecessarily),
+            Some(true)
+        );
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_cancellation_persists_a_negative_terminal_outcome() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [{"id": "build", "capability": "code.generate", "instruction": "Build"}],
+            "edges": []
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        persist(&workspace, &graph, "Build")?;
+
+        checkout_start_node(&workspace, "build", "agent-1", "Agent One")?;
+        release_node(
+            &workspace,
+            "build",
+            "agent-1",
+            Some((
+                crate::learning_data::NodeOutcome::Cancelled,
+                crate::learning_data::FailureCode::PrematureCompletion,
+            )),
+        )?;
+        let halted = load(&workspace)?;
+        assert_eq!(
+            halted
+                .execution
+                .as_ref()
+                .map(|execution| execution.phase.as_str()),
+            Some("halted")
+        );
+        let outcome = halted.learning.outcome.expect("halted outcome");
+        assert_eq!(outcome.final_verified_success, Some(false));
+        assert_eq!(outcome.stopped_too_early, Some(true));
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_learning_records_and_secret_content_are_rejected() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({"schema": "fractal.execution_graph.v1", "nodes": [{"id": "build"}], "edges": []});
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        persist(&workspace, &graph, "Build")?;
+        let mut raw: Value = serde_json::from_slice(&fs::read(path(&workspace))?)?;
+        raw["learning"]["nodes"]["build"]["outcome"] = json!("verified_success");
+        raw["learning"]["nodes"]["build"]["finished_at"] = json!("2024-01-01T00:00:00Z");
+        raw["learning"]["nodes"]["build"]["notes"] = json!("x".repeat(1001));
+        fs::write(path(&workspace), serde_json::to_vec_pretty(&raw)?)?;
+        assert!(load(&workspace)
+            .expect_err("oversized notes must fail")
+            .to_string()
+            .contains("notes exceed"));
+
+        raw["learning"]["nodes"]["build"]["notes"] = json!("ok");
+        raw["learning"]["nodes"]["build"]["api_key"] = json!("must-not-leak");
+        fs::write(path(&workspace), serde_json::to_vec_pretty(&raw)?)?;
+        assert!(
+            load(&workspace).is_err(),
+            "secret learning fields must fail"
+        );
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn evolved_child_preserves_unknown_fields_and_learning_attribution() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut parent = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_parent",
+            "nodes": [{"id": "build", "capability": "code.generate", "instruction": "Build", "future_node_field": true}],
+            "edges": [],
+            "future_topology_field": {"must": "survive"}
+        });
+        parent["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&parent).unwrap());
+        persist(&workspace, &parent, "Build")?;
+        checkout_start_node(&workspace, "build", "agent-1", "Agent One")?;
+        finish_node(
+            &workspace,
+            "build",
+            "agent-1",
+            crate::learning_data::NodeOutcome::UnverifiedSuccess,
+        )?;
+
+        let mut child = parent.clone();
+        child["parent_graph"] = parent["graph_hash"].clone();
+        child["nodes"].as_array_mut().unwrap().push(json!({"id": "repair", "capability": "code.generate", "instruction": "Repair", "future_child_field": 7}));
+        child["edges"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"from": "build", "to": "repair"}));
+        child.as_object_mut().unwrap().remove("graph_hash");
+        child["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&child).unwrap());
+        persist_evolved(&workspace, &child)?;
+
+        let document = load(&workspace)?;
+        assert_eq!(
+            document.learning.nodes["build"]
+                .executor
+                .as_ref()
+                .unwrap()
+                .agent
+                .as_deref(),
+            Some("Agent One")
+        );
+        assert_eq!(
+            document.graph["future_topology_field"],
+            json!({"must": "survive"})
+        );
+        assert_eq!(document.graph["nodes"][1]["future_child_field"], json!(7));
+        assert_eq!(document.learning.nodes["repair"].depends_on, vec!["build"]);
         fs::remove_dir_all(workspace)?;
         Ok(())
     }

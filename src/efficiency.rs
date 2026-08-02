@@ -254,6 +254,25 @@ impl Default for EfficiencyData {
     }
 }
 
+impl EfficiencyData {
+    pub(crate) fn for_config(mode: EfficiencyMode, config_hash: &str) -> Self {
+        let aggregate = EfficiencyAggregate {
+            aggregation_version: AGGREGATION_VERSION,
+            config_hash: config_hash.to_owned(),
+            ..EfficiencyAggregate::default()
+        };
+        Self {
+            schema: EFFICIENCY_SCHEMA.to_owned(),
+            mode,
+            aggregation_version: AGGREGATION_VERSION,
+            config_hash: config_hash.to_owned(),
+            episodes: Vec::new(),
+            build: aggregate.clone(),
+            lifetime: aggregate,
+        }
+    }
+}
+
 /// Validate node planning metadata ranges and size bounds.
 pub(crate) fn validate_node_metadata(meta: &NodeEfficiencyMetadata) -> Result<(), String> {
     if meta.expected_artifact.trim().is_empty() {
@@ -750,6 +769,7 @@ mod tests {
             nodes: BTreeMap::new(),
             graph_edits: Vec::new(),
             outcome: None,
+            ..LearningData::default()
         };
         let learning_bytes = serde_json::to_vec(&learning_before).unwrap();
 

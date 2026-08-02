@@ -66,6 +66,10 @@ pub(crate) struct Evolution {
     pub cause: String,
     /// Human-readable description of what changed.
     pub note: String,
+    /// Node ids introduced by this structural mutation.
+    pub created_nodes: Vec<String>,
+    /// Primary graph node targeted by the mutation.
+    pub target: String,
     /// The governed-apply verdict (panels/anomaly/promotion) for this step.
     pub verdict: String,
     /// The open canary + lineage session, settled once the re-run verdict lands.
@@ -206,6 +210,7 @@ pub(crate) fn evolve(
     failed_node: &str,
     attempt: u32,
 ) -> Result<Evolution> {
+    verify_parent_graph(graph, current_hash)?;
     let attribution = attribution_for(failed_node, attempt);
     let cause = attribution
         .primary_cause()
@@ -263,16 +268,20 @@ pub(crate) fn evolve(
         &motivating_hash,
     );
 
-    Ok(Evolution {
+    let evolution = Evolution {
         child_hash,
         child_graph,
         arm,
         context_bp,
         cause,
         note: result.note,
+        created_nodes: result.proposal.diff.added_nodes.clone(),
+        target: failed_node.to_owned(),
         verdict,
         governance,
-    })
+    };
+    evolution.record_learning_event(current_hash, "autonomous_verified_failure");
+    Ok(evolution)
 }
 
 /// `grow.verification`: use the real `propose_verification_growth` to add a
@@ -434,6 +443,7 @@ pub(crate) fn grow_proactive(
     current_hash: &str,
     source_node: &str,
 ) -> Result<Evolution> {
+    verify_parent_graph(graph, current_hash)?;
     let attribution = attribution_for(source_node, 0);
     let result = grow_arm(
         graph,
@@ -474,9 +484,20 @@ pub(crate) fn grow_proactive(
         context_bp: context_features(cause_index("harness"), 0),
         cause: "progress".to_owned(),
         note: result.note,
+        created_nodes: result.proposal.diff.added_nodes.clone(),
+        target: source_node.to_owned(),
         verdict,
         governance,
     })
+}
+
+fn verify_parent_graph(graph: &Value, current_hash: &str) -> Result<()> {
+    if graph.get("graph_hash").and_then(Value::as_str) != Some(current_hash) {
+        return Err(anyhow!(
+            "evolution parent hash does not match the current graph"
+        ));
+    }
+    graph_store::verify_graph_document(graph).context("evolution parent graph hash is invalid")
 }
 
 /// Fallback: splice the growth diff into the compiled graph (no recompile).
@@ -486,18 +507,38 @@ fn splice_grow_child(graph: &Value, growth: &fractal_evolution::GrowthProposal) 
         .get_mut("nodes")
         .and_then(Value::as_array_mut)
         .context("graph has no nodes array")?;
+    let created_at = crate::project_file::project_timestamp();
     for node_id in &growth.proposal.diff.added_nodes {
+        let dependencies = growth
+            .proposal
+            .diff
+            .changed_edges
+            .iter()
+            .filter(|edge| edge.to == *node_id && edge.condition != "failure")
+            .map(|edge| edge.from.clone())
+            .collect::<Vec<_>>();
         nodes.push(json!({
             "id": node_id,
             "kind": "verification",
+            "node_type": "verification",
+            "objective": format!("Verify the acceptance criteria after `{node_id}`."),
             "capability": "project.tests.execute",
             "instruction": "Re-run the acceptance suite against the produced artifact; \
-                            fail if any test fails."
+                            fail if any test fails.",
+            "depends_on": dependencies,
+            "created_at": created_at.clone(),
+            "attempt_count": 0,
+            "artifacts_produced": [],
+            "consumed_by": [],
+            "human_intervention": false,
+            "reopen_count": 0,
+            "structural_outcome": "created",
+            "controlled_outcome": "accepted"
         }));
     }
     if let Some(edges) = child.get_mut("edges").and_then(Value::as_array_mut) {
         for edge in &growth.proposal.diff.changed_edges {
-            edges.push(json!({ "from": edge.from, "to": edge.to, "on": edge.condition }));
+            edges.push(json!({ "from": edge.from, "to": edge.to, "condition": edge.condition }));
         }
     }
     Ok(child)
@@ -540,6 +581,7 @@ fn apply_repair(graph: &Value, current_hash: &str, failed_node: &str) -> Result<
         ),
     };
     stamp_lineage(&mut child, current_hash, ARM_REPAIR);
+    mark_autonomous_target(&mut child, failed_node, "repaired");
 
     // A policy-scoped mutation on the (mutable) harness-topology target; the
     // governed cycle validates it without a structural board change.
@@ -677,6 +719,7 @@ fn apply_differentiate(
         ),
     };
     stamp_lineage(&mut child, current_hash, ARM_DIFFERENTIATE);
+    mark_autonomous_target(&mut child, &source, "differentiated");
     Ok(ArmResult {
         child_graph: child,
         note: format!(
@@ -756,9 +799,128 @@ fn splice_repair_child(graph: &Value, failed_node: &str) -> Value {
     child
 }
 
+fn action_for_arm(arm: &str) -> &'static str {
+    match arm {
+        ARM_GROW => "grow_graph",
+        ARM_DIFFERENTIATE => "differentiate_graph",
+        _ => "repair_graph",
+    }
+}
+
+fn compact_actor() -> String {
+    std::env::var("FRACTAL_WORKER")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "fractal".to_owned())
+        .chars()
+        .take(120)
+        .collect()
+}
+
+impl Evolution {
+    pub(crate) fn record_learning_event(&self, graph_before_hash: &str, trigger: &str) {
+        let Ok(workspace) = std::env::current_dir() else {
+            return;
+        };
+        self.record_learning_event_in(&workspace, graph_before_hash, trigger);
+    }
+
+    pub(crate) fn record_learning_event_in(
+        &self,
+        workspace: &std::path::Path,
+        graph_before_hash: &str,
+        trigger: &str,
+    ) {
+        let _ = self.record_learning_event_in_with_index(workspace, graph_before_hash, trigger);
+    }
+
+    /// Append this autonomous mutation to the canonical project learning log
+    /// and return its stable index so the supervisor can fill in the eventual
+    /// effect after the downstream verification verdict arrives.
+    pub(crate) fn record_learning_event_in_with_index(
+        &self,
+        workspace: &std::path::Path,
+        graph_before_hash: &str,
+        trigger: &str,
+    ) -> Result<usize> {
+        let event = crate::learning_data::GraphEditEvent {
+            graph_before_hash: graph_before_hash.to_owned(),
+            action: crate::learning_data::GraphEditAction {
+                kind: action_for_arm(&self.arm).to_owned(),
+                target: Some(self.target.clone()),
+                created_nodes: self.created_nodes.clone(),
+                ..crate::learning_data::GraphEditAction::default()
+            },
+            trigger: trigger.chars().take(240).collect(),
+            actor: compact_actor(),
+            timestamp: String::new(),
+            eventual_effect: crate::learning_data::EventualEffect::default(),
+            ..crate::learning_data::GraphEditEvent::default()
+        };
+        crate::project_file::append_graph_edit_event(workspace, event)?;
+        let project = crate::project_file::load(workspace)?;
+        project
+            .learning
+            .graph_edits
+            .len()
+            .checked_sub(1)
+            .context("graph edit event was not appended")
+    }
+
+    pub(crate) fn update_learning_event_effect(
+        workspace: &std::path::Path,
+        index: usize,
+        success: bool,
+    ) -> Result<()> {
+        crate::project_file::update_graph_edit_event_effect(
+            workspace,
+            index,
+            crate::learning_data::EventualEffect {
+                success: Some(success),
+                rework_reduced: Some(success),
+                ..crate::learning_data::EventualEffect::default()
+            },
+        )
+    }
+}
+
+fn update_latest_learning_effect(arm: &str, success: bool) {
+    let Ok(workspace) = std::env::current_dir() else {
+        return;
+    };
+    let Ok(project) = crate::project_file::load(&workspace) else {
+        return;
+    };
+    let action = action_for_arm(arm);
+    let Some(index) = project
+        .learning
+        .graph_edits
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, event)| {
+            event.action.kind == action
+                && event.eventual_effect.success.is_none()
+                && event.eventual_effect.rework_reduced.is_none()
+        })
+        .map(|(index, _)| index)
+    else {
+        return;
+    };
+    let _ = crate::project_file::update_graph_edit_event_effect(
+        &workspace,
+        index,
+        crate::learning_data::EventualEffect {
+            success: Some(success),
+            rework_reduced: Some(success),
+            ..crate::learning_data::EventualEffect::default()
+        },
+    );
+}
+
 /// Record the verifiable reward for the previous evolution so the bandit learns
 /// across runs. Reward is 10,000bp for an independently-verified success, else 0.
 pub(crate) fn record_reward(arm: &str, context_bp: &[i32], cause: &str, success: bool) {
+    update_latest_learning_effect(arm, success);
     let record = json!({
         "arm": arm,
         "context_bp": context_bp,
@@ -1282,6 +1444,20 @@ fn stamp_lineage(child: &mut Value, parent_hash: &str, arm: &str) {
     child["evolution_arm"] = json!(arm);
 }
 
+fn mark_autonomous_target(child: &mut Value, target: &str, structural_outcome: &str) {
+    let Some(nodes) = child.get_mut("nodes").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if let Some(node) = nodes
+        .iter_mut()
+        .find(|node| node.get("id").and_then(Value::as_str) == Some(target))
+    {
+        node["structural_outcome"] = json!(structural_outcome);
+        node["controlled_outcome"] = json!("accepted");
+        node["human_intervention"] = json!(false);
+    }
+}
+
 /// Recompute the content hash (canonical over the graph minus `graph_hash`) and
 /// commit the child graph to the store.
 fn commit_child(mut child: Value) -> Result<(String, Value)> {
@@ -1307,6 +1483,57 @@ mod hash_tests {
     use super::*;
 
     #[test]
+    fn autonomous_learning_effect_updates_latest_unknown_event() {
+        let _lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let _home = crate::graph_store::TestHome::new("auto-edit-events").unwrap();
+        let workspace = std::env::temp_dir().join(format!(
+            "fractal-auto-edit-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let previous_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&workspace).unwrap();
+
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "auto-edit-test",
+            "nodes": [{"id":"build","capability":"code.generate","instruction":"build"}],
+            "edges": []
+        });
+        crate::graph_store::rehash_graph(&mut graph).unwrap();
+        crate::graph_store::commit_graph(&graph).unwrap();
+        crate::project_file::persist(&workspace, &graph, "Auto Edit Test").unwrap();
+        let before = graph["graph_hash"].as_str().unwrap().to_owned();
+
+        let event = crate::learning_data::GraphEditEvent {
+            graph_before_hash: before.clone(),
+            action: crate::learning_data::GraphEditAction {
+                kind: action_for_arm(ARM_GROW).to_owned(),
+                target: Some("build".to_owned()),
+                created_nodes: vec!["verify.build".to_owned()],
+                ..crate::learning_data::GraphEditAction::default()
+            },
+            trigger: "autonomous_midrun_grow".to_owned(),
+            actor: "agent".to_owned(),
+            timestamp: String::new(),
+            ..crate::learning_data::GraphEditEvent::default()
+        };
+        crate::project_file::append_graph_edit_event(&workspace, event).unwrap();
+        record_reward(ARM_GROW, &[1, 0], "progress", true);
+        let project = crate::project_file::load(&workspace).unwrap();
+        let recorded = &project.learning.graph_edits[0];
+        assert_eq!(recorded.graph_before_hash, before);
+        assert_eq!(recorded.action.kind, "grow_graph");
+        assert_eq!(recorded.action.created_nodes, vec!["verify.build"]);
+        assert_eq!(recorded.eventual_effect.success, Some(true));
+        assert_eq!(recorded.eventual_effect.rework_reduced, Some(true));
+
+        std::env::set_current_dir(previous_dir).unwrap();
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
     fn committed_child_value_carries_its_recomputed_hash() {
         let mut child = json!({
             "schema": "fractal.execution_graph.v1",
@@ -1318,5 +1545,92 @@ mod hash_tests {
         let hash = stamp_child_hash(&mut child).unwrap();
         assert_eq!(child["graph_hash"].as_str(), Some(hash.as_str()));
         crate::graph_store::verify_graph_document(&child).unwrap();
+    }
+
+    #[test]
+    fn cross_boundary_autonomous_edit_round_trips_with_effect_and_hash() {
+        let _lock = crate::graph_store::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home = crate::graph_store::TestHome::new("auto-edit-e2e").unwrap();
+        std::env::set_var("FRACTAL_OFFLINE", "1");
+        let workspace = std::env::temp_dir().join(format!(
+            "fractal-auto-e2e-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "auto-e2e",
+            "nodes": [{"id":"build","capability":"code.generate","instruction":"build"}],
+            "edges": []
+        });
+        crate::graph_store::rehash_graph(&mut graph).unwrap();
+        crate::graph_store::commit_graph(&graph).unwrap();
+        crate::project_file::persist(&workspace, &graph, "Auto E2E").unwrap();
+        let before = graph["graph_hash"].as_str().unwrap().to_owned();
+
+        let mut child = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "auto-e2e-child",
+            "parent_graph": before,
+            "nodes": [
+                {"id":"build","capability":"code.generate","instruction":"build"},
+                {"id":"verify.build","capability":"project.tests.execute","instruction":"verify"}
+            ],
+            "edges": [{"from":"build","to":"verify.build","condition":"success"}]
+        });
+        let child_hash = stamp_child_hash(&mut child).unwrap();
+        crate::graph_store::verify_graph_document(&child).unwrap();
+        crate::project_file::persist_evolved(&workspace, &child).unwrap();
+
+        let event = crate::learning_data::GraphEditEvent {
+            graph_before_hash: before.clone(),
+            action: crate::learning_data::GraphEditAction {
+                kind: action_for_arm(ARM_GROW).to_owned(),
+                target: Some("build".to_owned()),
+                created_nodes: vec!["verify.build".to_owned()],
+                ..crate::learning_data::GraphEditAction::default()
+            },
+            trigger: "autonomous_midrun_grow".to_owned(),
+            actor: "agent".to_owned(),
+            timestamp: String::new(),
+            ..crate::learning_data::GraphEditEvent::default()
+        };
+        crate::project_file::append_graph_edit_event(&workspace, event).unwrap();
+        crate::project_file::update_graph_edit_event_effect(
+            &workspace,
+            0,
+            crate::learning_data::EventualEffect {
+                success: Some(true),
+                rework_reduced: Some(true),
+                ..crate::learning_data::EventualEffect::default()
+            },
+        )
+        .unwrap();
+
+        let project = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(project.graph_hash, child_hash);
+        let recorded = &project.learning.graph_edits[0];
+        assert_eq!(recorded.graph_before_hash, before);
+        assert_eq!(recorded.action.kind, "grow_graph");
+        assert_eq!(recorded.action.target.as_deref(), Some("build"));
+        assert_eq!(recorded.action.created_nodes, vec!["verify.build"]);
+        assert_eq!(recorded.trigger, "autonomous_midrun_grow");
+        assert!(!recorded.timestamp.is_empty());
+        assert_eq!(recorded.eventual_effect.success, Some(true));
+        assert_eq!(recorded.eventual_effect.rework_reduced, Some(true));
+
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(crate::project_file::path(&workspace)).unwrap())
+                .unwrap();
+        assert_eq!(
+            raw["learning"]["graph_edits"][0]["action"]["type"],
+            "grow_graph"
+        );
+        assert_eq!(raw["graph_hash"], json!(child_hash));
+        std::fs::remove_dir_all(workspace).ok();
     }
 }

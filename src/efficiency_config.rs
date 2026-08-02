@@ -37,6 +37,17 @@ pub(crate) struct EfficiencyConfig {
     pub(crate) high_impact_autonomy: Vec<RepairAction>,
 }
 
+impl Default for EfficiencyConfig {
+    fn default() -> Self {
+        Self {
+            mode: EfficiencyMode::Suggest,
+            approved: Vec::new(),
+            overridden: Vec::new(),
+            high_impact_autonomy: Vec::new(),
+        }
+    }
+}
+
 impl EfficiencyConfig {
     /// Canonical sha256 over a stable, sorted text form of the configuration.
     pub(crate) fn config_hash(&self) -> String {
@@ -142,6 +153,7 @@ pub(crate) fn run(args: &EfficiencyArgs) -> Result<()> {
         Some(path) => path.clone(),
         None => std::env::current_dir()?,
     };
+    crate::efficiency_accounting::ensure_envelope(&workspace, config.mode, &config.config_hash())?;
     let data = load_project_efficiency(&workspace)?.unwrap_or_default();
     if args.json {
         println!(

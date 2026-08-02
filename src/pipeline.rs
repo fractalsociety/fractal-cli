@@ -202,24 +202,6 @@ pub(crate) fn print_evolve_stub(once: bool, watch: bool) {
     );
 }
 
-/// Print the future per-node control boundary.
-pub(crate) fn print_node_stub(id: &str, show: bool, retry: bool, cancel: bool) {
-    let action = if show {
-        "show"
-    } else if retry {
-        "retry"
-    } else if cancel {
-        "cancel"
-    } else {
-        "unspecified"
-    };
-    println!("Node: {id}");
-    println!("Action: {action}");
-    println!(
-        "[STUB] TODO: the execution-graph board plus squad-coordinate will wire per-node control in P2."
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

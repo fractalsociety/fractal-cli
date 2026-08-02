@@ -173,10 +173,135 @@ struct EfficiencyControls: Equatable {
     }
 }
 
+/// Concise learning projection for HUD / menu status. Absent fields stay nil so
+/// callers keep their existing status text instead of inventing a failure.
+struct LearningStatusPresentation: Equatable {
+    let nodeTitle: String?
+    let nodeOutcome: String?
+    let nodeAttempt: String?
+    let nodeVerification: String?
+    let nodeSummary: String?
+    let graphSummary: String?
+
+    /// Single secondary HUD line from whatever learning fields are present.
+    var detailLine: String? {
+        var parts: [String] = []
+        if let nodeSummary, !nodeSummary.isEmpty {
+            if let nodeTitle, !nodeTitle.isEmpty {
+                parts.append("\(nodeTitle): \(nodeSummary)")
+            } else {
+                parts.append(nodeSummary)
+            }
+        } else {
+            var nodeParts: [String] = []
+            if let nodeOutcome, !nodeOutcome.isEmpty { nodeParts.append(nodeOutcome) }
+            if let nodeAttempt, !nodeAttempt.isEmpty, nodeAttempt != "no attempts" {
+                nodeParts.append(nodeAttempt)
+            }
+            if let nodeVerification, !nodeVerification.isEmpty, nodeVerification != "not verified" {
+                nodeParts.append(nodeVerification)
+            }
+            if !nodeParts.isEmpty {
+                let joined = nodeParts.joined(separator: " · ")
+                if let nodeTitle, !nodeTitle.isEmpty {
+                    parts.append("\(nodeTitle): \(joined)")
+                } else {
+                    parts.append(joined)
+                }
+            }
+        }
+        if let graphSummary, !graphSummary.isEmpty {
+            parts.append(graphSummary)
+        }
+        guard !parts.isEmpty else { return nil }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Preferred suffix when a build finishes successfully.
+    var finishedSummary: String? {
+        if let graphSummary, !graphSummary.isEmpty { return graphSummary }
+        return detailLine
+    }
+
+    init?(learning: ProjectGraphLearning) {
+        let focus = Self.selectAvailableNode(from: learning)
+        let title = focus.flatMap { node -> String? in
+            let raw = (node.title?.isEmpty == false ? node.title : nil) ?? node.objective
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            if trimmed.count <= 42 { return trimmed }
+            return "\(trimmed.prefix(41))…"
+        }
+        let outcome = focus.map(\.outcomeText)
+        let attempt = focus.map(\.attemptText)
+        let verification = focus.map(\.verificationText)
+        let nodeSummary = focus.map(\.compactSummary)
+        let graphSummary: String?
+        if let outcome = learning.outcome {
+            graphSummary = outcome.compactSummary
+        } else if !learning.nodes.isEmpty,
+                  learning.nodes.values.contains(where: Self.nodeHasDisplayableLearning)
+        {
+            graphSummary = learning.compactCompletionSummary
+        } else {
+            graphSummary = nil
+        }
+
+        let usefulNode = focus.map(Self.nodeHasDisplayableLearning) ?? false
+        guard usefulNode || graphSummary != nil else { return nil }
+
+        self.nodeTitle = title
+        self.nodeOutcome = usefulNode ? outcome : nil
+        self.nodeAttempt = usefulNode ? attempt : nil
+        self.nodeVerification = usefulNode ? verification : nil
+        self.nodeSummary = usefulNode ? nodeSummary : nil
+        self.graphSummary = graphSummary
+    }
+
+    nonisolated static func selectAvailableNode(
+        from learning: ProjectGraphLearning
+    ) -> ProjectGraphLearning.Node? {
+        let nodes = Array(learning.nodes.values)
+        guard !nodes.isEmpty else { return nil }
+
+        let inProgress = nodes.filter { node in
+            if node.knownOutcome == .inProgress { return true }
+            let hasStart = !(node.startedAt ?? "").isEmpty
+            let hasEnd = !(node.completedAt ?? "").isEmpty
+            let openOutcome = node.outcome == nil || node.outcome?.isEmpty == true
+            return hasStart && !hasEnd && openOutcome
+        }
+        .sorted { ($0.startedAt ?? "") > ($1.startedAt ?? "") }
+        if let focus = inProgress.first { return focus }
+
+        let finished = nodes.filter { node in
+            !(node.completedAt ?? "").isEmpty
+                || (node.outcome != nil && !(node.outcome?.isEmpty ?? true))
+                || node.attemptCount > 0
+                || node.verification != nil
+        }
+        .sorted {
+            ($0.completedAt ?? $0.startedAt ?? "") > ($1.completedAt ?? $1.startedAt ?? "")
+        }
+        return finished.first
+    }
+
+    nonisolated private static func nodeHasDisplayableLearning(
+        _ node: ProjectGraphLearning.Node
+    ) -> Bool {
+        if node.attemptCount > 0 { return true }
+        if let outcome = node.outcome, !outcome.isEmpty { return true }
+        if node.verification != nil { return true }
+        if !(node.startedAt ?? "").isEmpty { return true }
+        return false
+    }
+}
+
 @MainActor
 final class BuildCoordinator: ObservableObject {
     @Published private(set) var state: VoiceState = .idle
     @Published private(set) var latestActivity = "Checking offline voice engine…"
+    @Published private(set) var learningDetail: String?
     @Published private(set) var voiceReady = false
     @Published private(set) var shortcutReady = false
     @Published private(set) var shortcutStatus = "Registering ⌥Space…"
@@ -199,6 +324,7 @@ final class BuildCoordinator: ObservableObject {
     private var stopRequested = false
     private var restartRequested = false
     private var activeWorkspace: URL?
+    private var lastLearningRefresh: Date?
     private let vocabularyEngine = VoiceVocabularyEngine(homeURL: AppRuntime.homeURL)
     private let speaker = KokoroSpeaker()
     private var transcriptionPurpose: TranscriptionPurpose = .request
@@ -292,18 +418,73 @@ final class BuildCoordinator: ObservableObject {
         )
     }
 
+    /// Optional learning status from the active workspace `project.fractal`.
+    /// Missing or partial learning data returns `nil` so callers keep existing text.
+    func learningStatusPresentation() -> LearningStatusPresentation? {
+        loadLearningPresentation()
+    }
+
+    /// Pure loader used by builds and unit tests. Never throws; legacy files yield nil.
+    nonisolated static func learningStatusPresentation(
+        from projectFractalURL: URL
+    ) -> LearningStatusPresentation? {
+        guard let learning = ProjectGraphLearning.load(from: projectFractalURL) else {
+            return nil
+        }
+        return LearningStatusPresentation(learning: learning)
+    }
+
+    nonisolated static func learningStatusPresentation(
+        data: Data
+    ) -> LearningStatusPresentation? {
+        guard let learning = ProjectGraphLearning.decode(from: data) else {
+            return nil
+        }
+        return LearningStatusPresentation(learning: learning)
+    }
+
     private func loadLifetimeEfficiency() -> ProjectGraphEfficiency? {
-        let candidates: [URL] = [
-            activeWorkspace?.appendingPathComponent(".fractal/project.fractal"),
-            Self.activeProjectURL()?.appendingPathComponent(".fractal/project.fractal"),
-            Self.mostRecentProjectFractalURL(),
-        ].compactMap { $0 }
-        for url in candidates {
+        for url in projectFractalCandidates() {
             if let efficiency = ProjectGraphEfficiency.load(from: url) {
                 return efficiency
             }
         }
         return nil
+    }
+
+    private func loadLearningPresentation() -> LearningStatusPresentation? {
+        for url in projectFractalCandidates() {
+            if let presentation = Self.learningStatusPresentation(from: url) {
+                return presentation
+            }
+        }
+        return nil
+    }
+
+    private func projectFractalCandidates() -> [URL] {
+        [
+            activeWorkspace?.appendingPathComponent(".fractal/project.fractal"),
+            Self.activeProjectURL()?.appendingPathComponent(".fractal/project.fractal"),
+            Self.mostRecentProjectFractalURL(),
+        ].compactMap { $0 }
+    }
+
+    /// Refresh HUD/menu learning detail from disk. Skipped on audio paths; only
+    /// called from build-status updates and terminal finish handling.
+    @discardableResult
+    private func refreshLearningDetail(force: Bool = false) -> String? {
+        if !force, let last = lastLearningRefresh, Date().timeIntervalSince(last) < 2 {
+            return learningDetail
+        }
+        lastLearningRefresh = Date()
+        let detail = loadLearningPresentation()?.detailLine
+        learningDetail = detail
+        return detail
+    }
+
+    private func clearLearningDetail() {
+        learningDetail = nil
+        lastLearningRefresh = nil
     }
 
     /// Pure CLI argument builder used by builds and unit tests.
@@ -590,9 +771,7 @@ final class BuildCoordinator: ObservableObject {
             onStop: { [weak self] in self?.stopCurrentBuild() },
             onRestart: { [weak self] in self?.restartVoiceCommand() }
         )
-        hud?.showBuilding(
-            summary: "External request received — starting \(external.projectName)…"
-        )
+        presentBuildingStatus("External request received — starting \(external.projectName)…")
         startBuild(
             transcript: external.request,
             projectName: external.projectName,
@@ -726,7 +905,7 @@ final class BuildCoordinator: ObservableObject {
             onStop: { [weak self] in self?.stopCurrentBuild() },
             onRestart: { [weak self] in self?.restartVoiceCommand() }
         )
-        hud?.showBuilding(summary: latestActivity)
+        presentBuildingStatus(latestActivity)
 
         let task = Process()
         let combinedOutput = Pipe()
@@ -1314,8 +1493,7 @@ final class BuildCoordinator: ObservableObject {
 
     private func submitAmendment(_ transcript: String) {
         state = .building
-        latestActivity = "Sending graph change to the lead planner…"
-        hud?.showBuilding(summary: latestActivity)
+        presentBuildingStatus("Sending graph change to the lead planner…")
         #if APP_STORE
         Task { [weak self] in
             do {
@@ -1344,7 +1522,7 @@ final class BuildCoordinator: ObservableObject {
             command.executableURL = executable
             command.arguments = [
                 "ingest", "--source", "fractal-mac-app",
-                "--format", "text", "--stdin",
+                "--format", "text", "--stdin", "--amend",
             ] + Self.efficiencyCLIArguments(EfficiencyControls.load())
             command.environment = Self.processEnvironment()
             command.standardInput = stdin
@@ -1382,8 +1560,7 @@ final class BuildCoordinator: ObservableObject {
         }
         activeAudioURL = nil
         state = .building
-        latestActivity = "Graph change was not accepted: \(error.localizedDescription)"
-        hud?.showBuilding(summary: latestActivity)
+        presentBuildingStatus("Graph change was not accepted: \(error.localizedDescription)")
     }
 
     private func handleSpokenConfirmation(_ transcript: String, forName: Bool) {
@@ -1454,8 +1631,7 @@ final class BuildCoordinator: ObservableObject {
         let requestWasTyped = pendingRequestWasTyped
         let projectName = pendingProjectName
         state = .building
-        hud?.showBuilding(summary: "Confirmed — starting \(projectName)…")
-        latestActivity = "Confirmed — starting \(projectName)…"
+        presentBuildingStatus("Confirmed — starting \(projectName)…")
         // Launch immediately. The acknowledgement is non-blocking and never
         // delays the planner.
         speaker.speak("Great. I am starting \(projectName) now.") { _ in }
@@ -1682,6 +1858,10 @@ final class BuildCoordinator: ObservableObject {
             let path = line[prefix.upperBound...].trimmingCharacters(in: .whitespaces)
             if !path.isEmpty {
                 activeWorkspace = URL(fileURLWithPath: path, isDirectory: true)
+                if state == .building {
+                    let detail = refreshLearningDetail(force: true)
+                    hud?.updateLearningDetail(detail)
+                }
             }
         }
         if let summary = Self.activitySummary(for: line) {
@@ -1692,8 +1872,15 @@ final class BuildCoordinator: ObservableObject {
     private func setActivity(_ activity: String) {
         latestActivity = activity
         if state == .building {
-            hud?.updateBuilding(summary: activity)
+            let detail = refreshLearningDetail()
+            hud?.updateBuilding(summary: activity, detail: detail, updateDetail: true)
         }
+    }
+
+    private func presentBuildingStatus(_ summary: String) {
+        latestActivity = summary
+        let detail = refreshLearningDetail(force: true)
+        hud?.showBuilding(summary: summary, detail: detail)
     }
 
     private func requestBuildStop(restart: Bool) {
@@ -1703,6 +1890,7 @@ final class BuildCoordinator: ObservableObject {
             pendingRequest = ""
             pendingRequestWasTyped = false
             pendingProjectName = ""
+            clearLearningDetail()
             hud?.close()
             hud = nil
             state = .idle
@@ -1809,6 +1997,7 @@ final class BuildCoordinator: ObservableObject {
             stopRequested = false
             restartRequested = false
             activeWorkspace = nil
+            clearLearningDetail()
             hud?.close()
             hud = nil
             state = .idle
@@ -1826,6 +2015,7 @@ final class BuildCoordinator: ObservableObject {
         }
         if exitCode != 0, Self.projectNameWasTaken(outputBuffer) {
             activeWorkspace = nil
+            clearLearningDetail()
             let takenName = pendingProjectName
             pendingProjectName = ""
             askForProjectName(
@@ -1839,15 +2029,18 @@ final class BuildCoordinator: ObservableObject {
             state = .idle
             let projectFile = activeWorkspace?
                 .appendingPathComponent(".fractal/project.fractal")
-            let learningSummary = projectFile.flatMap {
-                ProjectGraphLearning.load(from: $0)
-            }?.outcome?.compactSummary
+            let presentation = projectFile.flatMap {
+                Self.learningStatusPresentation(from: $0)
+            }
+            let learningSummary = presentation?.finishedSummary
+            learningDetail = presentation?.detailLine
             // Lifetime efficiency is secondary menu/detail only — never replace
             // the learning summary or claim Estimated totals are Realized.
             latestActivity = learningSummary.map { "Build finished — \($0)" }
                 ?? "Build finished — press ⌥Space for another project"
             notify(title: "Fractal build finished", body: learningSummary ?? "Your project run completed.")
         } else {
+            clearLearningDetail()
             let detail = outputBuffer
                 .split(separator: "\n")
                 .suffix(3)

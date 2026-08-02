@@ -310,6 +310,7 @@ fn handle(
                     "--format",
                     "text",
                     "--stdin",
+                    "--amend",
                 ])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())

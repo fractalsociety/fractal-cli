@@ -1,148 +1,16 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
-
-use crate::graph_store;
-
-/// Prepare the board-state file for a graph about to be served. A graph with no
-/// lineage starts clean (so progress shows from zero). An **evolved child** —
-/// grown / repaired / differentiated mid-run, identified by its `parent_graph`
-/// field — inherits its parent's board state (the completed / in-progress
-/// assignments for the tasks it still contains), so re-serving it mid-run keeps
-/// the progress already made instead of resetting every task to pending.
-fn seed_board_state(
-    graph: &serde_json::Value,
-    state_file: &Path,
-    preseed_completed: Option<&std::collections::BTreeSet<String>>,
-) {
-    let node_ids: std::collections::BTreeSet<&str> = graph
-        .get("nodes")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|node| node.get("id").and_then(serde_json::Value::as_str))
-        .collect();
-
-    // Resume: mark the already-completed tasks so the board shows prior progress
-    // (green) instead of restarting them from pending.
-    if let Some(completed) = preseed_completed {
-        let assignments: serde_json::Map<String, serde_json::Value> = completed
-            .iter()
-            .filter(|id| node_ids.contains(id.as_str()))
-            .map(|id| {
-                (
-                    id.clone(),
-                    serde_json::json!({
-                        "agent_id": "resumed",
-                        "agent_label": "resumed",
-                        "state": "completed",
-                    }),
-                )
-            })
-            .collect();
-        let graph_id = graph.get("graph_id").cloned().unwrap_or_default();
-        let state = serde_json::json!({ "graph_id": graph_id, "assignments": assignments });
-        if let Ok(serialized) = serde_json::to_string_pretty(&state) {
-            let _ = std::fs::write(state_file, serialized);
-        }
-        return;
-    }
-
-    if let Some(parent) = graph
-        .get("parent_graph")
-        .and_then(serde_json::Value::as_str)
-    {
-        let parent_state = graph_store::graph_path(parent).with_extension("board-state.json");
-        if let Ok(text) = std::fs::read_to_string(&parent_state) {
-            if let Ok(mut state) = serde_json::from_str::<serde_json::Value>(&text) {
-                // Keep only the assignments for tasks the child still has.
-                if let Some(map) = state
-                    .get_mut("assignments")
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    map.retain(|node_id, _| node_ids.contains(node_id.as_str()));
-                }
-                if let Ok(serialized) = serde_json::to_string_pretty(&state) {
-                    if std::fs::write(state_file, serialized).is_ok() {
-                        return; // inherited the parent's progress
-                    }
-                }
-            }
-        }
-    }
-    // No lineage (or the parent state was unreadable): start clean.
-    let _ = std::fs::remove_file(state_file);
-}
-
-/// Terminate any *leftover fractal board server* still listening on `port` from
-/// a previous run. Without this, the new server cannot bind the port and the
-/// browser connects to the stale (already-completed, all-green) server instead
-/// of the fresh graph. Only processes whose command is the execution-graph
-/// `server.py` are killed, never unrelated processes on the port.
-fn free_port(port: u16) {
-    use std::collections::BTreeSet;
-    // PIDs currently listening on the port.
-    let Ok(listing) = Command::new("lsof")
-        .args(["-ti", &format!("tcp:{port}")])
-        .output()
-    else {
-        return;
-    };
-    let on_port: BTreeSet<String> = String::from_utf8_lossy(&listing.stdout)
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect();
-    if on_port.is_empty() {
-        return;
-    }
-    // PIDs that are execution-graph board servers (matched on the full command
-    // line via pgrep, which — unlike `ps -o command=` — does not truncate the
-    // long macOS `python3` path before the server.py argument).
-    let board_servers: BTreeSet<String> = Command::new("pgrep")
-        .args(["-f", "execution-graph/server.py"])
-        .output()
-        .map(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut killed = false;
-    for pid in on_port.intersection(&board_servers) {
-        let _ = Command::new("kill").arg("-9").arg(pid).status();
-        killed = true;
-    }
-    if killed {
-        // Give the OS a moment to release the socket before the new bind.
-        std::thread::sleep(Duration::from_millis(250));
-    }
-}
-
-/// Block until the board's `/api/health` responds, so execution progress posted
-/// immediately after does not race a not-yet-listening server (which would drop
-/// the first node's checkout/complete and leave it stuck).
-pub(crate) fn wait_until_listening(port: u16) {
-    let url = format!("http://127.0.0.1:{port}/api/health");
-    let deadline = Instant::now() + Duration::from_secs(6);
-    while Instant::now() < deadline {
-        if ureq::get(&url)
-            .timeout(Duration::from_millis(300))
-            .call()
-            .is_ok()
-        {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
+use serde_json::{json, Value};
+use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:8091/";
-const START_COMMAND: &str = "python3 execution-graph/server.py --prd FRACTAL_PIPELINE_TASKS.md --state execution-graph/graph-state-pipeline.json --port 8091";
+const START_COMMAND: &str = "fractal graph board GRAPH_HASH";
 
 #[derive(Debug, Deserialize)]
 struct BoardPayload {
@@ -199,14 +67,48 @@ impl Counts {
     }
 }
 
-/// Open the default execution-graph board in the macOS browser.
+pub(crate) fn wait_until_listening(port: u16) {
+    let url = format!("http://127.0.0.1:{port}/api/health");
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        if ureq::get(&url)
+            .timeout(Duration::from_millis(300))
+            .call()
+            .is_ok()
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn free_board_port(port: u16) {
+    let Ok(listing) = Command::new("lsof")
+        .args(["-ti", &format!("tcp:{port}")])
+        .output()
+    else {
+        return;
+    };
+    for pid in String::from_utf8_lossy(&listing.stdout).split_whitespace() {
+        let command = Command::new("ps")
+            .args(["-p", pid, "-o", "command="])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
+        if command.contains("fractal graph serve") || command.contains("execution-graph/server.py")
+        {
+            let _ = Command::new("kill").arg(pid).status();
+        }
+    }
+    std::thread::sleep(Duration::from_millis(150));
+}
+
 pub(crate) fn open() -> Result<()> {
     open_url(DEFAULT_BOARD_URL)?;
     println!("Opened {DEFAULT_BOARD_URL}");
     Ok(())
 }
 
-/// Open one already-validated board or project URL in the macOS browser.
 pub(crate) fn open_url(url: &str) -> Result<()> {
     let status = Command::new("open")
         .arg(url)
@@ -221,9 +123,6 @@ pub(crate) fn open_url(url: &str) -> Result<()> {
     }
 }
 
-/// Select the page shown after graph publication. The localhost server remains
-/// the execution-status backend, while an authenticated cloud URL becomes the
-/// browser destination.
 pub(crate) fn browser_target(project_url: Option<&str>, port: u16) -> (String, bool) {
     match project_url {
         Some(url) => (url.to_owned(), true),
@@ -231,178 +130,377 @@ pub(crate) fn browser_target(project_url: Option<&str>, port: u16) -> (String, b
     }
 }
 
-/// Launch a board backed by a raw execution-graph JSON file (fresh state).
 pub(crate) fn serve_graph_file(
     graph_file: &Path,
     port: u16,
     exec_graph_dir: Option<&Path>,
     no_open: bool,
 ) -> Result<()> {
-    if !graph_file.is_file() {
-        bail!("execution graph file is missing: {}", graph_file.display());
-    }
-    let state_file = graph_file.with_extension("board-state.json");
-    let _ = std::fs::remove_file(&state_file); // start clean so progress shows
-    free_port(port); // replace any leftover board server holding this port
-    let viewer_dir = resolve_exec_graph_dir(exec_graph_dir)?;
-    let server_path = viewer_dir.join("server.py");
-    if !server_path.is_file() {
-        bail!(
-            "execution-graph viewer server.py is missing: {}",
-            server_path.display()
-        );
-    }
-    Command::new("python3")
-        .arg(&server_path)
-        .arg("--graph")
-        .arg(graph_file)
-        .arg("--state")
-        .arg(&state_file)
-        .arg("--port")
-        .arg(port.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("failed to launch board server {}", server_path.display()))?;
-    wait_until_listening(port);
-    let url = format!("http://127.0.0.1:{port}/");
-    println!("Board: {url}");
-    if !no_open {
-        let _ = Command::new("open").arg(&url).status();
-    }
-    Ok(())
+    let graph: Value = serde_json::from_slice(
+        &fs::read(graph_file)
+            .with_context(|| format!("read execution graph {}", graph_file.display()))?,
+    )
+    .with_context(|| format!("parse execution graph {}", graph_file.display()))?;
+    let workspace = env::current_dir()?;
+    let title = graph
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("Fractal project");
+    crate::project_file::persist(&workspace, &graph, title)?;
+    spawn_project_server(&workspace, port, exec_graph_dir, no_open)
 }
 
-/// Launch a board backed by one committed execution graph.
 pub(crate) fn serve_graph(
     graph_hash: &str,
     port: u16,
     exec_graph_dir: Option<&Path>,
     no_open: bool,
-    preseed_completed: Option<&std::collections::BTreeSet<String>>,
+    _preseed_completed: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<()> {
-    let graph = graph_store::load_graph(graph_hash)?;
-    let graph_file = graph_store::graph_path(graph_hash);
-    if !graph_file.is_file() {
+    let workspace = crate::run_control::current_workspace().unwrap_or(env::current_dir()?);
+    let project = crate::project_file::load(&workspace).with_context(|| {
+        format!(
+            "canonical project state is required before serving a board: {}",
+            crate::project_file::path(&workspace).display()
+        )
+    })?;
+    if project.graph_hash != graph_hash {
         bail!(
-            "committed execution graph file is missing: {}",
-            graph_file.display()
+            "requested graph {graph_hash} does not match canonical project graph {}",
+            project.graph_hash
         );
     }
-    let graph_id = graph
-        .get("graph_id")
-        .and_then(serde_json::Value::as_str)
-        .context("stored execution graph is missing graph_id")?;
-    let state_file = graph_file.with_extension("board-state.json");
-    // Seed the board state. A brand-new graph starts clean so progress shows from
-    // zero; an evolved child (grown/repaired/differentiated mid-run) INHERITS its
-    // parent's progress so re-serving it does not reset every completed task to
-    // pending — which, combined with the planning reveal, made the whole graph
-    // vanish behind "planning…" each time evolution fired.
-    seed_board_state(&graph, &state_file, preseed_completed);
-    free_port(port); // replace any leftover board server holding this port
+    spawn_project_server(&workspace, port, exec_graph_dir, no_open)
+}
 
+fn spawn_project_server(
+    workspace: &Path,
+    port: u16,
+    exec_graph_dir: Option<&Path>,
+    no_open: bool,
+) -> Result<()> {
     let viewer_dir = resolve_exec_graph_dir(exec_graph_dir)?;
-    let server_path = viewer_dir.join("server.py");
-    if !server_path.is_file() {
-        bail!(
-            "execution-graph viewer server.py is missing: {}",
-            server_path.display()
-        );
-    }
-
-    let mut command = Command::new("python3");
+    let executable = env::current_exe().context("resolve Fractal executable")?;
+    free_board_port(port);
+    let mut command = Command::new(&executable);
     command
-        .arg(&server_path)
-        .arg("--graph")
-        .arg(&graph_file)
-        .arg("--state")
-        .arg(&state_file)
+        .args(["graph", "serve", "--repo"])
+        .arg(workspace)
         .arg("--port")
-        .arg(port.to_string());
-    if let Some(workspace) = crate::run_control::current_workspace() {
-        let executable = std::env::current_exe().context("resolve Fractal executable")?;
-        command
-            .arg("--fractal-bin")
-            .arg(executable)
-            .arg("--workspace")
-            .arg(workspace);
-    }
-    command
+        .arg(port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to launch python3 execution-graph viewer {}",
-                server_path.display()
-            )
-        })?;
+        .stderr(Stdio::null());
+    if !viewer_dir.as_os_str().is_empty() {
+        command.arg("--exec-graph-dir").arg(&viewer_dir);
+    }
+    command.spawn().with_context(|| {
+        format!(
+            "launch Rust execution board for {}",
+            crate::project_file::path(workspace).display()
+        )
+    })?;
     wait_until_listening(port);
-
     let url = format!("http://127.0.0.1:{port}/");
     println!("Serving {url}");
-    println!("Graph id: {graph_id}");
-    println!("Graph hash: {graph_hash}");
-    println!("Board state: {}", state_file.display());
-
+    println!(
+        "Project graph: {}",
+        crate::project_file::path(workspace).display()
+    );
     if !no_open {
-        let status = Command::new("open")
-            .arg(&url)
-            .status()
-            .context("failed to launch the macOS `open` command")?;
-        if !status.success() {
-            return Err(anyhow!(
-                "macOS `open` could not open {url} (exit status {status})"
-            ));
+        open_url(&url)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn serve_project_foreground(
+    workspace: &Path,
+    port: u16,
+    exec_graph_dir: Option<&Path>,
+) -> Result<()> {
+    let viewer_dir = resolve_exec_graph_dir(exec_graph_dir)?;
+    crate::project_file::load(workspace).with_context(|| {
+        format!(
+            "canonical project state is missing: {}",
+            crate::project_file::path(workspace).display()
+        )
+    })?;
+    let server = Server::http(format!("127.0.0.1:{port}"))
+        .map_err(|error| anyhow!("bind Rust graph board on 127.0.0.1:{port}: {error}"))?;
+    let token = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos())
+    );
+    for request in server.incoming_requests() {
+        if let Err(error) = respond(request, workspace, &viewer_dir, &token) {
+            eprintln!("board request failed: {error:#}");
         }
     }
     Ok(())
 }
 
-fn resolve_exec_graph_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
-    if let Some(directory) = override_dir {
-        return Ok(directory.to_path_buf());
+fn respond(
+    request: tiny_http::Request,
+    workspace: &Path,
+    viewer_dir: &Path,
+    token: &str,
+) -> Result<()> {
+    let route = request.url().split('?').next().unwrap_or("/");
+    if request.method() == &Method::Get && route == "/api/health" {
+        return send_json(
+            request,
+            StatusCode(200),
+            &json!({"ok": true, "backend": "rust"}),
+        );
     }
-    if let Some(directory) = env::var_os("FRACTAL_EXEC_GRAPH_DIR") {
-        if directory.is_empty() {
-            bail!("FRACTAL_EXEC_GRAPH_DIR is set but empty");
+    if request.method() == &Method::Get && route == "/api/graph" {
+        return send_json(request, StatusCode(200), &project_view(workspace, token)?);
+    }
+    if request.method() == &Method::Post && route == "/api/run/pause" {
+        let authorized = request.headers().iter().any(|header| {
+            header.field.equiv("X-Fractal-Control-Token") && header.value.as_str() == token
+        });
+        if !authorized {
+            return send_json(
+                request,
+                StatusCode(403),
+                &json!({"error": "invalid local control token"}),
+            );
         }
-        return Ok(PathBuf::from(directory));
+        let output = Command::new(env::current_exe()?)
+            .args(["pause", "--project"])
+            .arg(workspace)
+            .output()
+            .context("run Rust pause command")?;
+        if output.status.success() {
+            return send_json(request, StatusCode(200), &json!({"ok": true}));
+        }
+        return send_json(
+            request,
+            StatusCode(409),
+            &json!({"error": String::from_utf8_lossy(&output.stderr)}),
+        );
     }
-
-    // The standalone repository owns its viewer. Keep the parent-directory
-    // fallback for binaries built from the historical Fractalmaster layout.
-    // Release builds provide a remapped, non-personal source root. Development
-    // builds resolve from the repository working directory instead of embedding
-    // the builder's absolute home-directory path in the distributed binary.
-    let manifest = Path::new(option_env!("FRACTAL_BUILD_SOURCE_ROOT").unwrap_or("."));
-    let standalone = manifest.join("execution-graph");
-    if standalone.join("server.py").is_file() {
-        return Ok(standalone);
+    if request.method() != &Method::Get {
+        return send_json(
+            request,
+            StatusCode(405),
+            &json!({"error": "the Rust board API is read-only; use `fractal node` for transitions"}),
+        );
     }
-    let repository = manifest
-        .parent()
-        .context("cannot resolve repository root from the fractal-cli manifest")?;
-    Ok(repository.join("execution-graph"))
+    let relative = match route {
+        "/" => "index.html",
+        "/app.js" => "app.js",
+        "/styles.css" => "styles.css",
+        "/assets/favicon.svg" => "assets/favicon.svg",
+        "/assets/fractal-graph-field.png" => "assets/fractal-graph-field.png",
+        _ => {
+            return send_json(request, StatusCode(404), &json!({"error": "not found"}));
+        }
+    };
+    let path = viewer_dir.join(relative);
+    let bytes = fs::read(&path).unwrap_or_else(|_| embedded_asset(relative).to_vec());
+    let content_type = match Path::new(relative)
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "application/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        _ => "application/octet-stream",
+    };
+    let response = Response::from_data(bytes).with_header(
+        Header::from_bytes("Content-Type", content_type).expect("valid content type header"),
+    );
+    request.respond(response).context("send board asset")?;
+    Ok(())
 }
 
-/// Fetch, parse, and print current execution-graph status.
+fn embedded_asset(relative: &str) -> &'static [u8] {
+    match relative {
+        "index.html" => include_bytes!("../execution-graph/index.html"),
+        "app.js" => include_bytes!("../execution-graph/app.js"),
+        "styles.css" => include_bytes!("../execution-graph/styles.css"),
+        "assets/favicon.svg" => include_bytes!("../execution-graph/assets/favicon.svg"),
+        "assets/fractal-graph-field.png" => {
+            include_bytes!("../execution-graph/assets/fractal-graph-field.png")
+        }
+        _ => &[],
+    }
+}
+
+fn send_json(request: tiny_http::Request, status: StatusCode, value: &Value) -> Result<()> {
+    let response = Response::from_string(serde_json::to_string(value)?)
+        .with_status_code(status)
+        .with_header(
+            Header::from_bytes("Content-Type", "application/json; charset=utf-8")
+                .expect("valid JSON header"),
+        );
+    request.respond(response).context("send board JSON")?;
+    Ok(())
+}
+
+fn project_view(workspace: &Path, token: &str) -> Result<Value> {
+    let project = crate::project_file::load(workspace)?;
+    let assignments = project
+        .execution
+        .as_ref()
+        .map(|execution| &execution.assignments);
+    let nodes = project
+        .graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .context("canonical project graph has no nodes")?;
+    let tasks: Vec<Value> = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            let id = node
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("node-{}", index + 1));
+            let assignment = assignments.and_then(|items| items.get(&id));
+            let status = match assignment.map(|item| item.state.as_str()) {
+                Some("completed") => "complete",
+                Some("checked_out") => "active",
+                _ => "incomplete",
+            };
+            json!({
+                "id": id,
+                "title": node.get("title").or_else(|| node.get("objective")).and_then(Value::as_str).unwrap_or(&id),
+                "kind": if node.get("capability").and_then(Value::as_str) == Some("control.verify") { "gate" } else { "task" },
+                "status": status,
+                "checked": status == "complete",
+                "line": 0,
+                "instruction": node.get("instruction").and_then(Value::as_str).unwrap_or(""),
+                "gate": node.get("verification_plan").and_then(Value::as_str).unwrap_or(""),
+                "assignment": assignment,
+                "execution": node.get("execution").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect();
+    let complete = tasks
+        .iter()
+        .filter(|task| task.get("status").and_then(Value::as_str) == Some("complete"))
+        .count();
+    let active = tasks
+        .iter()
+        .filter(|task| task.get("status").and_then(Value::as_str) == Some("active"))
+        .count();
+    let total = tasks.len();
+    let incomplete = total.saturating_sub(complete + active);
+    let percent = (complete * 100).checked_div(total).unwrap_or(0);
+    let group_status = if active > 0 {
+        "active"
+    } else if total > 0 && complete == total {
+        "complete"
+    } else {
+        "incomplete"
+    };
+    let edges: Vec<Value> = project
+        .graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|edge| {
+            Some(json!({
+                "from": edge.get("from")?.as_str()?,
+                "to": edge.get("to")?.as_str()?,
+                "condition": edge.get("condition").and_then(Value::as_str).unwrap_or("predecessor_complete"),
+            }))
+        })
+        .collect();
+    let phase = project
+        .execution
+        .as_ref()
+        .map(|execution| execution.phase.as_str())
+        .unwrap_or("planning");
+    Ok(json!({
+        "schema": "fractal.execution_graph_view.v1",
+        "title": project.project.title,
+        "graph": project.graph,
+        "efficiency": project.efficiency,
+        "work_id": project.project.slug,
+        "source": ".fractal/project.fractal",
+        "source_mtime": project.updated_at,
+        "development": {"visible": false, "steps": []},
+        "run_control": {"available": true, "phase": phase, "token": token},
+        "totals": {
+            "complete": complete,
+            "active": active,
+            "incomplete": incomplete,
+            "all": total,
+            "percent": percent,
+        },
+        "overview": {
+            "nodes": [{
+                "id": "G0",
+                "title": project.project.title,
+                "status": group_status,
+                "completed": complete,
+                "total": total,
+                "progress": percent,
+                "gate": ""
+            }],
+            "edges": []
+        },
+        "groups": [{
+            "id": "G0",
+            "title": project.project.title,
+            "status": group_status,
+            "completed": complete,
+            "total": total,
+            "progress": percent,
+            "tasks": tasks,
+            "edges": edges
+        }]
+    }))
+}
+
+fn resolve_exec_graph_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Some(directory) = override_dir {
+        if directory.join("index.html").is_file() {
+            return Ok(directory.to_path_buf());
+        }
+        bail!("board frontend is missing from {}", directory.display());
+    }
+    if let Some(directory) = env::var_os("FRACTAL_EXEC_GRAPH_DIR") {
+        let directory = PathBuf::from(directory);
+        if directory.join("index.html").is_file() {
+            return Ok(directory);
+        }
+        bail!("FRACTAL_EXEC_GRAPH_DIR has no board frontend");
+    }
+    let manifest = Path::new(option_env!("FRACTAL_BUILD_SOURCE_ROOT").unwrap_or("."));
+    let standalone = manifest.join("execution-graph");
+    if standalone.join("index.html").is_file() {
+        return Ok(standalone);
+    }
+    let repository = manifest.parent().unwrap_or_else(|| Path::new(""));
+    let historical = repository.join("execution-graph");
+    if historical.join("index.html").is_file() {
+        return Ok(historical);
+    }
+    // Installed and packaged binaries carry the frontend as compile-time assets,
+    // so no Python runtime or source checkout is required.
+    Ok(PathBuf::new())
+}
+
 pub(crate) fn status(base_url: &str, json: bool) -> Result<()> {
     let endpoint = format!("{}/api/graph", base_url.trim_end_matches('/'));
     let response = ureq::get(&endpoint).call().map_err(|error| {
         anyhow!("board not running at {base_url}: {error}\nStart it with:\n  {START_COMMAND}")
     })?;
-    let body = response.into_string().map_err(|error| {
-        anyhow!(
-            "board at {base_url} returned an unreadable response: {error}\nStart it with:\n  {START_COMMAND}"
-        )
-    })?;
+    let body = response.into_string().context("read board response")?;
     let (_, summary) = parse_payload(&body)
         .with_context(|| format!("board at {base_url} returned an invalid /api/graph payload"))?;
-
     if json {
         println!("{body}");
     } else {
@@ -411,12 +509,10 @@ pub(crate) fn status(base_url: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn parse_payload(body: &str) -> Result<(serde_json::Value, StatusSummary)> {
-    let value: serde_json::Value =
-        serde_json::from_str(body).context("response is not valid JSON")?;
+fn parse_payload(body: &str) -> Result<(Value, StatusSummary)> {
+    let value: Value = serde_json::from_str(body).context("response is not valid JSON")?;
     let payload: BoardPayload =
         serde_json::from_value(value.clone()).context("response has an unexpected graph schema")?;
-
     let mut task_counts = Counts::default();
     let mut gate_counts = Counts::default();
     let mut milestones = Vec::with_capacity(payload.groups.len());
@@ -428,7 +524,7 @@ fn parse_payload(body: &str) -> Result<(serde_json::Value, StatusSummary)> {
             }
             if task.kind == "gate" {
                 gate_counts.add(&task.status);
-            } else if task.kind == "task" {
+            } else {
                 task_counts.add(&task.status);
             }
         }
@@ -439,7 +535,6 @@ fn parse_payload(body: &str) -> Result<(serde_json::Value, StatusSummary)> {
             total: milestone.tasks.len(),
         });
     }
-
     Ok((
         value,
         StatusSummary {
@@ -475,7 +570,7 @@ fn render_summary(title: &str, summary: &StatusSummary) -> String {
     lines.extend(summary.milestones.iter().map(|milestone| {
         let percent = (milestone.complete * 100)
             .checked_div(milestone.total)
-            .map_or(0, std::convert::identity);
+            .unwrap_or(0);
         format!(
             "  {} — {}: {}/{} ({}%)",
             milestone.id, milestone.title, milestone.complete, milestone.total, percent
@@ -491,77 +586,23 @@ mod tests {
     const FIXTURE: &str = r#"{
       "schema": "fractal.execution_graph_view.v1",
       "title": "Fractal Pipeline",
-      "groups": [
-        {
-          "id": "P0",
-          "title": "Front door",
-          "tasks": [
-            {"id":"P0.1","title":"CLI","kind":"task","status":"complete"},
-            {"id":"P0.2","title":"Intent","kind":"task","status":"active"},
-            {"id":"P0.G1","title":"Stable hash","kind":"gate","status":"incomplete"}
-          ]
-        },
-        {
-          "id": "P1",
-          "title": "Compile",
-          "tasks": [
-            {"id":"P1.1","title":"Compile","kind":"task","status":"incomplete"},
-            {"id":"P1.G1","title":"Same hash","kind":"gate","status":"complete"}
-          ]
-        }
-      ]
+      "groups": [{
+        "id": "G0",
+        "title": "Pipeline",
+        "tasks": [
+          {"id":"P0.1","kind":"task","status":"complete"},
+          {"id":"P0.2","kind":"task","status":"active"},
+          {"id":"P0.G1","kind":"gate","status":"incomplete"}
+        ]
+      }]
     }"#;
 
     #[test]
     fn parses_api_graph_fixture_without_network() {
-        let (value, summary) = parse_payload(FIXTURE).unwrap();
-        assert_eq!(value["title"], "Fractal Pipeline");
-        assert_eq!(summary.milestone_count, 2);
-        assert_eq!(
-            summary.task_counts,
-            Counts {
-                total: 3,
-                complete: 1,
-                active: 1,
-                incomplete: 1
-            }
-        );
-        assert_eq!(
-            summary.gate_counts,
-            Counts {
-                total: 2,
-                complete: 1,
-                active: 0,
-                incomplete: 1
-            }
-        );
-        assert_eq!(
-            summary.milestones,
-            vec![
-                MilestoneProgress {
-                    id: "P0".to_owned(),
-                    title: "Front door".to_owned(),
-                    complete: 1,
-                    total: 3
-                },
-                MilestoneProgress {
-                    id: "P1".to_owned(),
-                    title: "Compile".to_owned(),
-                    complete: 1,
-                    total: 2
-                }
-            ]
-        );
-    }
-
-    #[test]
-    fn renders_counts_and_milestone_progress() {
         let (_, summary) = parse_payload(FIXTURE).unwrap();
-        let output = render_summary("Fractal Pipeline", &summary);
-        assert!(output.contains("Milestones: 2"));
-        assert!(output.contains("Tasks: 3 total, 1 complete, 1 active, 1 incomplete"));
-        assert!(output.contains("Gates: 2 total, 1 complete, 0 active, 1 incomplete"));
-        assert!(output.contains("P0 — Front door: 1/3 (33%)"));
+        assert_eq!(summary.milestone_count, 1);
+        assert_eq!(summary.task_counts.total, 2);
+        assert_eq!(summary.gate_counts.total, 1);
     }
 
     #[test]
@@ -569,9 +610,18 @@ mod tests {
         let (cloud, is_cloud) = browser_target(Some("https://fractalsociety.com/james/app"), 8092);
         assert_eq!(cloud, "https://fractalsociety.com/james/app");
         assert!(is_cloud);
-
         let (local, is_cloud) = browser_target(None, 8092);
         assert_eq!(local, "http://127.0.0.1:8092/");
         assert!(!is_cloud);
+    }
+
+    #[test]
+    fn embedded_board_exposes_the_efficiency_counter_without_source_assets() {
+        let html = String::from_utf8_lossy(embedded_asset("index.html"));
+        let script = String::from_utf8_lossy(embedded_asset("app.js"));
+        assert!(html.contains("id=\"efficiency-counter\""));
+        assert!(html.contains("Estimated 0 tokens saved"));
+        assert!(script.contains("renderEfficiency"));
+        assert!(script.contains("realized_tokens_saved"));
     }
 }

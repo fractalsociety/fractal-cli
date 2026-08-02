@@ -1238,7 +1238,8 @@
       "reopened_node_count": 2,
       "dead_or_unused_node_count": 3,
       "human_intervention_count": 0,
-      "verification_coverage": 0.16666666666666666
+      "verification_coverage": 0.16666666666666666,
+      "verification_coverage_denominator": 0
     }
   },
   "efficiency": {
@@ -1276,5 +1277,5 @@
       "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c"
     }
   },
-  "updated_at": "2026-08-02T12:48:32Z"
+  "updated_at": "2026-08-02T12:52:42Z"
 }

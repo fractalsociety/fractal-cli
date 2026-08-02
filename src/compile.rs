@@ -501,11 +501,16 @@ pub(crate) fn recompile(work: &Value, harness: &Value, target_id: &str) -> Resul
         target_from_id(target_id),
     )
     .map_err(|error| anyhow!("fractal-harnessc compile failed: {error}"))?;
-    annotate_execution_flow(&mut graph, harness)?;
+    annotate_execution_flow(&mut graph, harness, Some(work))?;
     Ok(graph)
 }
 
-fn annotate_execution_flow(graph: &mut Value, harness: &Value) -> Result<()> {
+/// Annotate a compiled graph with deterministic execution-flow and structural
+/// learning metadata.  `work` is optional for the small unit fixtures that
+/// exercise flow layout in isolation; real compilation always supplies it so
+/// node creation/ready timestamps derive from the work's recorded creation
+/// time rather than a fresh wall-clock value.
+fn annotate_execution_flow(graph: &mut Value, harness: &Value, work: Option<&Value>) -> Result<()> {
     let graph_edges = graph
         .get("edges")
         .and_then(Value::as_array)
@@ -526,18 +531,31 @@ fn annotate_execution_flow(graph: &mut Value, harness: &Value) -> Result<()> {
         .collect();
     let mut predecessors: BTreeMap<String, Vec<String>> =
         node_ids.iter().map(|id| (id.clone(), Vec::new())).collect();
+    let mut incoming_dependencies: BTreeMap<String, Vec<String>> =
+        node_ids.iter().map(|id| (id.clone(), Vec::new())).collect();
     for edge in &graph_edges {
-        if edge.get("condition").and_then(Value::as_str) == Some("failure") {
-            continue;
-        }
         if let (Some(from), Some(to)) = (
             edge.get("from").and_then(Value::as_str),
             edge.get("to").and_then(Value::as_str),
         ) {
+            if let Some(values) = incoming_dependencies.get_mut(to) {
+                values.push(from.to_owned());
+            }
+            if edge.get("condition").and_then(Value::as_str) == Some("failure") {
+                continue;
+            }
             if let Some(values) = predecessors.get_mut(to) {
                 values.push(from.to_owned());
             }
         }
+    }
+    for values in predecessors.values_mut() {
+        values.sort();
+        values.dedup();
+    }
+    for values in incoming_dependencies.values_mut() {
+        values.sort();
+        values.dedup();
     }
     let mut waves: BTreeMap<String, u32> = BTreeMap::new();
     while waves.len() < node_ids.len() {
@@ -586,6 +604,17 @@ fn annotate_execution_flow(graph: &mut Value, harness: &Value) -> Result<()> {
         })
         .filter(|(_, title)| !title.is_empty())
         .collect();
+    let harness_nodes: BTreeMap<&str, &Value> = harness
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| Some((node.get("id")?.as_str()?, node)))
+        .collect();
+    let created_at = work
+        .and_then(|value| value.get("created_at_ms"))
+        .and_then(Value::as_u64)
+        .map(crate::work_builder::rfc3339_from_unix_millis);
     let amendment_metadata: BTreeMap<String, Value> = harness
         .get("fractal_amendments")
         .and_then(Value::as_object)
@@ -652,6 +681,17 @@ fn annotate_execution_flow(graph: &mut Value, harness: &Value) -> Result<()> {
         if let Some(title) = titles.get(id.as_str()) {
             node["title"] = Value::String((*title).to_owned());
         }
+        initialize_node_learning(
+            node,
+            id.as_str(),
+            incoming_dependencies
+                .get(&id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            predecessors.get(&id).is_none_or(Vec::is_empty),
+            created_at.as_deref(),
+            harness_nodes.get(id.as_str()).copied(),
+        );
         if let Some(meta) = efficiency_by_id.get(&id) {
             for dependency in &meta.dependencies {
                 if !predecessors
@@ -703,6 +743,163 @@ fn annotate_execution_flow(graph: &mut Value, harness: &Value) -> Result<()> {
         .map_err(|error| anyhow!("execution flow graph hashing failed: {error}"))?;
     object.insert("graph_hash".to_owned(), Value::String(graph_hash));
     Ok(())
+}
+
+/// Populate only facts known at graph-production time.  Runtime timestamps,
+/// outcomes, verification, costs, artifacts, and intervention records remain
+/// absent until the lifecycle recorder observes them.
+fn initialize_node_learning(
+    node: &mut Value,
+    id: &str,
+    dependencies: &[String],
+    ready: bool,
+    created_at: Option<&str>,
+    harness_node: Option<&Value>,
+) {
+    let capability = node
+        .get("capability")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let node_type = node_type_for_capability(capability);
+    let objective = harness_node
+        .and_then(|source| source.get("title"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .or_else(|| node.get("title").and_then(Value::as_str))
+        .or_else(|| node.get("instruction").and_then(Value::as_str))
+        .unwrap_or(id)
+        .to_owned();
+
+    node["node_type"] = Value::String(node_type.to_owned());
+    node["objective"] = Value::String(bounded_objective(&objective));
+    node["depends_on"] = Value::Array(dependencies.iter().cloned().map(Value::String).collect());
+    if let Some(created_at) = created_at {
+        node["created_at"] = Value::String(created_at.to_owned());
+        if ready {
+            node["ready_at"] = Value::String(created_at.to_owned());
+        } else {
+            node.as_object_mut().map(|object| object.remove("ready_at"));
+        }
+    }
+
+    if let Some(executor) = executor_configuration(harness_node) {
+        node["executor"] = Value::Object(executor);
+    } else {
+        node.as_object_mut().map(|object| object.remove("executor"));
+    }
+
+    if let Some(estimated_cost) = estimated_cost(harness_node) {
+        node["estimated_cost"] = estimated_cost;
+    } else {
+        node.as_object_mut()
+            .map(|object| object.remove("estimated_cost"));
+    }
+
+    // These are initialized collections/defaults, not lifecycle facts.  Keep
+    // terminal and historical fields absent so downstream code cannot mistake
+    // a planned node for one that already ran.
+    node["attempt_count"] = Value::from(0_u64);
+    node["artifacts_produced"] = Value::Array(Vec::new());
+    node["consumed_by"] = Value::Array(Vec::new());
+    node["human_intervention"] = Value::Bool(false);
+    node["reopen_count"] = Value::from(0_u64);
+    if let Some(object) = node.as_object_mut() {
+        for key in [
+            "started_at",
+            "finished_at",
+            "outcome",
+            "failure_code",
+            "verification",
+            "actual_cost",
+            "notes",
+        ] {
+            object.remove(key);
+        }
+    }
+}
+
+fn node_type_for_capability(capability: &str) -> &'static str {
+    if capability.starts_with("control.") {
+        "control"
+    } else if capability.starts_with("project.tests")
+        || capability.starts_with("python.tests")
+        || capability.contains("verify")
+        || capability.contains("test")
+    {
+        "verification"
+    } else {
+        "implementation"
+    }
+}
+
+fn bounded_objective(value: &str) -> String {
+    let value = value.trim();
+    let mut cut = value.len().min(1_000);
+    while cut > 0 && !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    value[..cut].to_owned()
+}
+
+fn executor_configuration(harness_node: Option<&Value>) -> Option<Map<String, Value>> {
+    let source = harness_node?;
+    let mut executor = Map::new();
+    for (destination, source_key) in [
+        ("agent", "agent"),
+        ("model", "model"),
+        ("version", "version"),
+        ("config_hash", "config_hash"),
+        ("label", "agent_label"),
+    ] {
+        if let Some(value) = source
+            .get(source_key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            executor.insert(destination.to_owned(), Value::String(value.to_owned()));
+        }
+    }
+    for container_key in ["executor", "executor_config"] {
+        let Some(config) = source.get(container_key).and_then(Value::as_object) else {
+            continue;
+        };
+        for key in ["agent", "model", "version", "config_hash", "label"] {
+            if executor.contains_key(key) {
+                continue;
+            }
+            if let Some(value) = config
+                .get(key)
+                .or_else(|| {
+                    (key == "label")
+                        .then(|| config.get("agent_label"))
+                        .flatten()
+                })
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                executor.insert(key.to_owned(), Value::String(value.to_owned()));
+            }
+        }
+    }
+    (!executor.is_empty()).then_some(executor)
+}
+
+fn estimated_cost(harness_node: Option<&Value>) -> Option<Value> {
+    let source = harness_node?;
+    let raw = source.get("estimated_cost").or_else(|| {
+        source
+            .get("budget")
+            .and_then(|budget| budget.get("estimated_cost"))
+    })?;
+    // Canonical JSON deliberately rejects floating-point values.  Costs that
+    // are available at planning time are therefore accepted only in the
+    // integer/microunit form used by the work contract.
+    raw.as_u64()
+        .map(Value::from)
+        .or_else(|| raw.as_i64().filter(|value| *value >= 0).map(Value::from))
 }
 
 fn augment_work_authorizations(work: &mut Value, harness: &Value) -> Result<()> {
@@ -846,6 +1043,74 @@ mod tests {
     }
 
     #[test]
+    fn compiled_nodes_initialize_structural_learning_fields() {
+        let _guard = isolate();
+        let mut work = representative_work();
+        work["created_at_ms"] = json!(1_000);
+        work["goal"] = json!("Build a tiny CLI that reverses a string, with a passing test.");
+        let graph = compile_graph(&work, &select_harness("nl.code"), Target::DarwinMlxApple)
+            .expect("build harness compiles");
+        let nodes = graph["nodes"].as_array().expect("nodes");
+        let node = |id: &str| {
+            nodes
+                .iter()
+                .find(|node| node["id"] == id)
+                .unwrap_or_else(|| panic!("missing node {id}"))
+        };
+        let created = json!("1970-01-01T00:00:01Z");
+
+        let plan = node("plan");
+        assert_eq!(plan["node_type"], "implementation");
+        assert!(plan["objective"]
+            .as_str()
+            .is_some_and(|value| value.contains("Plan the build")));
+        assert_eq!(plan["depends_on"], json!([]));
+        assert_eq!(plan["created_at"], created);
+        assert_eq!(plan["ready_at"], created);
+
+        let implement = node("implement");
+        assert_eq!(implement["node_type"], "implementation");
+        assert_eq!(implement["depends_on"], json!(["plan"]));
+        assert_eq!(implement["created_at"], created);
+        assert!(implement.get("ready_at").is_none());
+        assert_eq!(implement["execution"]["mode"], "parallel");
+
+        let acceptance = node("acceptance");
+        assert_eq!(acceptance["node_type"], "verification");
+        assert_eq!(acceptance["depends_on"], json!(["review"]));
+        let complete = node("complete");
+        assert_eq!(complete["node_type"], "control");
+        assert_eq!(complete["depends_on"], json!(["acceptance"]));
+
+        for current in nodes {
+            assert!(current["id"].as_str().is_some_and(|id| !id.is_empty()));
+            assert!(current["objective"]
+                .as_str()
+                .is_some_and(|objective| !objective.is_empty()));
+            assert_eq!(current["attempt_count"], 0);
+            assert_eq!(current["artifacts_produced"], json!([]));
+            assert_eq!(current["consumed_by"], json!([]));
+            assert_eq!(current["human_intervention"], false);
+            assert_eq!(current["reopen_count"], 0);
+            for absent in [
+                "started_at",
+                "finished_at",
+                "outcome",
+                "failure_code",
+                "verification",
+                "actual_cost",
+                "notes",
+            ] {
+                assert!(
+                    current.get(absent).is_none(),
+                    "{absent} invented for {}",
+                    current["id"]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn greenfield_build_uses_task_faithful_acceptance_harness() {
         let _guard = isolate();
         let mut work = representative_work();
@@ -953,6 +1218,14 @@ mod tests {
         assert_eq!(graph["schema"], "fractal.execution_graph.v1");
         assert_eq!(graph["nodes"].as_array().map(Vec::len), Some(3));
         assert_eq!(graph["edges"].as_array().map(Vec::len), Some(2));
+        let nodes = graph["nodes"].as_array().expect("nodes");
+        let node = |id: &str| nodes.iter().find(|node| node["id"] == id).unwrap();
+        assert_eq!(node("analyze")["node_type"], "implementation");
+        assert_eq!(node("analyze")["depends_on"], json!([]));
+        assert_eq!(node("implement")["depends_on"], json!(["analyze"]));
+        assert_eq!(node("verify")["node_type"], "verification");
+        assert_eq!(node("verify")["depends_on"], json!(["implement"]));
+        assert!(nodes.iter().all(|node| node["created_at"].is_string()));
     }
 
     #[test]
@@ -980,7 +1253,7 @@ mod tests {
                 }
             }
         });
-        annotate_execution_flow(&mut graph, &harness).unwrap();
+        annotate_execution_flow(&mut graph, &harness, None).unwrap();
         let branch = graph["nodes"]
             .as_array()
             .unwrap()
@@ -990,6 +1263,30 @@ mod tests {
         assert_eq!(branch["execution"]["amendment_kind"], "branch");
         assert_eq!(branch["execution"]["branch_parent"], "anchor");
         assert_eq!(branch["execution"]["branch_depth"], 1);
+    }
+
+    #[test]
+    fn node_dependency_mirror_includes_each_normalized_incoming_edge() {
+        let mut graph = json!({
+            "nodes": [
+                {"id":"root","capability":"code.generate"},
+                {"id":"retry","capability":"code.generate"},
+                {"id":"verify","capability":"project.tests.execute"}
+            ],
+            "edges": [
+                {"from":"root","to":"verify","condition":"failure"},
+                {"from":"root","to":"retry","condition":"success"},
+                {"from":"retry","to":"verify","condition":"success"}
+            ]
+        });
+        annotate_execution_flow(&mut graph, &json!({"nodes": []}), None).expect("flow metadata");
+        let verify = graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["id"] == "verify")
+            .unwrap();
+        assert_eq!(verify["depends_on"], json!(["retry", "root"]));
     }
 
     #[test]
@@ -1100,5 +1397,76 @@ mod tests {
             .find(|node| node["id"] == "implement")
             .unwrap();
         assert_eq!(implement["execution"]["branch_id"], "branch.amend_1");
+    }
+
+    #[test]
+    fn cross_boundary_compile_persist_reload_asserts_ac1_fields_and_hash() {
+        let _guard = isolate();
+        std::env::set_var("FRACTAL_OFFLINE", "1");
+        let workspace = std::env::temp_dir().join(format!(
+            "fractal-compile-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let mut work = representative_work();
+        work["created_at_ms"] = json!(1_000);
+        work["goal"] = json!("Build a tiny CLI that reverses a string, with a passing test.");
+        let graph = compile_graph(&work, &select_harness("nl.code"), Target::DarwinMlxApple)
+            .expect("build harness compiles");
+        crate::graph_store::verify_graph_document(&graph).unwrap();
+        let hash = graph["graph_hash"].as_str().unwrap().to_owned();
+        crate::project_file::persist(&workspace, &graph, "Compile E2E").unwrap();
+
+        let project = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(project.graph_hash, hash);
+        assert_eq!(project.learning.schema, "fractal.learning.v1");
+        let plan_graph = project.graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["id"] == "plan")
+            .unwrap();
+        assert_eq!(plan_graph["created_at"], json!("1970-01-01T00:00:01Z"));
+        assert_eq!(plan_graph["ready_at"], json!("1970-01-01T00:00:01Z"));
+        assert_eq!(plan_graph["attempt_count"], 0);
+        assert_eq!(plan_graph["artifacts_produced"], json!([]));
+        assert_eq!(plan_graph["consumed_by"], json!([]));
+        assert_eq!(plan_graph["human_intervention"], false);
+
+        let plan = &project.learning.nodes["plan"];
+        assert_eq!(plan.node_id, "plan");
+        assert!(!plan.node_type.is_empty());
+        assert!(!plan.objective.is_empty());
+        assert_eq!(plan.depends_on, Vec::<String>::new());
+        assert!(plan.created_at.is_some());
+        assert!(plan.ready_at.is_some());
+        assert!(plan.started_at.is_none());
+        assert!(plan.finished_at.is_none());
+        assert_eq!(plan.attempt_count, 0);
+        assert!(plan.outcome.is_none());
+        assert!(plan.failure_code.is_none());
+        assert!(plan.verification.is_none());
+        assert!(plan.artifacts_produced.is_empty());
+        assert!(plan.consumed_by.is_empty());
+        assert!(!plan.human_intervention);
+        assert!(plan.actual_cost.is_none());
+        assert!(plan.notes.is_none());
+
+        let implement = &project.learning.nodes["implement"];
+        assert_eq!(implement.depends_on, vec!["plan".to_owned()]);
+        assert!(implement.ready_at.is_none());
+
+        let raw = std::fs::read(crate::project_file::path(&workspace)).unwrap();
+        let encoded: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(encoded["graph"]["graph_hash"], json!(hash));
+        assert!(!serde_json::to_string(&encoded["learning"])
+            .unwrap()
+            .contains("chain_of_thought"));
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }
