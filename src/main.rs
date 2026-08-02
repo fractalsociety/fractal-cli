@@ -22,6 +22,7 @@ mod graph_store;
 mod handoff;
 mod harness;
 mod harness_evolution;
+mod harness_policy;
 mod ingest;
 mod intent;
 mod interactive;
@@ -60,7 +61,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sha2::{Digest, Sha256};
 
-use crate::cli::{BridgeCommand, Cli, Command, GraphCommand};
+use crate::cli::{BridgeCommand, Cli, Command, GraphCommand, HarnessCommand};
 use crate::work_builder::IntentClassification;
 
 fn main() -> ExitCode {
@@ -91,6 +92,9 @@ fn uses_stable_json_diagnostics(cli: &Cli) -> bool {
         cli.command,
         Some(Command::Graph(crate::cli::GraphArgs {
             command: GraphCommand::Audit(_) | GraphCommand::Compose(_),
+        })) | Some(Command::Harness(crate::cli::HarnessArgs {
+            command: HarnessCommand::Validate(crate::cli::HarnessPolicyArgs { json: true, .. })
+                | HarnessCommand::Show(crate::cli::HarnessPolicyArgs { json: true, .. }),
         }))
     )
 }
@@ -168,6 +172,10 @@ fn run(cli: Cli) -> Result<()> {
                 args.port,
                 args.exec_graph_dir.as_deref(),
             ),
+        },
+        (None, Some(Command::Harness(args))) => match args.command {
+            HarnessCommand::Validate(args) => harness_policy::validate(&args.repo, args.json),
+            HarnessCommand::Show(args) => harness_policy::show(&args.repo, args.json),
         },
         (None, Some(Command::Run(args))) if args.local => {
             let efficiency = efficiency_config::resolve(&args.efficiency)?;

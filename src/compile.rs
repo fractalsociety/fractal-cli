@@ -7,6 +7,7 @@ use serde_json::{json, Map, Value};
 
 use crate::efficiency::{validate_node_metadata, NodeEfficiencyMetadata, MAX_BASIS_BYTES};
 use crate::harness::HarnessSelection;
+use crate::harness_policy::{self, LoadedHarnessPolicy};
 
 const CODE_HARNESS_FIXTURE: &str = include_str!(
     "../../FractalRuntime/contracts/v1/fixtures/fractal-compiled-harness-v1-python-repair.json"
@@ -444,6 +445,19 @@ pub(crate) fn compile_graph(
     selection: &HarnessSelection,
     target: fractal_harnessc::Target,
 ) -> Result<Value> {
+    let repo = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    compile_graph_for_repo(work, selection, target, &repo)
+}
+
+/// Compile a graph with the policy discovered from an explicit repository.
+/// This is the side-effect-free entry point used by policy-aware callers and
+/// tests; the legacy [`compile_graph`] wrapper resolves the current directory.
+pub(crate) fn compile_graph_for_repo(
+    work: &Value,
+    selection: &HarnessSelection,
+    target: fractal_harnessc::Target,
+    repo: &std::path::Path,
+) -> Result<Value> {
     let goal = work.get("goal").and_then(Value::as_str).unwrap_or_default();
     let success_criteria: Vec<String> = work
         .get("success_criteria")
@@ -455,9 +469,12 @@ pub(crate) fn compile_graph(
                 .collect()
         })
         .unwrap_or_default();
-    let harness = harness_for(selection, goal, &success_criteria);
+    let mut harness = harness_for(selection, goal, &success_criteria);
+    let policy = crate::harness::load_policy(repo)
+        .with_context(|| format!("load harness policy for {}", repo.display()))?;
+    harness_policy::attach_to_harness(&mut harness, &policy);
     let target_id = target_id(target);
-    let graph = recompile(work, &harness, target_id)?;
+    let graph = recompile_with_policy(work, &harness, target_id, &policy)?;
 
     // Persist the compile inputs (harness genome + work + target) alongside the
     // graph so harness evolution can mutate the genome and recompile it.
@@ -486,23 +503,72 @@ fn target_from_id(target_id: &str) -> fractal_harnessc::Target {
 /// genome→graph hop, shared by the initial compile and by harness evolution's
 /// recompile-after-mutation path.
 pub(crate) fn recompile(work: &Value, harness: &Value, target_id: &str) -> Result<Value> {
+    let policy = harness_policy::from_harness(harness)
+        .context("resolve harness policy for recompilation")?;
+    recompile_with_policy(work, harness, target_id, &policy)
+}
+
+/// Recompile with a resolved policy and attach immutable provenance/contracts to
+/// both the source harness and every graph node.
+pub(crate) fn recompile_with_policy(
+    work: &Value,
+    harness: &Value,
+    target_id: &str,
+    policy: &LoadedHarnessPolicy,
+) -> Result<Value> {
+    let mut harness_with_policy = harness.clone();
+    harness_policy::attach_to_harness(&mut harness_with_policy, policy);
     let registry = build_registry(harness);
     let mut authorized_work = work.clone();
 
     // NL work describes intent-level requirements. Compilation additionally
     // authorizes the concrete selected harness's capabilities and memory scopes
     // on this copy, leaving the submitted FractalWork object unchanged.
-    augment_work_authorizations(&mut authorized_work, harness)?;
+    augment_work_authorizations(&mut authorized_work, &harness_with_policy)?;
 
     let mut graph = fractal_harnessc::compile(
         &authorized_work,
-        harness,
+        &harness_with_policy,
         &registry,
         target_from_id(target_id),
     )
     .map_err(|error| anyhow!("fractal-harnessc compile failed: {error}"))?;
-    annotate_execution_flow(&mut graph, harness, Some(work))?;
+    annotate_execution_flow(&mut graph, &harness_with_policy, Some(work))?;
+    attach_policy_contracts(&mut graph, policy)?;
     Ok(graph)
+}
+
+fn attach_policy_contracts(graph: &mut Value, policy: &LoadedHarnessPolicy) -> Result<()> {
+    graph["policy_schema"] = Value::String(harness_policy::HARNESS_POLICY_SCHEMA.to_owned());
+    graph["policy_hash"] = Value::String(policy.policy_hash.clone());
+    // Only the stable provenance source is part of the graph identity.  The
+    // absolute checkout path stays in CLI diagnostics, never in graph hashes.
+    graph["policy_provenance"] = serde_json::json!({
+        "kind": policy.provenance.kind,
+        "source": policy.provenance.source,
+    });
+    let nodes = graph
+        .get_mut("nodes")
+        .and_then(Value::as_array_mut)
+        .context("compiled execution graph nodes must be an array")?;
+    for node in nodes {
+        let capability = node
+            .get("capability")
+            .and_then(Value::as_str)
+            .context("compiled graph node is missing capability")?
+            .to_owned();
+        node["policy_hash"] = Value::String(policy.policy_hash.clone());
+        node["policy_provenance"] = Value::String(policy.provenance.source.clone());
+        node["policy_contract"] = crate::harness::node_policy_contract(policy, &capability);
+    }
+    let object = graph
+        .as_object_mut()
+        .context("compiled execution graph must be an object")?;
+    object.remove("graph_hash");
+    let graph_hash = fractal_contracts::canonical_sha256(&Value::Object(object.clone()))
+        .map_err(|error| anyhow!("policy graph hashing failed: {error}"))?;
+    object.insert("graph_hash".to_owned(), Value::String(graph_hash));
+    Ok(())
 }
 
 /// Annotate a compiled graph with deterministic execution-flow and structural
@@ -970,8 +1036,8 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        annotate_execution_flow, compile_graph, harness_for, node_efficiency_from_graph_value,
-        recompile,
+        annotate_execution_flow, compile_graph, compile_graph_for_repo, harness_for,
+        node_efficiency_from_graph_value, recompile,
     };
 
     /// Isolate `FRACTAL_HOME` (compile now persists a genome sidecar) and
@@ -1202,6 +1268,61 @@ mod tests {
             .expect("second compile should succeed");
 
         assert_eq!(first["graph_hash"], second["graph_hash"]);
+    }
+
+    #[test]
+    fn policy_hash_and_node_contract_are_part_of_compiled_graph_identity() {
+        let _guard = isolate();
+        let root = std::env::temp_dir().join(format!(
+            "fractal-compile-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".fractal")).expect("directory");
+        std::fs::write(
+            root.join(".fractal/harness.yaml"),
+            r#"
+version: fractal.harness.v1
+mode: deny_by_default
+workspace:
+  writable: ["src/**"]
+capabilities:
+  code.generate:
+    writable: ["src/**"]
+    commands: ["cargo test"]
+    external_side_effects: false
+"#,
+        )
+        .expect("policy");
+        let graph = compile_graph_for_repo(
+            &representative_work(),
+            &select_harness("nl.code"),
+            Target::DarwinMlxApple,
+            &root,
+        )
+        .expect("policy graph compiles");
+        assert!(graph["policy_hash"].as_str().is_some());
+        assert_eq!(
+            graph["policy_provenance"]["source"],
+            "project:.fractal/harness.yaml"
+        );
+        let implement = graph["nodes"]
+            .as_array()
+            .expect("nodes")
+            .iter()
+            .find(|node| node["id"] == "implement")
+            .expect("implement node");
+        assert_eq!(implement["policy_hash"], graph["policy_hash"]);
+        assert_eq!(implement["policy_contract"]["capability"], "code.generate");
+        assert_eq!(
+            implement["policy_contract"]["allowed_writes"],
+            json!(["src/**"])
+        );
+        crate::graph_store::verify_graph_document(&graph).expect("graph hash");
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
