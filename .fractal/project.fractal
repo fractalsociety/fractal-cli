@@ -685,11 +685,11 @@
     "phase": "executing",
     "assignments": {
       "add_swift_graph_models": {
-        "agent_id": "cursor",
-        "agent_label": "cursor",
-        "state": "released",
+        "agent_id": "hermes",
+        "agent_label": "hermes",
+        "state": "completed",
         "checked_out_at": "2026-07-29T10:04:03Z",
-        "released_at": "2026-07-29T13:32:06Z"
+        "completed_at": "2026-08-02T08:27:05Z"
       },
       "define_learning_contract": {
         "agent_id": "cursor",
@@ -709,7 +709,7 @@
         "agent_label": "hermes",
         "state": "released",
         "checked_out_at": "2026-07-29T10:04:03Z",
-        "released_at": "2026-07-29T13:32:06Z"
+        "released_at": "2026-08-02T08:27:24Z"
       },
       "lead_plan": {
         "agent_id": "codex",
@@ -726,7 +726,7 @@
         "completed_at": "2026-07-29T13:31:53Z"
       }
     },
-    "updated_at": "2026-08-02T08:22:23Z"
+    "updated_at": "2026-08-02T08:27:58Z"
   },
   "learning": {
     "schema": "fractal.learning.v1",
@@ -769,7 +769,14 @@
           "define_learning_contract"
         ],
         "created_at": "2026-07-29T13:32:06Z",
-        "attempt_count": 0,
+        "started_at": "2026-08-02T08:22:42Z",
+        "finished_at": "2026-08-02T08:27:05Z",
+        "executor": {
+          "agent": "hermes",
+          "version": "0.1.0"
+        },
+        "attempt_count": 1,
+        "outcome": "unverified_success",
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -842,12 +849,12 @@
           "define_learning_contract"
         ],
         "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T08:22:23Z",
+        "started_at": "2026-08-02T08:27:58Z",
         "executor": {
           "agent": "Codex Luna · Enrich Graph Producers",
           "version": "0.1.0"
         },
-        "attempt_count": 1,
+        "attempt_count": 3,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -861,7 +868,12 @@
           "define_learning_contract"
         ],
         "created_at": "2026-07-29T13:32:06Z",
-        "attempt_count": 0,
+        "started_at": "2026-08-02T08:22:42Z",
+        "executor": {
+          "agent": "hermes",
+          "version": "0.1.0"
+        },
+        "attempt_count": 1,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -1019,5 +1031,5 @@
       "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c"
     }
   },
-  "updated_at": "2026-08-02T08:22:39Z"
+  "updated_at": "2026-08-02T08:28:14Z"
 }
