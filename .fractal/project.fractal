@@ -6,7 +6,7 @@
     "prompt": "Update the Fractal CLI and macOS Fractal Voice app, without Apple signing, notarization, or release submission, so portable .fractal execution graphs record compact, structurally meaningful learning data. Preserve backward compatibility wit",
     "visibility": "private"
   },
-  "graph_hash": "sha256:573f1f253b42ac7065e941e4eb776bbbb5e7ccbec288ef1c398db5fbe2ba8ce4",
+  "graph_hash": "sha256:52fdd8393c9c06ca583d6808ca0a796b214cf92f2b210333cec3993c9f34d588",
   "graph": {
     "compiler_version": "fractal-harnessc/0.1.0",
     "edges": [
@@ -92,6 +92,11 @@
       },
       {
         "condition": "success",
+        "from": "integrate_portable_persistence",
+        "to": "verify.integrate_portable_persistence.harness"
+      },
+      {
+        "condition": "success",
         "from": "lead_plan",
         "to": "define_learning_contract"
       },
@@ -169,7 +174,8 @@
             "display_learning_in_voice",
             "preserve_sync_boundaries",
             "record_graph_edit_events",
-            "record_runtime_lifecycle"
+            "record_runtime_lifecycle",
+            "verify.integrate_portable_persistence.harness"
           ],
           "parallel_group": "wave-3",
           "wave": 3
@@ -211,9 +217,9 @@
         }
       ]
     },
-    "graph_hash": "sha256:573f1f253b42ac7065e941e4eb776bbbb5e7ccbec288ef1c398db5fbe2ba8ce4",
-    "graph_id": "fg_a4a2b77c02116d6be7d3a86ed2b4a70e",
-    "harness_hash": "sha256:73f6ce785760fd33aac6efe76ce50e6fb9796ac367406c7ce4adcaeda604554a",
+    "graph_hash": "sha256:52fdd8393c9c06ca583d6808ca0a796b214cf92f2b210333cec3993c9f34d588",
+    "graph_id": "fg_6cd32b4aa2adf1a5cdb05db646206761",
+    "harness_hash": "sha256:20a775d1c3f5e6d67d8c9d7b8a5c678bf308b73f2fe90065bcf61b552afa5330",
     "nodes": [
       {
         "budget": {
@@ -626,6 +632,33 @@
         "capability": "project.tests.execute",
         "execution": {
           "mode": "parallel",
+          "parallel_group": "wave-3",
+          "task_number": "3.5",
+          "wave": 3
+        },
+        "id": "verify.integrate_portable_persistence.harness",
+        "instruction": "Re-run the acceptance suite against the produced artifact; fail if any test fails.",
+        "kind": "container",
+        "memory_scopes": [
+          "acceptance:spec",
+          "work:goal",
+          "workspace:root"
+        ],
+        "requires": [
+          "integrate_portable_persistence.ready"
+        ],
+        "route_candidates": [
+          "apple-container://project-tests-execute-default"
+        ],
+        "sandbox_profile": "apple-container://local-work-v1"
+      },
+      {
+        "budget": {
+          "timeout_ms": 120000
+        },
+        "capability": "project.tests.execute",
+        "execution": {
+          "mode": "parallel",
           "parallel_group": "wave-5",
           "task_number": "5.1",
           "wave": 5
@@ -675,14 +708,14 @@
         "title": "Run the complete Rust quality gate"
       }
     ],
-    "parent_graph": "sha256:09bb59393349e2a2e8633e0ce13d2df000ca35c8a8adc2252288c4e749ecfe30",
+    "parent_graph": "sha256:573f1f253b42ac7065e941e4eb776bbbb5e7ccbec288ef1c398db5fbe2ba8ce4",
     "schema": "fractal.execution_graph.v1",
     "target": "darwin-arm64",
     "work_hash": "sha256:3f3cd1a955e6ccd688c0849c282aada8b2f943a92c036be727189a32c8899dbe"
   },
   "execution": {
     "schema": "fractal.execution_state.v1",
-    "phase": "executing",
+    "phase": "halted",
     "assignments": {
       "add_swift_graph_models": {
         "agent_id": "hermes",
@@ -698,6 +731,13 @@
         "checked_out_at": "2026-07-29T10:01:24Z",
         "completed_at": "2026-07-29T10:04:02Z"
       },
+      "display_learning_in_voice": {
+        "agent_id": "hermes",
+        "agent_label": "hermes",
+        "state": "released",
+        "checked_out_at": "2026-08-02T08:51:47Z",
+        "released_at": "2026-08-02T08:52:49Z"
+      },
       "enrich_graph_producers": {
         "agent_id": "codex/luna-enrich",
         "agent_label": "Codex Luna · Enrich Graph Producers",
@@ -708,9 +748,9 @@
       "integrate_portable_persistence": {
         "agent_id": "hermes",
         "agent_label": "hermes",
-        "state": "released",
+        "state": "completed",
         "checked_out_at": "2026-07-29T10:04:03Z",
-        "released_at": "2026-08-02T08:28:37Z"
+        "completed_at": "2026-08-02T08:51:46Z"
       },
       "lead_plan": {
         "agent_id": "codex",
@@ -719,15 +759,43 @@
         "checked_out_at": "2026-07-29T10:01:24Z",
         "completed_at": "2026-07-29T10:01:24Z"
       },
+      "preserve_sync_boundaries": {
+        "agent_id": "claude",
+        "agent_label": "claude",
+        "state": "released",
+        "checked_out_at": "2026-08-02T08:51:47Z",
+        "released_at": "2026-08-02T08:52:49Z"
+      },
+      "record_graph_edit_events": {
+        "agent_id": "hermes",
+        "agent_label": "hermes",
+        "state": "released",
+        "checked_out_at": "2026-08-02T08:51:47Z",
+        "released_at": "2026-08-02T08:52:49Z"
+      },
+      "record_runtime_lifecycle": {
+        "agent_id": "claude",
+        "agent_label": "claude",
+        "state": "released",
+        "checked_out_at": "2026-08-02T08:51:47Z",
+        "released_at": "2026-08-02T08:52:49Z"
+      },
       "verify.define_learning_contract.harness": {
         "agent_id": "cursor",
         "agent_label": "cursor",
         "state": "completed",
         "checked_out_at": "2026-07-29T10:04:03Z",
         "completed_at": "2026-07-29T13:31:53Z"
+      },
+      "verify.integrate_portable_persistence.harness": {
+        "agent_id": "hermes",
+        "agent_label": "hermes",
+        "state": "completed",
+        "checked_out_at": "2026-08-02T08:51:47Z",
+        "completed_at": "2026-08-02T08:51:48Z"
       }
     },
-    "updated_at": "2026-08-02T08:38:04Z"
+    "updated_at": "2026-08-02T08:52:49Z"
   },
   "learning": {
     "schema": "fractal.learning.v1",
@@ -836,7 +904,12 @@
           "integrate_portable_persistence"
         ],
         "created_at": "2026-07-29T13:32:06Z",
-        "attempt_count": 0,
+        "started_at": "2026-08-02T08:51:47Z",
+        "executor": {
+          "agent": "hermes",
+          "version": "0.1.0"
+        },
+        "attempt_count": 1,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -871,12 +944,14 @@
           "define_learning_contract"
         ],
         "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T08:28:17Z",
+        "started_at": "2026-08-02T08:38:22Z",
+        "finished_at": "2026-08-02T08:51:46Z",
         "executor": {
           "agent": "hermes",
           "version": "0.1.0"
         },
-        "attempt_count": 2,
+        "attempt_count": 3,
+        "outcome": "unverified_success",
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -917,7 +992,12 @@
           "integrate_portable_persistence"
         ],
         "created_at": "2026-07-29T13:32:06Z",
-        "attempt_count": 0,
+        "started_at": "2026-08-02T08:51:47Z",
+        "executor": {
+          "agent": "claude",
+          "version": "0.1.0"
+        },
+        "attempt_count": 1,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -932,7 +1012,12 @@
           "integrate_portable_persistence"
         ],
         "created_at": "2026-07-29T13:32:06Z",
-        "attempt_count": 0,
+        "started_at": "2026-08-02T08:51:47Z",
+        "executor": {
+          "agent": "hermes",
+          "version": "0.1.0"
+        },
+        "attempt_count": 1,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -947,7 +1032,12 @@
           "integrate_portable_persistence"
         ],
         "created_at": "2026-07-29T13:32:06Z",
-        "attempt_count": 0,
+        "started_at": "2026-08-02T08:51:47Z",
+        "executor": {
+          "agent": "claude",
+          "version": "0.1.0"
+        },
+        "attempt_count": 1,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -962,6 +1052,31 @@
         ],
         "created_at": "2026-07-29T13:32:06Z",
         "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "verify.integrate_portable_persistence.harness": {
+        "node_id": "verify.integrate_portable_persistence.harness",
+        "node_type": "verification",
+        "objective": "Re-run the acceptance suite against the produced artifact; fail if any test fails.",
+        "depends_on": [
+          "integrate_portable_persistence"
+        ],
+        "created_at": "2026-08-02T08:51:46Z",
+        "started_at": "2026-08-02T08:51:47Z",
+        "finished_at": "2026-08-02T08:51:48Z",
+        "executor": {
+          "agent": "hermes",
+          "version": "0.1.0"
+        },
+        "attempt_count": 1,
+        "outcome": "verified_success",
+        "verification": {
+          "type": "automated",
+          "passed": true
+        },
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -1034,5 +1149,5 @@
       "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c"
     }
   },
-  "updated_at": "2026-08-02T08:38:19Z"
+  "updated_at": "2026-08-02T08:52:59Z"
 }
