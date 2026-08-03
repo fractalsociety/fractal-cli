@@ -23,6 +23,8 @@ use crate::harness_policy::NODE_POLICY_CONTRACT_SCHEMA;
 const REPORT_SCHEMA: &str = "fractal.policy_enforcement_report.v1";
 const SHA256_PREFIX: &str = "sha256:";
 const MAX_SNAPSHOT_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const INFERX_MODEL: &str = "deepseek-v4-flash";
+const INFERX_PROVIDER: &str = "custom";
 
 /// Compact limits copied from a node contract.  Values are intentionally
 /// integer-only and are never inferred from prompts or environment variables.
@@ -806,18 +808,18 @@ pub(crate) fn provider_eligibility(agent: &str, policy: &EffectivePolicy) -> Pro
                 version,
             }
         }
-        "hermes" => {
+        "hermes" | "inferx" => {
             controls.insert("workspace_paths".to_owned(), ControlStatus::Enforced);
             controls.insert("approval".to_owned(), ControlStatus::Detected);
             if shell_allowed {
                 controls.insert("command_allowlist".to_owned(), ControlStatus::Unavailable);
                 controls.insert("network".to_owned(), ControlStatus::Unavailable);
+                let provider_label = if kind == "inferx" { "InferX" } else { "Hermes" };
                 return ProviderEligibility {
                     status: ControlStatus::Unavailable,
-                    reason: Some(
-                        "Hermes terminal has no enforceable command allowlist; the v1 bounded shell grant fails closed"
-                            .to_owned(),
-                    ),
+                    reason: Some(format!(
+                        "{provider_label} terminal has no enforceable command allowlist; the v1 bounded shell grant fails closed"
+                    )),
                     controls,
                     version,
                 };
@@ -858,7 +860,12 @@ pub(crate) fn worker_command(
     if let Some(reason) = provider_eligibility(&kind, policy).reason {
         bail!("{reason}");
     }
-    let mut command = Command::new(if kind == "codex-luna" { "codex" } else { &kind });
+    let binary = match kind.as_str() {
+        "codex-luna" => "codex",
+        "inferx" => "hermes",
+        _ => kind.as_str(),
+    };
+    let mut command = Command::new(binary);
     match kind.as_str() {
         "codex" | "codex-luna" => {
             command.arg("exec");
@@ -928,6 +935,22 @@ pub(crate) fn worker_command(
             // Prompt is already passed as `-q`; do not append it again below.
             return Ok(command);
         }
+        "inferx" => {
+            // InferX is a logical Hermes route.  The API endpoint and key are
+            // installed by execute.rs immediately before spawn; keep this
+            // policy command free of credentials so argv/errors are safe to
+            // inspect and serialize.
+            command.args([
+                "--yolo",
+                "-m",
+                INFERX_MODEL,
+                "--provider",
+                INFERX_PROVIDER,
+                "-z",
+                prompt,
+            ]);
+            return Ok(command);
+        }
         "cursor-agent" => {
             command.args(["-p", "--sandbox", "enabled", "--workspace", "."]);
             if let Some(model) = model_for_provider("cursor") {
@@ -992,7 +1015,7 @@ fn provider_minimum(kind: &str) -> Option<ProviderVersion> {
             minor: 7,
             patch: 23,
         }),
-        "hermes" => Some(ProviderVersion {
+        "hermes" | "inferx" => Some(ProviderVersion {
             major: 0,
             minor: 13,
             patch: 0,
@@ -1011,7 +1034,7 @@ fn provider_binary(kind: &str) -> Option<&'static str> {
         "codex" | "codex-luna" => Some("codex"),
         "cursor-agent" => Some("cursor-agent"),
         "claude" => Some("claude"),
-        "hermes" => Some("hermes"),
+        "hermes" | "inferx" => Some("hermes"),
         _ => None,
     }
 }
@@ -1192,7 +1215,7 @@ pub(crate) fn sanitized_environment_for_workspace(
         "TERMINAL_CWD".to_owned(),
         workspace.to_string_lossy().into_owned(),
     );
-    if canonical_provider(kind) == "hermes" {
+    if matches!(canonical_provider(kind).as_str(), "hermes" | "inferx") {
         let root_key = sha256_bytes(workspace.to_string_lossy().as_bytes());
         let isolated_home = env::temp_dir()
             .join("fractal-hermes")
@@ -1632,6 +1655,13 @@ mod tests {
             Some(&ControlStatus::Enforced)
         );
 
+        let inferx = provider_eligibility("inferx", &file_policy);
+        assert_eq!(inferx.status, ControlStatus::Enforced);
+        assert_eq!(
+            inferx.controls.get("network"),
+            Some(&ControlStatus::Enforced)
+        );
+
         let cursor = provider_eligibility("cursor", &file_policy);
         assert_eq!(cursor.status, ControlStatus::Unavailable);
         assert!(cursor
@@ -1726,6 +1756,35 @@ mod tests {
         assert!(!hermes_args
             .iter()
             .any(|arg| { arg.contains("dangerously") || arg == "--yolo" || arg == "--force" }));
+    }
+
+    #[test]
+    fn inferx_policy_route_uses_hermes_without_credentials_in_argv() {
+        let mut value = node("code.generate");
+        value["policy_contract"]["allowed_commands"] = json!([]);
+        let policy = parse_contract(&value, None).unwrap();
+        let command = worker_command("inferx", "build files", "worker", &policy).unwrap();
+        assert_eq!(command.get_program().to_string_lossy(), "hermes");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--yolo",
+                "-m",
+                INFERX_MODEL,
+                "--provider",
+                INFERX_PROVIDER,
+                "-z",
+                "build files",
+            ]
+        );
+        assert!(command.get_envs().all(|(name, _)| {
+            name != std::ffi::OsStr::new("OPENAI_API_KEY")
+                && name != std::ffi::OsStr::new("FRACTAL_INFERX_API_KEY")
+        }));
     }
 
     #[test]

@@ -166,6 +166,99 @@ final class FractalVoiceTests: XCTestCase {
         XCTAssertTrue(path.contains("/opt/homebrew/bin"))
     }
 
+    func testInferXProviderConstantsAreFixed() {
+        XCTAssertEqual(
+            InferXProvider.endpointURL.absoluteString,
+            "https://model.inferx.net/endpoints/v1"
+        )
+        XCTAssertEqual(InferXProvider.model, "deepseek-v4-flash")
+        XCTAssertEqual(
+            InferXProvider.keychainService,
+            "com.fractalsociety.voice.inferx"
+        )
+        XCTAssertEqual(InferXProvider.keychainAccount, "api-key")
+    }
+
+    func testInferXAPIKeyTrimsAndRejectsUnsafeValues() throws {
+        XCTAssertEqual(
+            try InferXProvider.normalizedAPIKey("  inferx-test-token\n"),
+            "inferx-test-token"
+        )
+        XCTAssertFalse(InferXProvider.isValidAPIKey("   "))
+        XCTAssertFalse(InferXProvider.isValidAPIKey("token with spaces"))
+        XCTAssertFalse(InferXProvider.isValidAPIKey("token\u{0000}"))
+        XCTAssertFalse(InferXProvider.isValidAPIKey(String(repeating: "x", count: 4097)))
+    }
+
+    func testInferXRequestShapeAndAuthorizationHeader() throws {
+        let request = try InferXProvider.makeChatCompletionsRequest(
+            apiKey: "  inferx-secret-token  "
+        )
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(
+            request.url?.absoluteString,
+            "https://model.inferx.net/endpoints/v1/chat/completions"
+        )
+        XCTAssertEqual(
+            request.value(forHTTPHeaderField: "Authorization"),
+            "Bearer inferx-secret-token"
+        )
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+
+        let body = try XCTUnwrap(request.httpBody)
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: body) as? [String: Any]
+        )
+        XCTAssertEqual(payload["model"] as? String, InferXProvider.model)
+        let messages = try XCTUnwrap(payload["messages"] as? [[String: Any]])
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages[0]["role"] as? String, "user")
+        XCTAssertEqual(messages[0]["content"] as? String, "Reply with OK.")
+        XCTAssertLessThanOrEqual(request.timeoutInterval, InferXProvider.requestTimeout)
+    }
+
+    func testInferXSettingsURLRoutingIsStrict() {
+        XCTAssertTrue(
+            InferXProvider.isSettingsURL(
+                URL(string: "fractalvoice://provider/inferx")!
+            )
+        )
+        XCTAssertTrue(
+            InferXProvider.isSettingsURL(
+                URL(string: "FRACTALVOICE://PROVIDER/INFERX")!
+            )
+        )
+        XCTAssertFalse(
+            InferXProvider.isSettingsURL(
+                URL(string: "fractalvoice://provider/inferx?token=secret")!
+            )
+        )
+        XCTAssertFalse(
+            InferXProvider.isSettingsURL(
+                URL(string: "fractalvoice://provider/other")!
+            )
+        )
+    }
+
+    func testProcessEnvironmentInjectsInferXOnlyForCLIWithTestKeyProvider() {
+        let cliEnvironment = BuildCoordinator.processEnvironment(
+            includeInferX: true,
+            keyProvider: { "  inferx-secret-token  " }
+        )
+        XCTAssertEqual(
+            cliEnvironment[InferXProvider.environmentKey],
+            "inferx-secret-token"
+        )
+        XCTAssertEqual(cliEnvironment[InferXProvider.enabledEnvironmentKey], "1")
+
+        let localEnvironment = BuildCoordinator.processEnvironment(
+            includeInferX: false,
+            keyProvider: { "inferx-secret-token" }
+        )
+        XCTAssertNil(localEnvironment[InferXProvider.environmentKey])
+        XCTAssertNil(localEnvironment[InferXProvider.enabledEnvironmentKey])
+    }
+
     func testProjectLocationDefaultsAndPersistsAChosenFolder() throws {
         let suite = "FractalVoiceTests.ProjectsDirectory.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))

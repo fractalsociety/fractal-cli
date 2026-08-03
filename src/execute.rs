@@ -152,6 +152,70 @@ fn model_for(kind: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+const INFERX_ENDPOINT: &str = "https://model.inferx.net/endpoints/v1";
+const INFERX_MODEL: &str = "deepseek-v4-flash";
+const INFERX_PROVIDER: &str = "custom";
+
+/// Return a configured InferX API key without ever copying an empty value into
+/// a worker environment.  The key is only consumed by [`worker_command`] and
+/// the child-environment assembly immediately before spawning the worker.
+fn inferx_api_key() -> Option<String> {
+    std::env::var("FRACTAL_INFERX_API_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn require_inferx_api_key() -> Result<String> {
+    inferx_api_key().ok_or_else(|| {
+        anyhow::anyhow!("inferx worker is not configured (set FRACTAL_INFERX_API_KEY)")
+    })
+}
+
+/// Pure configuration predicate used by automatic roster detection.  Keeping
+/// the environment reads outside this helper makes detection tests independent
+/// of the process environment and prevents a secret from entering diagnostics.
+fn inferx_configured(enabled: Option<&str>, api_key: Option<&str>, hermes_on_path: bool) -> bool {
+    enabled == Some("1") && api_key.is_some_and(|value| !value.trim().is_empty()) && hermes_on_path
+}
+
+fn inferx_is_configured() -> bool {
+    inferx_configured(
+        std::env::var("FRACTAL_INFERX_ENABLED").ok().as_deref(),
+        std::env::var("FRACTAL_INFERX_API_KEY").ok().as_deref(),
+        binary_on_path(agent_binary("inferx")),
+    )
+}
+
+/// The exact argv contract for the InferX-backed Hermes route.  In particular,
+/// the API key is never represented in argv, which keeps process listings and
+/// command errors free of credentials.
+fn inferx_command_args(prompt: &str) -> Vec<String> {
+    vec![
+        "--yolo".to_owned(),
+        "-m".to_owned(),
+        INFERX_MODEL.to_owned(),
+        "--provider".to_owned(),
+        INFERX_PROVIDER.to_owned(),
+        "-z".to_owned(),
+        prompt.to_owned(),
+    ]
+}
+
+/// Environment entries that are specific to the InferX-backed Hermes child.
+/// This map is intentionally separate from the parent process environment:
+/// callers pass it directly to `Command::env`/`envs` after `env_clear`.
+fn inferx_child_environment(api_key: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("OPENAI_BASE_URL".to_owned(), INFERX_ENDPOINT.to_owned()),
+        ("OPENAI_API_KEY".to_owned(), api_key.to_owned()),
+        (
+            "HERMES_INFERENCE_PROVIDER".to_owned(),
+            INFERX_PROVIDER.to_owned(),
+        ),
+        ("HERMES_INFERENCE_MODEL".to_owned(), INFERX_MODEL.to_owned()),
+    ])
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentRole {
     Worker,
@@ -256,7 +320,18 @@ fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> 
             ]);
             c
         }
-        other => bail!("unknown worker: {other} (use claude|codex|codex-luna|cursor|hermes)"),
+        "inferx" => {
+            let api_key = require_inferx_api_key()?;
+            let mut c = Command::new("hermes");
+            c.args(inferx_command_args(prompt));
+            for (name, value) in inferx_child_environment(&api_key) {
+                c.env(name, value);
+            }
+            c
+        }
+        other => {
+            bail!("unknown worker: {other} (use claude|codex|codex-luna|cursor|hermes|inferx)")
+        }
     };
     command.env("FRACTAL_WORKER", kind);
     Ok(command)
@@ -404,6 +479,12 @@ fn run_agent_prompt_with_role(
     label: &str,
     policy: Option<&crate::policy_executor::EffectivePolicy>,
 ) -> Result<AgentRun> {
+    // Policy-backed command construction has its own provider matrix, so
+    // perform the logical InferX credential check before either route.  This
+    // keeps missing-key failures deterministic and secret-free in both paths.
+    if kind == "inferx" {
+        let _ = require_inferx_api_key()?;
+    }
     // Detach the worker's stdin: headless agents (e.g. `claude -p`) otherwise
     // inherit the CLI's piped stdin and block reading it instead of exiting.
     let mut command = if let Some(policy) = policy {
@@ -427,6 +508,7 @@ fn run_agent_prompt_with_role(
         network_denied,
         workspace,
     );
+    let child_env = child_environment_for_worker(kind, child_env);
     command
         .current_dir(workspace)
         .env_clear()
@@ -466,6 +548,31 @@ fn run_agent_prompt_with_role(
     }
 }
 
+/// Add logical-provider credentials after the generic environment has been
+/// sanitized.  `sanitized_environment_for_workspace` deliberately does not
+/// retain `FRACTAL_INFERX_API_KEY`; only the InferX child receives it, under
+/// the provider's standard `OPENAI_API_KEY` name.
+fn child_environment_for_worker(
+    kind: &str,
+    mut environment: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    if kind == "inferx" {
+        environment.remove("FRACTAL_INFERX_API_KEY");
+        if let Some(api_key) = inferx_api_key() {
+            environment.extend(inferx_child_environment(&api_key));
+        } else {
+            // `worker_command` rejects this configuration before spawn.  Keep
+            // this helper fail-safe for callers that assemble an environment
+            // independently: no ambient OpenAI/Hermes credentials survive.
+            environment.remove("OPENAI_API_KEY");
+            environment.remove("OPENAI_BASE_URL");
+            environment.remove("HERMES_INFERENCE_PROVIDER");
+            environment.remove("HERMES_INFERENCE_MODEL");
+        }
+    }
+    environment
+}
+
 /// The kill-timeout for an agent working `node`.  The strictest declared limit
 /// wins: node budget, immutable policy max_minutes, and an optional operator
 /// override are all upper bounds.  There is intentionally no historical
@@ -499,6 +606,7 @@ fn agent_binary(kind: &str) -> &str {
     match kind {
         "cursor" | "cursor-agent" => "cursor-agent",
         "codex-luna" => "codex",
+        "inferx" => "hermes",
         other => other,
     }
 }
@@ -515,17 +623,23 @@ fn binary_on_path(binary: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Every supported agent whose binary is on `PATH` (ignores env config).
+/// Every supported agent whose binary is on `PATH`.  InferX is listed only
+/// when its explicit enable/key configuration is present, because it is a
+/// logical route over the Hermes binary rather than a standalone executable.
 pub(crate) fn available_agents() -> Vec<String> {
-    ["claude", "codex", "cursor", "hermes"]
+    let mut agents: Vec<String> = ["claude", "codex", "cursor", "hermes"]
         .into_iter()
         .filter(|kind| binary_on_path(agent_binary(kind)))
         .map(str::to_owned)
-        .collect()
+        .collect();
+    if inferx_is_configured() && !agents.is_empty() {
+        agents.push("inferx".to_owned());
+    }
+    agents
 }
 
 /// The agents to run, from `$FRACTAL_AGENTS` (comma-separated) or auto-detected
-/// among claude / codex / cursor on `PATH`.
+/// among claude / codex / cursor / hermes on `PATH`.
 ///
 /// Codex has two logical routes in the scheduler: plain `codex` is reserved
 /// for the first (lead planner/orchestrator) slot, while `codex-luna` is the
@@ -557,7 +671,14 @@ pub(crate) fn detect_agents() -> Vec<String> {
             detected.insert(0, selected);
         }
     }
-    logical_agent_routes(detected)
+    let mut routes = logical_agent_routes(detected);
+    // InferX is a worker-only route.  Append it after logical Codex routes so
+    // `codex-luna` remains ahead of it, and never create a roster where
+    // InferX would occupy the automatic lead slot by itself.
+    if inferx_is_configured() && !routes.is_empty() {
+        routes.push("inferx".to_owned());
+    }
+    routes
 }
 
 /// Convert physical Codex entries into the role-aware logical routes used by
@@ -2938,9 +3059,238 @@ mod tests {
     use crate::efficiency_accounting::UpsertOutcome;
     use crate::efficiency_policy::PolicyDecision;
     use serde_json::json;
+    use std::ffi::OsString;
     use std::fs;
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, Mutex, MutexGuard, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct InferxEnvGuard {
+        saved: Vec<(&'static str, Option<OsString>)>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl InferxEnvGuard {
+        fn new(names: &[&'static str]) -> Self {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let lock = LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let saved = names
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect();
+            Self { saved, _lock: lock }
+        }
+
+        fn set(&self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+            std::env::set_var(name, value);
+        }
+
+        fn remove(&self, name: &'static str) {
+            std::env::remove_var(name);
+        }
+    }
+
+    impl Drop for InferxEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inferx_configuration_requires_explicit_enable_key_and_hermes() {
+        assert!(inferx_configured(Some("1"), Some("secret"), true));
+        assert!(!inferx_configured(Some("0"), Some("secret"), true));
+        assert!(!inferx_configured(Some("true"), Some("secret"), true));
+        assert!(!inferx_configured(Some("1"), None, true));
+        assert!(!inferx_configured(Some("1"), Some("   "), true));
+        assert!(!inferx_configured(Some("1"), Some("secret"), false));
+    }
+
+    #[test]
+    fn inferx_command_uses_hermes_argv_and_child_only_redacted_environment() {
+        let env = InferxEnvGuard::new(&["FRACTAL_INFERX_API_KEY"]);
+        let secret = "inferx-test-secret";
+        env.set("FRACTAL_INFERX_API_KEY", secret);
+        let command = worker_command("inferx", "implement files", AgentRole::Worker).unwrap();
+
+        assert_eq!(command.get_program().to_string_lossy(), "hermes");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--yolo",
+                "-m",
+                INFERX_MODEL,
+                "--provider",
+                INFERX_PROVIDER,
+                "-z",
+                "implement files"
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg.contains(secret)));
+
+        let environment: BTreeMap<String, String> = command
+            .get_envs()
+            .filter_map(|(name, value)| {
+                value.map(|value| {
+                    (
+                        name.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            environment.get("OPENAI_BASE_URL"),
+            Some(&INFERX_ENDPOINT.to_owned())
+        );
+        assert_eq!(environment.get("OPENAI_API_KEY"), Some(&secret.to_owned()));
+        assert_eq!(
+            environment.get("HERMES_INFERENCE_PROVIDER"),
+            Some(&INFERX_PROVIDER.to_owned())
+        );
+        assert_eq!(
+            environment.get("HERMES_INFERENCE_MODEL"),
+            Some(&INFERX_MODEL.to_owned())
+        );
+        assert!(!environment.contains_key("FRACTAL_INFERX_API_KEY"));
+
+        let rendered_error = worker_command("unsupported-inferx-test", secret, AgentRole::Worker)
+            .unwrap_err()
+            .to_string();
+        assert!(rendered_error.contains("inferx"));
+        assert!(!rendered_error.contains(secret));
+    }
+
+    #[test]
+    fn inferx_missing_key_is_a_non_secret_configuration_error() {
+        let env = InferxEnvGuard::new(&["FRACTAL_INFERX_API_KEY"]);
+        env.remove("FRACTAL_INFERX_API_KEY");
+        let error = worker_command("inferx", "build", AgentRole::Worker)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("inferx"));
+        assert!(error.contains("FRACTAL_INFERX_API_KEY"));
+
+        let error = match run_agent_prompt("inferx", "build", Path::new("."), 1) {
+            Ok(_) => panic!("missing InferX key must fail before spawning either command route"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("inferx"));
+        assert!(error.contains("FRACTAL_INFERX_API_KEY"));
+    }
+
+    #[test]
+    fn inferx_child_environment_replaces_ambient_openai_credentials() {
+        let env = InferxEnvGuard::new(&["FRACTAL_INFERX_API_KEY"]);
+        let secret = "inferx-child-secret";
+        env.set("FRACTAL_INFERX_API_KEY", secret);
+        let generic = BTreeMap::from([
+            ("OPENAI_API_KEY".to_owned(), "ambient-secret".to_owned()),
+            (
+                "OPENAI_BASE_URL".to_owned(),
+                "https://ambient.example".to_owned(),
+            ),
+            ("FRACTAL_INFERX_API_KEY".to_owned(), secret.to_owned()),
+        ]);
+        let child = child_environment_for_worker("inferx", generic);
+        assert_eq!(child.get("OPENAI_API_KEY"), Some(&secret.to_owned()));
+        assert_eq!(
+            child.get("OPENAI_BASE_URL"),
+            Some(&INFERX_ENDPOINT.to_owned())
+        );
+        assert_eq!(
+            child.get("HERMES_INFERENCE_PROVIDER"),
+            Some(&INFERX_PROVIDER.to_owned())
+        );
+        assert_eq!(
+            child.get("HERMES_INFERENCE_MODEL"),
+            Some(&INFERX_MODEL.to_owned())
+        );
+        assert!(!child.contains_key("FRACTAL_INFERX_API_KEY"));
+    }
+
+    #[test]
+    fn inferx_auto_detection_is_gated_and_always_last_after_codex_luna() {
+        let env = InferxEnvGuard::new(&[
+            "PATH",
+            "FRACTAL_AGENTS",
+            "FRACTAL_LEAD_AGENT",
+            "FRACTAL_INFERX_ENABLED",
+            "FRACTAL_INFERX_API_KEY",
+        ]);
+        let path = std::env::temp_dir().join(format!(
+            "fractal-inferx-detect-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        for binary in ["codex", "cursor-agent", "claude", "hermes"] {
+            fs::write(path.join(binary), b"test").unwrap();
+        }
+        env.set("PATH", &path);
+        env.remove("FRACTAL_AGENTS");
+        env.remove("FRACTAL_LEAD_AGENT");
+        env.set("FRACTAL_INFERX_ENABLED", "1");
+        env.set("FRACTAL_INFERX_API_KEY", "inferx-detection-secret");
+
+        let detected = detect_agents();
+        assert_eq!(
+            detected,
+            vec![
+                "codex".to_owned(),
+                "codex-luna".to_owned(),
+                "cursor".to_owned(),
+                "claude".to_owned(),
+                "hermes".to_owned(),
+                "inferx".to_owned(),
+            ]
+        );
+        assert_eq!(detected.last().map(String::as_str), Some("inferx"));
+        assert!(
+            detected
+                .iter()
+                .position(|agent| agent == "codex-luna")
+                .unwrap()
+                < detected.iter().position(|agent| agent == "inferx").unwrap()
+        );
+
+        env.remove("FRACTAL_INFERX_ENABLED");
+        assert!(!detect_agents().iter().any(|agent| agent == "inferx"));
+        env.set("FRACTAL_INFERX_ENABLED", "1");
+        env.remove("FRACTAL_INFERX_API_KEY");
+        assert!(!detect_agents().iter().any(|agent| agent == "inferx"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn inferx_can_be_selected_explicitly_as_a_logical_worker() {
+        let env = InferxEnvGuard::new(&[
+            "FRACTAL_AGENTS",
+            "FRACTAL_INFERX_ENABLED",
+            "FRACTAL_INFERX_API_KEY",
+        ]);
+        env.set("FRACTAL_AGENTS", "inferx");
+        env.set("FRACTAL_INFERX_ENABLED", "1");
+        env.set("FRACTAL_INFERX_API_KEY", "inferx-explicit-secret");
+        assert_eq!(detect_agents(), vec!["inferx".to_owned()]);
+        assert_eq!(agent_binary("inferx"), "hermes");
+    }
 
     #[test]
     fn codex_lead_planner_is_pinned_to_sol_high_without_changing_workers() {
