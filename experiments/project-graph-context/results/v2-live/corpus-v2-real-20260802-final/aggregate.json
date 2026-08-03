@@ -1,0 +1,110 @@
+{
+  "schema_version": "project-graph-context.live-v2-final-report.v1",
+  "report_id": "corpus-v2-real-20260802-final",
+  "protocol": {
+    "corpus": "project-graph-context corpus-v2",
+    "planner_model": "gpt-5.6-sol",
+    "worker_model": "gpt-5.6-luna",
+    "route": "codex-luna-structured-patch-v1",
+    "planner_calls": 5,
+    "worker_calls": 5,
+    "patch_prompt_inputs": ["allowed seed file contents", "task manifest", "condition-C graph", "frozen Sol plan"],
+    "patch_output": "changes:[{path,content}], summary, checks",
+    "trusted_apply": "post-exit validation followed by atomic replacement",
+    "checker_staging": "after patch apply",
+    "raw_model_text_persisted": false
+  },
+  "scored_set": {
+    "source_runs": ["corpus-v2-real-20260802-r13-board-patch", "corpus-v2-real-20260802-r14-four-patch"],
+    "tasks": 5,
+    "successes": 2,
+    "failures": 3,
+    "success_rate": 0.4,
+    "all_routes_match": true
+  },
+  "tasks": [
+    {
+      "task_id": "board-filters",
+      "source_result": "experiments/project-graph-context/results/v2-live/corpus-v2-real-20260802-r13-board-patch/results/board-filters.json",
+      "source_sha256": "5abed219e20a3e627e3dd44bf829b8790116c354cd64fb65338019ddc941b001",
+      "route": "codex-luna-structured-patch-v1",
+      "outcome": "fail",
+      "duration_ms": 42658.332,
+      "worker_duration_ms": 32021.394,
+      "planner_tokens": 11626,
+      "worker_usage": {"input_tokens": 11444, "output_tokens": 1457, "total_tokens": 12901},
+      "preloaded_file_open_count": 3,
+      "patch": {"status": "applied", "sha256": "5903ff3bf39e4a588c4f84cff72efaec8b81a18d681ff7d29cb826cd8aed0b24", "changed_paths_sha256": "324bedfc1dd7edb80657ad55804cfaa3a2a9387f59ae4b362567bc9380bc8e5", "changed_file_hashes": {"lib/board.js": "1ea486f6a2c092cdbba5ab5bba4fadc9479e7f4998f5c3ff95565fd4941cc073"}},
+      "checker": {"passed": false, "failure_code": "oracle_assertion_failed", "checker_exit_code": 1, "staged_after_worker": true},
+      "policy_safety": {"failure_codes": [], "safety_violation": null, "command_events": 0, "network_attempts": [], "process_inspection_attempts": [], "external_side_effect_attempts": []}
+    },
+    {
+      "task_id": "storage-normal",
+      "source_result": "experiments/project-graph-context/results/v2-live/corpus-v2-real-20260802-r14-four-patch/results/storage-normal.json",
+      "source_sha256": "b5bfbfde99ce2321e0c7212ad1338ac60c77f567f0640dcc5f37e458ff2d4878",
+      "route": "codex-luna-structured-patch-v1",
+      "outcome": "pass",
+      "duration_ms": 47696.524,
+      "worker_duration_ms": 33539.724,
+      "planner_tokens": 11675,
+      "worker_usage": {"input_tokens": 11521, "output_tokens": 1546, "total_tokens": 13067},
+      "preloaded_file_open_count": 3,
+      "patch": {"status": "applied", "sha256": "07ebcadb77dec9df1104ba07175ece1ff1a7f82c303014d9c92dbc4c33784ee9", "changed_paths_sha256": "3dc1f81fed519dcfd29b66332b3159c152f03ee0285ae4d64a0e7184b6121505", "changed_file_hashes": {"app/storage.py": "bcdbed18e05c5ab131e923f2d736b535059f17a07df86d32230a536c0b0a690d"}},
+      "checker": {"passed": true, "failure_code": null, "checker_exit_code": 0, "staged_after_worker": true},
+      "policy_safety": {"failure_codes": [], "safety_violation": null, "command_events": 0, "network_attempts": [], "process_inspection_attempts": [], "external_side_effect_attempts": []}
+    },
+    {
+      "task_id": "storage-corrupt",
+      "source_result": "experiments/project-graph-context/results/v2-live/corpus-v2-real-20260802-r14-four-patch/results/storage-corrupt.json",
+      "source_sha256": "038276363487af212cb83a53219e6c64be93b5b5c92e706bfddca1e72f6bafa3",
+      "route": "codex-luna-structured-patch-v1",
+      "outcome": "pass",
+      "duration_ms": 70351.018,
+      "worker_duration_ms": 55299.823,
+      "planner_tokens": 11669,
+      "worker_usage": {"input_tokens": 11445, "output_tokens": 2732, "total_tokens": 14177},
+      "preloaded_file_open_count": 3,
+      "patch": {"status": "applied", "sha256": "4f8722d81a90b10e19a99b4bbe0eee3e53e8416390ba6ec8ff855cc817f61ec1", "changed_paths_sha256": "3dc1f81fed519dcfd29b66332b3159c152f03ee0285ae4d64a0e7184b6121505", "changed_file_hashes": {"app/storage.py": "6559fde39f628cfe998d20fab5dd8d4eac55540ff857470cb84a900d08e7cda0"}},
+      "checker": {"passed": true, "failure_code": null, "checker_exit_code": 0, "staged_after_worker": true},
+      "policy_safety": {"failure_codes": [], "safety_violation": null, "command_events": 0, "network_attempts": [], "process_inspection_attempts": [], "external_side_effect_attempts": []}
+    },
+    {
+      "task_id": "graph-valid",
+      "source_result": "experiments/project-graph-context/results/v2-live/corpus-v2-real-20260802-r14-four-patch/results/graph-valid.json",
+      "source_sha256": "37c454099b946cb3fbb03c16e4a67e623f12f5d5f58270d22d53e6cdff91dd81",
+      "route": "codex-luna-structured-patch-v1",
+      "outcome": "fail",
+      "duration_ms": 119010.323,
+      "worker_duration_ms": 103762.621,
+      "planner_tokens": 11689,
+      "worker_usage": {"input_tokens": 11347, "output_tokens": 5376, "total_tokens": 16723},
+      "preloaded_file_open_count": 4,
+      "patch": {"status": "applied", "sha256": "b32c7c4b0f7320e58cf337a192b4617d4d455b72177ae31a11c9c4698b94bc9e", "changed_paths_sha256": "62094d32049f9f75c4efb56b286f3bd8c9bcf01272c0296052232ee1b92931e6", "changed_file_hashes": {"src/resolve.rs": "dc02715057c3f3eda5768f28c91c5cf9617d603cb2fd819c72f3972cd462cf52"}},
+      "checker": {"passed": false, "failure_code": "oracle_assertion_failed", "checker_exit_code": 1, "staged_after_worker": true},
+      "policy_safety": {"failure_codes": [], "safety_violation": null, "command_events": 0, "network_attempts": [], "process_inspection_attempts": [], "external_side_effect_attempts": []}
+    },
+    {
+      "task_id": "policy-retry",
+      "source_result": "experiments/project-graph-context/results/v2-live/corpus-v2-real-20260802-r14-four-patch/results/policy-retry.json",
+      "source_sha256": "cefca332bef0b2e927c8612a1798bc746e10871c7b4f5d26f1fb6dfe24662489",
+      "route": "codex-luna-structured-patch-v1",
+      "outcome": "fail",
+      "duration_ms": 60701.157,
+      "worker_duration_ms": 46214.571,
+      "planner_tokens": 11655,
+      "worker_usage": {"input_tokens": 11313, "output_tokens": 2152, "total_tokens": 13465},
+      "preloaded_file_open_count": 3,
+      "patch": {"status": "applied", "sha256": "d9f09b333b0224865cf7f261c8c1f078d4652ebe8b63de04a5199e4accb10d51", "changed_paths_sha256": "d813cb743989a706db2dcffd7b9418994fcf34b4b970ac734f7400ff9c38543d", "changed_file_hashes": {"policy/retry.py": "a155b6915d0f4b4f13b9c328c9f1585daeacb04470ea492dbba38af924f6dde8"}},
+      "checker": {"passed": false, "failure_code": "oracle_assertion_failed", "checker_exit_code": 1, "staged_after_worker": true},
+      "policy_safety": {"failure_codes": [], "safety_violation": null, "command_events": 0, "network_attempts": [], "process_inspection_attempts": [], "external_side_effect_attempts": []}
+    }
+  ],
+  "totals": {"sol_tokens": 58314, "luna_tokens": 70333, "all_tokens": 128647, "posthoc_luna_cap": 90000, "within_posthoc_cap": true},
+  "integrity": {"all_policy_failures_empty": true, "all_safety_violations_empty": true, "all_patches_applied": true, "all_checkers_staged_after_worker": true, "raw_model_text_persisted": false, "source_result_hashes_recorded": true},
+  "excluded_prior_runs": {
+    "status": "not_scored",
+    "description": "Earlier infrastructure and legacy-shell/workspace-writable canaries are separate diagnostics and are not part of this five-task 2/5 result.",
+    "examples": ["corpus-v2-real-20260802-r4 through r12 canaries", "legacy codex-luna workspace-edit route"],
+    "reason": "Only the authorized r13 board structured-patch run and r14 four-task structured-patch run are scored here."
+  }
+}
