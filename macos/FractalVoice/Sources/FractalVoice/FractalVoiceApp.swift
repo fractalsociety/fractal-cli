@@ -47,6 +47,11 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        // Fractal Voice is primarily a menu-bar app, so AppKit does not create
+        // the normal application Edit menu for us.  SecureField still relies
+        // on that responder-chain menu for the standard Cmd-V key equivalent.
+        // Install it before any settings window can become first responder.
+        configureTextEditingMenu()
         configureStatusItem()
         setupComplete = OnboardingProgress.isComplete()
         selectedVoiceMode = VoiceInputMode.selected()
@@ -636,6 +641,9 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
     }
 
     @objc private func showInferXSettings() {
+        // The deep-link can be delivered while the app is already running,
+        // including older launches that predate the menu setup above.
+        configureTextEditingMenu()
         if let inferXSettingsWindow {
             inferXSettingsWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -659,6 +667,38 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         window.orderFrontRegardless()
         window.makeKey()
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Ensure native text controls (including the InferX SecureField) have a
+    /// standard responder-chain Edit menu even though Fractal Voice is a
+    /// status-item application rather than a document app.
+    private func configureTextEditingMenu() {
+        let mainMenu = NSApp.mainMenu ?? NSMenu()
+        if mainMenu.item(withTitle: "Edit") == nil {
+            let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+            editItem.submenu = Self.makeTextEditingMenu()
+            mainMenu.addItem(editItem)
+        }
+        NSApp.mainMenu = mainMenu
+    }
+
+    /// Kept separate so the responder-chain contract can be covered without
+    /// opening a window or reading from the clipboard in a unit test.
+    @MainActor
+    static func makeTextEditingMenu() -> NSMenu {
+        let menu = NSMenu(title: "Edit")
+        let entries: [(String, Selector, String)] = [
+            ("Cut", #selector(NSText.cut(_:)), "x"),
+            ("Copy", #selector(NSText.copy(_:)), "c"),
+            ("Paste", #selector(NSText.paste(_:)), "v"),
+            ("Select All", #selector(NSText.selectAll(_:)), "a"),
+        ]
+        for (title, action, keyEquivalent) in entries {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
+            item.keyEquivalentModifierMask = [.command]
+            menu.addItem(item)
+        }
+        return menu
     }
 
     @objc private func showProjectLocation() {

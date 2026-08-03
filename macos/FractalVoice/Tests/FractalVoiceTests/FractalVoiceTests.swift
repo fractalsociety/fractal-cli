@@ -1,4 +1,5 @@
 import Carbon.HIToolbox
+import AppKit
 import Foundation
 import XCTest
 @testable import FractalVoice
@@ -238,6 +239,15 @@ final class FractalVoiceTests: XCTestCase {
                 URL(string: "fractalvoice://provider/other")!
             )
         )
+    }
+
+    @MainActor
+    func testTextEditingMenuExposesNativePasteResponderCommand() throws {
+        let menu = FractalVoiceApp.makeTextEditingMenu()
+        let paste = try XCTUnwrap(menu.item(withTitle: "Paste"))
+        XCTAssertEqual(paste.action, #selector(NSText.paste(_:)))
+        XCTAssertEqual(paste.keyEquivalent, "v")
+        XCTAssertEqual(paste.keyEquivalentModifierMask, [.command])
     }
 
     func testProcessEnvironmentInjectsInferXOnlyForCLIWithTestKeyProvider() {
