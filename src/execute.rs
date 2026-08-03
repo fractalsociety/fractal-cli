@@ -206,6 +206,9 @@ fn inferx_command_args(prompt: &str) -> Vec<String> {
 /// callers pass it directly to `Command::env`/`envs` after `env_clear`.
 fn inferx_child_environment(api_key: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
+        // Current Hermes resolves a bare `custom` provider's endpoint from
+        // CUSTOM_BASE_URL; OPENAI_BASE_URL remains for older Hermes builds.
+        ("CUSTOM_BASE_URL".to_owned(), INFERX_ENDPOINT.to_owned()),
         ("OPENAI_BASE_URL".to_owned(), INFERX_ENDPOINT.to_owned()),
         ("OPENAI_API_KEY".to_owned(), api_key.to_owned()),
         (
@@ -558,12 +561,14 @@ fn child_environment_for_worker(
 ) -> BTreeMap<String, String> {
     if kind == "inferx" {
         environment.remove("FRACTAL_INFERX_API_KEY");
+        environment.remove("CUSTOM_BASE_URL");
         if let Some(api_key) = inferx_api_key() {
             environment.extend(inferx_child_environment(&api_key));
         } else {
             // `worker_command` rejects this configuration before spawn.  Keep
             // this helper fail-safe for callers that assemble an environment
             // independently: no ambient OpenAI/Hermes credentials survive.
+            environment.remove("CUSTOM_BASE_URL");
             environment.remove("OPENAI_API_KEY");
             environment.remove("OPENAI_BASE_URL");
             environment.remove("HERMES_INFERENCE_PROVIDER");
@@ -3152,6 +3157,10 @@ mod tests {
             })
             .collect();
         assert_eq!(
+            environment.get("CUSTOM_BASE_URL"),
+            Some(&INFERX_ENDPOINT.to_owned())
+        );
+        assert_eq!(
             environment.get("OPENAI_BASE_URL"),
             Some(&INFERX_ENDPOINT.to_owned())
         );
@@ -3197,6 +3206,10 @@ mod tests {
         let secret = "inferx-child-secret";
         env.set("FRACTAL_INFERX_API_KEY", secret);
         let generic = BTreeMap::from([
+            (
+                "CUSTOM_BASE_URL".to_owned(),
+                "https://ambient-custom.example".to_owned(),
+            ),
             ("OPENAI_API_KEY".to_owned(), "ambient-secret".to_owned()),
             (
                 "OPENAI_BASE_URL".to_owned(),
@@ -3205,6 +3218,10 @@ mod tests {
             ("FRACTAL_INFERX_API_KEY".to_owned(), secret.to_owned()),
         ]);
         let child = child_environment_for_worker("inferx", generic);
+        assert_eq!(
+            child.get("CUSTOM_BASE_URL"),
+            Some(&INFERX_ENDPOINT.to_owned())
+        );
         assert_eq!(child.get("OPENAI_API_KEY"), Some(&secret.to_owned()));
         assert_eq!(
             child.get("OPENAI_BASE_URL"),
