@@ -308,9 +308,31 @@
   },
   "execution": {
     "schema": "fractal.execution_state.v1",
-    "phase": "executing",
-    "assignments": {},
-    "updated_at": "2026-08-08T02:11:48Z"
+    "phase": "completed",
+    "assignments": {
+      "analyze": {
+        "agent_id": "luna/task-detail-contract",
+        "agent_label": "Luna · Task Detail Contract",
+        "state": "completed",
+        "checked_out_at": "2026-08-08T02:14:45Z",
+        "completed_at": "2026-08-08T02:21:49Z"
+      },
+      "implement": {
+        "agent_id": "luna/task-detail-implement",
+        "agent_label": "Luna · Task Detail Implementation",
+        "state": "completed",
+        "checked_out_at": "2026-08-08T02:22:43Z",
+        "completed_at": "2026-08-08T02:34:30Z"
+      },
+      "verify": {
+        "agent_id": "luna/task-detail-verify",
+        "agent_label": "Luna · Task Detail Verification",
+        "state": "completed",
+        "checked_out_at": "2026-08-08T02:35:29Z",
+        "completed_at": "2026-08-08T02:42:22Z"
+      }
+    },
+    "updated_at": "2026-08-08T02:42:22Z"
   },
   "learning": {
     "schema": "fractal.learning.v1",
@@ -322,7 +344,14 @@
         "depends_on": [],
         "created_at": "2026-08-08T02:11:48Z",
         "ready_at": "2026-08-08T02:11:48Z",
-        "attempt_count": 0,
+        "started_at": "2026-08-08T02:16:08Z",
+        "finished_at": "2026-08-08T02:21:49Z",
+        "executor": {
+          "agent": "Luna · Task Detail Contract",
+          "version": "0.1.0"
+        },
+        "attempt_count": 2,
+        "outcome": "unverified_success",
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -336,7 +365,14 @@
           "analyze"
         ],
         "created_at": "2026-08-08T02:11:48Z",
-        "attempt_count": 0,
+        "started_at": "2026-08-08T02:22:43Z",
+        "finished_at": "2026-08-08T02:34:30Z",
+        "executor": {
+          "agent": "Luna · Task Detail Implementation",
+          "version": "0.1.0"
+        },
+        "attempt_count": 1,
+        "outcome": "unverified_success",
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -350,7 +386,18 @@
           "implement"
         ],
         "created_at": "2026-08-08T02:11:48Z",
-        "attempt_count": 0,
+        "started_at": "2026-08-08T02:35:29Z",
+        "finished_at": "2026-08-08T02:42:22Z",
+        "executor": {
+          "agent": "Luna · Task Detail Verification",
+          "version": "0.1.0"
+        },
+        "attempt_count": 1,
+        "outcome": "verified_success",
+        "verification": {
+          "type": "automated",
+          "passed": true
+        },
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -412,15 +459,16 @@
           "evidence_refs": []
         }
       ],
-      "total_duration_seconds": 186.0,
-      "total_agent_time_seconds": 143.0,
+      "total_duration_seconds": 1574.0,
+      "critical_path_duration_seconds": 1461.0,
+      "total_agent_time_seconds": 1461.0,
       "maximum_parallelism": 1,
-      "retry_count": 0,
+      "retry_count": 1,
       "reopened_node_count": 0,
       "dead_or_unused_node_count": 0,
       "human_intervention_count": 0,
-      "verification_coverage": 0.0,
-      "verification_coverage_denominator": 6,
+      "verification_coverage": 0.3333333333333333,
+      "verification_coverage_denominator": 3,
       "stopped_too_early": false
     },
     "acceptance_criteria": [
@@ -471,7 +519,7 @@
       "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c"
     }
   },
-  "updated_at": "2026-08-08T02:11:48Z",
+  "updated_at": "2026-08-08T02:42:22Z",
   "catalog": {
     "audit": {
       "auditor": "fractal graph audit",

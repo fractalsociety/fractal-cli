@@ -163,6 +163,54 @@ NORMALIZE_PROBE = textwrap.dedent(
 class ThreeGraphContractTests(unittest.TestCase):
     """Pure normalization/layout tests are usable without DOM or WebGL."""
 
+    def test_task_number_overview_and_detail_helpers_are_deterministic(self):
+        node = {
+            "id": "compile",
+            "title": "Compile",
+            "objective": "  Compile the\nboard  ",
+            "execution": {"task_number": "2.1", "wave": 3, "mode": "parallel", "parallel_group": "wave-3"},
+            "task_number": "9.9",
+            "instruction": "Run the compiler",
+            "capability": "code.generate",
+            "output": "Build artifact",
+            "assignment": {"agent_id": "builder", "agent_label": "Luna", "state": "checked_out"},
+            "why": {"ready": False, "reason": "Waiting for plan.", "blocked_by": ["plan"]},
+            "evidence": {"verification": {"passed": True}},
+            "gate": "cargo test",
+        }
+        result = node_json(
+            textwrap.dedent(
+                f"""
+                const Graph = require({json.dumps(str(MODULE))});
+                const node = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+                process.stdout.write(JSON.stringify({{
+                  number: Graph.canonicalTaskNumber(node),
+                  overview: Graph.oneLineOverview(node),
+                  detail: Graph.buildTaskDetail(node, {{ edges: [{{ from: 'plan', to: 'compile', condition: 'success' }}, {{ from: 'bad', to: 'compile', condition: 'failure' }}] }})
+                }}));
+                """
+            ),
+            node,
+        )
+        self.assertEqual(result["number"], "2.1", "nested execution number wins over additive value")
+        self.assertEqual(result["overview"], "Compile the board")
+        self.assertEqual(result["detail"]["dependencies"], ["plan"])
+        self.assertEqual(result["detail"]["execution"]["wave"], 3)
+        self.assertEqual(result["detail"]["expectedOutput"], "Build artifact")
+        self.assertFalse(result["detail"]["why"]["ready"])
+
+        missing = node_json(
+            f"""
+            const Graph = require({json.dumps(str(MODULE))});
+            process.stdout.write(JSON.stringify(Graph.buildTaskDetail({{ id: 'missing' }}, null)));
+            """
+        )
+        self.assertIsNone(missing["taskNumber"])
+        self.assertEqual(missing["overview"], "Task missing has no recorded purpose.")
+        self.assertIsNone(missing["why"]["ready"])
+        self.assertEqual(missing["why"]["reason"], "Dependency explanation not recorded.")
+        self.assertEqual(missing["dependencies"], [])
+
     def test_commonjs_export_and_normalization_are_immutable(self):
         payload = canonical_payload()
         result = node_json(NORMALIZE_PROBE, payload)
@@ -417,6 +465,29 @@ class ThreeGraphStaticAndControllerTests(unittest.TestCase):
         self.assertRegex(vendor_header, r"(?i)three(?:\.js)?")
         self.assertRegex(vendor_header, r"(?i)(version|release|r\d+(?:\.\d+)*)")
         self.assertRegex(vendor_header, r"(?i)(license|mit)")
+
+    def test_task_detail_inspector_and_numbered_surfaces_are_present(self):
+        html = INDEX.read_text(encoding="utf-8")
+        app = APP.read_text(encoding="utf-8")
+        css = STYLES.read_text(encoding="utf-8")
+        for identifier in (
+            "node-overview", "node-task-number", "node-purpose", "node-readiness",
+            "node-capability", "node-expected-output", "node-execution-wave",
+            "node-execution-mode", "node-execution-group", "node-agent", "node-evidence",
+        ):
+            self.assertIn(f'id="{identifier}"', html)
+        self.assertIn("task-number-label", app)
+        self.assertIn("task-number-label", css)
+        self.assertIn("RESET CAMERA", html)
+        self.assertIn("Full architecture", html)
+
+    def test_readiness_update_preserves_stable_child_for_repeated_selection(self):
+        """Updating one task must not remove #node-why before the next task."""
+        html = INDEX.read_text(encoding="utf-8")
+        app = APP.read_text(encoding="utf-8")
+        self.assertIn('id="node-readiness"><span id="node-why">', html)
+        self.assertIn('document.getElementById("node-why").textContent = readinessSummary;', app)
+        self.assertNotIn('document.getElementById("node-readiness").textContent =', app)
 
     def test_app_keeps_operational_paths_and_3d_callbacks(self):
         app = APP.read_text(encoding="utf-8")

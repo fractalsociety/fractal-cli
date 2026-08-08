@@ -172,6 +172,7 @@ h1 em { color: #a8beb4; font-weight: 400; }
 .node .rail { opacity: .95; }
 .node.complete .rail { fill: var(--green); }.node.active .rail { fill: var(--amber); }.node.incomplete .rail { fill: var(--red); }
 .node .id-label { fill: #aebdb7; font: 600 10px "SFMono-Regular", Consolas, monospace; letter-spacing: .12em; }
+.node .task-number-label { fill: #bde9d1; font: 700 8px "SFMono-Regular", Consolas, monospace; letter-spacing: .07em; }
 .node .title-label { fill: #e7f0ec; font: 500 13px "Avenir Next", sans-serif; }
 .node .meta-label { fill: #697b73; font: 500 8px "SFMono-Regular", Consolas, monospace; letter-spacing: .08em; }
 .agent-badge rect { fill: rgba(7,16,14,.96); stroke: rgba(var(--amber-rgb), .72); stroke-width: 1; }
@@ -201,7 +202,9 @@ h1 em { color: #a8beb4; font-weight: 400; }
 .status-pill.complete { color: var(--green); background: rgba(var(--green-rgb), .06); }.status-pill.active { color: var(--amber); background: rgba(var(--amber-rgb), .06); }.status-pill.incomplete { color: var(--red); background: rgba(var(--red-rgb), .06); }
 .node-kind { margin: 38px 0 8px; color: #6e8078; }
 .inspector h3 { margin: 0; font: 400 27px/1.15 Iowan Old Style, Georgia, serif; }
+.node-task-number { margin: 9px 0 0; color: #b7d9c9; font: 700 10px/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .1em; }
 .node-id { color: var(--green); font: 600 10px/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .14em; margin: 15px 0 34px; }
+.node-overview { margin: -20px 0 20px; color: #a4b8ae; font-size: 11px; line-height: 1.55; }
 .node-progress span { display: flex; justify-content: space-between; color: #73847d; font: 600 8px/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .1em; }
 .node-progress span small { color: #9fb0a9; font: inherit; }
 .node-progress > div { height: 2px; margin-top: 11px; background: #16221e; overflow: hidden; }

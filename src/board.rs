@@ -1732,9 +1732,16 @@ fn project_view(workspace: &Path, token: &str) -> Result<Value> {
             let depends_on = graph_predecessors(&project.graph, &id);
             let why = readiness_projection(&depends_on, assignments, node);
             let evidence = safe_learning_evidence(project.learning.nodes.get(&id));
+            let task_number = canonical_task_number(node);
+            let expected_output = canonical_expected_output(node);
             json!({
                 "id": id,
                 "title": node.get("title").or_else(|| node.get("objective")).and_then(Value::as_str).unwrap_or(&id),
+                // These are bounded, read-only conveniences.  The immutable
+                // graph remains the authority; runtime state below continues
+                // to come from the existing project projection.
+                "task_number": task_number,
+                "expected_output": expected_output,
                 "objective": bounded_text(Some(objective), 280),
                 "capability": bounded_text(Some(capability), 160),
                 "depends_on": depends_on,
@@ -1915,6 +1922,36 @@ fn bounded_text(value: Option<&str>, limit: usize) -> Value {
         .map(|text| text.chars().take(limit).collect::<String>())
         .map(Value::String)
         .unwrap_or(Value::Null)
+}
+
+/// Return the immutable graph's canonical execution number without deriving a
+/// value from display order.  The execution field is authoritative for the
+/// Rust projection; malformed, empty, and non-string values are intentionally
+/// omitted from the public projection.
+fn canonical_task_number(node: &Value) -> Option<String> {
+    node.get("execution")
+        .and_then(|execution| execution.get("task_number"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        // The task number is an immutable graph identity convenience.  Keep
+        // the exact canonical string rather than deriving or truncating it.
+        .map(str::to_owned)
+}
+
+/// Project only the first bounded expected-artifact string recorded on the
+/// canonical node.  Learning records, evidence paths, and unknown flattened
+/// fields are deliberately not consulted here.
+fn canonical_expected_output(node: &Value) -> Option<String> {
+    [
+        node.get("output"),
+        node.get("expected_output"),
+        node.get("efficiency").and_then(|efficiency| efficiency.get("expected_artifact")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .find(|value| !value.is_empty())
+    .map(|value| value.chars().take(320).collect())
 }
 
 fn bounded_strings(values: &[String], limit: usize) -> Vec<String> {
@@ -2550,6 +2587,52 @@ mod tests {
         );
         assert!(view.get("totals").is_some());
         assert!(view.get("groups").and_then(Value::as_array).is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_view_projects_bounded_task_number_and_expected_output_without_mutating_graph() {
+        let _guard = test_lock();
+        let root = temp_root("task-detail-projection");
+        let workspace = root.join("solo");
+        fs::create_dir_all(workspace.join(".fractal")).unwrap();
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [
+                {
+                    "id": "populated",
+                    "title": "Populated",
+                    "objective": "Inspect task",
+                    "execution": {"task_number": "2.1", "wave": 2},
+                    "output": "canonical output",
+                    "expected_output": "secondary output",
+                    "efficiency": {"expected_artifact": "fallback output"}
+                },
+                {
+                    "id": "missing",
+                    "title": "Missing",
+                    "execution": {"task_number": ""}
+                }
+            ],
+            "edges": []
+        });
+        let graph_hash = fractal_contracts::canonical_sha256(&graph).unwrap();
+        graph["graph_hash"] = json!(graph_hash);
+        crate::project_file::persist(&workspace, &graph, "Solo").unwrap();
+        let canonical = crate::project_file::load(&workspace).unwrap();
+        let canonical_graph = canonical.graph.clone();
+        let canonical_hash = canonical.graph_hash.clone();
+
+        let view = project_view(&workspace, "token").unwrap();
+        assert_eq!(view["schema"], "fractal.execution_graph_view.v1");
+        assert_eq!(view["graph"]["graph_hash"], canonical_hash);
+        assert_eq!(view["graph"], canonical_graph);
+        let tasks = view["groups"][0]["tasks"].as_array().unwrap();
+        assert_eq!(tasks[0]["task_number"], "2.1");
+        assert_eq!(tasks[0]["expected_output"], "canonical output");
+        assert_eq!(tasks[1]["task_number"], Value::Null);
+        assert_eq!(tasks[1]["expected_output"], Value::Null);
+
         let _ = fs::remove_dir_all(root);
     }
 

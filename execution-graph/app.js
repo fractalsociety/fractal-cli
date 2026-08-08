@@ -442,6 +442,10 @@ function renderGraph() {
   const svg = document.getElementById("graph");
   svg.replaceChildren();
   const taskView = state.view !== "overview";
+  // A single-group individual board opens directly in task view on first
+  // load, so keep the architecture back control in sync with the rendered
+  // view instead of relying only on the explicit milestone-open path.
+  document.getElementById("back")?.classList.toggle("hidden", !taskView);
   const group = taskView ? state.data.groups.find(item => item.id === state.view) : null;
   const nodes = taskView ? group.tasks : state.data.overview.nodes;
   const edges = taskView ? group.edges : state.data.overview.edges;
@@ -522,18 +526,31 @@ function renderGraph() {
   nodes.forEach(node => {
     const [x, y] = positions[node.id];
     const assignment = taskView ? node.assignment : null;
+    const graphApi = window.FractalThreeGraph || {};
+    const taskNumber = taskView && typeof graphApi.canonicalTaskNumber === "function"
+      ? graphApi.canonicalTaskNumber(node)
+      : null;
+    const taskLabel = taskNumber ? `Task ${taskNumber}` : "Task number unavailable";
+    const overview = typeof graphApi.oneLineOverview === "function"
+      ? graphApi.oneLineOverview(node)
+      : String(node.objective || node.instruction || node.title || `Task ${node.id} has no recorded purpose.`).replace(/\s+/g, " ").trim();
     const failureCount = taskView
       ? failureCountForNode(node.id)
       : (state.failure.data?.summary?.total || 0);
     const agentLabel = assignment?.agent_label || assignment?.agent_id || "";
-    const whyReason = node.why?.reason || (node.depends_on?.length ? `Waiting for ${node.depends_on.join(", ")}.` : "No dependencies; node is eligible.");
+    const whyReason = node.why?.reason
+      || (node.why?.ready === true ? "Ready to work." : node.why?.ready === false
+        ? `Blocked by ${(node.why?.blocked_by || []).join(", ") || "dependency"}.`
+        : "Dependency explanation not recorded.");
     const objective = node.objective || node.title;
     const evidenceSummary = node.evidence?.verification?.passed === true ? "verified evidence"
       : node.evidence?.verification?.passed === false ? "verification failed" : node.evidence?.outcome || "no outcome recorded";
     const item = svgElement("g", {
       class: `node ${node.status}${assignment?.state === "released" ? " released" : ""}${state.selected?.id === node.id ? " selected" : ""}`,
       transform: `translate(${x},${y})`, tabindex: "0", role: "button",
-      "aria-label": `${node.id}, ${node.title}, ${statusNames[node.status]}, objective ${objective}, ${whyReason}, ${evidenceSummary}${agentLabel ? `, agent ${agentLabel}` : ""}`
+      "aria-label": `${taskLabel}, ${node.id}, ${node.title}, ${statusNames[node.status]}, ${overview}, objective ${objective}, ${whyReason}, ${evidenceSummary}${agentLabel ? `, agent ${agentLabel}` : ""}`,
+      "aria-selected": state.selected?.id === node.id ? "true" : "false",
+      "aria-current": state.selected?.id === node.id ? "true" : "false"
     });
     item.append(svgElement("rect", { class: "node-aura", x: -width / 2 - 7, y: -height / 2 - 7, width: width + 14, height: height + 14, rx: 8 }));
     item.append(svgElement("rect", { class: "node-body", x: -width / 2, y: -height / 2, width, height, rx: 4 }));
@@ -544,6 +561,11 @@ function renderGraph() {
     const idText = svgElement("text", { class: "id-label", x: -width / 2 + 17, y: -height / 2 + 22 });
     idText.textContent = node.id;
     item.append(idText);
+    if (taskView) {
+      const numberText = svgElement("text", { class: "task-number-label", x: -width / 2 + 17, y: -height / 2 + 10 });
+      numberText.textContent = taskLabel;
+      item.append(numberText);
+    }
     if (failureCount > 0) {
       const failureBadge = svgElement("g", {
         class: "failure-badge",
@@ -614,7 +636,28 @@ function renderGraph() {
   }
 }
 
+function taskDetailFor(node) {
+  const api = window.FractalThreeGraph;
+  const model = state.view === "overview"
+    ? state.data?.overview
+    : state.data?.groups?.find(group => group.id === state.view);
+  if (api?.buildTaskDetail) return api.buildTaskDetail(node, model || null);
+  const overview = String(node?.objective || node?.instruction || node?.title || `Task ${node?.id || "unknown"} has no recorded purpose.`).replace(/\s+/g, " ").trim();
+  return {
+    taskNumber: null,
+    overview: overview.length <= 180 ? overview : `${overview.slice(0, 179)}…`,
+    purpose: node?.objective || "Purpose not recorded.",
+    why: { ready: null, reason: "Dependency explanation not recorded.", blockedBy: [] },
+    dependencies: Array.isArray(node?.depends_on) ? node.depends_on : [],
+    execution: { wave: null, mode: null, parallelGroup: null }, capability: node?.capability || null,
+    instruction: node?.instruction || null, expectedOutput: node?.expected_output || null,
+    agent: node?.assignment ? { id: node.assignment.agent_id || "", label: node.assignment.agent_label || "", state: node.assignment.state || "" } : null,
+    evidence: node?.evidence || {}, gate: node?.gate || null
+  };
+}
+
 function selectNode(node, kind) {
+  const detail = kind === "task" ? taskDetailFor(node) : null;
   state.selected = { ...node, kind };
   document.getElementById("inspector-empty").classList.add("hidden");
   document.getElementById("inspector-content").classList.remove("hidden");
@@ -623,14 +666,35 @@ function selectNode(node, kind) {
   pill.textContent = statusNames[node.status];
   document.getElementById("node-kind").textContent = kind === "milestone" ? "EXECUTION MILESTONE" : (node.kind || "TASK").toUpperCase();
   document.getElementById("node-title").textContent = node.title;
+  document.getElementById("node-task-number").textContent = kind === "task"
+    ? (detail.taskNumber ? `Task ${detail.taskNumber}` : "Task number unavailable")
+    : "";
   document.getElementById("node-id").textContent = node.id;
+  document.getElementById("node-overview").textContent = detail?.overview || node.objective || node.title;
   document.getElementById("node-source").textContent = `${state.data.source} · line ${node.line}`;
-  document.getElementById("node-gate").textContent = node.gate || node.efficiency?.verification_plan || (kind === "milestone" ? "Open milestone to inspect gate criteria" : "Inherited from milestone");
-  const why = node.why || { ready: true, blocked_by: [], reason: kind === "milestone" ? "Milestone summary; open it to inspect dependencies." : "No dependency explanation recorded." };
-  document.getElementById("node-objective").textContent = node.objective || node.title;
-  document.getElementById("node-why").textContent = why.reason || (why.ready ? "Ready to work." : "Blocked by dependency.");
-  document.getElementById("node-dependencies").textContent = Array.isArray(node.depends_on) && node.depends_on.length ? node.depends_on.join(" · ") : "None recorded";
-  const evidence = node.evidence || {};
+  document.getElementById("node-gate").textContent = detail?.gate || (kind === "milestone" ? "Open milestone to inspect gate criteria" : "Gate criteria not recorded.");
+  const why = node.why || { ready: null, blocked_by: [], reason: "Dependency explanation not recorded." };
+  const readiness = detail?.why || {
+    ready: typeof why.ready === "boolean" ? why.ready : null,
+    reason: why.reason || "Dependency explanation not recorded.",
+    blockedBy: Array.isArray(why.blocked_by) ? why.blocked_by : []
+  };
+  document.getElementById("node-objective").textContent = detail?.purpose || node.objective || "Purpose not recorded.";
+  const readinessSummary = readiness.ready === true
+    ? `Ready · ${readiness.reason || "Dependency explanation not recorded."}`
+    : readiness.ready === false
+      ? `Blocked · ${readiness.reason || "Dependency explanation not recorded."}`
+      : (readiness.reason || "Dependency explanation not recorded.");
+  /* Keep the stable #node-why child in the inspector.  Updating the parent
+   * #node-readiness.textContent would remove that child and make the next
+   * selection throw when it tries to update the readiness copy again. */
+  document.getElementById("node-why").textContent = readinessSummary;
+  document.getElementById("node-readiness").dataset.ready = readiness.ready == null
+    ? "unknown" : readiness.ready ? "true" : "false";
+  document.getElementById("node-dependencies").textContent = detail
+    ? (detail.dependencies.length ? detail.dependencies.join(" · ") : "No dependencies recorded.")
+    : (Array.isArray(node.depends_on) && node.depends_on.length ? node.depends_on.join(" · ") : "No dependencies recorded.");
+  const evidence = detail?.evidence || node.evidence || {};
   const verification = evidence.verification || {};
   const evidenceElement = document.getElementById("node-evidence");
   evidenceElement.className = verification.passed === false ? "evidence-failed" : verification.passed === true ? "evidence-passed" : "";
@@ -646,31 +710,39 @@ function selectNode(node, kind) {
   const eventLabel = evidence.finished_at ? "Evidence finished" : evidence.started_at ? "Work started" : assignmentForEvent?.completed_at ? "Assignment completed" : assignmentForEvent?.released_at ? "Assignment released" : assignmentForEvent?.checked_out_at ? "Assignment checked out" : "No runtime event recorded";
   document.getElementById("node-last-event").textContent = eventTime ? `${eventLabel} · ${new Date(eventTime).toLocaleString()}` : eventLabel;
   const assignmentWrap = document.getElementById("node-assignment-wrap");
-  if (kind === "task" && node.assignment) {
-    const assignment = node.assignment;
+  if (kind === "task") {
     assignmentWrap.classList.remove("hidden");
-    document.getElementById("node-agent").textContent = assignment.agent_label || assignment.agent_id;
-    const activity = (assignment.state || "checked_out").replace("_", " ");
-    const at = assignment.completed_at || assignment.released_at || assignment.checked_out_at;
+    const assignment = detail?.agent;
+    document.getElementById("node-agent").textContent = assignment
+      ? (assignment.label || assignment.id || "No agent assigned.")
+      : "No agent assigned.";
+    const activity = assignment?.state ? assignment.state.replaceAll("_", " ") : "No agent assigned.";
+    const at = assignmentForEvent?.completed_at || assignmentForEvent?.released_at || assignmentForEvent?.checked_out_at;
     document.getElementById("node-assignment").textContent = at ? `${activity} · ${new Date(at).toLocaleString()}` : activity;
   } else {
     assignmentWrap.classList.add("hidden");
   }
   const executionWrap = document.getElementById("node-execution-wrap");
-  if (kind === "task" && node.execution) {
+  const capabilityWrap = document.getElementById("node-capability-wrap");
+  const instructionWrap = document.getElementById("node-instruction-wrap");
+  const expectedOutputWrap = document.getElementById("node-expected-output-wrap");
+  if (kind === "task") {
     executionWrap.classList.remove("hidden");
-    const group = node.execution.parallel_group ? ` · ${node.execution.parallel_group}` : "";
-    document.getElementById("node-execution").textContent =
-      `Wave ${node.execution.wave} · ${node.execution.mode}${group}`;
+    document.getElementById("node-execution-wave").textContent = detail?.execution.wave == null ? "Execution wave not recorded." : String(detail.execution.wave);
+    document.getElementById("node-execution-mode").textContent = detail?.execution.mode || "Execution mode not recorded.";
+    document.getElementById("node-execution-group").textContent = detail?.execution.parallelGroup || "Parallel group not recorded.";
+    document.getElementById("node-execution").textContent = `${document.getElementById("node-execution-wave").textContent} · ${document.getElementById("node-execution-mode").textContent} · ${document.getElementById("node-execution-group").textContent}`;
+    capabilityWrap.classList.remove("hidden");
+    document.getElementById("node-capability").textContent = detail?.capability || "Capability not recorded.";
+    instructionWrap.classList.remove("hidden");
+    document.getElementById("node-instruction").textContent = detail?.instruction || "Instruction not recorded.";
+    expectedOutputWrap.classList.remove("hidden");
+    document.getElementById("node-expected-output").textContent = detail?.expectedOutput || "Expected output not recorded.";
   } else {
     executionWrap.classList.add("hidden");
-  }
-  const instructionWrap = document.getElementById("node-instruction-wrap");
-  if (kind === "task" && node.instruction) {
-    instructionWrap.classList.remove("hidden");
-    document.getElementById("node-instruction").textContent = node.instruction;
-  } else {
+    capabilityWrap.classList.add("hidden");
     instructionWrap.classList.add("hidden");
+    expectedOutputWrap.classList.add("hidden");
   }
   const progressWrap = document.getElementById("node-progress-wrap");
   const open = document.getElementById("open-milestone");
@@ -686,6 +758,10 @@ function selectNode(node, kind) {
     open.classList.add("hidden");
   }
   renderGraph();
+  if (kind === "task") {
+    const focusRef = detail?.taskNumber || node.id;
+    threeGraph?.focus?.(focusRef);
+  }
 }
 
 function openMilestone(id) {

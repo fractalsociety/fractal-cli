@@ -70,7 +70,7 @@
             <svg id="graph" role="group" aria-label="Fractal Runtime PRD execution graph"></svg>
             <div id="graph-3d" class="graph-3d-mount hidden" aria-label="Three dimensional execution graph"></div>
             <div class="graph-3d-controls" aria-label="Graph camera controls">
-              <button id="graph-reset-camera" type="button">RESET CAMERA</button>
+              <button id="graph-reset-camera" type="button" aria-label="Reset camera to fit graph">RESET CAMERA</button>
               <button id="graph-list-toggle" type="button" aria-expanded="false" aria-controls="graph-accessible-list">NODE LIST</button>
             </div>
             <section class="live-work-hud" id="live-work-hud" aria-label="Live execution status">
@@ -95,17 +95,22 @@
             <div class="status-pill" id="node-status"></div>
             <p class="node-kind" id="node-kind"></p>
             <h3 id="node-title"></h3>
+            <p class="node-task-number" id="node-task-number"></p>
             <p class="node-id" id="node-id"></p>
+            <p class="node-overview" id="node-overview"></p>
             <div class="node-progress" id="node-progress-wrap">
               <span><b id="node-progress-label"></b><small id="node-progress-count"></small></span>
               <div><i id="node-progress"></i></div>
             </div>
             <dl>
-              <div class="hidden" id="node-assignment-wrap"><dt>AGENT</dt><dd id="node-agent"></dd><dt class="assignment-state-label">ACTIVITY</dt><dd id="node-assignment"></dd></div>
-              <div class="hidden" id="node-execution-wrap"><dt>EXECUTION</dt><dd id="node-execution"></dd></div>
-              <div class="hidden" id="node-instruction-wrap"><dt>INSTRUCTION</dt><dd id="node-instruction"></dd></div>
-              <div id="node-objective-wrap"><dt>OBJECTIVE / WHY</dt><dd><strong id="node-objective"></strong><span id="node-why"></span></dd></div>
+              <div id="node-objective-wrap" class="node-purpose-wrap"><dt>PURPOSE</dt><dd id="node-purpose"><strong id="node-objective"></strong></dd></div>
+              <div id="node-readiness-wrap"><dt>WHY / READINESS</dt><dd id="node-readiness"><span id="node-why"></span></dd></div>
               <div id="node-dependencies-wrap"><dt>DEPENDENCIES</dt><dd id="node-dependencies"></dd></div>
+              <div id="node-execution-wrap"><dt>EXECUTION WAVE</dt><dd id="node-execution-wave"></dd><dt>EXECUTION MODE</dt><dd id="node-execution-mode"></dd><dt>PARALLEL GROUP</dt><dd id="node-execution-group"></dd><dd id="node-execution" class="sr-only"></dd></div>
+              <div id="node-capability-wrap"><dt>CAPABILITY</dt><dd id="node-capability"></dd></div>
+              <div id="node-instruction-wrap"><dt>INSTRUCTION</dt><dd id="node-instruction"></dd></div>
+              <div id="node-expected-output-wrap"><dt>EXPECTED OUTPUT</dt><dd id="node-expected-output"></dd></div>
+              <div id="node-assignment-wrap"><dt>AGENT</dt><dd id="node-agent"></dd><dt class="assignment-state-label">ACTIVITY</dt><dd id="node-assignment"></dd></div>
               <div id="node-evidence-wrap"><dt>EVIDENCE</dt><dd id="node-evidence"></dd></div>
               <div id="node-last-event-wrap"><dt>LAST EVENT</dt><dd id="node-last-event"></dd></div>
               <div><dt>SOURCE</dt><dd id="node-source"></dd></div>
