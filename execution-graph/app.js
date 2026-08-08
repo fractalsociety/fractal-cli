@@ -11,6 +11,32 @@ const state = {
 };
 const statusNames = { complete: "Complete", active: "In progress", incomplete: "Incomplete" };
 let masterBrowser = null;
+let threeGraph = null;
+
+function disposeThreeGraph() {
+  if (!threeGraph) return;
+  threeGraph.destroy();
+  threeGraph = null;
+}
+
+function ensureThreeGraph() {
+  if (threeGraph || !window.FractalThreeGraph || queryMode() === "master") return threeGraph;
+  const mount = document.getElementById("graph-3d");
+  if (!mount) return null;
+  threeGraph = window.FractalThreeGraph.createThreeGraph({
+    mount,
+    accessibleList: document.getElementById("graph-accessible-list"),
+    fallbackSvg: document.getElementById("graph"),
+    onSelect: (id, kind) => {
+      const model = state.view === "overview" ? state.data?.overview : state.data?.groups?.find(group => group.id === state.view);
+      const nodes = model?.tasks || model?.nodes || [];
+      const node = nodes.find(item => item.id === id);
+      if (node) selectNode(node, kind || (state.view === "overview" ? "milestone" : "task"));
+    },
+    onOpenMilestone: openMilestone
+  });
+  return threeGraph;
+}
 
 function queryMode() {
   return new URLSearchParams(window.location.search).get("mode") === "master" ? "master" : "individual";
@@ -54,6 +80,10 @@ function switchToMaster(push = true) {
   const params = new URLSearchParams(window.location.search);
   params.set("mode", "master");
   if (push) history.pushState(null, "", `${window.location.pathname}?${params}`);
+  /* The master browser owns its own SVG scene. Release the decorative WebGL
+   * controller while it is hidden so its RAF loop and canvas cannot outlive
+   * the individual graph view. It will be recreated on the next visit. */
+  disposeThreeGraph();
   setBoardMode("master");
   /* Rebuild the modular controller when entering master so URL state (q,
    * filters, selection, and view) is authoritative after an individual visit. */
@@ -486,6 +516,8 @@ function renderGraph() {
     item.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") select(); });
     svg.append(item);
   });
+  const three = ensureThreeGraph();
+  if (three && state.data) three.update(window.FractalThreeGraph.normalizeGraphPayload(state.data, state.view), state.selected?.id || null);
 }
 
 function selectNode(node, kind) {
@@ -737,6 +769,13 @@ document.getElementById("failure-history-toggle")?.addEventListener("click", () 
   persistFailureUrl(true);
   renderFailureHistory();
   if (state.failure.open && !state.failure.data) loadFailureGraph(false);
+});
+document.getElementById("graph-reset-camera")?.addEventListener("click", () => threeGraph?.resetCamera());
+document.getElementById("graph-list-toggle")?.addEventListener("click", event => {
+  const list = document.getElementById("graph-accessible-list");
+  if (!list) return;
+  const open = list.classList.toggle("hidden");
+  event.currentTarget.setAttribute("aria-expanded", String(!open));
 });
 
 window.addEventListener("popstate", () => {

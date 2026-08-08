@@ -1616,6 +1616,8 @@ fn serve_board_asset(request: tiny_http::Request, route: &str, viewer_dir: &Path
         "/styles.css" => "styles.css",
         "/master-graph.js" => "master-graph.js",
         "/master-graph.css" => "master-graph.css",
+        "/three-graph.js" => "three-graph.js",
+        "/vendor/three.min.js" => "vendor/three.min.js",
         "/assets/favicon.svg" => "assets/favicon.svg",
         "/assets/fractal-graph-field.png" => "assets/fractal-graph-field.png",
         _ => {
@@ -1653,6 +1655,8 @@ fn embedded_asset(relative: &str) -> &'static [u8] {
         "styles.css" => include_bytes!("../execution-graph/styles.css"),
         "master-graph.js" => include_bytes!("../execution-graph/master-graph.js"),
         "master-graph.css" => include_bytes!("../execution-graph/master-graph.css"),
+        "three-graph.js" => include_bytes!("../execution-graph/three-graph.js"),
+        "vendor/three.min.js" => include_bytes!("../execution-graph/vendor/three.min.js"),
         "assets/favicon.svg" => include_bytes!("../execution-graph/assets/favicon.svg"),
         "assets/fractal-graph-field.png" => {
             include_bytes!("../execution-graph/assets/fractal-graph-field.png")

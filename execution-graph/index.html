@@ -68,6 +68,12 @@
                  labelled group rather than an image (which hides descendants
                  from assistive technology). -->
             <svg id="graph" role="group" aria-label="Fractal Runtime PRD execution graph"></svg>
+            <div id="graph-3d" class="graph-3d-mount hidden" aria-label="Three dimensional execution graph"></div>
+            <div class="graph-3d-controls" aria-label="Graph camera controls">
+              <button id="graph-reset-camera" type="button">RESET CAMERA</button>
+              <button id="graph-list-toggle" type="button" aria-expanded="false" aria-controls="graph-accessible-list">NODE LIST</button>
+            </div>
+            <div id="graph-accessible-list" class="graph-accessible-list hidden" aria-label="Execution graph nodes"></div>
             <div class="graph-hint">Select a milestone to inspect its executable checklist</div>
           </div>
         </div>
@@ -120,6 +126,8 @@
       <span>Native MLX thinks · Containers act · Policy controls · Verifiers decide</span>
     </footer>
     <script src="master-graph.js"></script>
+    <script src="vendor/three.min.js"></script>
+    <script src="three-graph.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

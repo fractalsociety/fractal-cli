@@ -608,9 +608,52 @@
   },
   "execution": {
     "schema": "fractal.execution_state.v1",
-    "phase": "executing",
-    "assignments": {},
-    "updated_at": "2026-08-08T00:37:07Z"
+    "phase": "completed",
+    "assignments": {
+      "acceptance": {
+        "agent_id": "luna/three-graph-acceptance",
+        "agent_label": "Luna · 3D Graph Acceptance",
+        "state": "completed",
+        "checked_out_at": "2026-08-08T01:18:24Z",
+        "completed_at": "2026-08-08T01:21:38Z"
+      },
+      "author_tests": {
+        "agent_id": "luna/three-graph-tests",
+        "agent_label": "Luna · 3D Graph Tests",
+        "state": "completed",
+        "checked_out_at": "2026-08-08T00:43:22Z",
+        "completed_at": "2026-08-08T00:53:46Z"
+      },
+      "complete": {
+        "agent_id": "luna/three-graph-acceptance",
+        "agent_label": "Luna · 3D Graph Acceptance",
+        "state": "completed",
+        "checked_out_at": "2026-08-08T01:21:45Z",
+        "completed_at": "2026-08-08T01:21:45Z"
+      },
+      "implement": {
+        "agent_id": "luna/three-graph-final",
+        "agent_label": "Luna · 3D Graph Final",
+        "state": "completed",
+        "checked_out_at": "2026-08-08T00:43:22Z",
+        "completed_at": "2026-08-08T01:13:33Z"
+      },
+      "plan": {
+        "agent_id": "luna/three-graph",
+        "agent_label": "Luna · 3D Graph",
+        "state": "completed",
+        "checked_out_at": "2026-08-08T00:37:42Z",
+        "completed_at": "2026-08-08T00:40:52Z"
+      },
+      "review": {
+        "agent_id": "luna/three-graph-review",
+        "agent_label": "Luna · 3D Graph Review",
+        "state": "completed",
+        "checked_out_at": "2026-08-08T01:13:59Z",
+        "completed_at": "2026-08-08T01:17:56Z"
+      }
+    },
+    "updated_at": "2026-08-08T01:21:45Z"
   },
   "learning": {
     "schema": "fractal.learning.v1",
@@ -623,7 +666,14 @@
           "review"
         ],
         "created_at": "2026-08-08T00:37:07Z",
-        "attempt_count": 0,
+        "started_at": "2026-08-08T01:18:24Z",
+        "finished_at": "2026-08-08T01:21:38Z",
+        "executor": {
+          "agent": "Luna · 3D Graph Acceptance",
+          "version": "0.1.0"
+        },
+        "attempt_count": 1,
+        "outcome": "unverified_success",
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -637,7 +687,14 @@
           "plan"
         ],
         "created_at": "2026-08-08T00:37:07Z",
-        "attempt_count": 0,
+        "started_at": "2026-08-08T00:43:22Z",
+        "finished_at": "2026-08-08T00:53:46Z",
+        "executor": {
+          "agent": "Luna · 3D Graph Tests",
+          "version": "0.1.0"
+        },
+        "attempt_count": 1,
+        "outcome": "unverified_success",
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -651,7 +708,14 @@
           "acceptance"
         ],
         "created_at": "2026-08-08T00:37:07Z",
-        "attempt_count": 0,
+        "started_at": "2026-08-08T01:21:45Z",
+        "finished_at": "2026-08-08T01:21:45Z",
+        "executor": {
+          "agent": "Luna · 3D Graph Acceptance",
+          "version": "0.1.0"
+        },
+        "attempt_count": 1,
+        "outcome": "unverified_success",
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -665,7 +729,14 @@
           "plan"
         ],
         "created_at": "2026-08-08T00:37:07Z",
-        "attempt_count": 0,
+        "started_at": "2026-08-08T01:11:56Z",
+        "finished_at": "2026-08-08T01:13:33Z",
+        "executor": {
+          "agent": "Luna · 3D Graph Final",
+          "version": "0.1.0"
+        },
+        "attempt_count": 5,
+        "outcome": "unverified_success",
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -678,7 +749,14 @@
         "depends_on": [],
         "created_at": "2026-08-08T00:37:07Z",
         "ready_at": "2026-08-08T00:37:07Z",
-        "attempt_count": 0,
+        "started_at": "2026-08-08T00:37:42Z",
+        "finished_at": "2026-08-08T00:40:52Z",
+        "executor": {
+          "agent": "Luna · 3D Graph",
+          "version": "0.1.0"
+        },
+        "attempt_count": 1,
+        "outcome": "unverified_success",
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -693,7 +771,14 @@
           "implement"
         ],
         "created_at": "2026-08-08T00:37:07Z",
-        "attempt_count": 0,
+        "started_at": "2026-08-08T01:13:59Z",
+        "finished_at": "2026-08-08T01:17:56Z",
+        "executor": {
+          "agent": "Luna · 3D Graph Review",
+          "version": "0.1.0"
+        },
+        "attempt_count": 1,
+        "outcome": "unverified_success",
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -703,17 +788,69 @@
     "graph_edits": [],
     "outcome": {
       "final_verified_success": false,
-      "acceptance_criteria": [],
-      "total_duration_seconds": 15934.0,
-      "total_agent_time_seconds": 26368.0,
-      "maximum_parallelism": 3,
-      "total_cost": -0.0,
-      "retry_count": 13,
-      "reopened_node_count": 2,
-      "dead_or_unused_node_count": 3,
+      "acceptance_criteria": [
+        {
+          "id": "AC-1",
+          "passed": false,
+          "evidence_refs": []
+        },
+        {
+          "id": "AC-10",
+          "passed": false,
+          "evidence_refs": []
+        },
+        {
+          "id": "AC-2",
+          "passed": false,
+          "evidence_refs": []
+        },
+        {
+          "id": "AC-3",
+          "passed": false,
+          "evidence_refs": []
+        },
+        {
+          "id": "AC-4",
+          "passed": false,
+          "evidence_refs": []
+        },
+        {
+          "id": "AC-5",
+          "passed": false,
+          "evidence_refs": []
+        },
+        {
+          "id": "AC-6",
+          "passed": false,
+          "evidence_refs": []
+        },
+        {
+          "id": "AC-7",
+          "passed": false,
+          "evidence_refs": []
+        },
+        {
+          "id": "AC-8",
+          "passed": false,
+          "evidence_refs": []
+        },
+        {
+          "id": "AC-9",
+          "passed": false,
+          "evidence_refs": []
+        }
+      ],
+      "total_duration_seconds": 2643.0,
+      "critical_path_duration_seconds": 1245.0,
+      "total_agent_time_seconds": 1342.0,
+      "maximum_parallelism": 1,
+      "retry_count": 4,
+      "reopened_node_count": 0,
+      "dead_or_unused_node_count": 0,
       "human_intervention_count": 0,
-      "verification_coverage": 0.16666666666666666,
-      "verification_coverage_denominator": 0
+      "verification_coverage": 0.0,
+      "verification_coverage_denominator": 5,
+      "stopped_too_early": false
     },
     "acceptance_criteria": [
       "AC-1",
@@ -763,7 +900,7 @@
       "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c"
     }
   },
-  "updated_at": "2026-08-08T00:37:07Z",
+  "updated_at": "2026-08-08T01:21:45Z",
   "catalog": {
     "audit": {
       "auditor": "fractal graph audit",
