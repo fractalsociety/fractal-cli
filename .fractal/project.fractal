@@ -1,158 +1,53 @@
 {
   "schema": "fractal.project.v1",
   "project": {
-    "slug": "fractal-cli",
-    "title": "Update the Fractal CLI and macOS Fractal Voice app, without Apple signing, notarization, or release submission, so portable .fractal execution graphs record compact, structurally meaningful learning data. Preserve backward compatibility wit",
-    "prompt": "Update the Fractal CLI and macOS Fractal Voice app, without Apple signing, notarization, or release submission, so portable .fractal execution graphs record compact, structurally meaningful learning data. Preserve backward compatibility wit",
+    "slug": "fractal-cli-three-graph",
+    "title": "Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters, lu",
+    "prompt": "Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters, lu",
     "visibility": "private"
   },
-  "graph_hash": "sha256:2d582d4c735de8a65d8af41a56e73d07d1773f3a108ba9ed58cb59afb729c230",
+  "graph_hash": "sha256:95a5d9beaa8ec861275cdb1a26b524ac329d4f674a9d07a0b8b2b8e0c0a94f33",
   "graph": {
     "compiler_version": "fractal-harnessc/0.1.0",
     "edges": [
       {
         "condition": "success",
-        "from": "add_cross_boundary_rust_tests",
-        "to": "verify_rust_repository"
+        "from": "acceptance",
+        "to": "complete"
       },
       {
         "condition": "success",
-        "from": "add_native_swift_tests",
-        "to": "verify_native_swift"
+        "from": "author_tests",
+        "to": "review"
       },
       {
         "condition": "success",
-        "from": "add_swift_graph_models",
-        "to": "display_learning_in_voice"
+        "from": "implement",
+        "to": "review"
       },
       {
         "condition": "success",
-        "from": "aggregate_graph_outcomes",
-        "to": "verify_rust_repository"
+        "from": "plan",
+        "to": "author_tests"
       },
       {
         "condition": "success",
-        "from": "audit_acceptance_and_scope",
-        "to": "lead_closeout"
+        "from": "plan",
+        "to": "implement"
       },
       {
         "condition": "success",
-        "from": "define_learning_contract",
-        "to": "add_swift_graph_models"
-      },
-      {
-        "condition": "success",
-        "from": "define_learning_contract",
-        "to": "enrich_graph_producers"
-      },
-      {
-        "condition": "success",
-        "from": "define_learning_contract",
-        "to": "integrate_portable_persistence"
-      },
-      {
-        "condition": "success",
-        "from": "define_learning_contract",
-        "to": "verify.define_learning_contract.harness"
-      },
-      {
-        "condition": "success",
-        "from": "display_learning_in_voice",
-        "to": "add_native_swift_tests"
-      },
-      {
-        "condition": "success",
-        "from": "enrich_graph_producers",
-        "to": "record_graph_edit_events"
-      },
-      {
-        "condition": "success",
-        "from": "enrich_graph_producers",
-        "to": "record_runtime_lifecycle"
-      },
-      {
-        "condition": "success",
-        "from": "integrate_portable_persistence",
-        "to": "display_learning_in_voice"
-      },
-      {
-        "condition": "success",
-        "from": "integrate_portable_persistence",
-        "to": "preserve_sync_boundaries"
-      },
-      {
-        "condition": "success",
-        "from": "integrate_portable_persistence",
-        "to": "record_graph_edit_events"
-      },
-      {
-        "condition": "success",
-        "from": "integrate_portable_persistence",
-        "to": "record_runtime_lifecycle"
-      },
-      {
-        "condition": "success",
-        "from": "integrate_portable_persistence",
-        "to": "verify.integrate_portable_persistence.harness"
-      },
-      {
-        "condition": "success",
-        "from": "lead_plan",
-        "to": "define_learning_contract"
-      },
-      {
-        "condition": "success",
-        "from": "preserve_sync_boundaries",
-        "to": "add_cross_boundary_rust_tests"
-      },
-      {
-        "condition": "success",
-        "from": "record_graph_edit_events",
-        "to": "add_cross_boundary_rust_tests"
-      },
-      {
-        "condition": "success",
-        "from": "record_graph_edit_events",
-        "to": "aggregate_graph_outcomes"
-      },
-      {
-        "condition": "success",
-        "from": "record_runtime_lifecycle",
-        "to": "add_cross_boundary_rust_tests"
-      },
-      {
-        "condition": "success",
-        "from": "record_runtime_lifecycle",
-        "to": "aggregate_graph_outcomes"
-      },
-      {
-        "condition": "success",
-        "from": "verify_native_swift",
-        "to": "audit_acceptance_and_scope"
-      },
-      {
-        "condition": "success",
-        "from": "verify_rust_repository",
-        "to": "audit_acceptance_and_scope"
+        "from": "review",
+        "to": "acceptance"
       }
     ],
-    "evolution": 1,
-    "evolution_arm": "repair.reinstruct",
     "execution_flow": {
       "schema": "fractal.execution_flow.v1",
       "waves": [
         {
           "mode": "sequential",
           "nodes": [
-            "lead_plan"
-          ],
-          "parallel_group": null,
-          "wave": 0
-        },
-        {
-          "mode": "sequential",
-          "nodes": [
-            "define_learning_contract"
+            "plan"
           ],
           "parallel_group": null,
           "wave": 1
@@ -160,1066 +55,645 @@
         {
           "mode": "parallel",
           "nodes": [
-            "add_swift_graph_models",
-            "enrich_graph_producers",
-            "integrate_portable_persistence",
-            "verify.define_learning_contract.harness"
+            "author_tests",
+            "implement"
           ],
           "parallel_group": "wave-2",
           "wave": 2
         },
         {
-          "mode": "parallel",
+          "mode": "sequential",
           "nodes": [
-            "display_learning_in_voice",
-            "preserve_sync_boundaries",
-            "record_graph_edit_events",
-            "record_runtime_lifecycle",
-            "verify.integrate_portable_persistence.harness"
+            "review"
           ],
-          "parallel_group": "wave-3",
+          "parallel_group": null,
           "wave": 3
         },
         {
-          "mode": "parallel",
+          "mode": "sequential",
           "nodes": [
-            "add_cross_boundary_rust_tests",
-            "add_native_swift_tests",
-            "aggregate_graph_outcomes"
+            "acceptance"
           ],
-          "parallel_group": "wave-4",
+          "parallel_group": null,
           "wave": 4
         },
         {
-          "mode": "parallel",
+          "mode": "sequential",
           "nodes": [
-            "verify_native_swift",
-            "verify_rust_repository"
+            "complete"
           ],
-          "parallel_group": "wave-5",
+          "parallel_group": null,
           "wave": 5
-        },
-        {
-          "mode": "sequential",
-          "nodes": [
-            "audit_acceptance_and_scope"
-          ],
-          "parallel_group": null,
-          "wave": 6
-        },
-        {
-          "mode": "sequential",
-          "nodes": [
-            "lead_closeout"
-          ],
-          "parallel_group": null,
-          "wave": 7
         }
       ]
     },
-    "graph_hash": "sha256:2d582d4c735de8a65d8af41a56e73d07d1773f3a108ba9ed58cb59afb729c230",
-    "graph_id": "fg_5cf869eedf9e381f7013bfa9e11b307a",
-    "harness_hash": "sha256:97c71ef150b18d101b2d78f30e394e1ef53b980da6297f4fce7f2fe243b06ac9",
+    "graph_hash": "sha256:95a5d9beaa8ec861275cdb1a26b524ac329d4f674a9d07a0b8b2b8e0c0a94f33",
+    "graph_id": "fg_ee2cf3da72a51239e71cbe564fb4c70b",
+    "harness_hash": "sha256:432ccff8b63a5057cedefdb57d1bedfc7844fa20c68b05686acef5fe2973a0de",
     "nodes": [
       {
+        "artifacts_produced": [],
+        "attempt_count": 0,
         "budget": {
-          "timeout_ms": 180000
+          "timeout_ms": 120000
         },
-        "capability": "code.edit",
+        "capability": "python.tests.execute",
+        "consumed_by": [],
+        "created_at": "2026-08-08T00:37:07Z",
+        "depends_on": [
+          "review"
+        ],
+        "efficiency": {
+          "confidence_still_useful": "1",
+          "current_assumptions": [],
+          "dependencies": [
+            "review"
+          ],
+          "estimated_remaining_tokens": 4000,
+          "expected_artifact": "A fully passing unittest run.",
+          "files_or_systems_affected": [],
+          "similarity_to_other_active_nodes": {},
+          "verification_plan": "python3 -m unittest exits successfully."
+        },
         "execution": {
-          "mode": "parallel",
-          "parallel_group": "wave-4",
+          "mode": "sequential",
+          "parallel_group": null,
           "task_number": "4.1",
           "wave": 4
         },
-        "id": "add_cross_boundary_rust_tests",
-        "instruction": "Extend the existing #[cfg(test)] suites in src/compile.rs, src/execute.rs, src/amendments.rs, src/harness_evolution.rs, src/project_sync.rs, and src/graph_store.rs with end-to-end fixtures that compile a graph, persist it, execute success/failure/retry/verification/artifact-consumption/human-intervention paths, apply graph edits, serialize/reload it, and inspect the sync payload. Assert every AC-1 through AC-8 field and invariant, including exact controlled values, legacy migration, round-trip preservation, compact reference-only evidence, and graph hash validity. Keep tests deterministic with injected/fixed timestamps and no live network, model, agent, or cloud dependency. Do not edit src/learning_data.rs, src/project_file.rs, Swift files, production behavior, or dist-* paths.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
-        "kind": "container",
+        "human_intervention": false,
+        "id": "acceptance",
+        "instruction": "Run the whole unittest suite; every test must pass before completion.",
+        "kind": "cursor",
         "memory_scopes": [
+          "acceptance:spec",
           "work:goal",
           "workspace:root"
         ],
+        "node_type": "verification",
+        "objective": "Run the whole unittest suite; every test must pass before completion.",
+        "policy_contract": {
+          "allowed_commands": [],
+          "allowed_writes": [],
+          "budgets": {
+            "max_attempts": 1,
+            "max_cost_usd": 20,
+            "max_diff_lines": 500,
+            "max_files_changed": 6,
+            "max_input_tokens": 250000,
+            "max_minutes": 60,
+            "max_output_tokens": 50000,
+            "max_steps": 40
+          },
+          "capability": "python.tests.execute",
+          "decision": "allow",
+          "evidence_requirements": [
+            "commands",
+            "exit_codes",
+            "stderr",
+            "stdout"
+          ],
+          "external_side_effects": false,
+          "network": {
+            "allowed_destinations": [],
+            "default": "deny"
+          },
+          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+          "provenance": "builtin:safe-default.v1",
+          "sandbox_profile": "local-work-v1",
+          "schema": "fractal.node_policy_contract.v1",
+          "verifier_ids": [
+            "independent"
+          ]
+        },
+        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+        "policy_provenance": "builtin:safe-default.v1",
+        "reopen_count": 0,
         "requires": [
-          "preserve_sync_boundaries.ready",
-          "record_graph_edit_events.ready",
-          "record_runtime_lifecycle.ready"
+          "reviewed"
         ],
         "route_candidates": [
-          "apple-container://code-edit-default"
-        ],
-        "sandbox_profile": "apple-container://local-work-v1",
-        "title": "Add cross-boundary Rust regression coverage"
+          "cursor://python-tests-execute-default"
+        ]
       },
       {
-        "budget": {
-          "timeout_ms": 180000
-        },
-        "capability": "code.edit",
-        "execution": {
-          "mode": "parallel",
-          "parallel_group": "wave-4",
-          "task_number": "4.2",
-          "wave": 4
-        },
-        "id": "add_native_swift_tests",
-        "instruction": "Edit macos/FractalVoice/Tests/FractalVoiceTests/FractalVoiceTests.swift to add temporary project.fractal fixtures for a legacy graph with no learning fields, a fully enriched graph containing all controlled records and a graph outcome, a partially populated graph, and a graph with unknown future controlled strings. Test Codable parsing, fallback behavior, concise node and graph formatting, BuildCoordinator active-project loading, and the relevant HUD/status presentation without starting a real build. Assert no crash and no false corruption status for missing additive data. Do not edit production Swift, Rust, Package.swift, generated resources, signing settings, or dist-* paths.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
-        "kind": "container",
-        "memory_scopes": [
-          "work:goal",
-          "workspace:root"
-        ],
-        "requires": [
-          "display_learning_in_voice.ready"
-        ],
-        "route_candidates": [
-          "apple-container://code-edit-default"
-        ],
-        "sandbox_profile": "apple-container://local-work-v1",
-        "title": "Add native Swift compatibility and display tests"
-      },
-      {
+        "artifacts_produced": [],
+        "attempt_count": 0,
         "budget": {
           "timeout_ms": 180000
         },
         "capability": "code.generate",
+        "consumed_by": [],
+        "created_at": "2026-08-08T00:37:07Z",
+        "depends_on": [
+          "plan"
+        ],
+        "efficiency": {
+          "confidence_still_useful": "1",
+          "current_assumptions": [],
+          "dependencies": [
+            "plan"
+          ],
+          "estimated_remaining_tokens": 16000,
+          "expected_artifact": "A unittest file covering every INTERFACE.md benchmark.",
+          "files_or_systems_affected": [],
+          "similarity_to_other_active_nodes": {},
+          "verification_plan": "The acceptance node runs the whole unittest suite."
+        },
         "execution": {
           "mode": "parallel",
           "parallel_group": "wave-2",
           "task_number": "2.1",
           "wave": 2
         },
-        "id": "add_swift_graph_models",
-        "instruction": "Create macos/FractalVoice/Sources/FractalVoice/ProjectGraphLearning.swift containing additive Codable projections for fractal.project.v1, enriched graph nodes, executor, verification, artifact references, human intervention, controlled outcomes/failure codes, graph-edit events, and graph outcome summaries. Make every new learning field optional or safely defaulted so legacy and partially enriched project.fractal files decode; retain raw unknown controlled strings for forward-compatible display rather than crashing. Provide pure formatting helpers for concise node outcome/attempt/verification text and graph completion summaries. Do not edit BuildCoordinator.swift, views, tests, Rust files, Package.swift, generated resources, or dist-* paths.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
-        "kind": "inference",
+        "human_intervention": false,
+        "id": "author_tests",
+        "instruction": "Read INTERFACE.md and write a Python `unittest` test file (test_<module>.py) that imports the module and rigorously tests EVERY benchmark behavior and edge case the plan listed for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. The plan's benchmarks are the bar for high performance, so make the tests demanding — cover the edge cases and failure modes, not just the happy path. Do not write the implementation — another agent is doing that in parallel.",
+        "kind": "codex",
         "memory_scopes": [
           "work:goal",
           "workspace:root"
         ],
+        "node_type": "implementation",
+        "objective": "Read INTERFACE.md and write a Python `unittest` test file (test_<module>.py) that imports the module and rigorously tests EVERY benchmark behavior and edge case the plan listed for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. The plan's benchmarks are the bar for high performance, so make the tests demanding — cover the edge cases and failure modes, not just the happy path. Do not write the implementation — another agent is doing that in parallel.",
+        "policy_contract": {
+          "allowed_commands": [],
+          "allowed_writes": [],
+          "budgets": {
+            "max_attempts": 1,
+            "max_cost_usd": 20,
+            "max_diff_lines": 500,
+            "max_files_changed": 6,
+            "max_input_tokens": 250000,
+            "max_minutes": 60,
+            "max_output_tokens": 50000,
+            "max_steps": 40
+          },
+          "capability": "code.generate",
+          "decision": "allow",
+          "evidence_requirements": [
+            "commands",
+            "exit_codes",
+            "stderr",
+            "stdout"
+          ],
+          "external_side_effects": false,
+          "network": {
+            "allowed_destinations": [],
+            "default": "deny"
+          },
+          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+          "provenance": "builtin:safe-default.v1",
+          "sandbox_profile": "local-work-v1",
+          "schema": "fractal.node_policy_contract.v1",
+          "verifier_ids": [
+            "independent"
+          ]
+        },
+        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+        "policy_provenance": "builtin:safe-default.v1",
+        "reopen_count": 0,
         "requires": [
-          "define_learning_contract.ready"
+          "plan_ready"
         ],
         "route_candidates": [
-          "mlx://code-generate-default"
-        ],
-        "title": "Add tolerant Swift graph learning models"
+          "codex://code-generate-default"
+        ]
       },
       {
+        "artifacts_produced": [],
+        "attempt_count": 0,
         "budget": {
-          "timeout_ms": 180000
+          "timeout_ms": 5000
         },
-        "capability": "code.edit",
-        "execution": {
-          "mode": "parallel",
-          "parallel_group": "wave-4",
-          "task_number": "4.3",
-          "wave": 4
+        "capability": "control.complete",
+        "consumed_by": [],
+        "created_at": "2026-08-08T00:37:07Z",
+        "depends_on": [
+          "acceptance"
+        ],
+        "efficiency": {
+          "confidence_still_useful": "1",
+          "current_assumptions": [],
+          "dependencies": [
+            "acceptance"
+          ],
+          "estimated_remaining_tokens": 500,
+          "expected_artifact": "The verified-outcome completion marker.",
+          "files_or_systems_affected": [],
+          "similarity_to_other_active_nodes": {},
+          "verification_plan": "The acceptance_passed state is present before completion."
         },
-        "id": "aggregate_graph_outcomes",
-        "instruction": "Edit src/learning_data.rs and src/project_file.rs to implement deterministic terminal aggregation and invoke it exactly when a project becomes completed, cancelled/halted terminal, or human-completed. Derive final_verified_success; every PRD acceptance criterion passed/failed with compact evidence IDs; wall-clock total duration; DAG critical-path duration using recorded node intervals; summed agent time; observed maximum overlapping executions; summed measured total cost; retry and reopened-node counts; dead/unused nodes; human-intervention count; verification coverage with an explicit denominator; and evidence-based stopped-too-early and expanded-unnecessarily booleans. Represent unknown inputs explicitly and never estimate missing historical facts. Recompute safely after an event eventual_effect update without double counting. Add deterministic fixtures for sequential, parallel, retry, reopen, dead-node, failed-verification, cancellation, superseded expansion, and human-completed graphs. Do not edit callers outside project_file.rs, sync, Swift, or dist-* files.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
-        "kind": "container",
-        "memory_scopes": [
-          "work:goal",
-          "workspace:root"
-        ],
-        "requires": [
-          "record_graph_edit_events.ready",
-          "record_runtime_lifecycle.ready"
-        ],
-        "route_candidates": [
-          "apple-container://code-edit-default"
-        ],
-        "sandbox_profile": "apple-container://local-work-v1",
-        "title": "Derive and persist terminal graph outcomes"
-      },
-      {
-        "budget": {
-          "timeout_ms": 180000
-        },
-        "capability": "content.analyze",
         "execution": {
           "mode": "sequential",
           "parallel_group": null,
-          "task_number": "6.1",
-          "wave": 6
+          "task_number": "5.1",
+          "wave": 5
         },
-        "id": "audit_acceptance_and_scope",
-        "instruction": "Review the final workspace changes and test evidence against every acceptance criterion in fractal-plan.json. Inspect git diff --name-only and git diff --stat to prove no generated dist-* release bundle, signing/notarization setting, archive, DMG, ZIP, or Apple submission path changed. Inspect representative newly compiled, migrated legacy, lifecycle-failed/retried, graph-edited, and completed graph fixtures to confirm compact external references, all controlled values, aggregation fields, and absence of chain-of-thought, huge transcripts, speculative metrics, arbitrary self-evaluations, secrets, or inline artifacts. Report criterion-by-criterion evidence and any residual risk; do not modify files, commit, push, sign, package, notarize, or submit.",
-        "kind": "inference",
+        "human_intervention": false,
+        "id": "complete",
+        "instruction": "Implementation and tests were built in parallel, cross-checked, and verified — mark the outcome complete.",
+        "kind": "codex",
         "memory_scopes": [
-          "work:goal",
-          "workspace:root"
+          "work:goal"
         ],
+        "node_type": "control",
+        "objective": "Implementation and tests were built in parallel, cross-checked, and verified — mark the outcome complete.",
+        "policy_contract": {
+          "allowed_commands": [],
+          "allowed_writes": [],
+          "budgets": {
+            "max_attempts": 1,
+            "max_cost_usd": 20,
+            "max_diff_lines": 500,
+            "max_files_changed": 6,
+            "max_input_tokens": 250000,
+            "max_minutes": 60,
+            "max_output_tokens": 50000,
+            "max_steps": 40
+          },
+          "capability": "control.complete",
+          "decision": "allow",
+          "evidence_requirements": [
+            "commands",
+            "exit_codes",
+            "stderr",
+            "stdout"
+          ],
+          "external_side_effects": false,
+          "network": {
+            "allowed_destinations": [],
+            "default": "deny"
+          },
+          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+          "provenance": "builtin:safe-default.v1",
+          "sandbox_profile": "local-work-v1",
+          "schema": "fractal.node_policy_contract.v1",
+          "verifier_ids": [
+            "independent"
+          ]
+        },
+        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+        "policy_provenance": "builtin:safe-default.v1",
+        "reopen_count": 0,
         "requires": [
-          "verify_native_swift.ready",
-          "verify_rust_repository.ready"
+          "acceptance_passed"
         ],
         "route_candidates": [
-          "mlx://content-analyze-default"
-        ],
-        "title": "Audit acceptance evidence and excluded release scope"
+          "codex://control-complete-default"
+        ]
       },
       {
+        "artifacts_produced": [],
+        "attempt_count": 0,
         "budget": {
           "timeout_ms": 180000
         },
         "capability": "code.generate",
-        "execution": {
-          "mode": "sequential",
-          "parallel_group": null,
-          "task_number": "1.1",
-          "wave": 1
+        "consumed_by": [],
+        "created_at": "2026-08-08T00:37:07Z",
+        "depends_on": [
+          "plan"
+        ],
+        "efficiency": {
+          "confidence_still_useful": "1",
+          "current_assumptions": [],
+          "dependencies": [
+            "plan"
+          ],
+          "estimated_remaining_tokens": 20000,
+          "expected_artifact": "The module file specified by INTERFACE.md.",
+          "files_or_systems_affected": [],
+          "similarity_to_other_active_nodes": {},
+          "verification_plan": "The acceptance node runs the whole unittest suite."
         },
-        "id": "define_learning_contract",
-        "instruction": "Create src/learning_data.rs and register it from src/main.rs. Define serde types and controlled enums for all requested node fields, the exact seven outcomes, exact twelve failure codes, verification type/passed/evidence_refs, compact artifact IDs, consumed_by, human_intervention, executor agent/model/version-or-config-hash, costs, graph-edit actions/events, eventual_effect, acceptance results, and graph outcomes. Implement bounded notes/reference validation, forbidden large-content and chain-of-thought-style key rejection, RFC 3339 timestamp helpers, dependency normalization from graph edges, and backward-compatible serde defaults that never fabricate unknown historical facts. Add exhaustive unit tests in src/learning_data.rs for allowed enum round trips, unknown controlled values, cross-field invariants, bounds, and legacy defaulting. Do not edit project persistence, runtime producers, Swift files, or any dist-* path.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
-        "kind": "inference",
-        "memory_scopes": [
-          "work:goal",
-          "workspace:root"
-        ],
-        "requires": [
-          "lead_plan.ready"
-        ],
-        "route_candidates": [
-          "mlx://code-generate-default"
-        ],
-        "title": "Define the versioned learning-data contract"
-      },
-      {
-        "budget": {
-          "timeout_ms": 180000
-        },
-        "capability": "code.edit",
-        "execution": {
-          "mode": "parallel",
-          "parallel_group": "wave-3",
-          "task_number": "3.1",
-          "wave": 3
-        },
-        "id": "display_learning_in_voice",
-        "instruction": "Edit macos/FractalVoice/Sources/FractalVoice/BuildCoordinator.swift and the smallest relevant existing SwiftUI status surface, preferably macos/FractalVoice/Sources/FractalVoice/RecordingHUD.swift, to load the active workspace .fractal/project.fractal through ProjectGraphLearning.swift and display concise available node outcome, attempt, verification, and final graph summary information. Missing learning fields in legacy files, partially written files, and unknown future controlled strings must degrade to existing status text without a crash or false failure. Keep file reads off latency-sensitive audio paths and preserve current voice/build state behavior. Do not edit Swift tests, Rust, Package.swift, generated resources, signing settings, or dist-* paths.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
-        "kind": "container",
-        "memory_scopes": [
-          "work:goal",
-          "workspace:root"
-        ],
-        "requires": [
-          "add_swift_graph_models.ready",
-          "integrate_portable_persistence.ready"
-        ],
-        "route_candidates": [
-          "apple-container://code-edit-default"
-        ],
-        "sandbox_profile": "apple-container://local-work-v1",
-        "title": "Read and display enriched graphs in Fractal Voice"
-      },
-      {
-        "budget": {
-          "timeout_ms": 180000
-        },
-        "capability": "code.edit",
         "execution": {
           "mode": "parallel",
           "parallel_group": "wave-2",
           "task_number": "2.2",
           "wave": 2
         },
-        "id": "enrich_graph_producers",
-        "instruction": "Edit src/compile.rs, src/decompose.rs, and src/work_builder.rs so planning previews, normal compiled DAGs, fallback graphs, and lead-generated task graphs initialize every node with stable ID/type, objective, normalized dependency IDs, created_at, ready_at when root-ready, executor configuration metadata when known, attempt_count zero, estimated_cost when actually available, empty verification/artifact/consumption/intervention collections, and absent historical/terminal facts rather than invented values. Ensure stable IDs survive serialization and graph recompilation, and dependency mirrors exactly match incoming edges. Update the existing module tests to cover preview, sequential, parallel, verification, and closeout nodes. Do not edit runtime lifecycle, persistence, amendment/evolution, Swift, sync, or dist-* files.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
-        "kind": "container",
+        "human_intervention": false,
+        "id": "implement",
+        "instruction": "Read INTERFACE.md and implement the module file exactly as specified for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. Self-contained, no network. Do not write tests — another agent is doing that in parallel.",
+        "kind": "codex",
         "memory_scopes": [
           "work:goal",
           "workspace:root"
         ],
+        "node_type": "implementation",
+        "objective": "Read INTERFACE.md and implement the module file exactly as specified for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. Self-contained, no network. Do not write tests — another agent is doing that in parallel.",
+        "policy_contract": {
+          "allowed_commands": [],
+          "allowed_writes": [],
+          "budgets": {
+            "max_attempts": 1,
+            "max_cost_usd": 20,
+            "max_diff_lines": 500,
+            "max_files_changed": 6,
+            "max_input_tokens": 250000,
+            "max_minutes": 60,
+            "max_output_tokens": 50000,
+            "max_steps": 40
+          },
+          "capability": "code.generate",
+          "decision": "allow",
+          "evidence_requirements": [
+            "commands",
+            "exit_codes",
+            "stderr",
+            "stdout"
+          ],
+          "external_side_effects": false,
+          "network": {
+            "allowed_destinations": [],
+            "default": "deny"
+          },
+          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+          "provenance": "builtin:safe-default.v1",
+          "sandbox_profile": "local-work-v1",
+          "schema": "fractal.node_policy_contract.v1",
+          "verifier_ids": [
+            "independent"
+          ]
+        },
+        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+        "policy_provenance": "builtin:safe-default.v1",
+        "reopen_count": 0,
         "requires": [
-          "define_learning_contract.ready"
+          "plan_ready"
         ],
         "route_candidates": [
-          "apple-container://code-edit-default"
-        ],
-        "sandbox_profile": "apple-container://local-work-v1",
-        "title": "Populate structural learning fields in every graph producer"
+          "codex://code-generate-default"
+        ]
       },
       {
+        "artifacts_produced": [],
+        "attempt_count": 0,
         "budget": {
-          "timeout_ms": 180000
+          "timeout_ms": 60000
         },
-        "capability": "code.edit",
-        "execution": {
-          "mode": "parallel",
-          "parallel_group": "wave-2",
-          "task_number": "2.3",
-          "wave": 2
+        "capability": "code.generate",
+        "consumed_by": [],
+        "created_at": "2026-08-08T00:37:07Z",
+        "depends_on": [],
+        "efficiency": {
+          "confidence_still_useful": "1",
+          "current_assumptions": [],
+          "dependencies": [],
+          "estimated_remaining_tokens": 6000,
+          "expected_artifact": "INTERFACE.md",
+          "files_or_systems_affected": [
+            "INTERFACE.md"
+          ],
+          "similarity_to_other_active_nodes": {},
+          "verification_plan": "The review and acceptance nodes prove the interface is implemented and tested."
         },
-        "id": "integrate_portable_persistence",
-        "instruction": "Edit src/project_file.rs and src/graph_store.rs to load old fractal.project.v1 and fractal.execution_graph.v1 documents with missing learning data, normalize them through src/learning_data.rs, validate enriched node/event/outcome records, and atomically serialize them without losing topology, identity, unknown forward-compatible fields, or graph-hash integrity. Add central mutation APIs for node-ready, checkout/start, finish, release/reopen, verification result, artifact produced/consumed, human intervention, estimated/actual cost, graph-edit event append/update, and terminal graph outcome storage; make APIs enforce monotonic timestamps and controlled state combinations. Preserve parent-to-child execution attribution and local-board backfill. Add legacy fixture, enriched round-trip, invalid-record, secret/oversized-content, and evolved-child preservation tests in these modules. Do not edit execution callers, compiler producers, sync code, Swift files, or dist-* paths.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
-        "kind": "container",
-        "memory_scopes": [
-          "work:goal",
-          "workspace:root"
-        ],
-        "requires": [
-          "define_learning_contract.ready"
-        ],
-        "route_candidates": [
-          "apple-container://code-edit-default"
-        ],
-        "sandbox_profile": "apple-container://local-work-v1",
-        "title": "Integrate migration and validation into portable persistence"
-      },
-      {
-        "budget": {
-          "timeout_ms": 180000
-        },
-        "capability": "control.closeout",
         "execution": {
           "mode": "sequential",
           "parallel_group": null,
-          "task_number": "7.1",
-          "wave": 7
+          "task_number": "1.1",
+          "wave": 1
         },
-        "id": "lead_closeout",
-        "instruction": "Review the finished implementation against .fractal/lead-prd.json. Inspect the changes and verification evidence, run any final checks needed, then write .fractal/closeout.json with schema fractal.closeout.v1, status approved, a non-empty summary, an acceptance array containing every PRD acceptance id with passed=true and concrete evidence, and a risks array. Do not approve if any criterion is unsupported.",
-        "kind": "control",
+        "human_intervention": false,
+        "id": "plan",
+        "instruction": "Plan the build for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. Optimize for the BEST performance and quality of the product itself — correctness, robustness, and the behaviors that matter — NOT for the lowest cost or the least effort. First reason briefly through 2-3 alternative implementation approaches and choose the one that maximizes product performance, noting why the others are weaker. Then write INTERFACE.md stating: the single module filename (e.g. solution.py); the public function name(s) and signatures; the chosen approach (1-2 lines) and the alternatives you rejected; and — as your own acceptance BENCHMARKS — 5-8 concrete, measurable behaviors and edge cases the product must satisfy to count as high-performing: the requested outcome is delivered and verified: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. Make the benchmarks demanding and specific so they genuinely test performance, not just happy-path. Keep it concrete so two agents can build the code and the tests in parallel from it.",
+        "kind": "codex",
         "memory_scopes": [
           "work:goal",
           "workspace:root"
         ],
-        "requires": [
-          "audit_acceptance_and_scope.ready"
-        ],
+        "node_type": "implementation",
+        "objective": "Plan the build for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. Optimize for the BEST performance and quality of the product itself — correctness, robustness, and the behaviors that matter — NOT for the lowest cost or the least effort. First reason briefly through 2-3 alternative implementation approaches and choose the one that maximizes product performance, noting why the others are weaker. Then write INTERFACE.md stating: the single module filename (e.g. solution.py); the public function name(s) and signatures; the chosen approach (1-2 lines) and the alternatives you rejected; and — as your own acceptance BENCHMARKS — 5-8 concrete, measurable behaviors and edge cases the product must satisfy to count as high-performing: the requested outcome is delivered and verified: Redesign the",
+        "policy_contract": {
+          "allowed_commands": [],
+          "allowed_writes": [],
+          "budgets": {
+            "max_attempts": 1,
+            "max_cost_usd": 20,
+            "max_diff_lines": 500,
+            "max_files_changed": 6,
+            "max_input_tokens": 250000,
+            "max_minutes": 60,
+            "max_output_tokens": 50000,
+            "max_steps": 40
+          },
+          "capability": "code.generate",
+          "decision": "allow",
+          "evidence_requirements": [
+            "commands",
+            "exit_codes",
+            "stderr",
+            "stdout"
+          ],
+          "external_side_effects": false,
+          "network": {
+            "allowed_destinations": [],
+            "default": "deny"
+          },
+          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+          "provenance": "builtin:safe-default.v1",
+          "sandbox_profile": "local-work-v1",
+          "schema": "fractal.node_policy_contract.v1",
+          "verifier_ids": [
+            "independent"
+          ]
+        },
+        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+        "policy_provenance": "builtin:safe-default.v1",
+        "ready_at": "2026-08-08T00:37:07Z",
+        "reopen_count": 0,
         "route_candidates": [
-          "control://control-closeout-default"
-        ],
-        "title": "Lead acceptance review and closeout"
+          "codex://code-generate-default"
+        ]
       },
       {
+        "artifacts_produced": [],
+        "attempt_count": 0,
         "budget": {
-          "timeout_ms": 5000
+          "timeout_ms": 180000
         },
-        "capability": "control.plan",
+        "capability": "code.edit",
+        "consumed_by": [],
+        "created_at": "2026-08-08T00:37:07Z",
+        "depends_on": [
+          "author_tests",
+          "implement"
+        ],
+        "efficiency": {
+          "confidence_still_useful": "1",
+          "current_assumptions": [],
+          "dependencies": [
+            "implement",
+            "author_tests"
+          ],
+          "estimated_remaining_tokens": 10000,
+          "expected_artifact": "The reconciled implementation and test files.",
+          "files_or_systems_affected": [],
+          "similarity_to_other_active_nodes": {},
+          "verification_plan": "python3 -m unittest passes after reconciliation."
+        },
         "execution": {
           "mode": "sequential",
           "parallel_group": null,
-          "task_number": "0.1",
-          "wave": 0
-        },
-        "id": "lead_plan",
-        "instruction": "The lead-authored .fractal/lead-prd.json and validated task DAG are ready.",
-        "kind": "control",
-        "memory_scopes": [
-          "work:goal",
-          "workspace:root"
-        ],
-        "route_candidates": [
-          "control://control-plan-default"
-        ],
-        "title": "Lead PRD and architecture approved"
-      },
-      {
-        "budget": {
-          "timeout_ms": 180000
-        },
-        "capability": "code.edit",
-        "execution": {
-          "mode": "parallel",
-          "parallel_group": "wave-3",
-          "task_number": "3.2",
+          "task_number": "3.1",
           "wave": 3
         },
-        "id": "preserve_sync_boundaries",
-        "instruction": "Edit src/project_sync.rs and src/projects.rs to ensure project discovery, runtime coalesced uploads, one-shot uploads, conflict handling, and remote-hash state always read the validated current project.fractal and preserve its complete enriched graph, events, and outcomes. Add boundary tests using legacy and enriched local fixtures plus mocked upload payloads, asserting canonical learning fields are neither stripped nor rewritten and invalid/oversized data is refused before upload. Keep local persistence fail-soft with respect to network errors and do not alter authentication, visibility behavior, remote APIs, GitHub publication semantics, or any dist-* path.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
+        "human_intervention": false,
+        "id": "review",
+        "instruction": "The implementation and the tests were written in parallel by two agents. Run `python3 -m unittest`, then reconcile them: fix any import/name/signature mismatch so the tests exercise the implementation and all tests pass. Criteria: the requested outcome is delivered and verified: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,….",
         "kind": "container",
         "memory_scopes": [
           "work:goal",
           "workspace:root"
         ],
+        "node_type": "implementation",
+        "objective": "The implementation and the tests were written in parallel by two agents. Run `python3 -m unittest`, then reconcile them: fix any import/name/signature mismatch so the tests exercise the implementation and all tests pass. Criteria: the requested outcome is delivered and verified: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,….",
+        "policy_contract": {
+          "allowed_commands": [],
+          "allowed_writes": [],
+          "budgets": {
+            "max_attempts": 1,
+            "max_cost_usd": 20,
+            "max_diff_lines": 500,
+            "max_files_changed": 6,
+            "max_input_tokens": 250000,
+            "max_minutes": 60,
+            "max_output_tokens": 50000,
+            "max_steps": 40
+          },
+          "capability": "code.edit",
+          "decision": "allow",
+          "evidence_requirements": [
+            "commands",
+            "exit_codes",
+            "stderr",
+            "stdout"
+          ],
+          "external_side_effects": false,
+          "network": {
+            "allowed_destinations": [],
+            "default": "deny"
+          },
+          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+          "provenance": "builtin:safe-default.v1",
+          "sandbox_profile": "local-work-v1",
+          "schema": "fractal.node_policy_contract.v1",
+          "verifier_ids": [
+            "independent"
+          ]
+        },
+        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+        "policy_provenance": "builtin:safe-default.v1",
+        "reopen_count": 0,
         "requires": [
-          "integrate_portable_persistence.ready"
+          "implementation_ready",
+          "tests_ready"
         ],
         "route_candidates": [
           "apple-container://code-edit-default"
-        ],
-        "sandbox_profile": "apple-container://local-work-v1",
-        "title": "Preserve learning data across validation and sync boundaries"
-      },
-      {
-        "budget": {
-          "timeout_ms": 180000
-        },
-        "capability": "code.edit",
-        "execution": {
-          "mode": "parallel",
-          "parallel_group": "wave-3",
-          "task_number": "3.3",
-          "wave": 3
-        },
-        "id": "record_graph_edit_events",
-        "instruction": "Edit src/amendments.rs, src/harness_evolution.rs, and src/supervise.rs so every accepted human split, reroute, cancel, dependency edit, and autonomous grow/repair/differentiate graph mutation appends a compact learning event through project_file APIs. Capture the verified graph_before_hash before mutation; controlled action type with target and created_nodes; bounded trigger; actor identity; timestamp; and eventual_effect success/rework_reduced, initially unknown where necessary and updated when downstream evidence arrives. Ensure rejected/no-op edits do not claim success, child graph hashes remain valid, and created/cancelled/superseded nodes get appropriate structural and controlled outcome fields. Add tests for all four human-edit forms, autonomous edits, event ordering, before-hash accuracy, eventual-effect update, and no-op rejection. Do not edit runtime lifecycle files, persistence schema, Swift, sync, or dist-* files.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
-        "kind": "container",
-        "memory_scopes": [
-          "work:goal",
-          "workspace:root"
-        ],
-        "requires": [
-          "enrich_graph_producers.ready",
-          "integrate_portable_persistence.ready"
-        ],
-        "route_candidates": [
-          "apple-container://code-edit-default"
-        ],
-        "sandbox_profile": "apple-container://local-work-v1",
-        "title": "Record graph-edit decision events"
-      },
-      {
-        "budget": {
-          "timeout_ms": 180000
-        },
-        "capability": "code.edit",
-        "execution": {
-          "mode": "parallel",
-          "parallel_group": "wave-3",
-          "task_number": "3.4",
-          "wave": 3
-        },
-        "id": "record_runtime_lifecycle",
-        "instruction": "Edit src/execute.rs, src/orchestrate.rs, src/run_control.rs, and src/checkpoint.rs to call the central project_file learning mutation APIs at dependency readiness, checkout/start, success, execution error, verification failure, timeout, retry/reopen, cancellation/stale release, resume, and human completion. Record executor agent/model/version-or-config-hash from real agent configuration, increment attempt_count only for actual starts, attach controlled outcomes/failure codes, verification type/passed/compact evidence_refs, actual elapsed agent time and actual cost only when measured, and artifact production/consumption IDs where runtime facts exist. Map errors deterministically to requested failure codes without arbitrary self-evaluation; preserve previous attempts on retry. Extend module tests for retries, tool failure, timeout, failed verification, cancellation, stale release/resume, artifact lineage, human intervention, and monotonic timestamps. Do not edit graph-edit producers, persistence schema, sync, Swift, or dist-* files.\n\nREPAIR: a previous attempt did NOT succeed at `record_graph_edit_events` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
-        "kind": "container",
-        "memory_scopes": [
-          "work:goal",
-          "workspace:root"
-        ],
-        "requires": [
-          "enrich_graph_producers.ready",
-          "integrate_portable_persistence.ready"
-        ],
-        "route_candidates": [
-          "apple-container://code-edit-default"
-        ],
-        "sandbox_profile": "apple-container://local-work-v1",
-        "title": "Record complete node lifecycle facts"
-      },
-      {
-        "budget": {
-          "timeout_ms": 120000
-        },
-        "capability": "project.tests.execute",
-        "execution": {
-          "mode": "parallel",
-          "parallel_group": "wave-2",
-          "task_number": "2.4",
-          "wave": 2
-        },
-        "id": "verify.define_learning_contract.harness",
-        "instruction": "Re-run the acceptance suite against the produced artifact; fail if any test fails.",
-        "kind": "container",
-        "memory_scopes": [
-          "acceptance:spec",
-          "work:goal",
-          "workspace:root"
-        ],
-        "requires": [
-          "define_learning_contract.ready"
-        ],
-        "route_candidates": [
-          "apple-container://project-tests-execute-default"
         ],
         "sandbox_profile": "apple-container://local-work-v1"
-      },
-      {
-        "budget": {
-          "timeout_ms": 120000
-        },
-        "capability": "project.tests.execute",
-        "execution": {
-          "mode": "parallel",
-          "parallel_group": "wave-3",
-          "task_number": "3.5",
-          "wave": 3
-        },
-        "id": "verify.integrate_portable_persistence.harness",
-        "instruction": "Re-run the acceptance suite against the produced artifact; fail if any test fails.",
-        "kind": "container",
-        "memory_scopes": [
-          "acceptance:spec",
-          "work:goal",
-          "workspace:root"
-        ],
-        "requires": [
-          "integrate_portable_persistence.ready"
-        ],
-        "route_candidates": [
-          "apple-container://project-tests-execute-default"
-        ],
-        "sandbox_profile": "apple-container://local-work-v1"
-      },
-      {
-        "budget": {
-          "timeout_ms": 120000
-        },
-        "capability": "project.tests.execute",
-        "execution": {
-          "mode": "parallel",
-          "parallel_group": "wave-5",
-          "task_number": "5.1",
-          "wave": 5
-        },
-        "id": "verify_native_swift",
-        "instruction": "From /workspace/fractal-cli run swift test --package-path macos/FractalVoice. Fix only Swift source or XCTest defects caused by the enriched graph decoding/display work and rerun until the complete package suite passes. Confirm tests cover legacy, enriched, partial, and forward-compatible fixtures and report the exact passing command. Do not alter Package.swift dependency versions, generated resources, signing/notarization settings, Rust files, or any dist-* path; do not build a release app, archive, DMG, or ZIP.",
-        "kind": "container",
-        "memory_scopes": [
-          "work:goal",
-          "workspace:root"
-        ],
-        "requires": [
-          "add_native_swift_tests.ready"
-        ],
-        "route_candidates": [
-          "apple-container://project-tests-execute-default"
-        ],
-        "sandbox_profile": "apple-container://local-work-v1",
-        "title": "Run the native Fractal Voice quality gate"
-      },
-      {
-        "budget": {
-          "timeout_ms": 120000
-        },
-        "capability": "project.tests.execute",
-        "execution": {
-          "mode": "parallel",
-          "parallel_group": "wave-5",
-          "task_number": "5.2",
-          "wave": 5
-        },
-        "id": "verify_rust_repository",
-        "instruction": "From /workspace/fractal-cli run cargo fmt --all -- --check, cargo test --no-fail-fast, and cargo clippy --all-targets -- -D warnings. Also run focused tests for learning_data, project_file, graph_store, compile, execute, orchestrate, run_control, checkpoint, amendments, harness_evolution, supervise, project_sync, and projects if the full-suite output does not make their evidence individually clear. Fix only Rust source or Rust test defects caused by this feature, rerun every failed gate, and record exact passing commands in the task result. Do not weaken tests, access live services, modify Swift or any dist-* path, or perform release/signing work.",
-        "kind": "container",
-        "memory_scopes": [
-          "work:goal",
-          "workspace:root"
-        ],
-        "requires": [
-          "add_cross_boundary_rust_tests.ready",
-          "aggregate_graph_outcomes.ready"
-        ],
-        "route_candidates": [
-          "apple-container://project-tests-execute-default"
-        ],
-        "sandbox_profile": "apple-container://local-work-v1",
-        "title": "Run the complete Rust quality gate"
       }
     ],
-    "parent_graph": "sha256:52fdd8393c9c06ca583d6808ca0a796b214cf92f2b210333cec3993c9f34d588",
+    "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+    "policy_provenance": {
+      "kind": "builtin_default",
+      "source": "builtin:safe-default.v1"
+    },
+    "policy_schema": "fractal.harness_policy.v1",
     "schema": "fractal.execution_graph.v1",
     "target": "darwin-arm64",
-    "work_hash": "sha256:3f3cd1a955e6ccd688c0849c282aada8b2f943a92c036be727189a32c8899dbe"
+    "work_hash": "sha256:5bab08d596c42abe6f876899aec16341440a290705294507f45fa6f6e33618d9"
   },
   "execution": {
     "schema": "fractal.execution_state.v1",
-    "phase": "completed",
-    "assignments": {
-      "add_cross_boundary_rust_tests": {
-        "agent_id": "cursor",
-        "agent_label": "cursor",
-        "state": "completed",
-        "checked_out_at": "2026-08-02T12:35:33Z",
-        "completed_at": "2026-08-02T12:43:34Z"
-      },
-      "add_native_swift_tests": {
-        "agent_id": "cursor",
-        "agent_label": "cursor",
-        "state": "completed",
-        "checked_out_at": "2026-08-02T12:03:48Z",
-        "completed_at": "2026-08-02T12:05:23Z"
-      },
-      "add_swift_graph_models": {
-        "agent_id": "hermes",
-        "agent_label": "hermes",
-        "state": "completed",
-        "checked_out_at": "2026-07-29T10:04:03Z",
-        "completed_at": "2026-08-02T08:27:05Z"
-      },
-      "aggregate_graph_outcomes": {
-        "agent_id": "codex/luna-aggregate",
-        "agent_label": "Codex Luna · Aggregate Outcomes",
-        "state": "completed",
-        "checked_out_at": "2026-08-02T12:22:31Z",
-        "completed_at": "2026-08-02T12:33:14Z"
-      },
-      "audit_acceptance_and_scope": {
-        "agent_id": "codex/orchestrator",
-        "agent_label": "Codex Sol High · Orchestrator",
-        "state": "completed",
-        "checked_out_at": "2026-08-02T12:43:37Z",
-        "completed_at": "2026-08-02T12:47:30Z"
-      },
-      "define_learning_contract": {
-        "agent_id": "cursor",
-        "agent_label": "cursor",
-        "state": "completed",
-        "checked_out_at": "2026-07-29T10:01:24Z",
-        "completed_at": "2026-07-29T10:04:02Z"
-      },
-      "display_learning_in_voice": {
-        "agent_id": "cursor",
-        "agent_label": "cursor",
-        "state": "completed",
-        "checked_out_at": "2026-08-02T08:51:47Z",
-        "completed_at": "2026-08-02T08:56:10Z"
-      },
-      "enrich_graph_producers": {
-        "agent_id": "codex/luna-enrich",
-        "agent_label": "Codex Luna · Enrich Graph Producers",
-        "state": "completed",
-        "checked_out_at": "2026-07-29T10:04:03Z",
-        "completed_at": "2026-08-02T08:38:04Z"
-      },
-      "integrate_portable_persistence": {
-        "agent_id": "hermes",
-        "agent_label": "hermes",
-        "state": "completed",
-        "checked_out_at": "2026-07-29T10:04:03Z",
-        "completed_at": "2026-08-02T08:51:46Z"
-      },
-      "lead_closeout": {
-        "agent_id": "codex/orchestrator",
-        "agent_label": "Codex Sol High · Orchestrator",
-        "state": "completed",
-        "checked_out_at": "2026-08-02T12:47:30Z",
-        "completed_at": "2026-08-02T12:48:16Z"
-      },
-      "lead_plan": {
-        "agent_id": "codex",
-        "agent_label": "codex",
-        "state": "completed",
-        "checked_out_at": "2026-07-29T10:01:24Z",
-        "completed_at": "2026-07-29T10:01:24Z"
-      },
-      "preserve_sync_boundaries": {
-        "agent_id": "hermes",
-        "agent_label": "hermes",
-        "state": "completed",
-        "checked_out_at": "2026-08-02T08:51:47Z",
-        "completed_at": "2026-08-02T12:03:45Z"
-      },
-      "record_graph_edit_events": {
-        "agent_id": "codex/luna-graph-events",
-        "agent_label": "Codex Luna · Graph Edit Events",
-        "state": "completed",
-        "checked_out_at": "2026-08-02T08:51:47Z",
-        "completed_at": "2026-08-02T12:22:15Z"
-      },
-      "record_runtime_lifecycle": {
-        "agent_id": "cursor",
-        "agent_label": "cursor",
-        "state": "completed",
-        "checked_out_at": "2026-08-02T08:51:47Z",
-        "completed_at": "2026-08-02T12:01:11Z"
-      },
-      "verify.define_learning_contract.harness": {
-        "agent_id": "cursor",
-        "agent_label": "cursor",
-        "state": "completed",
-        "checked_out_at": "2026-07-29T10:04:03Z",
-        "completed_at": "2026-07-29T13:31:53Z"
-      },
-      "verify.integrate_portable_persistence.harness": {
-        "agent_id": "hermes",
-        "agent_label": "hermes",
-        "state": "completed",
-        "checked_out_at": "2026-08-02T08:51:47Z",
-        "completed_at": "2026-08-02T08:51:48Z"
-      },
-      "verify_native_swift": {
-        "agent_id": "hermes",
-        "agent_label": "hermes",
-        "state": "completed",
-        "checked_out_at": "2026-08-02T12:14:09Z",
-        "completed_at": "2026-08-02T12:35:35Z"
-      },
-      "verify_rust_repository": {
-        "agent_id": "cursor",
-        "agent_label": "cursor",
-        "state": "completed",
-        "checked_out_at": "2026-08-02T12:43:34Z",
-        "completed_at": "2026-08-02T12:43:37Z"
-      }
-    },
-    "updated_at": "2026-08-02T12:48:16Z"
+    "phase": "executing",
+    "assignments": {},
+    "updated_at": "2026-08-08T00:37:07Z"
   },
   "learning": {
     "schema": "fractal.learning.v1",
     "nodes": {
-      "add_cross_boundary_rust_tests": {
-        "node_id": "add_cross_boundary_rust_tests",
+      "acceptance": {
+        "node_id": "acceptance",
         "node_type": "implementation",
-        "objective": "Add cross-boundary Rust regression coverage",
+        "objective": "Run the whole unittest suite; every test must pass before completion.",
         "depends_on": [
-          "preserve_sync_boundaries",
-          "record_graph_edit_events",
-          "record_runtime_lifecycle"
+          "review"
         ],
-        "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T12:35:33Z",
-        "finished_at": "2026-08-02T12:43:34Z",
-        "executor": {
-          "agent": "cursor",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "add_native_swift_tests": {
-        "node_id": "add_native_swift_tests",
-        "node_type": "implementation",
-        "objective": "Add native Swift compatibility and display tests",
-        "depends_on": [
-          "display_learning_in_voice"
-        ],
-        "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T12:03:48Z",
-        "finished_at": "2026-08-02T12:05:23Z",
-        "executor": {
-          "agent": "cursor",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "add_swift_graph_models": {
-        "node_id": "add_swift_graph_models",
-        "node_type": "implementation",
-        "objective": "Add tolerant Swift graph learning models",
-        "depends_on": [
-          "define_learning_contract"
-        ],
-        "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T08:22:42Z",
-        "finished_at": "2026-08-02T08:27:05Z",
-        "executor": {
-          "agent": "hermes",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "aggregate_graph_outcomes": {
-        "node_id": "aggregate_graph_outcomes",
-        "node_type": "implementation",
-        "objective": "Derive and persist terminal graph outcomes",
-        "depends_on": [
-          "record_graph_edit_events",
-          "record_runtime_lifecycle"
-        ],
-        "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T12:22:31Z",
-        "finished_at": "2026-08-02T12:33:14Z",
-        "executor": {
-          "agent": "Codex Luna · Aggregate Outcomes",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "audit_acceptance_and_scope": {
-        "node_id": "audit_acceptance_and_scope",
-        "node_type": "implementation",
-        "objective": "Audit acceptance evidence and excluded release scope",
-        "depends_on": [
-          "verify_native_swift",
-          "verify_rust_repository"
-        ],
-        "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T12:44:12Z",
-        "finished_at": "2026-08-02T12:47:30Z",
-        "executor": {
-          "agent": "Codex Sol High · Orchestrator",
-          "version": "0.1.0"
-        },
-        "attempt_count": 2,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "define_learning_contract": {
-        "node_id": "define_learning_contract",
-        "node_type": "implementation",
-        "objective": "Define the versioned learning-data contract",
-        "depends_on": [
-          "lead_plan"
-        ],
-        "created_at": "2026-07-29T13:32:06Z",
+        "created_at": "2026-08-08T00:37:07Z",
         "attempt_count": 0,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
         "reopen_count": 0
       },
-      "display_learning_in_voice": {
-        "node_id": "display_learning_in_voice",
+      "author_tests": {
+        "node_id": "author_tests",
         "node_type": "implementation",
-        "objective": "Read and display enriched graphs in Fractal Voice",
+        "objective": "Read INTERFACE.md and write a Python `unittest` test file (test_<module>.py) that imports the module and rigorously tests EVERY benchmark behavior and edge case the plan listed for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. The plan's benchmarks are the bar for high performance, so make the tests demanding — cover the edge cases and failure modes, not just the happy path. Do not write the implementation — another agent is doing that in parallel.",
         "depends_on": [
-          "add_swift_graph_models",
-          "integrate_portable_persistence"
+          "plan"
         ],
-        "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T08:53:02Z",
-        "finished_at": "2026-08-02T08:56:10Z",
-        "executor": {
-          "agent": "cursor",
-          "version": "0.1.0"
-        },
-        "attempt_count": 2,
-        "outcome": "unverified_success",
+        "created_at": "2026-08-08T00:37:07Z",
+        "attempt_count": 0,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
         "reopen_count": 0
       },
-      "enrich_graph_producers": {
-        "node_id": "enrich_graph_producers",
-        "node_type": "implementation",
-        "objective": "Populate structural learning fields in every graph producer",
-        "depends_on": [
-          "define_learning_contract"
-        ],
-        "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T08:28:38Z",
-        "finished_at": "2026-08-02T08:38:04Z",
-        "executor": {
-          "agent": "Codex Luna · Enrich Graph Producers",
-          "version": "0.1.0"
-        },
-        "attempt_count": 4,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "integrate_portable_persistence": {
-        "node_id": "integrate_portable_persistence",
-        "node_type": "implementation",
-        "objective": "Integrate migration and validation into portable persistence",
-        "depends_on": [
-          "define_learning_contract"
-        ],
-        "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T08:38:22Z",
-        "finished_at": "2026-08-02T08:51:46Z",
-        "executor": {
-          "agent": "hermes",
-          "version": "0.1.0"
-        },
-        "attempt_count": 3,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "lead_closeout": {
-        "node_id": "lead_closeout",
+      "complete": {
+        "node_id": "complete",
         "node_type": "control",
-        "objective": "Lead acceptance review and closeout",
+        "objective": "Implementation and tests were built in parallel, cross-checked, and verified — mark the outcome complete.",
         "depends_on": [
-          "audit_acceptance_and_scope"
+          "acceptance"
         ],
-        "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T12:47:30Z",
-        "finished_at": "2026-08-02T12:48:16Z",
-        "executor": {
-          "agent": "Codex Sol High · Orchestrator",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
+        "created_at": "2026-08-08T00:37:07Z",
+        "attempt_count": 0,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
         "reopen_count": 0
       },
-      "lead_plan": {
-        "node_id": "lead_plan",
-        "node_type": "control",
-        "objective": "Lead PRD and architecture approved",
+      "implement": {
+        "node_id": "implement",
+        "node_type": "implementation",
+        "objective": "Read INTERFACE.md and implement the module file exactly as specified for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. Self-contained, no network. Do not write tests — another agent is doing that in parallel.",
+        "depends_on": [
+          "plan"
+        ],
+        "created_at": "2026-08-08T00:37:07Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "plan": {
+        "node_id": "plan",
+        "node_type": "implementation",
+        "objective": "Plan the build for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. Optimize for the BEST performance and quality of the product itself — correctness, robustness, and the behaviors that matter — NOT for the lowest cost or the least effort. First reason briefly through 2-3 alternative implementation approaches and choose the one that maximizes product performance, noting why the others are weaker. Then write INTERFACE.md stating: the single module filename (e.g. solution.py); the public function name(s) and signatures; the chosen approach (1-2 lines) and the alternatives you rejected; and — as your own acceptance BENCHMARKS — 5-8 concrete, measurable behaviors and edge cases the product must satisfy to count as high-performing: the requested outcome is delivered and verified: Redesign the Fractal e",
         "depends_on": [],
-        "created_at": "2026-07-29T13:32:06Z",
-        "ready_at": "2026-07-29T13:32:06Z",
+        "created_at": "2026-08-08T00:37:07Z",
+        "ready_at": "2026-08-08T00:37:07Z",
         "attempt_count": 0,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
         "reopen_count": 0
       },
-      "preserve_sync_boundaries": {
-        "node_id": "preserve_sync_boundaries",
+      "review": {
+        "node_id": "review",
         "node_type": "implementation",
-        "objective": "Preserve learning data across validation and sync boundaries",
+        "objective": "The implementation and the tests were written in parallel by two agents. Run `python3 -m unittest`, then reconcile them: fix any import/name/signature mismatch so the tests exercise the implementation and all tests pass. Criteria: the requested outcome is delivered and verified: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,….",
         "depends_on": [
-          "integrate_portable_persistence"
+          "author_tests",
+          "implement"
         ],
-        "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T08:53:02Z",
-        "finished_at": "2026-08-02T12:03:45Z",
-        "executor": {
-          "agent": "hermes",
-          "version": "0.1.0"
-        },
-        "attempt_count": 2,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "record_graph_edit_events": {
-        "node_id": "record_graph_edit_events",
-        "node_type": "implementation",
-        "objective": "Record graph-edit decision events",
-        "depends_on": [
-          "enrich_graph_producers",
-          "integrate_portable_persistence"
-        ],
-        "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T12:16:28Z",
-        "finished_at": "2026-08-02T12:22:15Z",
-        "executor": {
-          "agent": "Codex Luna · Graph Edit Events",
-          "version": "0.1.0"
-        },
-        "attempt_count": 4,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 1
-      },
-      "record_runtime_lifecycle": {
-        "node_id": "record_runtime_lifecycle",
-        "node_type": "implementation",
-        "objective": "Record complete node lifecycle facts",
-        "depends_on": [
-          "enrich_graph_producers",
-          "integrate_portable_persistence"
-        ],
-        "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T08:53:03Z",
-        "finished_at": "2026-08-02T12:01:11Z",
-        "executor": {
-          "agent": "cursor",
-          "version": "0.1.0"
-        },
-        "attempt_count": 2,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "verify.define_learning_contract.harness": {
-        "node_id": "verify.define_learning_contract.harness",
-        "node_type": "verification",
-        "objective": "Re-run the acceptance suite against the produced artifact; fail if any test fails.",
-        "depends_on": [
-          "define_learning_contract"
-        ],
-        "created_at": "2026-07-29T13:32:06Z",
+        "created_at": "2026-08-08T00:37:07Z",
         "attempt_count": 0,
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "verify.integrate_portable_persistence.harness": {
-        "node_id": "verify.integrate_portable_persistence.harness",
-        "node_type": "verification",
-        "objective": "Re-run the acceptance suite against the produced artifact; fail if any test fails.",
-        "depends_on": [
-          "integrate_portable_persistence"
-        ],
-        "created_at": "2026-08-02T08:51:46Z",
-        "started_at": "2026-08-02T08:51:47Z",
-        "finished_at": "2026-08-02T08:51:48Z",
-        "executor": {
-          "agent": "hermes",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "verified_success",
-        "verification": {
-          "type": "automated",
-          "passed": true
-        },
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "verify_native_swift": {
-        "node_id": "verify_native_swift",
-        "node_type": "verification",
-        "objective": "Run the native Fractal Voice quality gate",
-        "depends_on": [
-          "add_native_swift_tests"
-        ],
-        "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T12:35:33Z",
-        "finished_at": "2026-08-02T12:35:35Z",
-        "executor": {
-          "agent": "hermes",
-          "version": "0.1.0"
-        },
-        "attempt_count": 2,
-        "outcome": "verified_success",
-        "verification": {
-          "type": "automated",
-          "passed": true
-        },
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 1
-      },
-      "verify_rust_repository": {
-        "node_id": "verify_rust_repository",
-        "node_type": "verification",
-        "objective": "Run the complete Rust quality gate",
-        "depends_on": [
-          "add_cross_boundary_rust_tests",
-          "aggregate_graph_outcomes"
-        ],
-        "created_at": "2026-07-29T13:32:06Z",
-        "started_at": "2026-08-02T12:43:34Z",
-        "finished_at": "2026-08-02T12:43:37Z",
-        "executor": {
-          "agent": "cursor",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "verified_success",
-        "verification": {
-          "type": "automated",
-          "passed": true
-        },
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -1240,7 +714,19 @@
       "human_intervention_count": 0,
       "verification_coverage": 0.16666666666666666,
       "verification_coverage_denominator": 0
-    }
+    },
+    "acceptance_criteria": [
+      "AC-1",
+      "AC-10",
+      "AC-2",
+      "AC-3",
+      "AC-4",
+      "AC-5",
+      "AC-6",
+      "AC-7",
+      "AC-8",
+      "AC-9"
+    ]
   },
   "efficiency": {
     "schema": "fractal.efficiency.v1",
@@ -1277,7 +763,7 @@
       "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c"
     }
   },
-  "updated_at": "2026-08-02T16:08:36Z",
+  "updated_at": "2026-08-08T00:37:07Z",
   "catalog": {
     "audit": {
       "auditor": "fractal graph audit",
