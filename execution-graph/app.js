@@ -4,6 +4,7 @@ const NS = "http://www.w3.org/2000/svg";
 const state = {
   data: null, view: "overview", selected: null, initialized: false,
   pausing: false, estimatedSaved: 0,
+  liveSnapshot: null, announcementTimer: null, lastAnnouncement: "",
   failure: {
     data: null, loading: false, error: null, open: false, selected: "",
     filters: { q: "", state: [], code: "", component: "", lesson: "" }
@@ -12,6 +13,88 @@ const state = {
 const statusNames = { complete: "Complete", active: "In progress", incomplete: "Incomplete" };
 let masterBrowser = null;
 let threeGraph = null;
+
+function runtimeNodeState(node) {
+  const assignment = node?.assignment || null;
+  const evidence = node?.evidence || null;
+  const status = assignment?.state === "completed" ? "complete"
+    : assignment?.state === "checked_out" ? "active" : String(node?.status || "incomplete");
+  return {
+    status,
+    assignment: assignment ? {
+      agent_id: assignment.agent_id || "", agent_label: assignment.agent_label || "", state: assignment.state || "",
+      checked_out_at: assignment.checked_out_at || "", completed_at: assignment.completed_at || "", released_at: assignment.released_at || ""
+    } : null,
+    evidence: evidence ? JSON.stringify(evidence) : ""
+  };
+}
+
+/* Compare only server-reported facts.  Initial snapshots are quiet so opening
+ * a graph never invents a completion animation; every later transition is
+ * bounded and deterministic for the two-second poll cadence. */
+function classifyTransitions(previous, next) {
+  const prior = new Map((previous?.nodes || []).map(node => [node.id, runtimeNodeState(node)]));
+  const transitions = [];
+  (next?.nodes || []).forEach(node => {
+    const before = prior.get(node.id);
+    if (!before) return;
+    const after = runtimeNodeState(node);
+    if (before.status !== "active" && after.status === "active") transitions.push({ id: node.id, type: "became_active", detail: node.objective || node.title });
+    if (before.status !== "complete" && after.status === "complete") transitions.push({ id: node.id, type: "completed", detail: node.objective || node.title });
+    if (before.status === "active" && after.assignment?.state === "released") transitions.push({ id: node.id, type: "released", detail: node.objective || node.title });
+    const beforeAssignment = JSON.stringify(before.assignment || null);
+    const afterAssignment = JSON.stringify(after.assignment || null);
+    if (beforeAssignment !== afterAssignment && !((before.status === "active" && after.status === "complete") || (before.status === "active" && after.assignment?.state === "released"))) {
+      transitions.push({ id: node.id, type: "assignment_changed", detail: after.assignment?.agent_label || after.assignment?.agent_id || "assignment changed" });
+    }
+    if (before.evidence !== after.evidence) {
+      transitions.push({ id: node.id, type: after.evidence.includes('"passed":false') ? "failed_verification" : "evidence_updated", detail: node.evidence?.outcome || "evidence updated" });
+    }
+  });
+  return transitions.slice(0, 64);
+}
+
+// Expose the pure classifier for offline diagnostics and controller tests while
+// keeping snapshot ownership in this polling layer.
+window.FractalExecutionTransitions = { classifyTransitions };
+
+function activeRunModel() {
+  if (!window.FractalThreeGraph || !state.data) return null;
+  return window.FractalThreeGraph.normalizeGraphPayload(state.data, state.view);
+}
+
+function renderLiveHud(model, transitions = []) {
+  const hud = document.getElementById("live-work-hud");
+  if (!hud || !model) return;
+  const active = (model.nodes || []).filter(node => node.status === "active");
+  const progress = model.execution?.progress;
+  const phase = String(model.execution?.phase || "planning").replaceAll("_", " ");
+  const settled = model.nodes.length > 0 && active.length === 0 && model.nodes.every(node => node.status === "complete");
+  const agents = settled ? [] : [...new Set(active.map(node => node.assignment?.agent_label || node.assignment?.agent_id).filter(Boolean))];
+  const selected = state.selected ? model.nodes.find(node => node.id === state.selected.id) : null;
+  const objective = settled ? "Run complete — all nodes settled." : selected?.objective || active[0]?.objective || progress?.message || "Waiting for the next eligible node.";
+  const why = settled ? "All nodes completed; no agent is active." : selected?.why?.reason || active[0]?.why?.reason || (progress?.agent_label ? `Assigned to ${progress.agent_label}.` : "The coordinator is evaluating dependencies.");
+  document.getElementById("live-work-phase").textContent = phase.toUpperCase();
+  document.getElementById("live-work-agents").textContent = agents.length ? agents.join(" · ") : "No active agent";
+  document.getElementById("live-work-objective").textContent = objective;
+  document.getElementById("live-work-why").textContent = why;
+  hud.classList.toggle("calm", settled || (!active.length && phase === "completed"));
+  if (!transitions.length) return;
+  const announcement = transitions.map(item => {
+    const label = item.detail || item.id;
+    if (item.type === "completed") return `${label} completed.`;
+    if (item.type === "released") return `${label} was released for review.`;
+    if (item.type === "failed_verification") return `${label} has failed verification.`;
+    if (item.type === "became_active") return `${label} is now active.`;
+    return `${label} changed.`;
+  }).join(" ");
+  if (announcement === state.lastAnnouncement) return;
+  state.lastAnnouncement = announcement;
+  const live = document.getElementById("transition-announcements");
+  if (!live) return;
+  clearTimeout(state.announcementTimer);
+  state.announcementTimer = setTimeout(() => { live.textContent = announcement; }, 120);
+}
 
 function disposeThreeGraph() {
   if (!threeGraph) return;
@@ -443,10 +526,14 @@ function renderGraph() {
       ? failureCountForNode(node.id)
       : (state.failure.data?.summary?.total || 0);
     const agentLabel = assignment?.agent_label || assignment?.agent_id || "";
+    const whyReason = node.why?.reason || (node.depends_on?.length ? `Waiting for ${node.depends_on.join(", ")}.` : "No dependencies; node is eligible.");
+    const objective = node.objective || node.title;
+    const evidenceSummary = node.evidence?.verification?.passed === true ? "verified evidence"
+      : node.evidence?.verification?.passed === false ? "verification failed" : node.evidence?.outcome || "no outcome recorded";
     const item = svgElement("g", {
-      class: `node ${node.status}${state.selected?.id === node.id ? " selected" : ""}`,
+      class: `node ${node.status}${assignment?.state === "released" ? " released" : ""}${state.selected?.id === node.id ? " selected" : ""}`,
       transform: `translate(${x},${y})`, tabindex: "0", role: "button",
-      "aria-label": `${node.id}, ${node.title}, ${statusNames[node.status]}${agentLabel ? `, agent ${agentLabel}` : ""}`
+      "aria-label": `${node.id}, ${node.title}, ${statusNames[node.status]}, objective ${objective}, ${whyReason}, ${evidenceSummary}${agentLabel ? `, agent ${agentLabel}` : ""}`
     });
     item.append(svgElement("rect", { class: "node-aura", x: -width / 2 - 7, y: -height / 2 - 7, width: width + 14, height: height + 14, rx: 8 }));
     item.append(svgElement("rect", { class: "node-body", x: -width / 2, y: -height / 2, width, height, rx: 4 }));
@@ -517,7 +604,14 @@ function renderGraph() {
     svg.append(item);
   });
   const three = ensureThreeGraph();
-  if (three && state.data) three.update(window.FractalThreeGraph.normalizeGraphPayload(state.data, state.view), state.selected?.id || null);
+  if (three && state.data && window.FractalThreeGraph) {
+    const normalized = window.FractalThreeGraph.normalizeGraphPayload(state.data, state.view);
+    const transitions = state.liveSnapshot ? classifyTransitions(state.liveSnapshot, normalized) : [];
+    normalized.transitions = transitions;
+    state.liveSnapshot = normalized;
+    renderLiveHud(normalized, transitions);
+    three.update(normalized, state.selected?.id || null);
+  }
 }
 
 function selectNode(node, kind) {
@@ -531,7 +625,26 @@ function selectNode(node, kind) {
   document.getElementById("node-title").textContent = node.title;
   document.getElementById("node-id").textContent = node.id;
   document.getElementById("node-source").textContent = `${state.data.source} · line ${node.line}`;
-  document.getElementById("node-gate").textContent = node.gate || (kind === "milestone" ? "Open milestone to inspect gate criteria" : "Inherited from milestone");
+  document.getElementById("node-gate").textContent = node.gate || node.efficiency?.verification_plan || (kind === "milestone" ? "Open milestone to inspect gate criteria" : "Inherited from milestone");
+  const why = node.why || { ready: true, blocked_by: [], reason: kind === "milestone" ? "Milestone summary; open it to inspect dependencies." : "No dependency explanation recorded." };
+  document.getElementById("node-objective").textContent = node.objective || node.title;
+  document.getElementById("node-why").textContent = why.reason || (why.ready ? "Ready to work." : "Blocked by dependency.");
+  document.getElementById("node-dependencies").textContent = Array.isArray(node.depends_on) && node.depends_on.length ? node.depends_on.join(" · ") : "None recorded";
+  const evidence = node.evidence || {};
+  const verification = evidence.verification || {};
+  const evidenceElement = document.getElementById("node-evidence");
+  evidenceElement.className = verification.passed === false ? "evidence-failed" : verification.passed === true ? "evidence-passed" : "";
+  const evidenceParts = [];
+  if (evidence.outcome) evidenceParts.push(String(evidence.outcome).replaceAll("_", " "));
+  if (verification.passed === true) evidenceParts.push("verification passed");
+  else if (verification.passed === false) evidenceParts.push("verification failed");
+  if (verification.evidence_refs?.length) evidenceParts.push(`${verification.evidence_refs.length} evidence ref${verification.evidence_refs.length === 1 ? "" : "s"}`);
+  if (evidence.attempt_count) evidenceParts.push(`attempt ${evidence.attempt_count}`);
+  evidenceElement.textContent = evidenceParts.length ? evidenceParts.join(" · ") : "No evidence recorded yet.";
+  const assignmentForEvent = node.assignment || null;
+  const eventTime = evidence.finished_at || evidence.started_at || assignmentForEvent?.completed_at || assignmentForEvent?.released_at || assignmentForEvent?.checked_out_at;
+  const eventLabel = evidence.finished_at ? "Evidence finished" : evidence.started_at ? "Work started" : assignmentForEvent?.completed_at ? "Assignment completed" : assignmentForEvent?.released_at ? "Assignment released" : assignmentForEvent?.checked_out_at ? "Assignment checked out" : "No runtime event recorded";
+  document.getElementById("node-last-event").textContent = eventTime ? `${eventLabel} · ${new Date(eventTime).toLocaleString()}` : eventLabel;
   const assignmentWrap = document.getElementById("node-assignment-wrap");
   if (kind === "task" && node.assignment) {
     const assignment = node.assignment;
@@ -579,6 +692,7 @@ function openMilestone(id) {
   const group = state.data.groups.find(item => item.id === id);
   state.view = id;
   state.selected = null;
+  state.liveSnapshot = null;
   document.getElementById("graph-kicker").textContent = `${id} · EXECUTABLE CHECKLIST`;
   document.getElementById("graph-title").textContent = group.title;
   document.getElementById("back").classList.remove("hidden");
@@ -590,6 +704,7 @@ function openMilestone(id) {
 function showOverview() {
   state.view = "overview";
   state.selected = null;
+  state.liveSnapshot = null;
   document.getElementById("graph-kicker").textContent = "COMPILED EXECUTION PLAN";
   document.getElementById("graph-title").textContent = "Runtime implementation";
   document.getElementById("back").classList.add("hidden");

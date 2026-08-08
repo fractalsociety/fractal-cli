@@ -7,6 +7,7 @@
   "use strict";
   const STATUS = { complete: "complete", active: "active", incomplete: "incomplete" };
   const finite = (n, fallback) => Number.isFinite(Number(n)) ? Number(n) : fallback;
+  const boundedText = (value, limit = 280) => String(value == null ? "" : value).slice(0, limit);
   function hash(text) {
     let h = 2166136261;
     for (let i = 0; i < String(text).length; i++) { h ^= String(text).charCodeAt(i); h = Math.imul(h, 16777619); }
@@ -33,7 +34,16 @@
         status, gate: String(raw?.gate || ""), instruction: String(raw?.instruction || ""),
         line: finite(raw?.line, 0), completed: finite(raw?.completed, 0), total: finite(raw?.total, 0),
         progress: finite(raw?.progress, 0), checked: Boolean(raw?.checked),
-        assignment: raw?.assignment || null, execution: raw?.execution || null
+        assignment: normalizeAssignment(raw?.assignment), execution: raw?.execution || null,
+        objective: boundedText(raw?.objective || raw?.title || id),
+        capability: boundedText(raw?.capability || "implementation", 160),
+        depends_on: Array.isArray(raw?.depends_on) ? raw.depends_on.map(item => boundedText(item, 160)).slice(0, 64) : [],
+        why: raw?.why && typeof raw.why === "object" ? {
+          ready: raw.why.ready === true,
+          blocked_by: Array.isArray(raw.why.blocked_by) ? raw.why.blocked_by.map(item => boundedText(item, 160)).slice(0, 64) : [],
+          reason: boundedText(raw.why.reason || "", 320)
+        } : { ready: true, blocked_by: [], reason: "" },
+        evidence: normalizeEvidence(raw?.evidence)
       });
     });
     const edges = [];
@@ -43,7 +53,62 @@
       if (!ids.has(from) || !ids.has(to)) { diagnostics.missingEdgeNodes.push(`${from}->${to}`); return; }
       edges.push({ from, to, condition: String(edge?.condition || "predecessor_complete") });
     });
-    return { mode: groupId ? "tasks" : "overview", groupId, title: String(source?.title || payload?.title || "Execution graph"), nodes, edges, diagnostics };
+    const execution = payload?.execution && typeof payload.execution === "object" ? {
+      phase: boundedText(payload.execution.phase || "planning", 40),
+      updated_at: payload.execution.updated_at == null ? null : boundedText(payload.execution.updated_at, 80),
+      progress: payload.execution.progress && typeof payload.execution.progress === "object" ? {
+        message: boundedText(payload.execution.progress.message || "", 280),
+        step: finite(payload.execution.progress.step, 0),
+        elapsed_seconds: finite(payload.execution.progress.elapsed_seconds, 0),
+        agent_label: boundedText(payload.execution.progress.agent_label || "", 160),
+        source: boundedText(payload.execution.progress.source || "", 80),
+        updated_at: payload.execution.progress.updated_at == null ? null : boundedText(payload.execution.progress.updated_at, 80)
+      } : null
+    } : { phase: "planning", updated_at: null, progress: null };
+    const transitions = Array.isArray(payload?.transitions) ? payload.transitions.slice(0, 64).map(item => ({
+      id: item?.id == null ? "" : boundedText(item.id, 160),
+      type: item?.type == null ? "" : boundedText(item.type, 80),
+      detail: item?.detail == null ? "" : boundedText(item.detail, 280)
+    })).filter(item => item.id && item.type) : [];
+    return { mode: groupId ? "tasks" : "overview", groupId, title: String(source?.title || payload?.title || "Execution graph"), nodes, edges, diagnostics, execution, updated_at: execution.updated_at, transitions };
+  }
+  function normalizeAssignment(value) {
+    if (!value || typeof value !== "object") return null;
+    return {
+      agent_id: boundedText(value.agent_id, 160),
+      agent_label: boundedText(value.agent_label, 160),
+      state: boundedText(value.state, 40),
+      checked_out_at: value.checked_out_at == null ? null : boundedText(value.checked_out_at, 80),
+      completed_at: value.completed_at == null ? null : boundedText(value.completed_at, 80),
+      released_at: value.released_at == null ? null : boundedText(value.released_at, 80)
+    };
+  }
+  function normalizeEvidence(value) {
+    const source = value && typeof value === "object" ? value : {};
+    const verification = source.verification && typeof source.verification === "object" ? source.verification : {};
+    const executor = source.executor && typeof source.executor === "object" ? source.executor : {};
+    const list = input => Array.isArray(input) ? input.map(item => boundedText(item, 240)).slice(0, 32) : [];
+    return {
+      started_at: source.started_at == null ? null : boundedText(source.started_at, 80),
+      finished_at: source.finished_at == null ? null : boundedText(source.finished_at, 80),
+      attempt_count: finite(source.attempt_count, 0),
+      outcome: source.outcome == null ? null : boundedText(source.outcome, 80),
+      failure_code: source.failure_code == null ? null : boundedText(source.failure_code, 80),
+      verification: {
+        type: verification.type == null ? null : boundedText(verification.type, 80),
+        passed: verification.passed === true ? true : verification.passed === false ? false : null,
+        evidence_refs: list(verification.evidence_refs)
+      },
+      artifacts_produced: list(source.artifacts_produced),
+      consumed_by: list(source.consumed_by),
+      executor: {
+        agent: executor.agent == null ? null : boundedText(executor.agent, 160),
+        model: executor.model == null ? null : boundedText(executor.model, 160),
+        version: executor.version == null ? null : boundedText(executor.version, 120)
+      },
+      human_intervention: source.human_intervention === true,
+      reopen_count: finite(source.reopen_count, 0)
+    };
   }
   function computeLayout(model, options) {
     const o = Object.assign({ waveGap: 8, rowGap: 4.2, depthSpread: 3.2, nodeRadius: 1.25, seed: "fractal-execution-graph" }, options || {});
@@ -109,9 +174,10 @@
     const requestFrame = root.requestAnimationFrame || (typeof requestAnimationFrame === "function" ? requestAnimationFrame : fn => setTimeout(fn, 16));
     const cancelFrame = root.cancelAnimationFrame || (typeof cancelAnimationFrame === "function" ? cancelAnimationFrame : clearTimeout);
     let active = false;
-    let renderer, scene, camera, world, nodeGroup, edgeObject, selectedEdgeObject;
+    let renderer, scene, camera, world, nodeGroup, edgeObject, selectedEdgeObject, effectGroup;
     let labelLayer, raycaster, pointer;
-    let nodeMap = new Map(), labels = new Map(), current = null, layoutCache = null, modelHash = "";
+    let nodeMap = new Map(), haloMap = new Map(), evidenceMap = new Map(), labels = new Map(), edgePulses = [], transientEffects = [];
+    let current = null, layoutCache = null, modelHash = "";
     let selected = null, raf = 0, disposed = false, reduced = false;
     let yaw = .35, pitch = .28, distance = 24, target = { x: 0, y: 0, z: 0 };
     let drag = null, frameCount = 0, mediaQuery = null, capability = null;
@@ -254,9 +320,15 @@
         label.dataset && (label.dataset.nodeId = node.id);
         /* Keep the scene legible at a glance.  Full titles remain available
          * for the focused node while the list/inspector carries every detail. */
-        label.textContent = node.id === selected ? `${node.id} · ${String(sourceNode.title || node.id)}` : node.id;
+        const agent = sourceNode.assignment?.agent_label || sourceNode.assignment?.agent_id || "";
+        const blocked = sourceNode.why?.ready === false ? ` · blocked by ${(sourceNode.why.blocked_by || []).join(", ")}` : "";
+        label.textContent = node.id === selected
+          ? `${node.id} · ${String(sourceNode.title || node.id)}${agent ? ` · ${agent}` : ""}${blocked}`
+          : `${node.id}${agent ? ` · ${agent}` : ""}${blocked}`;
         label.title = String(sourceNode.title || node.id);
         toggleClass(label, "selected", node.id === selected);
+        toggleClass(label, "active", sourceNode.status === "active");
+        toggleClass(label, "blocked", sourceNode.why?.ready === false);
       });
       [...labels.keys()].forEach(id => {
         if (visibleIds.has(id)) return;
@@ -283,7 +355,15 @@
         const node = current?.nodes?.find(item => item.id === id);
         const pulse = !reduced && node?.status === "active" ? 1 + Math.sin(now * 3.5) * .08 : 1;
         mesh.scale?.setScalar?.(id === selected ? 1.12 * pulse : pulse);
+        const halo = haloMap.get(id);
+        if (halo) {
+          const haloPulse = !reduced && node?.status === "active" ? 1.14 + Math.sin(now * 3.5) * .09 : 1.03;
+          halo.scale?.setScalar?.(haloPulse);
+          if (halo.material) halo.material.opacity = node?.status === "active" && !reduced ? .26 + Math.sin(now * 3.5) * .08 : .13;
+        }
       });
+      if (!reduced) updateEdgePulses(now);
+      updateTransientEffects(now);
       setCameraPosition();
       updateLabels();
       renderer.render?.(scene, camera);
@@ -330,13 +410,33 @@
       mesh.userData.kind = current?.mode === "tasks" ? "task" : "milestone";
       nodeMap.set(node.id, mesh);
       nodeGroup.add?.(mesh);
+      if (three?.Mesh && (three.RingGeometry || three.SphereGeometry) && three.MeshBasicMaterial) {
+        const haloGeometry = three.RingGeometry ? new three.RingGeometry(1.28, 1.38, 32) : new three.SphereGeometry(1.32, 12, 8);
+        const haloMaterial = new three.MeshBasicMaterial({ color: node.status === "active" ? 0xffc45b : 0x54f49a, transparent: true, opacity: node.status === "active" ? .25 : .1, depthWrite: false, side: three.DoubleSide });
+        const halo = new three.Mesh(haloGeometry, haloMaterial);
+        halo.position?.set?.(node.x, node.y, node.z);
+        halo.userData = { effect: "halo", nodeId: node.id };
+        haloMap.set(node.id, halo);
+        effectGroup?.add?.(halo);
+      }
+      if (isFailureNode(current?.nodes?.find(item => item.id === node.id)) && three?.Mesh && three.OctahedronGeometry && three.MeshBasicMaterial) {
+        const marker = new three.Mesh(new three.OctahedronGeometry(.22, 1), new three.MeshBasicMaterial({ color: 0xff5f67, transparent: true, opacity: .92, depthWrite: false }));
+        marker.position?.set?.(node.x + node.radius * .75, node.y + node.radius * .75, node.z);
+        marker.userData = { effect: "evidence", nodeId: node.id };
+        evidenceMap.set(node.id, marker);
+        effectGroup?.add?.(marker);
+      }
     }
-    function edgeVertices(edges) {
+    function isFailureNode(node) {
+      return Boolean(node && (node.assignment?.state === "released" || node.evidence?.failure_code || node.evidence?.verification?.passed === false));
+    }
+    function edgeVertices(edges, options) {
       const positions = [], colors = [];
       edges.forEach(edge => {
         if (!Array.isArray(edge.points) || edge.points.length < 2) return;
         const failure = edge.condition === "failure";
-        const color = failure ? [1, .25, .3] : [.28, .68, .7];
+        const blocked = options?.blockedIds?.has?.(edge.to);
+        const color = failure ? [1, .25, .3] : blocked ? [.12, .25, .27] : [.28, .68, .7];
         for (let index = 1; index < edge.points.length; index++) {
           const before = edge.points[index - 1], after = edge.points[index];
           [before, after].forEach(point => {
@@ -347,9 +447,9 @@
       });
       return { positions, colors };
     }
-    function makeEdgeObject(edges, highlighted) {
+    function makeEdgeObject(edges, highlighted, options) {
       if (!edges.length || !three?.BufferGeometry || !three?.Float32BufferAttribute) return null;
-      const values = edgeVertices(edges);
+      const values = edgeVertices(edges, options);
       if (!values.positions.length) return null;
       const geometry = new three.BufferGeometry();
       geometry.setAttribute("position", new three.Float32BufferAttribute(values.positions, 3));
@@ -363,6 +463,80 @@
       });
       const LineType = three.LineSegments || three.Line;
       return LineType ? new LineType(geometry, material) : null;
+    }
+    function activeDependencyEdges() {
+      const activeIds = new Set((current?.nodes || []).filter(node => node.status === "active").map(node => node.id));
+      return (layoutCache?.edges || []).filter(edge => activeIds.has(edge.to) && edge.condition !== "failure").map(edge => ({ edge, color: 0x9fffe5, speed: .42 }));
+    }
+    function failedEvidenceEdges() {
+      const failedIds = new Set((current?.nodes || []).filter(isFailureNode).map(node => node.id));
+      return (layoutCache?.edges || []).filter(edge => (failedIds.has(edge.from) || failedIds.has(edge.to))).map(edge => ({ edge, color: 0xff5f67, speed: .3 }));
+    }
+    function syncEdgePulses() {
+      edgePulses.forEach(item => removeObject(item.mesh, effectGroup));
+      edgePulses = [];
+      if (reduced || !effectGroup || !three?.Mesh || !three?.SphereGeometry || !three?.MeshBasicMaterial) return;
+      const seen = new Set();
+      activeDependencyEdges().concat(failedEvidenceEdges()).slice(0, 64).forEach(item => {
+        const edge = item.edge;
+        const key = `${edge.from}->${edge.to}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        const pulse = new three.Mesh(new three.SphereGeometry(.12, 8, 6), new three.MeshBasicMaterial({ color: item.color, transparent: true, opacity: .95, depthWrite: false }));
+        pulse.userData = { effect: "edge-pulse", from: edge.from, to: edge.to, color: item.color };
+        effectGroup.add?.(pulse);
+        edgePulses.push({ mesh: pulse, points: edge.points, offset: hash(`${edge.from}:${edge.to}`), speed: item.speed });
+      });
+    }
+    function updateEdgePulses(now) {
+      edgePulses.forEach(item => {
+        const points = item.points || [];
+        if (points.length < 2 || !item.mesh?.position?.set) return;
+        const position = ((now * (item.speed || .42) + item.offset) % 1 + 1) % 1;
+        const scaled = position * (points.length - 1);
+        const index = Math.min(points.length - 2, Math.floor(scaled));
+        const t = scaled - index;
+        const from = points[index], to = points[index + 1];
+        item.mesh.position.set(
+          finite(from.x, 0) + (finite(to.x, 0) - finite(from.x, 0)) * t,
+          finite(from.y, 0) + (finite(to.y, 0) - finite(from.y, 0)) * t,
+          finite(from.z, 0) + (finite(to.z, 0) - finite(from.z, 0)) * t
+        );
+      });
+    }
+    function triggerCompletion(nodeId, kind) {
+      if (reduced || !effectGroup || !three?.Mesh || !three?.RingGeometry || !three?.MeshBasicMaterial) return;
+      const source = nodeMap.get(nodeId);
+      if (!source) return;
+      const ring = new three.Mesh(new three.RingGeometry(1.15, 1.22, 32), new three.MeshBasicMaterial({ color: kind === "released" ? 0xff5f67 : 0x54f49a, transparent: true, opacity: .8, side: three.DoubleSide, depthWrite: false }));
+      ring.position?.set?.(source.position?.x || 0, source.position?.y || 0, source.position?.z || 0);
+      ring.userData = { effect: "transition", nodeId };
+      effectGroup.add?.(ring);
+      transientEffects.push({ mesh: ring, started: (perf?.now?.() || Date.now()) / 1000, duration: kind === "released" ? 1.15 : .9 });
+      /* A rapid stream of snapshots must not grow the transient effect list
+       * without bound. Keep the newest 64 sweeps and dispose evicted meshes. */
+      while (transientEffects.length > 64) {
+        const oldest = transientEffects.shift();
+        removeObject(oldest?.mesh, effectGroup);
+      }
+    }
+    function updateTransientEffects(now) {
+      transientEffects = transientEffects.filter(item => {
+        const progress = (now - item.started) / item.duration;
+        if (progress >= 1) { removeObject(item.mesh, effectGroup); return false; }
+        item.mesh.scale?.setScalar?.(1 + progress * 2.4);
+        if (item.mesh.material) item.mesh.material.opacity = Math.max(0, .8 * (1 - progress));
+        return true;
+      });
+    }
+    function applyTransitions(transitions) {
+      if (!Array.isArray(transitions)) return;
+      transitions.slice(0, 64).forEach(transition => {
+        const nodeId = String(transition?.id || "");
+        if (!nodeId) return;
+        if (transition.type === "completed") triggerCompletion(nodeId, "completed");
+        if (transition.type === "released" || transition.type === "evidence_updated" || transition.type === "failed_verification") triggerCompletion(nodeId, "released");
+      });
     }
     function updateEdgeHighlight() {
       if (!world || !layoutCache) return;
@@ -378,6 +552,11 @@
       if (nodeGroup.clear) nodeGroup.clear();
       else nodeGroup.children?.slice?.().forEach(child => nodeGroup.remove?.(child));
       nodeMap.clear();
+      haloMap.forEach(mesh => removeObject(mesh, effectGroup));
+      evidenceMap.forEach(mesh => removeObject(mesh, effectGroup));
+      haloMap.clear(); evidenceMap.clear();
+      transientEffects.forEach(item => removeObject(item.mesh, effectGroup));
+      transientEffects = [];
     }
     function clearEdges() {
       if (edgeObject) { removeObject(edgeObject, world); edgeObject = null; }
@@ -453,6 +632,8 @@
         nodeGroup = new three.Group();
         world.add?.(nodeGroup);
         scene.add?.(world);
+        effectGroup = new three.Group();
+        world.add?.(effectGroup);
         scene.add?.(new three.AmbientLight(0x8fb6ff, 1.3));
         const key = new three.DirectionalLight(0x8cf6d8, 2.2);
         key.position?.set?.(6, 12, 10);
@@ -515,11 +696,16 @@
       model.nodes.forEach(node => {
         const button = doc.createElement("button");
         button.type = "button";
-        button.className = `graph-node-option ${node.status}`;
+        button.className = `graph-node-option ${node.status}${node.assignment?.state === "released" ? " released" : ""}`;
         button.dataset && (button.dataset.nodeId = node.id);
         button.setAttribute?.("role", "option");
-        button.setAttribute?.("aria-label", `${node.id}: ${node.title}; ${node.status}`);
-        button.textContent = `${node.id} · ${node.title} · ${node.status}`;
+        const agent = node.assignment?.agent_label || node.assignment?.agent_id || "unassigned";
+        const objective = node.objective || node.title;
+        const why = node.why?.reason || (node.why?.ready ? "Ready to work." : `Blocked by ${(node.why?.blocked_by || []).join(", ") || "dependency"}.`);
+        const outcome = node.evidence?.outcome ? ` · ${node.evidence.outcome}` : "";
+        const verification = node.evidence?.verification?.passed === true ? " · verified" : node.evidence?.verification?.passed === false ? " · verification failed" : "";
+        button.setAttribute?.("aria-label", `${node.id}: ${node.title}; ${node.status}; objective ${objective}; ${why}; agent ${agent}${outcome}${verification}`);
+        button.textContent = `${node.id} · ${node.title} · ${node.status} · objective: ${objective} · ${why} · ${agent}${outcome}${verification}`;
         button.setAttribute?.("aria-selected", node.id === selected ? "true" : "false");
         button.setAttribute?.("aria-current", node.id === selected ? "true" : "false");
         const kind = model.mode === "tasks" ? "task" : "milestone";
@@ -549,7 +735,8 @@
         edges: Array.isArray(supplied.edges) ? supplied.edges : []
       });
       const nextSelected = selectedId ? String(selectedId) : null;
-      const nextHash = JSON.stringify(current);
+      const transitions = Array.isArray(current.transitions) ? current.transitions.slice(0, 64) : [];
+      const nextHash = JSON.stringify({ mode: current.mode, groupId: current.groupId, title: current.title, nodes: current.nodes, edges: current.edges });
       const unchanged = nextHash === modelHash;
       selected = nextSelected;
       if (!unchanged) {
@@ -571,14 +758,18 @@
           if (!three.Mesh || !geometry) return;
           addMesh(new three.Mesh(geometry, materials[node.status] || materials.incomplete), node);
         });
-        edgeObject = makeEdgeObject(layoutCache.edges, false);
+        const blockedIds = new Set(current.nodes.filter(node => node.why && node.why.ready === false).map(node => node.id));
+        edgeObject = makeEdgeObject(layoutCache.edges, false, { blockedIds });
         if (edgeObject) world.add?.(edgeObject);
         target = copyPoint(layoutCache.bounds.center);
         if (!nextSelected) distance = Math.max(12, layoutCache.bounds.radius * 2.5);
         syncLabels(layoutCache);
+        syncEdgePulses();
       } else {
         renderList(current);
       }
+      applyTransitions(transitions);
+      if (!unchanged && active) syncEdgePulses();
       if (selected && !focusMesh(selected, false)) {
         selected = null;
         updateEdgeHighlight();
@@ -606,9 +797,28 @@
     function setReducedMotion(value) {
       reduced = Boolean(value);
       toggleClass(labelLayer, "reduced-motion", reduced);
+      if (reduced) {
+        transientEffects.forEach(item => removeObject(item.mesh, effectGroup));
+        transientEffects = [];
+      }
+      syncEdgePulses();
     }
     function getSnapshot() {
-      return { active, nodeCount: current?.nodes?.length || 0, edgeCount: current?.edges?.length || 0, renderer: active ? "three-webgl" : "svg-fallback", frameCount };
+      const activeNodes = (current?.nodes || []).filter(node => node.status === "active").map(node => node.id);
+      return {
+        active,
+        nodeCount: current?.nodes?.length || 0,
+        edgeCount: current?.edges?.length || 0,
+        renderer: active ? "three-webgl" : "svg-fallback",
+        frameCount,
+        animationFlags: {
+          activeNodes,
+          dependencyPaths: edgePulses.length,
+          completionSweeps: transientEffects.filter(item => item.mesh?.userData?.effect === "transition").length,
+          evidenceMarkers: evidenceMap.size,
+          reducedMotion: reduced
+        }
+      };
     }
     function destroy() {
       if (disposed) return;
@@ -631,5 +841,5 @@
     init();
     return { update, setView, focus, resetCamera, setReducedMotion, getSnapshot, destroy };
   }
-  return { VERSION: "three-r160", normalizeGraphPayload, computeLayout, createThreeGraph };
+  return { VERSION: "three-r160-live", normalizeGraphPayload, computeLayout, createThreeGraph };
 });

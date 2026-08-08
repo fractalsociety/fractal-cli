@@ -1719,17 +1719,38 @@ fn project_view(workspace: &Path, token: &str) -> Result<Value> {
                 Some("checked_out") => "active",
                 _ => "incomplete",
             };
+            let objective = node
+                .get("objective")
+                .or_else(|| node.get("title"))
+                .or_else(|| node.get("instruction"))
+                .and_then(Value::as_str)
+                .unwrap_or(&id);
+            let capability = node
+                .get("capability")
+                .and_then(Value::as_str)
+                .unwrap_or("implementation");
+            let depends_on = graph_predecessors(&project.graph, &id);
+            let why = readiness_projection(&depends_on, assignments, node);
+            let evidence = safe_learning_evidence(project.learning.nodes.get(&id));
             json!({
                 "id": id,
                 "title": node.get("title").or_else(|| node.get("objective")).and_then(Value::as_str).unwrap_or(&id),
+                "objective": bounded_text(Some(objective), 280),
+                "capability": bounded_text(Some(capability), 160),
+                "depends_on": depends_on,
                 "kind": if node.get("capability").and_then(Value::as_str) == Some("control.verify") { "gate" } else { "task" },
                 "status": status,
                 "checked": status == "complete",
                 "line": 0,
                 "instruction": node.get("instruction").and_then(Value::as_str).unwrap_or(""),
-                "gate": node.get("verification_plan").and_then(Value::as_str).unwrap_or(""),
-                "assignment": assignment,
+                "gate": node.get("verification_plan")
+                    .and_then(Value::as_str)
+                    .or_else(|| node.get("efficiency").and_then(|value| value.get("verification_plan")).and_then(Value::as_str))
+                    .unwrap_or(""),
+                "assignment": safe_assignment(assignment),
                 "execution": node.get("execution").cloned().unwrap_or(Value::Null),
+                "why": why,
+                "evidence": evidence,
             })
         })
         .collect();
@@ -1770,6 +1791,7 @@ fn project_view(workspace: &Path, token: &str) -> Result<Value> {
         .as_ref()
         .map(|execution| execution.phase.as_str())
         .unwrap_or("planning");
+    let execution_view = safe_execution_view(project.execution.as_ref());
     Ok(json!({
         "schema": "fractal.execution_graph_view.v1",
         "title": project.project.title,
@@ -1783,6 +1805,7 @@ fn project_view(workspace: &Path, token: &str) -> Result<Value> {
         "source": ".fractal/project.fractal",
         "source_mtime": project.updated_at,
         "development": {"visible": false, "steps": []},
+        "execution": execution_view,
         "run_control": {"available": true, "phase": phase, "token": token},
         "totals": {
             "complete": complete,
@@ -1814,6 +1837,181 @@ fn project_view(workspace: &Path, token: &str) -> Result<Value> {
             "edges": edges
         }]
     }))
+}
+
+/// Return the immutable graph's non-failure predecessors in stable order.  The
+/// execution graph, rather than learning records or assignment side data, is
+/// the authority for dependency explanations.
+fn graph_predecessors(graph: &Value, node_id: &str) -> Vec<String> {
+    let mut predecessors = std::collections::BTreeSet::new();
+    for edge in graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if edge.get("to").and_then(Value::as_str) != Some(node_id)
+            || edge.get("condition").and_then(Value::as_str) == Some("failure")
+        {
+            continue;
+        }
+        if let Some(from) = edge.get("from").and_then(Value::as_str) {
+            if !from.is_empty() {
+                predecessors.insert(from.chars().take(160).collect::<String>());
+            }
+        }
+    }
+    predecessors.into_iter().take(64).collect()
+}
+
+fn readiness_projection(
+    predecessors: &[String],
+    assignments: Option<&std::collections::BTreeMap<String, crate::project_file::ExecutionAssignment>>,
+    node: &Value,
+) -> Value {
+    let blocked_by: Vec<String> = predecessors
+        .iter()
+        .filter(|id| {
+            assignments
+                .and_then(|items| items.get(*id))
+                .map(|assignment| assignment.state.as_str() == "completed")
+                != Some(true)
+        })
+        .cloned()
+        .collect();
+    let ready = blocked_by.is_empty();
+    let reason = if !ready {
+        if blocked_by.len() == 1 {
+            format!("Waiting for dependency {} to complete.", blocked_by[0])
+        } else {
+            format!(
+                "Waiting for dependencies {} to complete.",
+                blocked_by.join(", ")
+            )
+        }
+    } else if predecessors.is_empty() {
+        "No dependencies; node is eligible.".to_owned()
+    } else if let Some(wave) = node
+        .get("execution")
+        .and_then(|execution| execution.get("wave"))
+        .and_then(Value::as_i64)
+    {
+        format!(
+            "Dependencies {} completed; wave {} is eligible.",
+            predecessors.join(", "),
+            wave
+        )
+    } else {
+        format!(
+            "Dependencies {} completed; node is eligible.",
+            predecessors.join(", ")
+        )
+    };
+    json!({ "ready": ready, "blocked_by": blocked_by, "reason": reason })
+}
+
+fn bounded_text(value: Option<&str>, limit: usize) -> Value {
+    value
+        .map(|text| text.chars().take(limit).collect::<String>())
+        .map(Value::String)
+        .unwrap_or(Value::Null)
+}
+
+fn bounded_strings(values: &[String], limit: usize) -> Vec<String> {
+    values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .take(limit)
+        .map(|value| value.chars().take(240).collect())
+        .collect()
+}
+
+/// Keep assignments backwards compatible while excluding flattened unknown
+/// fields that could contain credentials or workspace details.
+fn safe_assignment(
+    assignment: Option<&crate::project_file::ExecutionAssignment>,
+) -> Value {
+    let Some(assignment) = assignment else {
+        return Value::Null;
+    };
+    json!({
+        "agent_id": assignment.agent_id.chars().take(160).collect::<String>(),
+        "agent_label": assignment.agent_label.chars().take(160).collect::<String>(),
+        "state": assignment.state.chars().take(40).collect::<String>(),
+        "checked_out_at": bounded_text(Some(&assignment.checked_out_at), 80),
+        "completed_at": bounded_text(assignment.completed_at.as_deref(), 80),
+        "released_at": bounded_text(assignment.released_at.as_deref(), 80),
+    })
+}
+
+fn safe_learning_evidence(record: Option<&crate::learning_data::NodeRecord>) -> Value {
+    let Some(record) = record else {
+        return json!({
+            "started_at": null,
+            "finished_at": null,
+            "attempt_count": 0,
+            "outcome": null,
+            "failure_code": null,
+            "verification": {"type": null, "passed": null, "evidence_refs": []},
+            "artifacts_produced": [],
+            "consumed_by": [],
+            "executor": {"agent": null, "model": null, "version": null},
+            "human_intervention": false,
+            "reopen_count": 0,
+        });
+    };
+    let verification = record.verification.as_ref().map(|verification| {
+        json!({
+            "type": bounded_text(verification.kind.as_deref(), 80),
+            "passed": verification.passed,
+            "evidence_refs": bounded_strings(&verification.evidence_refs, 32),
+        })
+    }).unwrap_or_else(|| json!({"type": null, "passed": null, "evidence_refs": []}));
+    let executor = record.executor.as_ref().map(|executor| {
+        json!({
+            "agent": bounded_text(executor.agent.as_deref(), 160),
+            "model": bounded_text(executor.model.as_deref(), 160),
+            "version": bounded_text(executor.version.as_deref(), 120),
+        })
+    }).unwrap_or_else(|| json!({"agent": null, "model": null, "version": null}));
+    json!({
+        "started_at": bounded_text(record.started_at.as_deref(), 80),
+        "finished_at": bounded_text(record.finished_at.as_deref(), 80),
+        "attempt_count": record.attempt_count,
+        "outcome": record.outcome.as_ref().and_then(|outcome| serde_json::to_value(outcome).ok()),
+        "failure_code": record.failure_code.as_ref().and_then(|code| serde_json::to_value(code).ok()),
+        "verification": verification,
+        "artifacts_produced": bounded_strings(&record.artifacts_produced, 32),
+        "consumed_by": bounded_strings(&record.consumed_by, 32),
+        "executor": executor,
+        "human_intervention": record.human_intervention,
+        "reopen_count": record.reopen_count,
+    })
+}
+
+fn safe_execution_view(execution: Option<&crate::project_file::ExecutionState>) -> Value {
+    let Some(execution) = execution else {
+        return json!({
+            "phase": "planning",
+            "updated_at": null,
+            "progress": null,
+        });
+    };
+    let progress = execution.progress.as_ref().map(|progress| {
+        json!({
+            "message": progress.message.chars().take(280).collect::<String>(),
+            "step": progress.step,
+            "elapsed_seconds": progress.elapsed_seconds,
+            "agent_label": progress.agent_label.chars().take(160).collect::<String>(),
+            "source": progress.source.chars().take(80).collect::<String>(),
+            "updated_at": bounded_text(Some(&progress.updated_at), 80),
+        })
+    });
+    json!({
+        "phase": bounded_text(Some(&execution.phase), 40),
+        "updated_at": bounded_text(Some(&execution.updated_at), 80),
+        "progress": progress,
+    })
 }
 
 fn resolve_exec_graph_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
@@ -2352,6 +2550,136 @@ mod tests {
         );
         assert!(view.get("totals").is_some());
         assert!(view.get("groups").and_then(Value::as_array).is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_view_falls_back_to_nested_efficiency_verification_plan() {
+        let _guard = test_lock();
+        let root = temp_root("gate-fallback");
+        let workspace = root.join("solo");
+        fs::create_dir_all(workspace.join(".fractal")).unwrap();
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [{
+                "id": "verify",
+                "title": "Verify",
+                "capability": "control.verify",
+                "efficiency": {"verification_plan": "cargo test board"}
+            }],
+            "edges": []
+        });
+        let graph_hash = fractal_contracts::canonical_sha256(&graph).unwrap();
+        graph["graph_hash"] = json!(graph_hash);
+        crate::project_file::persist(&workspace, &graph, "Solo").unwrap();
+        let view = project_view(&workspace, "token").unwrap();
+        let gate = &view["groups"][0]["tasks"][0]["gate"];
+        assert_eq!(gate, "cargo test board");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_view_projects_runtime_progress_readiness_and_safe_learning_evidence() {
+        let _guard = test_lock();
+        let root = temp_root("live-projection");
+        let workspace = root.join("solo");
+        fs::create_dir_all(workspace.join(".fractal")).unwrap();
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [
+                {"id": "plan", "title": "Plan", "objective": "Plan the work", "capability": "planning"},
+                {"id": "build", "title": "Build", "objective": "Build the change", "capability": "code.generate", "execution": {"wave": 2}},
+                {"id": "review", "title": "Review", "objective": "Review evidence", "capability": "control.verify", "execution": {"wave": 3}}
+            ],
+            "edges": [
+                {"from": "plan", "to": "build", "condition": "success"},
+                {"from": "build", "to": "review", "condition": "success"},
+                {"from": "plan", "to": "review", "condition": "failure"}
+            ]
+        });
+        let graph_hash = fractal_contracts::canonical_sha256(&graph).unwrap();
+        graph["graph_hash"] = json!(graph_hash);
+        crate::project_file::persist(&workspace, &graph, "Solo").unwrap();
+        crate::project_file::set_execution_phase(&workspace, "planning").unwrap();
+        crate::project_file::update_planning_progress(
+            &workspace,
+            "Selecting eligible workers",
+            2,
+            17,
+            "Luna · Planner",
+            "planner",
+        )
+        .unwrap();
+        let planning = project_view(&workspace, "token").unwrap();
+        assert_eq!(planning["execution"]["phase"], "planning");
+        assert_eq!(planning["execution"]["progress"]["message"], "Selecting eligible workers");
+        assert_eq!(planning["execution"]["progress"]["agent_label"], "Luna · Planner");
+
+        crate::project_file::checkout_start_node(&workspace, "plan", "agent-plan", "Luna · Planner").unwrap();
+        crate::project_file::finish_node(
+            &workspace,
+            "plan",
+            "agent-plan",
+            crate::learning_data::NodeOutcome::UnverifiedSuccess,
+        )
+        .unwrap();
+        crate::project_file::checkout_start_node(&workspace, "build", "agent-build", "Luna · Builder").unwrap();
+        crate::project_file::record_verification_result(
+            &workspace,
+            "build",
+            false,
+            vec!["evidence:build-failed".to_owned()],
+        )
+        .unwrap();
+        crate::project_file::release_node(
+            &workspace,
+            "build",
+            "agent-build",
+            Some((
+                crate::learning_data::NodeOutcome::FailedVerification,
+                crate::learning_data::FailureCode::WeakVerifier,
+            )),
+        )
+        .unwrap();
+        crate::project_file::record_verification_result(
+            &workspace,
+            "build",
+            false,
+            vec!["evidence:build-failed".to_owned()],
+        )
+        .unwrap();
+
+        // Flattened learning extras are intentionally not part of the public
+        // projection, even when they are non-secret diagnostic fields.
+        let mut document = crate::project_file::load(&workspace).unwrap();
+        document
+            .learning
+            .nodes
+            .get_mut("build")
+            .unwrap()
+            .extra
+            .insert("unknown_flattened".to_owned(), json!("should-not-ship"));
+        fs::write(
+            crate::project_file::path(&workspace),
+            serde_json::to_vec_pretty(&document).unwrap(),
+        )
+        .unwrap();
+
+        let view = project_view(&workspace, "token").unwrap();
+        assert_eq!(view["execution"]["phase"], "executing");
+        let tasks = view["groups"][0]["tasks"].as_array().unwrap();
+        let task = |id: &str| tasks.iter().find(|item| item["id"] == id).unwrap();
+        assert!(task("build")["why"]["ready"].as_bool().unwrap());
+        assert_eq!(task("build")["why"]["blocked_by"].as_array().unwrap().len(), 0);
+        assert_eq!(task("review")["why"]["ready"], false);
+        assert_eq!(task("review")["why"]["blocked_by"], json!(["build"]));
+        assert_eq!(task("build")["assignment"]["state"], "released");
+        assert_eq!(task("build")["evidence"]["failure_code"], "weak_verifier");
+        assert_eq!(task("build")["evidence"]["verification"]["passed"], false);
+        assert_eq!(task("build")["evidence"]["verification"]["evidence_refs"], json!(["evidence:build-failed"]));
+        let encoded = serde_json::to_string(&task("build")["evidence"]).unwrap();
+        assert!(!encoded.contains("unknown_flattened"));
+        assert!(!encoded.contains("should-not-ship"));
         let _ = fs::remove_dir_all(root);
     }
 

@@ -210,6 +210,64 @@ class ThreeGraphContractTests(unittest.TestCase):
         self.assertEqual(views[2]["nodes"], [])
         self.assertTrue(views[2]["mode"] in ("overview", "tasks"))
 
+    def test_normalization_preserves_safe_live_fields_and_defaults_missing_evidence(self):
+        payload = canonical_payload()
+        payload["execution"] = {
+            "phase": "executing",
+            "updated_at": "2026-08-07T21:00:00Z",
+            "progress": {"message": "Assigning verifier", "step": 2, "elapsed_seconds": 12, "agent_label": "Luna · Planner", "source": "planner"},
+        }
+        payload["groups"][0]["tasks"][1].update({
+            "objective": "Run focused verification",
+            "capability": "project.tests.run",
+            "depends_on": ["compile"],
+            "why": {"ready": False, "blocked_by": ["compile"], "reason": "Waiting for dependency compile to complete."},
+            "evidence": {"attempt_count": 2, "outcome": "failed_verification", "verification": {"type": "automated", "passed": False, "evidence_refs": ["evidence:1"]}, "executor": {"agent": "Luna · Verifier"}},
+        })
+        result = node_json(
+            textwrap.dedent(
+                f"""
+                const Graph = require({json.dumps(str(MODULE))});
+                const payload = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+                process.stdout.write(JSON.stringify(Graph.normalizeGraphPayload(payload, 'build-group')));
+                """
+            ),
+            payload,
+        )
+        node = result["nodes"][1]
+        self.assertEqual(result["execution"]["phase"], "executing")
+        self.assertEqual(result["execution"]["progress"]["agent_label"], "Luna · Planner")
+        self.assertEqual(node["objective"], "Run focused verification")
+        self.assertEqual(node["capability"], "project.tests.run")
+        self.assertEqual(node["depends_on"], ["compile"])
+        self.assertFalse(node["why"]["ready"])
+        self.assertEqual(node["why"]["blocked_by"], ["compile"])
+        self.assertEqual(node["evidence"]["verification"]["evidence_refs"], ["evidence:1"])
+        missing = result["nodes"][0]["evidence"]
+        self.assertIsNone(missing["outcome"])
+        self.assertEqual(missing["verification"]["evidence_refs"], [])
+
+    def test_app_transition_classifier_is_deterministic_and_bounded(self):
+        probe = textwrap.dedent(
+            f"""
+            const fs = require('fs'); const vm = require('vm');
+            const source = fs.readFileSync({json.dumps(str(APP))}, 'utf8');
+            const end = source.indexOf('function activeRunModel');
+            const context = {{ window: {{}}, Map, JSON }};
+            vm.runInNewContext(source.slice(0, end), context);
+            const classify = context.window.FractalExecutionTransitions.classifyTransitions;
+            const previous = {{ nodes: [{{ id: 'build', title: 'Build', status: 'incomplete', assignment: null, evidence: {{}} }}] }};
+            const active = {{ nodes: [{{ id: 'build', title: 'Build', status: 'active', assignment: {{ state: 'checked_out', agent_label: 'Luna · Builder' }}, evidence: {{}} }}] }};
+            const released = {{ nodes: [{{ id: 'build', title: 'Build', status: 'incomplete', assignment: {{ state: 'released', agent_label: 'Luna · Builder' }}, evidence: {{ failure_code: 'tool_failure', verification: {{ passed: false }} }} }}] }};
+            process.stdout.write(JSON.stringify({{ first: classify(previous, active), second: classify(active, released) }}));
+            """
+        )
+        transitions = node_json(probe)
+        self.assertEqual([item["type"] for item in transitions["first"]], ["became_active", "assignment_changed"])
+        self.assertIn("released", [item["type"] for item in transitions["second"]])
+        self.assertIn("failed_verification", [item["type"] for item in transitions["second"]])
+        self.assertLessEqual(len(transitions["first"]), 64)
+
     def test_layout_honors_declared_waves_and_excludes_failure_edges(self):
         model = {
             "mode": "tasks",
@@ -374,6 +432,40 @@ class ThreeGraphStaticAndControllerTests(unittest.TestCase):
         self.assertIn("/api/run/pause", app)
         self.assertRegex(app, r"failureGraph|failure-graph")
 
+    def test_completed_settled_hud_does_not_report_waiting_or_dependency_evaluation(self):
+        probe = textwrap.dedent(
+            f"""
+            const fs = require('fs'); const vm = require('vm');
+            const source = fs.readFileSync({json.dumps(str(APP))}, 'utf8');
+            const end = source.indexOf('function disposeThreeGraph');
+            const elements = {{}};
+            function Element() {{ this.textContent = ''; this.classList = {{ toggle() {{}} }}; }}
+            const context = {{
+              window: {{}}, Map, JSON, Set, clearTimeout, setTimeout,
+              document: {{ getElementById(id) {{ return elements[id] ||= new Element(); }} }}
+            }};
+            vm.runInNewContext(source.slice(0, end) + ';globalThis.probe={{renderLiveHud,state}};', context);
+            context.probe.state.selected = {{ id: 'ship' }};
+            context.probe.renderLiveHud({{
+              nodes: [{{ id: 'ship', title: 'Ship', objective: 'Ship the build', status: 'complete', why: {{ ready: true, blocked_by: [], reason: 'Dependencies complete.' }}, assignment: {{ state: 'completed', agent_label: 'Luna · Builder' }} }}],
+              execution: {{ phase: 'completed', progress: {{ message: 'stale planner message', agent_label: 'Luna · Planner' }} }}
+            }}, []);
+            process.stdout.write(JSON.stringify({{
+              objective: elements['live-work-objective'].textContent,
+              why: elements['live-work-why'].textContent,
+              agents: elements['live-work-agents'].textContent
+            }}));
+            """
+        )
+        result = node_json(probe)
+        self.assertIn("complete", result["objective"].lower())
+        self.assertIn("settled", result["objective"].lower())
+        self.assertIn("completed", result["why"].lower())
+        self.assertIn("no agent", result["why"].lower())
+        self.assertNotIn("waiting for", result["objective"].lower())
+        self.assertNotIn("evaluating dependencies", result["why"].lower())
+        self.assertEqual(result["agents"], "No active agent")
+
     def test_controller_webgl_fallback_keeps_svg_and_accessible_list_alive(self):
         model = node_json(
             textwrap.dedent(
@@ -468,10 +560,10 @@ class ThreeGraphStaticAndControllerTests(unittest.TestCase):
             controller.update(model, null); const second = controller.getSnapshot();
             const buttons = list.querySelectorAll('button'); const firstButton = buttons[0];
             if (firstButton) {{ firstButton.dispatchEvent({{ type: 'keydown', key: 'Enter', preventDefault() {{}} }}); firstButton.dispatchEvent({{ type: 'keydown', key: 'ArrowDown', preventDefault() {{}} }}); }}
-            const focused = controller.focus('build'); const unknown = controller.focus('missing'); controller.setReducedMotion(true); controller.setView('overview'); controller.resetCamera();
+            const focused = controller.focus('build'); const unknown = controller.focus('missing'); controller.setReducedMotion(true); const reducedSnapshot = controller.getSnapshot(); controller.setView('overview'); controller.resetCamera();
             const large = {{ mode: 'overview', title: 'large', nodes: Array.from({{ length: 200 }}, (_, i) => ({{ id: `n-${{i}}`, title: `Node ${{i}}`, status: i % 3 ? 'incomplete' : 'active', execution: {{}} }})), edges: Array.from({{ length: 600 }}, (_, i) => ({{ from: `n-${{i % 199}}`, to: `n-${{(i % 199) + 1}}`, condition: 'success' }})), diagnostics: {{}} }};
             const budgetStart = performance.now(); controller.update(large); const budgetMs = performance.now() - budgetStart; const largeSnapshot = controller.getSnapshot();
-            process.stdout.write(JSON.stringify({{ first, second, largeSnapshot, budgetMs, selected, focused, unknown, buttonCount: buttons.length, names: buttons.map(x => x.textContent), aria: buttons.map(x => x.attributes), rafCount: rafs.length }}));
+            process.stdout.write(JSON.stringify({{ first, second, reducedSnapshot, largeSnapshot, budgetMs, selected, focused, unknown, buttonCount: buttons.length, names: buttons.map(x => x.textContent), aria: buttons.map(x => x.attributes), rafCount: rafs.length }}));
             """
         )
         result = node_json(probe, model)
@@ -482,6 +574,8 @@ class ThreeGraphStaticAndControllerTests(unittest.TestCase):
         self.assertEqual(result["first"]["edgeCount"], 2)
         self.assertEqual(result["second"]["nodeCount"], result["first"]["nodeCount"])
         self.assertEqual(result["second"]["edgeCount"], result["first"]["edgeCount"])
+        self.assertTrue(result["reducedSnapshot"]["animationFlags"]["reducedMotion"])
+        self.assertIn("activeNodes", result["reducedSnapshot"]["animationFlags"])
         self.assertEqual(result["largeSnapshot"]["nodeCount"], 200)
         self.assertEqual(result["largeSnapshot"]["edgeCount"], 600)
         self.assertLessEqual(result["budgetMs"], 250.0)
