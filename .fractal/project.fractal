@@ -1,49 +1,24 @@
 {
   "schema": "fractal.project.v1",
   "project": {
-    "slug": "fractal-cli-live-graph",
-    "title": "Fix the completed-state semantics in the newly refined live Three.js execution graph. When every node is complete and no agent is active, the live HUD must clearly say the run is complete and settled; it must not claim it is waiting for ano",
-    "prompt": "Fix the completed-state semantics in the newly refined live Three.js execution graph. When every node is complete and no agent is active, the live HUD must clearly say the run is complete and settled; it must not claim it is waiting for ano",
+    "slug": "fractal-cli-task-detail",
+    "title": "Add a production-quality numbered task inspection feature to the offline Three.js Fractal execution graph. Every task node must visibly expose its canonical execution task number when available. Selecting a numbered task by 3D node, SVG fal",
+    "prompt": "Add a production-quality numbered task inspection feature to the offline Three.js Fractal execution graph. Every task node must visibly expose its canonical execution task number when available. Selecting a numbered task by 3D node, SVG fal",
     "visibility": "private"
   },
-  "graph_hash": "sha256:dbc673087ac1cfd346bee1e76975bc073b96400c48fa43c523070c8fe5aa4bc5",
+  "graph_hash": "sha256:c1a94adf532b8674eb8271857d41d3e79e15fcd57b476b3569df4096cfa9d1d4",
   "graph": {
     "compiler_version": "fractal-harnessc/0.1.0",
     "edges": [
       {
         "condition": "success",
-        "from": "inspect",
-        "to": "patch"
+        "from": "analyze",
+        "to": "implement"
       },
       {
         "condition": "success",
-        "from": "locate",
-        "to": "inspect"
-      },
-      {
-        "condition": "success",
-        "from": "patch",
-        "to": "verify_target"
-      },
-      {
-        "condition": "success",
-        "from": "reproduce",
-        "to": "locate"
-      },
-      {
-        "condition": "success",
-        "from": "verify_related",
-        "to": "complete"
-      },
-      {
-        "condition": "failure",
-        "from": "verify_target",
-        "to": "inspect"
-      },
-      {
-        "condition": "success",
-        "from": "verify_target",
-        "to": "verify_related"
+        "from": "implement",
+        "to": "verify"
       }
     ],
     "execution_flow": {
@@ -52,7 +27,7 @@
         {
           "mode": "sequential",
           "nodes": [
-            "reproduce"
+            "analyze"
           ],
           "parallel_group": null,
           "wave": 1
@@ -60,7 +35,7 @@
         {
           "mode": "sequential",
           "nodes": [
-            "locate"
+            "implement"
           ],
           "parallel_group": null,
           "wave": 2
@@ -68,353 +43,37 @@
         {
           "mode": "sequential",
           "nodes": [
-            "inspect"
+            "verify"
           ],
           "parallel_group": null,
           "wave": 3
-        },
-        {
-          "mode": "sequential",
-          "nodes": [
-            "patch"
-          ],
-          "parallel_group": null,
-          "wave": 4
-        },
-        {
-          "mode": "sequential",
-          "nodes": [
-            "verify_target"
-          ],
-          "parallel_group": null,
-          "wave": 5
-        },
-        {
-          "mode": "sequential",
-          "nodes": [
-            "verify_related"
-          ],
-          "parallel_group": null,
-          "wave": 6
-        },
-        {
-          "mode": "sequential",
-          "nodes": [
-            "complete"
-          ],
-          "parallel_group": null,
-          "wave": 7
         }
       ]
     },
-    "graph_hash": "sha256:dbc673087ac1cfd346bee1e76975bc073b96400c48fa43c523070c8fe5aa4bc5",
-    "graph_id": "fg_a08521a2ec367e5771670e1172bace70",
-    "harness_hash": "sha256:346f32aa59e848dc04172936e5dd4f63f8a4c914dc42d8aecfa7e73fda611d6b",
+    "graph_hash": "sha256:c1a94adf532b8674eb8271857d41d3e79e15fcd57b476b3569df4096cfa9d1d4",
+    "graph_id": "fg_5cf303f52ec4f8489800e86fd3952522",
+    "harness_hash": "sha256:e46d406fcfb2887e3b97211d4cecc27ac20cfdaee178d44281ab0803c1827233",
     "nodes": [
-      {
-        "artifacts_produced": [],
-        "attempt_count": 0,
-        "budget": {
-          "timeout_ms": 5000
-        },
-        "capability": "control.complete",
-        "consumed_by": [],
-        "created_at": "2026-08-08T01:52:57Z",
-        "depends_on": [
-          "verify_related"
-        ],
-        "execution": {
-          "mode": "sequential",
-          "parallel_group": null,
-          "task_number": "7.1",
-          "wave": 7
-        },
-        "human_intervention": false,
-        "id": "complete",
-        "kind": "control",
-        "memory_scopes": [
-          "harness:python_repair",
-          "repo:src",
-          "repo:tests",
-          "work:goal"
-        ],
-        "node_type": "control",
-        "objective": "complete",
-        "policy_contract": {
-          "allowed_commands": [],
-          "allowed_writes": [],
-          "budgets": {
-            "max_attempts": 1,
-            "max_cost_usd": 20,
-            "max_diff_lines": 500,
-            "max_files_changed": 6,
-            "max_input_tokens": 250000,
-            "max_minutes": 60,
-            "max_output_tokens": 50000,
-            "max_steps": 40
-          },
-          "capability": "control.complete",
-          "decision": "allow",
-          "evidence_requirements": [
-            "commands",
-            "exit_codes",
-            "stderr",
-            "stdout"
-          ],
-          "external_side_effects": false,
-          "network": {
-            "allowed_destinations": [],
-            "default": "deny"
-          },
-          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
-          "provenance": "builtin:safe-default.v1",
-          "sandbox_profile": "local-work-v1",
-          "schema": "fractal.node_policy_contract.v1",
-          "verifier_ids": [
-            "independent"
-          ]
-        },
-        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
-        "policy_provenance": "builtin:safe-default.v1",
-        "reopen_count": 0,
-        "requires": [
-          "related_tests_passed"
-        ],
-        "route_candidates": [
-          "control://control-complete-default"
-        ]
-      },
-      {
-        "artifacts_produced": [],
-        "attempt_count": 0,
-        "budget": {
-          "timeout_ms": 15000
-        },
-        "capability": "code.read",
-        "consumed_by": [],
-        "created_at": "2026-08-08T01:52:57Z",
-        "depends_on": [
-          "locate",
-          "verify_target"
-        ],
-        "execution": {
-          "mode": "sequential",
-          "parallel_group": null,
-          "task_number": "3.1",
-          "wave": 3
-        },
-        "human_intervention": false,
-        "id": "inspect",
-        "kind": "inference",
-        "memory_scopes": [
-          "harness:python_repair",
-          "repo:src",
-          "repo:tests",
-          "work:goal"
-        ],
-        "node_type": "implementation",
-        "objective": "inspect",
-        "policy_contract": {
-          "allowed_commands": [],
-          "allowed_writes": [],
-          "budgets": {
-            "max_attempts": 1,
-            "max_cost_usd": 20,
-            "max_diff_lines": 500,
-            "max_files_changed": 6,
-            "max_input_tokens": 250000,
-            "max_minutes": 60,
-            "max_output_tokens": 50000,
-            "max_steps": 40
-          },
-          "capability": "code.read",
-          "decision": "deny",
-          "evidence_requirements": [
-            "commands",
-            "exit_codes",
-            "stderr",
-            "stdout"
-          ],
-          "external_side_effects": false,
-          "network": {
-            "allowed_destinations": [],
-            "default": "deny"
-          },
-          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
-          "provenance": "builtin:safe-default.v1",
-          "sandbox_profile": "deny",
-          "schema": "fractal.node_policy_contract.v1",
-          "verifier_ids": [
-            "independent"
-          ]
-        },
-        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
-        "policy_provenance": "builtin:safe-default.v1",
-        "reopen_count": 0,
-        "requires": [
-          "source_located"
-        ],
-        "route_candidates": [
-          "mlx://code-read-default"
-        ]
-      },
-      {
-        "artifacts_produced": [],
-        "attempt_count": 0,
-        "budget": {
-          "timeout_ms": 15000
-        },
-        "capability": "code.search",
-        "consumed_by": [],
-        "created_at": "2026-08-08T01:52:57Z",
-        "depends_on": [
-          "reproduce"
-        ],
-        "execution": {
-          "mode": "sequential",
-          "parallel_group": null,
-          "task_number": "2.1",
-          "wave": 2
-        },
-        "human_intervention": false,
-        "id": "locate",
-        "kind": "inference",
-        "memory_scopes": [
-          "harness:python_repair",
-          "repo:src",
-          "repo:tests",
-          "work:goal"
-        ],
-        "node_type": "implementation",
-        "objective": "locate",
-        "policy_contract": {
-          "allowed_commands": [],
-          "allowed_writes": [],
-          "budgets": {
-            "max_attempts": 1,
-            "max_cost_usd": 20,
-            "max_diff_lines": 500,
-            "max_files_changed": 6,
-            "max_input_tokens": 250000,
-            "max_minutes": 60,
-            "max_output_tokens": 50000,
-            "max_steps": 40
-          },
-          "capability": "code.search",
-          "decision": "deny",
-          "evidence_requirements": [
-            "commands",
-            "exit_codes",
-            "stderr",
-            "stdout"
-          ],
-          "external_side_effects": false,
-          "network": {
-            "allowed_destinations": [],
-            "default": "deny"
-          },
-          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
-          "provenance": "builtin:safe-default.v1",
-          "sandbox_profile": "deny",
-          "schema": "fractal.node_policy_contract.v1",
-          "verifier_ids": [
-            "independent"
-          ]
-        },
-        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
-        "policy_provenance": "builtin:safe-default.v1",
-        "reopen_count": 0,
-        "requires": [
-          "failure_reproduced"
-        ],
-        "route_candidates": [
-          "mlx://code-search-default"
-        ]
-      },
       {
         "artifacts_produced": [],
         "attempt_count": 0,
         "budget": {
           "timeout_ms": 30000
         },
-        "capability": "code.edit",
+        "capability": "content.analyze",
         "consumed_by": [],
-        "created_at": "2026-08-08T01:52:57Z",
-        "depends_on": [
-          "inspect"
-        ],
-        "execution": {
-          "mode": "sequential",
-          "parallel_group": null,
-          "task_number": "4.1",
-          "wave": 4
-        },
-        "human_intervention": false,
-        "id": "patch",
-        "kind": "container",
-        "memory_scopes": [
-          "harness:python_repair",
-          "repo:src",
-          "repo:tests",
-          "work:goal"
-        ],
-        "node_type": "implementation",
-        "objective": "patch",
-        "policy_contract": {
-          "allowed_commands": [],
-          "allowed_writes": [],
-          "budgets": {
-            "max_attempts": 1,
-            "max_cost_usd": 20,
-            "max_diff_lines": 500,
-            "max_files_changed": 6,
-            "max_input_tokens": 250000,
-            "max_minutes": 60,
-            "max_output_tokens": 50000,
-            "max_steps": 40
-          },
-          "capability": "code.edit",
-          "decision": "allow",
-          "evidence_requirements": [
-            "commands",
-            "exit_codes",
-            "stderr",
-            "stdout"
-          ],
-          "external_side_effects": false,
-          "network": {
-            "allowed_destinations": [],
-            "default": "deny"
-          },
-          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
-          "provenance": "builtin:safe-default.v1",
-          "sandbox_profile": "local-work-v1",
-          "schema": "fractal.node_policy_contract.v1",
-          "verifier_ids": [
-            "independent"
-          ]
-        },
-        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
-        "policy_provenance": "builtin:safe-default.v1",
-        "reopen_count": 0,
-        "requires": [
-          "incorrect_assumption_identified"
-        ],
-        "route_candidates": [
-          "apple-container://code-edit-default"
-        ],
-        "sandbox_profile": "apple-container://local-work-v1"
-      },
-      {
-        "artifacts_produced": [],
-        "attempt_count": 0,
-        "budget": {
-          "timeout_ms": 120000
-        },
-        "capability": "python.tests.execute",
-        "consumed_by": [],
-        "created_at": "2026-08-08T01:52:57Z",
+        "created_at": "2026-08-08T02:11:48Z",
         "depends_on": [],
+        "efficiency": {
+          "confidence_still_useful": "1",
+          "current_assumptions": [],
+          "dependencies": [],
+          "estimated_remaining_tokens": 4000,
+          "expected_artifact": "An analysis of the work goal.",
+          "files_or_systems_affected": [],
+          "similarity_to_other_active_nodes": {},
+          "verification_plan": "The verify node checks the implemented result."
+        },
         "execution": {
           "mode": "sequential",
           "parallel_group": null,
@@ -422,16 +81,13 @@
           "wave": 1
         },
         "human_intervention": false,
-        "id": "reproduce",
-        "kind": "container",
+        "id": "analyze",
+        "kind": "inference",
         "memory_scopes": [
-          "harness:python_repair",
-          "repo:src",
-          "repo:tests",
           "work:goal"
         ],
-        "node_type": "verification",
-        "objective": "reproduce",
+        "node_type": "implementation",
+        "objective": "analyze",
         "policy_contract": {
           "allowed_commands": [],
           "allowed_writes": [],
@@ -445,7 +101,7 @@
             "max_output_tokens": 50000,
             "max_steps": 40
           },
-          "capability": "python.tests.execute",
+          "capability": "content.analyze",
           "decision": "allow",
           "evidence_requirements": [
             "commands",
@@ -468,12 +124,11 @@
         },
         "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
         "policy_provenance": "builtin:safe-default.v1",
-        "ready_at": "2026-08-08T01:52:57Z",
+        "ready_at": "2026-08-08T02:11:48Z",
         "reopen_count": 0,
         "route_candidates": [
-          "apple-container://python-tests-execute-default"
-        ],
-        "sandbox_profile": "apple-container://local-work-v1"
+          "mlx://content-analyze-default"
+        ]
       },
       {
         "artifacts_produced": [],
@@ -481,29 +136,38 @@
         "budget": {
           "timeout_ms": 120000
         },
-        "capability": "python.tests.execute",
+        "capability": "code.generate",
         "consumed_by": [],
-        "created_at": "2026-08-08T01:52:57Z",
+        "created_at": "2026-08-08T02:11:48Z",
         "depends_on": [
-          "verify_target"
+          "analyze"
         ],
+        "efficiency": {
+          "confidence_still_useful": "1",
+          "current_assumptions": [],
+          "dependencies": [
+            "analyze"
+          ],
+          "estimated_remaining_tokens": 12000,
+          "expected_artifact": "The implemented outcome for the work goal.",
+          "files_or_systems_affected": [],
+          "similarity_to_other_active_nodes": {},
+          "verification_plan": "The verify node checks the implemented result."
+        },
         "execution": {
           "mode": "sequential",
           "parallel_group": null,
-          "task_number": "6.1",
-          "wave": 6
+          "task_number": "2.1",
+          "wave": 2
         },
         "human_intervention": false,
-        "id": "verify_related",
-        "kind": "container",
+        "id": "implement",
+        "kind": "inference",
         "memory_scopes": [
-          "harness:python_repair",
-          "repo:src",
-          "repo:tests",
           "work:goal"
         ],
-        "node_type": "verification",
-        "objective": "verify_related",
+        "node_type": "implementation",
+        "objective": "implement",
         "policy_contract": {
           "allowed_commands": [],
           "allowed_writes": [],
@@ -517,7 +181,7 @@
             "max_output_tokens": 50000,
             "max_steps": 40
           },
-          "capability": "python.tests.execute",
+          "capability": "code.generate",
           "decision": "allow",
           "evidence_requirements": [
             "commands",
@@ -542,42 +206,50 @@
         "policy_provenance": "builtin:safe-default.v1",
         "reopen_count": 0,
         "requires": [
-          "target_test_passed"
+          "analysis_complete"
         ],
         "route_candidates": [
-          "apple-container://python-tests-execute-default"
-        ],
-        "sandbox_profile": "apple-container://local-work-v1"
+          "mlx://code-generate-default"
+        ]
       },
       {
         "artifacts_produced": [],
         "attempt_count": 0,
         "budget": {
-          "timeout_ms": 120000
+          "timeout_ms": 60000
         },
-        "capability": "python.tests.execute",
+        "capability": "result.verify",
         "consumed_by": [],
-        "created_at": "2026-08-08T01:52:57Z",
+        "created_at": "2026-08-08T02:11:48Z",
         "depends_on": [
-          "patch"
+          "implement"
         ],
+        "efficiency": {
+          "confidence_still_useful": "1",
+          "current_assumptions": [],
+          "dependencies": [
+            "implement"
+          ],
+          "estimated_remaining_tokens": 4000,
+          "expected_artifact": "A verified result for the work goal.",
+          "files_or_systems_affected": [],
+          "similarity_to_other_active_nodes": {},
+          "verification_plan": "The result.verify capability confirms the outcome."
+        },
         "execution": {
           "mode": "sequential",
           "parallel_group": null,
-          "task_number": "5.1",
-          "wave": 5
+          "task_number": "3.1",
+          "wave": 3
         },
         "human_intervention": false,
-        "id": "verify_target",
-        "kind": "container",
+        "id": "verify",
+        "kind": "verification",
         "memory_scopes": [
-          "harness:python_repair",
-          "repo:src",
-          "repo:tests",
           "work:goal"
         ],
         "node_type": "verification",
-        "objective": "verify_target",
+        "objective": "verify",
         "policy_contract": {
           "allowed_commands": [],
           "allowed_writes": [],
@@ -591,7 +263,7 @@
             "max_output_tokens": 50000,
             "max_steps": 40
           },
-          "capability": "python.tests.execute",
+          "capability": "result.verify",
           "decision": "allow",
           "evidence_requirements": [
             "commands",
@@ -616,10 +288,10 @@
         "policy_provenance": "builtin:safe-default.v1",
         "reopen_count": 0,
         "requires": [
-          "patch_written"
+          "implementation_complete"
         ],
         "route_candidates": [
-          "apple-container://python-tests-execute-default"
+          "mlx://result-verify-default"
         ],
         "sandbox_profile": "apple-container://local-work-v1"
       }
@@ -632,209 +304,53 @@
     "policy_schema": "fractal.harness_policy.v1",
     "schema": "fractal.execution_graph.v1",
     "target": "darwin-arm64",
-    "work_hash": "sha256:33a251263a59ab0f94b09060e848bd7542c1c36c6871fe2145382c28ae1d1d15"
+    "work_hash": "sha256:b3923435b1487e6e50bd7cd68c900c369b0bde39b72a0789d9fc1533f69ddaa8"
   },
   "execution": {
     "schema": "fractal.execution_state.v1",
-    "phase": "completed",
-    "assignments": {
-      "complete": {
-        "agent_id": "luna/live-graph-verify",
-        "agent_label": "Luna · Live Graph Verification",
-        "state": "completed",
-        "checked_out_at": "2026-08-08T01:56:31Z",
-        "completed_at": "2026-08-08T01:56:36Z"
-      },
-      "inspect": {
-        "agent_id": "luna/live-graph-implement",
-        "agent_label": "Luna · Live Graph Implementation",
-        "state": "completed",
-        "checked_out_at": "2026-08-08T01:54:01Z",
-        "completed_at": "2026-08-08T01:54:49Z"
-      },
-      "locate": {
-        "agent_id": "luna/live-graph-implement",
-        "agent_label": "Luna · Live Graph Implementation",
-        "state": "completed",
-        "checked_out_at": "2026-08-08T01:53:50Z",
-        "completed_at": "2026-08-08T01:53:58Z"
-      },
-      "patch": {
-        "agent_id": "luna/live-graph-implement",
-        "agent_label": "Luna · Live Graph Implementation",
-        "state": "completed",
-        "checked_out_at": "2026-08-08T01:54:52Z",
-        "completed_at": "2026-08-08T01:55:06Z"
-      },
-      "reproduce": {
-        "agent_id": "luna/live-graph-implement",
-        "agent_label": "Luna · Live Graph Implementation",
-        "state": "completed",
-        "checked_out_at": "2026-08-08T01:53:30Z",
-        "completed_at": "2026-08-08T01:53:47Z"
-      },
-      "verify_related": {
-        "agent_id": "luna/live-graph-verify",
-        "agent_label": "Luna · Live Graph Verification",
-        "state": "completed",
-        "checked_out_at": "2026-08-08T01:56:09Z",
-        "completed_at": "2026-08-08T01:56:19Z"
-      },
-      "verify_target": {
-        "agent_id": "luna/live-graph-verify",
-        "agent_label": "Luna · Live Graph Verification",
-        "state": "completed",
-        "checked_out_at": "2026-08-08T01:55:25Z",
-        "completed_at": "2026-08-08T01:56:06Z"
-      }
-    },
-    "updated_at": "2026-08-08T01:56:36Z"
+    "phase": "executing",
+    "assignments": {},
+    "updated_at": "2026-08-08T02:11:48Z"
   },
   "learning": {
     "schema": "fractal.learning.v1",
     "nodes": {
-      "complete": {
-        "node_id": "complete",
-        "node_type": "control",
-        "objective": "complete",
-        "depends_on": [
-          "verify_related"
-        ],
-        "created_at": "2026-08-08T01:52:57Z",
-        "started_at": "2026-08-08T01:56:31Z",
-        "finished_at": "2026-08-08T01:56:36Z",
-        "executor": {
-          "agent": "Luna · Live Graph Verification",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "inspect": {
-        "node_id": "inspect",
+      "analyze": {
+        "node_id": "analyze",
         "node_type": "implementation",
-        "objective": "inspect",
-        "depends_on": [
-          "locate",
-          "verify_target"
-        ],
-        "created_at": "2026-08-08T01:52:57Z",
-        "started_at": "2026-08-08T01:54:01Z",
-        "finished_at": "2026-08-08T01:54:49Z",
-        "executor": {
-          "agent": "Luna · Live Graph Implementation",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "locate": {
-        "node_id": "locate",
-        "node_type": "implementation",
-        "objective": "locate",
-        "depends_on": [
-          "reproduce"
-        ],
-        "created_at": "2026-08-08T01:52:57Z",
-        "started_at": "2026-08-08T01:53:50Z",
-        "finished_at": "2026-08-08T01:53:58Z",
-        "executor": {
-          "agent": "Luna · Live Graph Implementation",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "patch": {
-        "node_id": "patch",
-        "node_type": "implementation",
-        "objective": "patch",
-        "depends_on": [
-          "inspect"
-        ],
-        "created_at": "2026-08-08T01:52:57Z",
-        "started_at": "2026-08-08T01:54:52Z",
-        "finished_at": "2026-08-08T01:55:06Z",
-        "executor": {
-          "agent": "Luna · Live Graph Implementation",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "reproduce": {
-        "node_id": "reproduce",
-        "node_type": "implementation",
-        "objective": "reproduce",
+        "objective": "analyze",
         "depends_on": [],
-        "created_at": "2026-08-08T01:52:57Z",
-        "ready_at": "2026-08-08T01:52:57Z",
-        "started_at": "2026-08-08T01:53:30Z",
-        "finished_at": "2026-08-08T01:53:47Z",
-        "executor": {
-          "agent": "Luna · Live Graph Implementation",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
+        "created_at": "2026-08-08T02:11:48Z",
+        "ready_at": "2026-08-08T02:11:48Z",
+        "attempt_count": 0,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
         "reopen_count": 0
       },
-      "verify_related": {
-        "node_id": "verify_related",
+      "implement": {
+        "node_id": "implement",
         "node_type": "implementation",
-        "objective": "verify_related",
+        "objective": "implement",
         "depends_on": [
-          "verify_target"
+          "analyze"
         ],
-        "created_at": "2026-08-08T01:52:57Z",
-        "started_at": "2026-08-08T01:56:09Z",
-        "finished_at": "2026-08-08T01:56:19Z",
-        "executor": {
-          "agent": "Luna · Live Graph Verification",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
+        "created_at": "2026-08-08T02:11:48Z",
+        "attempt_count": 0,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
         "reopen_count": 0
       },
-      "verify_target": {
-        "node_id": "verify_target",
-        "node_type": "implementation",
-        "objective": "verify_target",
+      "verify": {
+        "node_id": "verify",
+        "node_type": "verification",
+        "objective": "verify",
         "depends_on": [
-          "patch"
+          "implement"
         ],
-        "created_at": "2026-08-08T01:52:57Z",
-        "started_at": "2026-08-08T01:55:25Z",
-        "finished_at": "2026-08-08T01:56:06Z",
-        "executor": {
-          "agent": "Luna · Live Graph Verification",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
+        "created_at": "2026-08-08T02:11:48Z",
+        "attempt_count": 0,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -955,7 +471,7 @@
       "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c"
     }
   },
-  "updated_at": "2026-08-08T01:56:36Z",
+  "updated_at": "2026-08-08T02:11:48Z",
   "catalog": {
     "audit": {
       "auditor": "fractal graph audit",
