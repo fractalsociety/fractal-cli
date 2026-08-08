@@ -1,44 +1,24 @@
 {
   "schema": "fractal.project.v1",
   "project": {
-    "slug": "fractal-cli-three-graph",
-    "title": "Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters, lu",
-    "prompt": "Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters, lu",
+    "slug": "fractal-cli-live-graph",
+    "title": "Refine the existing offline Three.js Fractal execution graph so an active run visibly communicates what agents are doing and why. Preserve the current API, master mode, SVG fallback, accessibility, reduced motion, deterministic layout, and ",
+    "prompt": "Refine the existing offline Three.js Fractal execution graph so an active run visibly communicates what agents are doing and why. Preserve the current API, master mode, SVG fallback, accessibility, reduced motion, deterministic layout, and ",
     "visibility": "private"
   },
-  "graph_hash": "sha256:95a5d9beaa8ec861275cdb1a26b524ac329d4f674a9d07a0b8b2b8e0c0a94f33",
+  "graph_hash": "sha256:6457c750240a7c3ca9956843c8c104bd6a5cfdc66de6fb9dd70476ee97b43dbc",
   "graph": {
     "compiler_version": "fractal-harnessc/0.1.0",
     "edges": [
       {
         "condition": "success",
-        "from": "acceptance",
-        "to": "complete"
-      },
-      {
-        "condition": "success",
-        "from": "author_tests",
-        "to": "review"
-      },
-      {
-        "condition": "success",
-        "from": "implement",
-        "to": "review"
-      },
-      {
-        "condition": "success",
-        "from": "plan",
-        "to": "author_tests"
-      },
-      {
-        "condition": "success",
-        "from": "plan",
+        "from": "analyze",
         "to": "implement"
       },
       {
         "condition": "success",
-        "from": "review",
-        "to": "acceptance"
+        "from": "implement",
+        "to": "verify"
       }
     ],
     "execution_flow": {
@@ -47,407 +27,52 @@
         {
           "mode": "sequential",
           "nodes": [
-            "plan"
+            "analyze"
           ],
           "parallel_group": null,
           "wave": 1
         },
         {
-          "mode": "parallel",
+          "mode": "sequential",
           "nodes": [
-            "author_tests",
             "implement"
           ],
-          "parallel_group": "wave-2",
+          "parallel_group": null,
           "wave": 2
         },
         {
           "mode": "sequential",
           "nodes": [
-            "review"
+            "verify"
           ],
           "parallel_group": null,
           "wave": 3
-        },
-        {
-          "mode": "sequential",
-          "nodes": [
-            "acceptance"
-          ],
-          "parallel_group": null,
-          "wave": 4
-        },
-        {
-          "mode": "sequential",
-          "nodes": [
-            "complete"
-          ],
-          "parallel_group": null,
-          "wave": 5
         }
       ]
     },
-    "graph_hash": "sha256:95a5d9beaa8ec861275cdb1a26b524ac329d4f674a9d07a0b8b2b8e0c0a94f33",
-    "graph_id": "fg_ee2cf3da72a51239e71cbe564fb4c70b",
-    "harness_hash": "sha256:432ccff8b63a5057cedefdb57d1bedfc7844fa20c68b05686acef5fe2973a0de",
+    "graph_hash": "sha256:6457c750240a7c3ca9956843c8c104bd6a5cfdc66de6fb9dd70476ee97b43dbc",
+    "graph_id": "fg_1aae594c1ad72fbd285aa380a8af991e",
+    "harness_hash": "sha256:6540221c15418cfbf64b4e7558ce6b3bc073f4fe0b1f8d89a0dec87bcf1631de",
     "nodes": [
       {
         "artifacts_produced": [],
         "attempt_count": 0,
         "budget": {
-          "timeout_ms": 120000
+          "timeout_ms": 30000
         },
-        "capability": "python.tests.execute",
+        "capability": "content.analyze",
         "consumed_by": [],
-        "created_at": "2026-08-08T00:37:07Z",
-        "depends_on": [
-          "review"
-        ],
-        "efficiency": {
-          "confidence_still_useful": "1",
-          "current_assumptions": [],
-          "dependencies": [
-            "review"
-          ],
-          "estimated_remaining_tokens": 4000,
-          "expected_artifact": "A fully passing unittest run.",
-          "files_or_systems_affected": [],
-          "similarity_to_other_active_nodes": {},
-          "verification_plan": "python3 -m unittest exits successfully."
-        },
-        "execution": {
-          "mode": "sequential",
-          "parallel_group": null,
-          "task_number": "4.1",
-          "wave": 4
-        },
-        "human_intervention": false,
-        "id": "acceptance",
-        "instruction": "Run the whole unittest suite; every test must pass before completion.",
-        "kind": "cursor",
-        "memory_scopes": [
-          "acceptance:spec",
-          "work:goal",
-          "workspace:root"
-        ],
-        "node_type": "verification",
-        "objective": "Run the whole unittest suite; every test must pass before completion.",
-        "policy_contract": {
-          "allowed_commands": [],
-          "allowed_writes": [],
-          "budgets": {
-            "max_attempts": 1,
-            "max_cost_usd": 20,
-            "max_diff_lines": 500,
-            "max_files_changed": 6,
-            "max_input_tokens": 250000,
-            "max_minutes": 60,
-            "max_output_tokens": 50000,
-            "max_steps": 40
-          },
-          "capability": "python.tests.execute",
-          "decision": "allow",
-          "evidence_requirements": [
-            "commands",
-            "exit_codes",
-            "stderr",
-            "stdout"
-          ],
-          "external_side_effects": false,
-          "network": {
-            "allowed_destinations": [],
-            "default": "deny"
-          },
-          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
-          "provenance": "builtin:safe-default.v1",
-          "sandbox_profile": "local-work-v1",
-          "schema": "fractal.node_policy_contract.v1",
-          "verifier_ids": [
-            "independent"
-          ]
-        },
-        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
-        "policy_provenance": "builtin:safe-default.v1",
-        "reopen_count": 0,
-        "requires": [
-          "reviewed"
-        ],
-        "route_candidates": [
-          "cursor://python-tests-execute-default"
-        ]
-      },
-      {
-        "artifacts_produced": [],
-        "attempt_count": 0,
-        "budget": {
-          "timeout_ms": 180000
-        },
-        "capability": "code.generate",
-        "consumed_by": [],
-        "created_at": "2026-08-08T00:37:07Z",
-        "depends_on": [
-          "plan"
-        ],
-        "efficiency": {
-          "confidence_still_useful": "1",
-          "current_assumptions": [],
-          "dependencies": [
-            "plan"
-          ],
-          "estimated_remaining_tokens": 16000,
-          "expected_artifact": "A unittest file covering every INTERFACE.md benchmark.",
-          "files_or_systems_affected": [],
-          "similarity_to_other_active_nodes": {},
-          "verification_plan": "The acceptance node runs the whole unittest suite."
-        },
-        "execution": {
-          "mode": "parallel",
-          "parallel_group": "wave-2",
-          "task_number": "2.1",
-          "wave": 2
-        },
-        "human_intervention": false,
-        "id": "author_tests",
-        "instruction": "Read INTERFACE.md and write a Python `unittest` test file (test_<module>.py) that imports the module and rigorously tests EVERY benchmark behavior and edge case the plan listed for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. The plan's benchmarks are the bar for high performance, so make the tests demanding — cover the edge cases and failure modes, not just the happy path. Do not write the implementation — another agent is doing that in parallel.",
-        "kind": "codex",
-        "memory_scopes": [
-          "work:goal",
-          "workspace:root"
-        ],
-        "node_type": "implementation",
-        "objective": "Read INTERFACE.md and write a Python `unittest` test file (test_<module>.py) that imports the module and rigorously tests EVERY benchmark behavior and edge case the plan listed for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. The plan's benchmarks are the bar for high performance, so make the tests demanding — cover the edge cases and failure modes, not just the happy path. Do not write the implementation — another agent is doing that in parallel.",
-        "policy_contract": {
-          "allowed_commands": [],
-          "allowed_writes": [],
-          "budgets": {
-            "max_attempts": 1,
-            "max_cost_usd": 20,
-            "max_diff_lines": 500,
-            "max_files_changed": 6,
-            "max_input_tokens": 250000,
-            "max_minutes": 60,
-            "max_output_tokens": 50000,
-            "max_steps": 40
-          },
-          "capability": "code.generate",
-          "decision": "allow",
-          "evidence_requirements": [
-            "commands",
-            "exit_codes",
-            "stderr",
-            "stdout"
-          ],
-          "external_side_effects": false,
-          "network": {
-            "allowed_destinations": [],
-            "default": "deny"
-          },
-          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
-          "provenance": "builtin:safe-default.v1",
-          "sandbox_profile": "local-work-v1",
-          "schema": "fractal.node_policy_contract.v1",
-          "verifier_ids": [
-            "independent"
-          ]
-        },
-        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
-        "policy_provenance": "builtin:safe-default.v1",
-        "reopen_count": 0,
-        "requires": [
-          "plan_ready"
-        ],
-        "route_candidates": [
-          "codex://code-generate-default"
-        ]
-      },
-      {
-        "artifacts_produced": [],
-        "attempt_count": 0,
-        "budget": {
-          "timeout_ms": 5000
-        },
-        "capability": "control.complete",
-        "consumed_by": [],
-        "created_at": "2026-08-08T00:37:07Z",
-        "depends_on": [
-          "acceptance"
-        ],
-        "efficiency": {
-          "confidence_still_useful": "1",
-          "current_assumptions": [],
-          "dependencies": [
-            "acceptance"
-          ],
-          "estimated_remaining_tokens": 500,
-          "expected_artifact": "The verified-outcome completion marker.",
-          "files_or_systems_affected": [],
-          "similarity_to_other_active_nodes": {},
-          "verification_plan": "The acceptance_passed state is present before completion."
-        },
-        "execution": {
-          "mode": "sequential",
-          "parallel_group": null,
-          "task_number": "5.1",
-          "wave": 5
-        },
-        "human_intervention": false,
-        "id": "complete",
-        "instruction": "Implementation and tests were built in parallel, cross-checked, and verified — mark the outcome complete.",
-        "kind": "codex",
-        "memory_scopes": [
-          "work:goal"
-        ],
-        "node_type": "control",
-        "objective": "Implementation and tests were built in parallel, cross-checked, and verified — mark the outcome complete.",
-        "policy_contract": {
-          "allowed_commands": [],
-          "allowed_writes": [],
-          "budgets": {
-            "max_attempts": 1,
-            "max_cost_usd": 20,
-            "max_diff_lines": 500,
-            "max_files_changed": 6,
-            "max_input_tokens": 250000,
-            "max_minutes": 60,
-            "max_output_tokens": 50000,
-            "max_steps": 40
-          },
-          "capability": "control.complete",
-          "decision": "allow",
-          "evidence_requirements": [
-            "commands",
-            "exit_codes",
-            "stderr",
-            "stdout"
-          ],
-          "external_side_effects": false,
-          "network": {
-            "allowed_destinations": [],
-            "default": "deny"
-          },
-          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
-          "provenance": "builtin:safe-default.v1",
-          "sandbox_profile": "local-work-v1",
-          "schema": "fractal.node_policy_contract.v1",
-          "verifier_ids": [
-            "independent"
-          ]
-        },
-        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
-        "policy_provenance": "builtin:safe-default.v1",
-        "reopen_count": 0,
-        "requires": [
-          "acceptance_passed"
-        ],
-        "route_candidates": [
-          "codex://control-complete-default"
-        ]
-      },
-      {
-        "artifacts_produced": [],
-        "attempt_count": 0,
-        "budget": {
-          "timeout_ms": 180000
-        },
-        "capability": "code.generate",
-        "consumed_by": [],
-        "created_at": "2026-08-08T00:37:07Z",
-        "depends_on": [
-          "plan"
-        ],
-        "efficiency": {
-          "confidence_still_useful": "1",
-          "current_assumptions": [],
-          "dependencies": [
-            "plan"
-          ],
-          "estimated_remaining_tokens": 20000,
-          "expected_artifact": "The module file specified by INTERFACE.md.",
-          "files_or_systems_affected": [],
-          "similarity_to_other_active_nodes": {},
-          "verification_plan": "The acceptance node runs the whole unittest suite."
-        },
-        "execution": {
-          "mode": "parallel",
-          "parallel_group": "wave-2",
-          "task_number": "2.2",
-          "wave": 2
-        },
-        "human_intervention": false,
-        "id": "implement",
-        "instruction": "Read INTERFACE.md and implement the module file exactly as specified for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. Self-contained, no network. Do not write tests — another agent is doing that in parallel.",
-        "kind": "codex",
-        "memory_scopes": [
-          "work:goal",
-          "workspace:root"
-        ],
-        "node_type": "implementation",
-        "objective": "Read INTERFACE.md and implement the module file exactly as specified for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. Self-contained, no network. Do not write tests — another agent is doing that in parallel.",
-        "policy_contract": {
-          "allowed_commands": [],
-          "allowed_writes": [],
-          "budgets": {
-            "max_attempts": 1,
-            "max_cost_usd": 20,
-            "max_diff_lines": 500,
-            "max_files_changed": 6,
-            "max_input_tokens": 250000,
-            "max_minutes": 60,
-            "max_output_tokens": 50000,
-            "max_steps": 40
-          },
-          "capability": "code.generate",
-          "decision": "allow",
-          "evidence_requirements": [
-            "commands",
-            "exit_codes",
-            "stderr",
-            "stdout"
-          ],
-          "external_side_effects": false,
-          "network": {
-            "allowed_destinations": [],
-            "default": "deny"
-          },
-          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
-          "provenance": "builtin:safe-default.v1",
-          "sandbox_profile": "local-work-v1",
-          "schema": "fractal.node_policy_contract.v1",
-          "verifier_ids": [
-            "independent"
-          ]
-        },
-        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
-        "policy_provenance": "builtin:safe-default.v1",
-        "reopen_count": 0,
-        "requires": [
-          "plan_ready"
-        ],
-        "route_candidates": [
-          "codex://code-generate-default"
-        ]
-      },
-      {
-        "artifacts_produced": [],
-        "attempt_count": 0,
-        "budget": {
-          "timeout_ms": 60000
-        },
-        "capability": "code.generate",
-        "consumed_by": [],
-        "created_at": "2026-08-08T00:37:07Z",
+        "created_at": "2026-08-08T01:30:08Z",
         "depends_on": [],
         "efficiency": {
           "confidence_still_useful": "1",
           "current_assumptions": [],
           "dependencies": [],
-          "estimated_remaining_tokens": 6000,
-          "expected_artifact": "INTERFACE.md",
-          "files_or_systems_affected": [
-            "INTERFACE.md"
-          ],
+          "estimated_remaining_tokens": 4000,
+          "expected_artifact": "An analysis of the work goal.",
+          "files_or_systems_affected": [],
           "similarity_to_other_active_nodes": {},
-          "verification_plan": "The review and acceptance nodes prove the interface is implemented and tested."
+          "verification_plan": "The verify node checks the implemented result."
         },
         "execution": {
           "mode": "sequential",
@@ -456,15 +81,93 @@
           "wave": 1
         },
         "human_intervention": false,
-        "id": "plan",
-        "instruction": "Plan the build for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. Optimize for the BEST performance and quality of the product itself — correctness, robustness, and the behaviors that matter — NOT for the lowest cost or the least effort. First reason briefly through 2-3 alternative implementation approaches and choose the one that maximizes product performance, noting why the others are weaker. Then write INTERFACE.md stating: the single module filename (e.g. solution.py); the public function name(s) and signatures; the chosen approach (1-2 lines) and the alternatives you rejected; and — as your own acceptance BENCHMARKS — 5-8 concrete, measurable behaviors and edge cases the product must satisfy to count as high-performing: the requested outcome is delivered and verified: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. Make the benchmarks demanding and specific so they genuinely test performance, not just happy-path. Keep it concrete so two agents can build the code and the tests in parallel from it.",
-        "kind": "codex",
+        "id": "analyze",
+        "kind": "inference",
         "memory_scopes": [
-          "work:goal",
-          "workspace:root"
+          "work:goal"
         ],
         "node_type": "implementation",
-        "objective": "Plan the build for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. Optimize for the BEST performance and quality of the product itself — correctness, robustness, and the behaviors that matter — NOT for the lowest cost or the least effort. First reason briefly through 2-3 alternative implementation approaches and choose the one that maximizes product performance, noting why the others are weaker. Then write INTERFACE.md stating: the single module filename (e.g. solution.py); the public function name(s) and signatures; the chosen approach (1-2 lines) and the alternatives you rejected; and — as your own acceptance BENCHMARKS — 5-8 concrete, measurable behaviors and edge cases the product must satisfy to count as high-performing: the requested outcome is delivered and verified: Redesign the",
+        "objective": "analyze",
+        "policy_contract": {
+          "allowed_commands": [],
+          "allowed_writes": [],
+          "budgets": {
+            "max_attempts": 1,
+            "max_cost_usd": 20,
+            "max_diff_lines": 500,
+            "max_files_changed": 6,
+            "max_input_tokens": 250000,
+            "max_minutes": 60,
+            "max_output_tokens": 50000,
+            "max_steps": 40
+          },
+          "capability": "content.analyze",
+          "decision": "allow",
+          "evidence_requirements": [
+            "commands",
+            "exit_codes",
+            "stderr",
+            "stdout"
+          ],
+          "external_side_effects": false,
+          "network": {
+            "allowed_destinations": [],
+            "default": "deny"
+          },
+          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+          "provenance": "builtin:safe-default.v1",
+          "sandbox_profile": "local-work-v1",
+          "schema": "fractal.node_policy_contract.v1",
+          "verifier_ids": [
+            "independent"
+          ]
+        },
+        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+        "policy_provenance": "builtin:safe-default.v1",
+        "ready_at": "2026-08-08T01:30:08Z",
+        "reopen_count": 0,
+        "route_candidates": [
+          "mlx://content-analyze-default"
+        ]
+      },
+      {
+        "artifacts_produced": [],
+        "attempt_count": 0,
+        "budget": {
+          "timeout_ms": 120000
+        },
+        "capability": "code.generate",
+        "consumed_by": [],
+        "created_at": "2026-08-08T01:30:08Z",
+        "depends_on": [
+          "analyze"
+        ],
+        "efficiency": {
+          "confidence_still_useful": "1",
+          "current_assumptions": [],
+          "dependencies": [
+            "analyze"
+          ],
+          "estimated_remaining_tokens": 12000,
+          "expected_artifact": "The implemented outcome for the work goal.",
+          "files_or_systems_affected": [],
+          "similarity_to_other_active_nodes": {},
+          "verification_plan": "The verify node checks the implemented result."
+        },
+        "execution": {
+          "mode": "sequential",
+          "parallel_group": null,
+          "task_number": "2.1",
+          "wave": 2
+        },
+        "human_intervention": false,
+        "id": "implement",
+        "kind": "inference",
+        "memory_scopes": [
+          "work:goal"
+        ],
+        "node_type": "implementation",
+        "objective": "implement",
         "policy_contract": {
           "allowed_commands": [],
           "allowed_writes": [],
@@ -501,37 +204,37 @@
         },
         "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
         "policy_provenance": "builtin:safe-default.v1",
-        "ready_at": "2026-08-08T00:37:07Z",
         "reopen_count": 0,
+        "requires": [
+          "analysis_complete"
+        ],
         "route_candidates": [
-          "codex://code-generate-default"
+          "mlx://code-generate-default"
         ]
       },
       {
         "artifacts_produced": [],
         "attempt_count": 0,
         "budget": {
-          "timeout_ms": 180000
+          "timeout_ms": 60000
         },
-        "capability": "code.edit",
+        "capability": "result.verify",
         "consumed_by": [],
-        "created_at": "2026-08-08T00:37:07Z",
+        "created_at": "2026-08-08T01:30:08Z",
         "depends_on": [
-          "author_tests",
           "implement"
         ],
         "efficiency": {
           "confidence_still_useful": "1",
           "current_assumptions": [],
           "dependencies": [
-            "implement",
-            "author_tests"
+            "implement"
           ],
-          "estimated_remaining_tokens": 10000,
-          "expected_artifact": "The reconciled implementation and test files.",
+          "estimated_remaining_tokens": 4000,
+          "expected_artifact": "A verified result for the work goal.",
           "files_or_systems_affected": [],
           "similarity_to_other_active_nodes": {},
-          "verification_plan": "python3 -m unittest passes after reconciliation."
+          "verification_plan": "The result.verify capability confirms the outcome."
         },
         "execution": {
           "mode": "sequential",
@@ -540,15 +243,13 @@
           "wave": 3
         },
         "human_intervention": false,
-        "id": "review",
-        "instruction": "The implementation and the tests were written in parallel by two agents. Run `python3 -m unittest`, then reconcile them: fix any import/name/signature mismatch so the tests exercise the implementation and all tests pass. Criteria: the requested outcome is delivered and verified: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,….",
-        "kind": "container",
+        "id": "verify",
+        "kind": "verification",
         "memory_scopes": [
-          "work:goal",
-          "workspace:root"
+          "work:goal"
         ],
-        "node_type": "implementation",
-        "objective": "The implementation and the tests were written in parallel by two agents. Run `python3 -m unittest`, then reconcile them: fix any import/name/signature mismatch so the tests exercise the implementation and all tests pass. Criteria: the requested outcome is delivered and verified: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,….",
+        "node_type": "verification",
+        "objective": "verify",
         "policy_contract": {
           "allowed_commands": [],
           "allowed_writes": [],
@@ -562,7 +263,7 @@
             "max_output_tokens": 50000,
             "max_steps": 40
           },
-          "capability": "code.edit",
+          "capability": "result.verify",
           "decision": "allow",
           "evidence_requirements": [
             "commands",
@@ -587,11 +288,10 @@
         "policy_provenance": "builtin:safe-default.v1",
         "reopen_count": 0,
         "requires": [
-          "implementation_ready",
-          "tests_ready"
+          "implementation_complete"
         ],
         "route_candidates": [
-          "apple-container://code-edit-default"
+          "mlx://result-verify-default"
         ],
         "sandbox_profile": "apple-container://local-work-v1"
       }
@@ -604,118 +304,25 @@
     "policy_schema": "fractal.harness_policy.v1",
     "schema": "fractal.execution_graph.v1",
     "target": "darwin-arm64",
-    "work_hash": "sha256:5bab08d596c42abe6f876899aec16341440a290705294507f45fa6f6e33618d9"
+    "work_hash": "sha256:9dc5af56e4a55b456a4b3c81d97359e46441276b62e74d80e829fcfd0e665d23"
   },
   "execution": {
     "schema": "fractal.execution_state.v1",
-    "phase": "completed",
-    "assignments": {
-      "acceptance": {
-        "agent_id": "luna/three-graph-acceptance",
-        "agent_label": "Luna · 3D Graph Acceptance",
-        "state": "completed",
-        "checked_out_at": "2026-08-08T01:18:24Z",
-        "completed_at": "2026-08-08T01:21:38Z"
-      },
-      "author_tests": {
-        "agent_id": "luna/three-graph-tests",
-        "agent_label": "Luna · 3D Graph Tests",
-        "state": "completed",
-        "checked_out_at": "2026-08-08T00:43:22Z",
-        "completed_at": "2026-08-08T00:53:46Z"
-      },
-      "complete": {
-        "agent_id": "luna/three-graph-acceptance",
-        "agent_label": "Luna · 3D Graph Acceptance",
-        "state": "completed",
-        "checked_out_at": "2026-08-08T01:21:45Z",
-        "completed_at": "2026-08-08T01:21:45Z"
-      },
-      "implement": {
-        "agent_id": "luna/three-graph-final",
-        "agent_label": "Luna · 3D Graph Final",
-        "state": "completed",
-        "checked_out_at": "2026-08-08T00:43:22Z",
-        "completed_at": "2026-08-08T01:13:33Z"
-      },
-      "plan": {
-        "agent_id": "luna/three-graph",
-        "agent_label": "Luna · 3D Graph",
-        "state": "completed",
-        "checked_out_at": "2026-08-08T00:37:42Z",
-        "completed_at": "2026-08-08T00:40:52Z"
-      },
-      "review": {
-        "agent_id": "luna/three-graph-review",
-        "agent_label": "Luna · 3D Graph Review",
-        "state": "completed",
-        "checked_out_at": "2026-08-08T01:13:59Z",
-        "completed_at": "2026-08-08T01:17:56Z"
-      }
-    },
-    "updated_at": "2026-08-08T01:21:45Z"
+    "phase": "executing",
+    "assignments": {},
+    "updated_at": "2026-08-08T01:30:08Z"
   },
   "learning": {
     "schema": "fractal.learning.v1",
     "nodes": {
-      "acceptance": {
-        "node_id": "acceptance",
+      "analyze": {
+        "node_id": "analyze",
         "node_type": "implementation",
-        "objective": "Run the whole unittest suite; every test must pass before completion.",
-        "depends_on": [
-          "review"
-        ],
-        "created_at": "2026-08-08T00:37:07Z",
-        "started_at": "2026-08-08T01:18:24Z",
-        "finished_at": "2026-08-08T01:21:38Z",
-        "executor": {
-          "agent": "Luna · 3D Graph Acceptance",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "author_tests": {
-        "node_id": "author_tests",
-        "node_type": "implementation",
-        "objective": "Read INTERFACE.md and write a Python `unittest` test file (test_<module>.py) that imports the module and rigorously tests EVERY benchmark behavior and edge case the plan listed for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. The plan's benchmarks are the bar for high performance, so make the tests demanding — cover the edge cases and failure modes, not just the happy path. Do not write the implementation — another agent is doing that in parallel.",
-        "depends_on": [
-          "plan"
-        ],
-        "created_at": "2026-08-08T00:37:07Z",
-        "started_at": "2026-08-08T00:43:22Z",
-        "finished_at": "2026-08-08T00:53:46Z",
-        "executor": {
-          "agent": "Luna · 3D Graph Tests",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "complete": {
-        "node_id": "complete",
-        "node_type": "control",
-        "objective": "Implementation and tests were built in parallel, cross-checked, and verified — mark the outcome complete.",
-        "depends_on": [
-          "acceptance"
-        ],
-        "created_at": "2026-08-08T00:37:07Z",
-        "started_at": "2026-08-08T01:21:45Z",
-        "finished_at": "2026-08-08T01:21:45Z",
-        "executor": {
-          "agent": "Luna · 3D Graph Acceptance",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
+        "objective": "analyze",
+        "depends_on": [],
+        "created_at": "2026-08-08T01:30:08Z",
+        "ready_at": "2026-08-08T01:30:08Z",
+        "attempt_count": 0,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -726,7 +333,7 @@
         "node_type": "implementation",
         "objective": "Read INTERFACE.md and implement the module file exactly as specified for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. Self-contained, no network. Do not write tests — another agent is doing that in parallel.",
         "depends_on": [
-          "plan"
+          "analyze"
         ],
         "created_at": "2026-08-08T00:37:07Z",
         "started_at": "2026-08-08T01:11:56Z",
@@ -742,43 +349,15 @@
         "human_intervention": false,
         "reopen_count": 0
       },
-      "plan": {
-        "node_id": "plan",
-        "node_type": "implementation",
-        "objective": "Plan the build for: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,…. Optimize for the BEST performance and quality of the product itself — correctness, robustness, and the behaviors that matter — NOT for the lowest cost or the least effort. First reason briefly through 2-3 alternative implementation approaches and choose the one that maximizes product performance, noting why the others are weaker. Then write INTERFACE.md stating: the single module filename (e.g. solution.py); the public function name(s) and signatures; the chosen approach (1-2 lines) and the alternatives you rejected; and — as your own acceptance BENCHMARKS — 5-8 concrete, measurable behaviors and edge cases the product must satisfy to count as high-performing: the requested outcome is delivered and verified: Redesign the Fractal e",
-        "depends_on": [],
-        "created_at": "2026-08-08T00:37:07Z",
-        "ready_at": "2026-08-08T00:37:07Z",
-        "started_at": "2026-08-08T00:37:42Z",
-        "finished_at": "2026-08-08T00:40:52Z",
-        "executor": {
-          "agent": "Luna · 3D Graph",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
-        "artifacts_produced": [],
-        "consumed_by": [],
-        "human_intervention": false,
-        "reopen_count": 0
-      },
-      "review": {
-        "node_id": "review",
-        "node_type": "implementation",
-        "objective": "The implementation and the tests were written in parallel by two agents. Run `python3 -m unittest`, then reconcile them: fix any import/name/signature mismatch so the tests exercise the implementation and all tests pass. Criteria: the requested outcome is delivered and verified: Redesign the Fractal execution-graph viewer as a stunning, production-quality Three.js 3D experience while preserving the existing graph API and operational controls. Build an offline-capable spatial scene with depth-aware node clusters,….",
+      "verify": {
+        "node_id": "verify",
+        "node_type": "verification",
+        "objective": "verify",
         "depends_on": [
-          "author_tests",
           "implement"
         ],
-        "created_at": "2026-08-08T00:37:07Z",
-        "started_at": "2026-08-08T01:13:59Z",
-        "finished_at": "2026-08-08T01:17:56Z",
-        "executor": {
-          "agent": "Luna · 3D Graph Review",
-          "version": "0.1.0"
-        },
-        "attempt_count": 1,
-        "outcome": "unverified_success",
+        "created_at": "2026-08-08T01:30:08Z",
+        "attempt_count": 0,
         "artifacts_produced": [],
         "consumed_by": [],
         "human_intervention": false,
@@ -900,7 +479,7 @@
       "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c"
     }
   },
-  "updated_at": "2026-08-08T01:21:45Z",
+  "updated_at": "2026-08-08T01:30:08Z",
   "catalog": {
     "audit": {
       "auditor": "fractal graph audit",
