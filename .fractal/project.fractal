@@ -844,7 +844,7 @@
         "completed_at": "2026-08-02T12:43:37Z"
       }
     },
-    "updated_at": "2026-08-02T12:48:16Z"
+    "updated_at": "2026-08-10T02:47:46Z"
   },
   "learning": {
     "schema": "fractal.learning.v1",
@@ -1226,21 +1226,75 @@
         "reopen_count": 0
       }
     },
-    "graph_edits": [],
+    "graph_edits": [
+      {
+        "graph_before_hash": "sha256:2e42ffe1e78f8a4b13f604730771eb289102a149a77745993bb44aca3dcdaad0",
+        "action": {
+          "type": "repair_graph",
+          "target": "audit_native_handoffs",
+          "created_nodes": []
+        },
+        "trigger": "autonomous_verified_failure",
+        "actor": "jamesstar",
+        "timestamp": "2026-08-10T02:47:40Z",
+        "eventual_effect": {
+          "success": false,
+          "rework_reduced": false
+        }
+      },
+      {
+        "graph_before_hash": "sha256:9f339f46bd1d1aba59e2d4dcc11f7156e16fe4d745f22fa77c0b868ba66e0230",
+        "action": {
+          "type": "repair_graph",
+          "target": "audit_native_handoffs",
+          "created_nodes": []
+        },
+        "trigger": "autonomous_verified_failure",
+        "actor": "jamesstar",
+        "timestamp": "2026-08-10T02:47:42Z",
+        "eventual_effect": {
+          "success": false,
+          "rework_reduced": false
+        }
+      },
+      {
+        "graph_before_hash": "sha256:b888ede79dce78caec74c6de87424460d5215e019658f647be70bbf62c360148",
+        "action": {
+          "type": "repair_graph",
+          "target": "audit_native_handoffs",
+          "created_nodes": []
+        },
+        "trigger": "autonomous_verified_failure",
+        "actor": "jamesstar",
+        "timestamp": "2026-08-10T02:47:44Z",
+        "eventual_effect": {
+          "success": false,
+          "rework_reduced": false
+        }
+      }
+    ],
     "outcome": {
-      "final_verified_success": false,
       "acceptance_criteria": [],
-      "total_duration_seconds": 15934.0,
-      "total_agent_time_seconds": 26368.0,
-      "maximum_parallelism": 3,
-      "total_cost": -0.0,
+      "maximum_parallelism": 0,
       "retry_count": 13,
       "reopened_node_count": 2,
-      "dead_or_unused_node_count": 3,
+      "dead_or_unused_node_count": 1,
       "human_intervention_count": 0,
-      "verification_coverage": 0.16666666666666666,
-      "verification_coverage_denominator": 0
-    }
+      "verification_coverage": 0.1875,
+      "verification_coverage_denominator": 16
+    },
+    "acceptance_criteria": [
+      "AC-1",
+      "AC-10",
+      "AC-2",
+      "AC-3",
+      "AC-4",
+      "AC-5",
+      "AC-6",
+      "AC-7",
+      "AC-8",
+      "AC-9"
+    ]
   },
   "efficiency": {
     "schema": "fractal.efficiency.v1",
@@ -1277,7 +1331,7 @@
       "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c"
     }
   },
-  "updated_at": "2026-08-02T16:08:36Z",
+  "updated_at": "2026-08-10T02:49:04Z",
   "catalog": {
     "audit": {
       "auditor": "fractal graph audit",
