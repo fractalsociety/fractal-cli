@@ -67,6 +67,12 @@ pub(crate) enum Command {
     Efficiency(EfficiencyArgs),
     /// Inspect or control one graph node (stub).
     Node(NodeArgs),
+    /// Join the local project as a worker and wait for coordinator assignment.
+    Join(JoinArgs),
+    /// Run the local project coordinator assignment loop.
+    Coordinator(CoordinatorArgs),
+    /// Continuously form one-leader/five-worker specialist teams.
+    Architect(ArchitectArgs),
     /// Safely clear a fractal workspace/test folder (guarded + confirmed).
     Clean(CleanArgs),
     /// GRPO-train an adapter from accumulated verifiable rewards (fractal-rlvr).
@@ -642,10 +648,14 @@ pub(crate) enum GraphCommand {
     Audit(GraphAuditArgs),
     /// Compose a read-only master graph from a frozen repository inventory.
     Compose(GraphComposeArgs),
+    /// Reconcile the six-repository master graph from frozen inventory and audit evidence.
+    Reconcile(GraphReconcileArgs),
     /// Serve a read-only master graph from a frozen repository inventory.
     Master(GraphMasterArgs),
     /// Import a legacy graph-state JSON file into .fractal/project.fractal once.
     ImportLegacy(GraphImportLegacyArgs),
+    /// Seed a disposable project with a broad parallel graph for join testing.
+    SeedParallelTest(GraphSeedParallelTestArgs),
     /// Internal foreground Rust board server.
     #[command(hide = true)]
     Serve(GraphServeArgs),
@@ -745,6 +755,31 @@ pub(crate) struct GraphComposeArgs {
     pub(crate) validate_only: bool,
 }
 
+/// Arguments accepted by `fractal graph reconcile`.
+#[derive(Debug, Args)]
+pub(crate) struct GraphReconcileArgs {
+    /// Frozen fractal.repository_inventory.v1 JSON artifact.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) inventory: PathBuf,
+
+    /// Current graph-audit report (repeat for multiple audit evidence files).
+    #[arg(
+        long = "audit",
+        alias = "current-audit",
+        value_name = "PATH",
+        required = true
+    )]
+    pub(crate) audits: Vec<PathBuf>,
+
+    /// Optional prior reconciliation JSON used as the drift baseline.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) baseline: Option<PathBuf>,
+
+    /// Write canonical reconciliation JSON to this path; stdout when omitted.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) output: Option<PathBuf>,
+}
+
 /// Arguments accepted by `fractal graph master`.
 #[derive(Debug, Args)]
 pub(crate) struct GraphMasterArgs {
@@ -770,6 +805,25 @@ pub(crate) struct GraphImportLegacyArgs {
     /// Project workspace containing .fractal/project.fractal.
     #[arg(long, default_value = ".", value_name = "PATH")]
     pub(crate) repo: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GraphSeedParallelTestArgs {
+    /// Empty or new project workspace to initialize.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+
+    /// Number of independent test tasks across all waves.
+    #[arg(long, default_value_t = 36, value_parser = clap::value_parser!(u32).range(8..=96))]
+    pub(crate) nodes: u32,
+
+    /// Number of parallel lanes available in the first wave.
+    #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u32).range(2..=32))]
+    pub(crate) first_wave: u32,
+
+    /// Human-readable project title.
+    #[arg(long, default_value = "Parallel Join Stress Test")]
+    pub(crate) title: String,
 }
 
 #[derive(Debug, Args)]
@@ -1024,6 +1078,122 @@ pub(crate) struct NodeArgs {
     /// Human-readable agent label (defaults to FRACTAL_AGENT_LABEL).
     #[arg(long, env = "FRACTAL_AGENT_LABEL", default_value = "Codex")]
     pub(crate) agent_label: String,
+}
+
+/// Arguments accepted by `fractal join`.
+#[derive(Debug, Args)]
+pub(crate) struct JoinArgs {
+    /// Agent role requested from the coordinator.
+    #[arg(long, default_value = "worker")]
+    pub(crate) role: String,
+
+    /// Project workspace, or any directory below it.
+    #[arg(long, default_value = ".", value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+
+    /// Stable worker identity (defaults to FRACTAL_AGENT_ID or an auto-generated id).
+    #[arg(long, env = "FRACTAL_AGENT_ID")]
+    pub(crate) agent_id: Option<String>,
+
+    /// Human-readable worker label (defaults to FRACTAL_AGENT_LABEL or an automatic label).
+    #[arg(long, env = "FRACTAL_AGENT_LABEL")]
+    pub(crate) agent_label: Option<String>,
+
+    /// Emit versioned JSON state records instead of human-readable output.
+    #[arg(long)]
+    pub(crate) json: bool,
+
+    /// Poll once and return `no_work` when no assignment arrives.
+    #[arg(long)]
+    pub(crate) once: bool,
+
+    /// Seconds spent waiting in each coordinator receive call.
+    #[arg(long, default_value_t = 5)]
+    pub(crate) poll_secs: u64,
+
+    /// Maximum total wait time. Zero means wait indefinitely.
+    #[arg(long, default_value_t = 86_400)]
+    pub(crate) timeout_secs: u64,
+
+    /// Worker assignment lease duration in seconds (positive, capped).
+    #[arg(long, default_value_t = 60, env = "FRACTAL_JOIN_LEASE_SECS")]
+    pub(crate) lease_secs: u64,
+
+    /// Optional squad executable path. The client/provider is intentionally not selected here.
+    #[arg(long, env = "SQUAD_BIN", value_name = "PATH")]
+    pub(crate) squad_bin: Option<PathBuf>,
+}
+
+/// Arguments for the local coordinator assignment loop.
+#[derive(Debug, Args)]
+pub(crate) struct CoordinatorArgs {
+    /// Project workspace containing `.fractal/project.fractal`.
+    #[arg(long, default_value = ".")]
+    pub(crate) repo: PathBuf,
+
+    /// Polling interval for worker readiness messages.
+    #[arg(long, default_value_t = 2)]
+    pub(crate) poll_secs: u64,
+
+    /// Stop after one polling pass.
+    #[arg(long)]
+    pub(crate) once: bool,
+
+    /// Assignment lease duration in seconds (positive, capped).
+    #[arg(long, default_value_t = 60, env = "FRACTAL_JOIN_LEASE_SECS")]
+    pub(crate) lease_secs: u64,
+
+    /// Optional squad executable override.
+    #[arg(long, env = "SQUAD_BIN")]
+    pub(crate) squad_bin: Option<PathBuf>,
+
+    /// Keep coordinator startup diagnostics off the worker's JSON stdout.
+    #[arg(long, hide = true)]
+    pub(crate) quiet: bool,
+}
+
+/// Arguments for the hierarchical specialist-team architect.
+#[derive(Debug, Args)]
+pub(crate) struct ArchitectArgs {
+    /// Project workspace containing `.fractal/project.fractal`.
+    #[arg(long, default_value = ".")]
+    pub(crate) repo: PathBuf,
+
+    /// Form at most this many teams; zero means no policy cap.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) max_teams: usize,
+
+    /// Seconds between admission checks.
+    #[arg(long, default_value_t = 10)]
+    pub(crate) poll_secs: u64,
+
+    /// Refuse a new team above this one-minute-load/logical-core ratio.
+    #[arg(long, default_value_t = 1.25)]
+    pub(crate) max_load_per_core: f64,
+
+    /// Refuse a new team below this amount of available memory.
+    #[arg(long, default_value_t = 8.0)]
+    pub(crate) min_free_memory_gib: f64,
+
+    /// Required measured improvement over the accepted baseline, in basis points.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) min_improvement_bps: i64,
+
+    /// Evaluate one admission cycle and exit.
+    #[arg(long)]
+    pub(crate) once: bool,
+
+    /// Launch the planned Codex leader and workers; otherwise preview only.
+    #[arg(long)]
+    pub(crate) launch: bool,
+
+    /// Persist a stop request for the running architect loop.
+    #[arg(long, conflicts_with = "launch")]
+    pub(crate) stop: bool,
+
+    /// Emit a versioned JSON status record.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[cfg(test)]
@@ -1287,6 +1457,92 @@ mod tests {
 
         let version = Cli::try_parse_from(["fractal", "version"]).unwrap();
         assert!(matches!(version.command, Some(Command::Version)));
+    }
+
+    #[test]
+    fn parses_worker_join_with_worker_default_and_no_client_selector() {
+        let previous_id = std::env::var_os("FRACTAL_AGENT_ID");
+        let previous_label = std::env::var_os("FRACTAL_AGENT_LABEL");
+        let previous_lease = std::env::var_os("FRACTAL_JOIN_LEASE_SECS");
+        std::env::remove_var("FRACTAL_AGENT_ID");
+        std::env::remove_var("FRACTAL_AGENT_LABEL");
+        std::env::remove_var("FRACTAL_JOIN_LEASE_SECS");
+        let join = Cli::try_parse_from(["fractal", "join", "--role", "worker", "--once", "--json"])
+            .unwrap();
+        let Some(Command::Join(args)) = join.command else {
+            panic!("expected join command");
+        };
+        assert_eq!(args.role, "worker");
+        assert!(args.once);
+        assert!(args.json);
+        assert_eq!(
+            args.agent_id.as_deref(),
+            std::env::var("FRACTAL_AGENT_ID").ok().as_deref()
+        );
+        assert_eq!(
+            args.agent_label.as_deref(),
+            std::env::var("FRACTAL_AGENT_LABEL").ok().as_deref()
+        );
+        assert_eq!(args.lease_secs, 60);
+        restore_env("FRACTAL_AGENT_ID", previous_id);
+        restore_env("FRACTAL_AGENT_LABEL", previous_label);
+        restore_env("FRACTAL_JOIN_LEASE_SECS", previous_lease);
+    }
+
+    #[test]
+    fn parses_worker_join_and_coordinator_lease_secs() {
+        let previous_lease = std::env::var_os("FRACTAL_JOIN_LEASE_SECS");
+        std::env::remove_var("FRACTAL_JOIN_LEASE_SECS");
+        let join =
+            Cli::try_parse_from(["fractal", "join", "--role", "worker", "--lease-secs", "90"])
+                .unwrap();
+        let Some(Command::Join(args)) = join.command else {
+            panic!("expected join command");
+        };
+        assert_eq!(args.lease_secs, 90);
+
+        let coordinator =
+            Cli::try_parse_from(["fractal", "coordinator", "--lease-secs", "120"]).unwrap();
+        let Some(Command::Coordinator(args)) = coordinator.command else {
+            panic!("expected coordinator command");
+        };
+        assert_eq!(args.lease_secs, 120);
+        restore_env("FRACTAL_JOIN_LEASE_SECS", previous_lease);
+    }
+
+    #[test]
+    fn parses_hierarchical_architect_controls() {
+        let cli = Cli::try_parse_from([
+            "fractal",
+            "architect",
+            "--repo",
+            "/tmp/project",
+            "--max-teams",
+            "7",
+            "--max-load-per-core",
+            "1.5",
+            "--min-free-memory-gib",
+            "12",
+            "--launch",
+            "--once",
+            "--json",
+        ])
+        .unwrap();
+        let Some(Command::Architect(args)) = cli.command else {
+            panic!("expected architect command");
+        };
+        assert_eq!(args.max_teams, 7);
+        assert_eq!(args.max_load_per_core, 1.5);
+        assert_eq!(args.min_free_memory_gib, 12.0);
+        assert!(args.launch && args.once && args.json);
+        assert!(Cli::try_parse_from(["fractal", "architect", "--launch", "--stop"]).is_err());
+    }
+
+    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
     }
 
     #[test]

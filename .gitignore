@@ -8,3 +8,9 @@
 *.tmp
 *.profraw
 .DS_Store
+.squad/
+.fractal/
+/dist-*/
+/locks/
+/CLAUDE.md
+/GEMINI.md

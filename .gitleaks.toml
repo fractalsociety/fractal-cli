@@ -1,0 +1,24 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Deterministic public project identifiers in contract examples"
+regexTarget = "match"
+regexes = [
+  '''(?:origin_project_key|project_key|key)": "(?:fractal-cli-3c8b9dde9efc|fractal-efficiency-5793dcf94336)"''',
+]
+paths = [
+  '''docs/project-catalog-contract\.md''',
+  '''schemas/fractal\.catalog\.v1\.schema\.json''',
+  '''schemas/fractal\.master_graph_view\.v1\.schema\.json''',
+]
+
+[[allowlists]]
+description = "Public UserDefaults namespace, not an authentication credential"
+regexTarget = "match"
+regexes = [
+  '''approvedDefaultsKey = "FractalVoice\.EfficiencyApproved\.v1"''',
+]
+paths = [
+  '''macos/FractalVoice/Sources/FractalVoice/BuildCoordinator\.swift''',
+]

@@ -175,7 +175,7 @@ Minimal contract (field names stable):
   "bound_project_key": "… or null",
   "projects": [
     {
-      "project_key": "fractal-cli-bbbfd315b970",
+      "project_key": "fractal-cli-3c8b9dde9efc",
       "labels": ["fractal-cli"],
       "registry_numbers": [18],
       "canonical_workspace": "/workspace/fractal-cli",

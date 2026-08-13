@@ -40,6 +40,15 @@ pub(crate) fn run(args: &NodeArgs) -> Result<()> {
     } else {
         unreachable!("node operation already validated")
     };
+    if action == "checkout"
+        && crate::architect::enabled(&args.repo)
+        && !crate::architect::checkout_authorized(&args.repo, &args.agent_id, &args.id)
+    {
+        bail!(
+            "architect mode permits agent `{}` to checkout only its leader-assigned team node",
+            args.agent_id
+        );
+    }
     crate::project_file::transition(
         &args.repo,
         &args.id,
@@ -47,7 +56,18 @@ pub(crate) fn run(args: &NodeArgs) -> Result<()> {
         &args.agent_id,
         &args.agent_label,
     )?;
-    crate::project_sync::maybe_sync_runtime(&args.repo);
+    let next = if action == "complete" && !crate::architect::enabled(&args.repo) {
+        Some(crate::coordinator::checkout_next(
+            &args.repo,
+            &args.agent_id,
+            &args.agent_label,
+        ))
+    } else {
+        None
+    };
+    if let Err(error) = crate::project_sync::sync_worker_transition_now(&args.repo) {
+        eprintln!("  live graph sync note: {error:#}");
+    }
     println!(
         "{}: {} by {} ({})",
         match action {
@@ -59,5 +79,27 @@ pub(crate) fn run(args: &NodeArgs) -> Result<()> {
         args.agent_label,
         args.agent_id
     );
+    if let Some(next) = next {
+        match next? {
+            crate::coordinator::NextAssignment::Assigned(node_id) => {
+                println!(
+                    "Next assigned: {node_id} to {} ({})",
+                    args.agent_label, args.agent_id
+                );
+                println!(
+                    "Inspect it with: fractal node {node_id} --show --repo {}",
+                    args.repo.display()
+                );
+            }
+            crate::coordinator::NextAssignment::GraphComplete => {
+                println!("No next task: the execution graph is complete.");
+            }
+            crate::coordinator::NextAssignment::AmendmentRequested => {
+                println!(
+                    "No dependency-ready task is available; the coordinator requested governed graph expansion."
+                );
+            }
+        }
+    }
     Ok(())
 }

@@ -96,8 +96,8 @@ Examples (real, from the frozen inventory):
 
 | `canonical_workspace` | `project_key` |
 |---|---|
-| `/workspace/fractal-cli` | `fractal-cli-bbbfd315b970` |
-| `/workspace/fractal-efficiency.yFzdFF` | `fractal-efficiency-yfzdff-fe96f21dda82` |
+| `/workspace/fractal-cli` | `fractal-cli-3c8b9dde9efc` |
+| `/workspace/fractal-efficiency` | `fractal-efficiency-5793dcf94336` |
 
 `project_key` MUST NOT be derived from display titles, registry labels, or registry
 numbers: labels are mutable aliases and registry numbers are keyed by raw uncanonicalized
@@ -465,11 +465,11 @@ It is also embedded as `examples[0]` of the catalog schema.
 ```json
 {
   "schema": "fractal.catalog.v1",
-  "project_key": "fractal-cli-bbbfd315b970",
+  "project_key": "fractal-cli-3c8b9dde9efc",
   "generated_at": "2026-08-02T14:05:00Z",
   "source": {
     "canonical_workspace": "/workspace/fractal-cli",
-    "workspace_fingerprint": "sha256:bbbfd315b97032d8324f48b8ab1b9c749b26fffcb3b2680d26b2df797b29a0de",
+    "workspace_fingerprint": "sha256:3c8b9dde9efc0ec68bc37f293ca5da385612fdeaa1eeed3bd447a6801e2e21e2",
     "registry_numbers": [
       18
     ],
@@ -652,7 +652,7 @@ It is also embedded as `examples[0]` of the catalog schema.
         "component_key": "fractal-chain"
       },
       "to": {
-        "project_key": "fractal-efficiency-yfzdff-fe96f21dda82",
+        "project_key": "fractal-efficiency-5793dcf94336",
         "alias": "fractal-efficiency.yFzdFF",
         "component_key": "fractal-chain"
       },
@@ -669,7 +669,7 @@ It is also embedded as `examples[0]` of the catalog schema.
     }
   ],
   "diagnostics": [],
-  "catalog_hash": "sha256:7996e73720de288102cb1b0af161830086f2f09ed38449c01a3a087b99dd913d"
+  "catalog_hash": "sha256:42137bdf3868019f12f29925d92f0ffeb8df3fe498fd99180f5b681c19134e97"
 }
 ```
 
@@ -701,9 +701,9 @@ workspace from the frozen inventory.
   },
   "projects": [
     {
-      "project_key": "fractal-cli-bbbfd315b970",
+      "project_key": "fractal-cli-3c8b9dde9efc",
       "canonical_workspace": "/workspace/fractal-cli",
-      "workspace_fingerprint": "sha256:bbbfd315b97032d8324f48b8ab1b9c749b26fffcb3b2680d26b2df797b29a0de",
+      "workspace_fingerprint": "sha256:3c8b9dde9efc0ec68bc37f293ca5da385612fdeaa1eeed3bd447a6801e2e21e2",
       "labels": [
         "fractal-cli"
       ],
@@ -713,7 +713,7 @@ workspace from the frozen inventory.
       "available": true,
       "catalog_state": "valid",
       "graph_hash": "sha256:9b9b72c888c3bf318515a95dc79c16af21175cb1ead37c3a742839b4e8de48bb",
-      "catalog_hash": "sha256:7996e73720de288102cb1b0af161830086f2f09ed38449c01a3a087b99dd913d",
+      "catalog_hash": "sha256:42137bdf3868019f12f29925d92f0ffeb8df3fe498fd99180f5b681c19134e97",
       "git": {
         "commit": "56df19ed4dd0f19b56fc2c10faaa40278dc07936",
         "dirty": true,
@@ -727,9 +727,9 @@ workspace from the frozen inventory.
       }
     },
     {
-      "project_key": "fractal-efficiency-yfzdff-fe96f21dda82",
-      "canonical_workspace": "/workspace/fractal-efficiency.yFzdFF",
-      "workspace_fingerprint": "sha256:fe96f21dda82b510eee6d8c9aa48f3d89134180a836ac7816ccfe5b43713d159",
+      "project_key": "fractal-efficiency-5793dcf94336",
+      "canonical_workspace": "/workspace/fractal-efficiency",
+      "workspace_fingerprint": "sha256:5793dcf94336727ccbed8cc2ade1a38071a66e208cc4e98c2800cf2825f88994",
       "labels": [
         "fractal-efficiency.yFzdFF"
       ],
@@ -755,75 +755,75 @@ workspace from the frozen inventory.
   ],
   "nodes": [
     {
-      "id": "capability:fractal-cli-bbbfd315b970/canonical-project-persistence",
+      "id": "capability:fractal-cli-3c8b9dde9efc/canonical-project-persistence",
       "kind": "capability",
-      "project_key": "fractal-cli-bbbfd315b970",
+      "project_key": "fractal-cli-3c8b9dde9efc",
       "key": "canonical-project-persistence",
       "title": "Locked, validated, atomic persistence of .fractal/project.fractal",
       "status": "verified"
     },
     {
-      "id": "component:fractal-cli-bbbfd315b970/fractal-chain",
+      "id": "component:fractal-cli-3c8b9dde9efc/fractal-chain",
       "kind": "component",
-      "project_key": "fractal-cli-bbbfd315b970",
+      "project_key": "fractal-cli-3c8b9dde9efc",
       "key": "fractal-chain",
       "title": "fractal-chain",
       "status": "implemented_unverified",
       "component_kind": "library"
     },
     {
-      "id": "component:fractal-cli-bbbfd315b970/fractal-cli-bin",
+      "id": "component:fractal-cli-3c8b9dde9efc/fractal-cli-bin",
       "kind": "component",
-      "project_key": "fractal-cli-bbbfd315b970",
+      "project_key": "fractal-cli-3c8b9dde9efc",
       "key": "fractal-cli-bin",
       "title": "fractal-cli",
       "status": "verified",
       "component_kind": "binary"
     },
     {
-      "id": "component:fractal-efficiency-yfzdff-fe96f21dda82/fractal-chain",
+      "id": "component:fractal-efficiency-5793dcf94336/fractal-chain",
       "kind": "component",
-      "project_key": "fractal-efficiency-yfzdff-fe96f21dda82",
+      "project_key": "fractal-efficiency-5793dcf94336",
       "key": "fractal-chain",
       "title": "fractal-chain",
       "status": "implemented_unverified",
       "component_kind": "library"
     },
     {
-      "id": "project:fractal-cli-bbbfd315b970",
+      "id": "project:fractal-cli-3c8b9dde9efc",
       "kind": "project",
-      "project_key": "fractal-cli-bbbfd315b970",
-      "key": "fractal-cli-bbbfd315b970",
+      "project_key": "fractal-cli-3c8b9dde9efc",
+      "key": "fractal-cli-3c8b9dde9efc",
       "title": "fractal-cli"
     },
     {
-      "id": "project:fractal-efficiency-yfzdff-fe96f21dda82",
+      "id": "project:fractal-efficiency-5793dcf94336",
       "kind": "project",
-      "project_key": "fractal-efficiency-yfzdff-fe96f21dda82",
-      "key": "fractal-efficiency-yfzdff-fe96f21dda82",
+      "project_key": "fractal-efficiency-5793dcf94336",
+      "key": "fractal-efficiency-5793dcf94336",
       "title": "fractal-efficiency.yFzdFF"
     }
   ],
   "edges": [
     {
-      "id": "dep:fractal-cli-bbbfd315b970/fractal-cli-bin->fractal-chain:build",
+      "id": "dep:fractal-cli-3c8b9dde9efc/fractal-cli-bin->fractal-chain:build",
       "type": "internal_dependency",
-      "origin_project_key": "fractal-cli-bbbfd315b970",
-      "from": "component:fractal-cli-bbbfd315b970/fractal-cli-bin",
+      "origin_project_key": "fractal-cli-3c8b9dde9efc",
+      "from": "component:fractal-cli-3c8b9dde9efc/fractal-cli-bin",
       "to": {
-        "node_id": "component:fractal-cli-bbbfd315b970/fractal-chain",
+        "node_id": "component:fractal-cli-3c8b9dde9efc/fractal-chain",
         "raw": null
       },
       "resolution": "resolved",
       "cycle_group": null
     },
     {
-      "id": "link:fractal-cli-bbbfd315b970/shares-fractal-chain",
+      "id": "link:fractal-cli-3c8b9dde9efc/shares-fractal-chain",
       "type": "shares_component",
-      "origin_project_key": "fractal-cli-bbbfd315b970",
-      "from": "component:fractal-cli-bbbfd315b970/fractal-chain",
+      "origin_project_key": "fractal-cli-3c8b9dde9efc",
+      "from": "component:fractal-cli-3c8b9dde9efc/fractal-chain",
       "to": {
-        "node_id": "component:fractal-efficiency-yfzdff-fe96f21dda82/fractal-chain",
+        "node_id": "component:fractal-efficiency-5793dcf94336/fractal-chain",
         "raw": null
       },
       "resolution": "resolved",
@@ -831,10 +831,10 @@ workspace from the frozen inventory.
       "confidence": "high"
     },
     {
-      "id": "link:fractal-efficiency-yfzdff-fe96f21dda82/depends-on-voice-models",
+      "id": "link:fractal-efficiency-5793dcf94336/depends-on-voice-models",
       "type": "depends_on",
-      "origin_project_key": "fractal-efficiency-yfzdff-fe96f21dda82",
-      "from": "project:fractal-efficiency-yfzdff-fe96f21dda82",
+      "origin_project_key": "fractal-efficiency-5793dcf94336",
+      "from": "project:fractal-efficiency-5793dcf94336",
       "to": {
         "node_id": null,
         "raw": {
@@ -855,30 +855,30 @@ workspace from the frozen inventory.
       "message": "registry workspace does not exist and was recorded without fabricating content",
       "project_key": null,
       "edge_id": null,
-      "context": "/workspace/fractal-rust-convergence.MtjZnv/fractal-cli"
+      "context": "/workspace/fractal-rust-convergence/fractal-cli"
     },
     {
       "code": "unresolved_link_target",
       "severity": "warning",
       "message": "alias 'fractal-voice-models' matched no project_key, label, remote fingerprint, or workspace fingerprint in the frozen inventory",
-      "project_key": "fractal-efficiency-yfzdff-fe96f21dda82",
-      "edge_id": "link:fractal-efficiency-yfzdff-fe96f21dda82/depends-on-voice-models",
+      "project_key": "fractal-efficiency-5793dcf94336",
+      "edge_id": "link:fractal-efficiency-5793dcf94336/depends-on-voice-models",
       "context": "cross_graph_links[key=depends-on-voice-models]"
     }
   ],
   "sources": [
     {
-      "project_key": "fractal-cli-bbbfd315b970",
+      "project_key": "fractal-cli-3c8b9dde9efc",
       "canonical_workspace": "/workspace/fractal-cli",
       "relative_path": ".fractal/project.fractal",
       "project_fractal_sha256": "sha256:07afdc826a8d766ee1dbef8681d146c8d1473e337a96958a6c5582da0cbc7a75",
       "size_bytes": 55656,
       "graph_hash": "sha256:9b9b72c888c3bf318515a95dc79c16af21175cb1ead37c3a742839b4e8de48bb",
-      "catalog_hash": "sha256:7996e73720de288102cb1b0af161830086f2f09ed38449c01a3a087b99dd913d"
+      "catalog_hash": "sha256:42137bdf3868019f12f29925d92f0ffeb8df3fe498fd99180f5b681c19134e97"
     },
     {
-      "project_key": "fractal-efficiency-yfzdff-fe96f21dda82",
-      "canonical_workspace": "/workspace/fractal-efficiency.yFzdFF",
+      "project_key": "fractal-efficiency-5793dcf94336",
+      "canonical_workspace": "/workspace/fractal-efficiency",
       "relative_path": ".fractal/project.fractal",
       "project_fractal_sha256": "sha256:7bb6f30ce4f793d4a2819c3adb1af777c904140a88af19ff98f9071319ea73c9",
       "size_bytes": 58267,
@@ -888,7 +888,7 @@ workspace from the frozen inventory.
   ],
   "unavailable": [
     {
-      "canonical_workspace": "/workspace/fractal-rust-convergence.MtjZnv/fractal-cli",
+      "canonical_workspace": "/workspace/fractal-rust-convergence/fractal-cli",
       "reason": "workspace_path_does_not_exist",
       "registry_numbers": [
         33
@@ -929,7 +929,7 @@ tested input is the JSON without them.)
           "fingerprint_sha256": "f1057ab13991aac2f870f5e8a03e76b7f40c7e6ea63a5130d2296458d36164fa",
           "sanitized_url": "https://user:hunter2@github.com/fractalsociety/fractal-cli.git",
                                                          // ✗ §13: credentialed URL — not sanitized
-          "token": "ghp_XXXXXXXXXXXXXXXXXXXX"            // ✗ §13: forbidden key name; poisons the whole document
+          "token": "REDACTED_GITHUB_TOKEN"               // ✗ §13: forbidden key name; poisons the whole document
         }
       ]
     }
@@ -1045,17 +1045,17 @@ siblings.
     {
       "id": "fractal-chain",                             // ✗ §9: un-namespaced node id
       "kind": "component",
-      "project_key": "fractal-cli-bbbfd315b970",
+      "project_key": "fractal-cli-3c8b9dde9efc",
       "key": "fractal-chain",
       "title": "fractal-chain"
     }
   ],
   "edges": [
     {
-      "id": "link:fractal-cli-bbbfd315b970/depends-on-voice",
+      "id": "link:fractal-cli-3c8b9dde9efc/depends-on-voice",
       "type": "depends_on",
-      "origin_project_key": "fractal-cli-bbbfd315b970",
-      "from": "project:fractal-cli-bbbfd315b970",
+      "origin_project_key": "fractal-cli-3c8b9dde9efc",
+      "from": "project:fractal-cli-3c8b9dde9efc",
       "to": { "node_id": null, "raw": null },            // ✗ §10.2: unresolved edge must preserve the raw target specifier
       "resolution": "resolved",                          // ✗ §10.2: 'resolved' with node_id null is contradictory
       "cycle_group": null

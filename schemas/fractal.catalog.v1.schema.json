@@ -813,11 +813,11 @@
   "examples": [
     {
       "schema": "fractal.catalog.v1",
-      "project_key": "fractal-cli-bbbfd315b970",
+      "project_key": "fractal-cli-3c8b9dde9efc",
       "generated_at": "2026-08-02T14:05:00Z",
       "source": {
         "canonical_workspace": "/workspace/fractal-cli",
-        "workspace_fingerprint": "sha256:bbbfd315b97032d8324f48b8ab1b9c749b26fffcb3b2680d26b2df797b29a0de",
+        "workspace_fingerprint": "sha256:3c8b9dde9efc0ec68bc37f293ca5da385612fdeaa1eeed3bd447a6801e2e21e2",
         "registry_numbers": [
           18
         ],
@@ -1000,7 +1000,7 @@
             "component_key": "fractal-chain"
           },
           "to": {
-            "project_key": "fractal-efficiency-yfzdff-fe96f21dda82",
+            "project_key": "fractal-efficiency-5793dcf94336",
             "alias": "fractal-efficiency.yFzdFF",
             "component_key": "fractal-chain"
           },
@@ -1017,7 +1017,7 @@
         }
       ],
       "diagnostics": [],
-      "catalog_hash": "sha256:7996e73720de288102cb1b0af161830086f2f09ed38449c01a3a087b99dd913d"
+      "catalog_hash": "sha256:42137bdf3868019f12f29925d92f0ffeb8df3fe498fd99180f5b681c19134e97"
     }
   ]
 }

@@ -1467,14 +1467,11 @@ mod tests {
         let schema: Value = serde_json::from_str(example).unwrap();
         let value = schema["examples"][0].clone();
         let catalog = validate_value(&value).expect("contract example must validate");
+        assert_eq!(catalog.project_key, project_key("/workspace/fractal-cli"));
+        assert_eq!(catalog.project_key, "fractal-cli-3c8b9dde9efc");
         assert_eq!(
-            catalog.project_key,
-            project_key("/workspace/fractal-cli")
-        );
-        assert_eq!(catalog.project_key, "fractal-cli-bbbfd315b970");
-        assert_eq!(
-            project_key("/workspace/fractal-efficiency.yFzdFF"),
-            "fractal-efficiency-yfzdff-fe96f21dda82"
+            project_key("/workspace/fractal-efficiency"),
+            "fractal-efficiency-5793dcf94336"
         );
         assert_eq!(component_key_from("Cargo.toml"), "cargo-toml");
         assert_eq!(component_key_from("My Package!!"), "my-package");

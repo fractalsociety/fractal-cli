@@ -1,14 +1,243 @@
 # Fractal CLI
 
-Fractal CLI turns a natural-language or voice request into a structured PRD,
-dependency-aware execution graph, and coordinated multi-agent build.
+Fractal turns a product request into a structured PRD, a dependency-aware
+execution graph, and a coordinated multi-agent build. It is designed for work
+that is too broad for one coding session: Fractal exposes independent lanes,
+leases each node to exactly one worker, records evidence, recovers stale work,
+and keeps assigning ready tasks until the graph is complete.
+
+The project includes a Rust CLI, a local and hosted graph experience, a native
+macOS voice front end, graph lineage receipts, and adapters for Codex, Cursor,
+Claude, and Hermes.
+
+## Contents
+
+- [Why Fractal](#why-fractal)
+- [Quick start](#quick-start)
+- [Multi-agent execution](#multi-agent-execution)
+- [Worker, coordinator, and architect roles](#worker-coordinator-and-architect-roles)
+- [Scale-out provider pool](#scale-out-provider-pool)
+- [Graph inspection and testing](#graph-inspection-and-testing)
+- [Safety and repository hygiene](#safety-and-repository-hygiene)
+- [Development setup](#development-setup)
+- [Voice and external handoff](#voice)
+
+## Why Fractal
+
+Most agent runners treat a build as one long prompt. Fractal treats it as a
+state machine. The canonical `.fractal/project.fractal` document stores nodes,
+dependencies, ownership, completion status, and evidence. Workers do not choose
+arbitrary work or mutate a side-channel state file; they atomically check out a
+ready node through the Rust controller.
+
+The multi-agent runtime provides:
+
+- dependency-aware parallelism, so only genuinely unblocked work is leased;
+- unique worker identities and collision-resistant checkout;
+- one assignment listener per worker, bounded leases, heartbeat renewal, and
+  stale-worker reclamation;
+- automatic next-task assignment after accepted completion;
+- governed graph expansion when workers are idle and no useful parallel lane
+  exists;
+- specialist teams with one leader and five workers, formed continuously while
+  resource and quality gates allow it;
+- heterogeneous execution across Codex, Cursor, Claude, and Hermes;
+- deterministic tests for duplicate ownership, stale generations, retries,
+  starvation, dependency violations, and logical makespan;
+- local graph boards plus authenticated Fractal Society synchronization.
+
+## Quick start
+
+Build and install the CLI:
+
+```sh
+git clone https://github.com/fractalsociety/fractal-cli.git
+cd fractal-cli
+cargo build --release
+install -m 755 target/release/fractal ~/.cargo/bin/fractal
+fractal version
+```
+
+Run `fractal` without arguments for the interactive front door, or submit a
+request directly:
+
+```sh
+fractal submit 'Build a small issue tracker with tests and documentation'
+```
+
+To hand a complete request from another desktop assistant to Fractal Voice,
+keep the request on standard input:
+
+```sh
+fractal handoff --name 'Issue Tracker' <<'FRACTAL_REQUEST'
+Build a small issue tracker with tests and documentation.
+FRACTAL_REQUEST
+```
+
+The managed workflow creates the project, plans the PRD, compiles its graph,
+starts workers, verifies completed nodes, and preserves state for resume.
+
+## Multi-agent execution
+
+Fractal supports two complementary ways to add capacity:
+
+1. Human-opened agent terminals join an existing project with one command.
+2. The architect launches bounded six-agent specialist teams automatically.
+
+For manual terminals, start or verify the coordinator in the project root:
+
+```sh
+fractal coordinator --repo .
+```
+
+Then run this in every additional agent window already inside that project:
+
+```sh
+fractal join --role worker
+```
+
+No provider selector is required. The joining process discovers its client,
+registers a stable identity, asks the coordinator for work, checks out the
+assigned node, and keeps its lease alive. When a completion is accepted, the
+same worker is offered the next dependency-ready node. If no coordinator loop
+is present, join can use a short one-shot coordinator transaction to reserve a
+distinct ready node safely.
+
+Useful operational variants:
+
+```sh
+# Poll once and emit a machine-readable result.
+fractal join --role worker --once --json
+
+# Use a stable identity across restarts.
+FRACTAL_AGENT_ID=codex/reviewer \
+FRACTAL_AGENT_LABEL='Codex · Reviewer' \
+fractal join --role worker
+
+# Inspect running managed projects.
+fractal status --running
+
+# Pause one project without destroying completed graph state.
+fractal pause --project PROJECT_NAME
+```
+
+### Worker, coordinator, and architect roles
+
+The worker is deliberately narrow: it receives one structured assignment,
+claims that graph node, operates inside its scope, reports evidence, and either
+completes or releases the lease.
+
+The coordinator owns assignment flow. It reconciles worker heartbeats, prevents
+double ownership, reclaims expired leases, validates completion generations,
+and chains successful workers onto subsequent ready nodes. When all workers are
+idle because the frontier is too narrow, it can request a bounded graph
+amendment instead of inventing ungoverned tasks.
+
+The architect is the scale controller. Each admitted specialist team contains
+one planning/review leader and five implementation workers. Teams are formed
+only when the graph has a coherent five-node mission and CPU, memory, cooldown,
+CI, backlog, and measured-improvement gates permit more load.
+
+Preview one architect admission cycle without launching processes:
+
+```sh
+fractal architect --repo . --once --json
+```
+
+Launch continuously until stopped or constrained by policy:
+
+```sh
+fractal architect --repo . --launch
+fractal architect --repo . --stop
+```
+
+Use `--max-teams`, `--max-load-per-core`, `--min-free-memory-gib`, and
+`--min-improvement-bps` to tune the envelope. A zero `--max-teams` means there
+is no policy count cap; resource and graph-quality gates still apply.
+
+### Scale-out provider pool
+
+The in-process executor can opt into a 20–42 slot heterogeneous pool. All four
+providers must be explicit and their binaries must be available on `PATH`:
+
+```sh
+export FRACTAL_AGENT_POOL='codex=6,cursor=6,claude=6,hermes=6'
+fractal run --local --graph-file path/to/graph.json
+```
+
+The Codex lead planner is separate from those worker slots. Each provider has
+independent capacity, so a slow or failed provider does not stop healthy slots
+from consuming the ready queue. Invalid counts, missing providers, unavailable
+binaries, and totals outside the verified envelope fail closed. See
+[`docs/heterogeneous-agent-pool.md`](docs/heterogeneous-agent-pool.md) for the
+contract, benchmark, and rollback details.
+
+## Graph inspection and testing
+
+Open the current graph experience:
+
+```sh
+fractal graph open
+```
+
+Serve a committed graph by content hash and open its board:
+
+```sh
+fractal graph board sha256:GRAPH_HASH
+```
+
+Use `--no-open` for a headless server, and inspect a running board API with:
+
+```sh
+fractal graph status --json
+fractal graph show sha256:GRAPH_HASH --json
+```
+
+To test many independent agent windows without risking a production project,
+seed a disposable 36-node graph with 12 immediately ready lanes:
+
+```sh
+fractal graph seed-parallel-test \
+  --repo /tmp/parallel-join-test \
+  --nodes 36 \
+  --first-wave 12
+cd /tmp/parallel-join-test
+fractal coordinator --repo .
+```
+
+Open more terminals in that folder and run `fractal join --role worker` in each.
+Increase `--nodes` and `--first-wave` within the CLI limits for a larger stress
+test.
+
+## Safety and repository hygiene
+
+Fractal separates portable source from machine-local runtime state. Do not
+commit `.fractal/`, `.squad/`, `target/`, `dist*/`, profiling output, tokens,
+cookies, model caches, or local absolute paths. Keep credentials in the
+provider's normal login store or environment and never put them in a graph
+instruction, PRD, fixture, or command argument.
+
+Before publishing a change, run:
+
+```sh
+cargo fmt --all -- --check
+cargo test --no-fail-fast
+cargo clippy --all-targets -- -D warnings
+gitleaks git --redact
+```
+
+Security fixtures use unmistakably fake values to prove secret-redaction and
+prompt-sanitization behavior. They are tests, not configuration examples.
 
 ## Repository layout
 
-- `src/` — the `fractal` command-line application.
+- `src/` — Rust CLI, graph transitions, coordinator, architect, and workers.
 - `crates/fractal-chain/` — signed execution receipts and graph lineage.
 - `execution-graph/` — the local live graph viewer.
-- `scripts/` — local routing and DataEvol adapters.
+- `macos/FractalVoice/` — native menu-bar voice application.
+- `schemas/` — versioned graph, catalog, and reconciliation contracts.
+- `docs/` — runtime and data-contract documentation.
+- `scripts/` — routing, release, model, and DataEvol adapters.
 
 ## Development setup
 
@@ -32,6 +261,33 @@ install -m 755 target/release/fractal ~/.cargo/bin/fractal
 ```
 
 Run `fractal version` to verify the installed binary.
+
+## Read-only master-graph reconciliation
+
+`fractal graph reconcile` consumes a frozen `fractal.repository_inventory.v1`
+artifact and one or more current reports produced by `fractal graph audit`.
+It emits `fractal.graph_reconcile.v1` canonical JSON, reports unresolved drift
+with a nonzero exit status, and never writes a repository graph or Git state.
+Only `--output` is writable; omit it to print the report.
+
+```sh
+fractal graph audit \
+  --inventory artifacts/audit/repository-inventory.json \
+  --shard 0/1 \
+  --report /tmp/fractal-audit.json
+
+fractal graph reconcile \
+  --inventory artifacts/audit/repository-inventory.json \
+  --audit /tmp/fractal-audit.json \
+  --baseline artifacts/audit/master-graph-reconcile-baseline.json \
+  --output /tmp/fractal-reconcile.json
+```
+
+The audit command is evidence generation; reconciliation is the read-only
+freshness and identity gate over exactly `fractalmaster`, `fractal-cli`,
+`fractalchain`, `FractalRuntime`, `Fractalwork`, and
+`fractalsociety-website`. Repeated runs over unchanged evidence produce
+byte-identical output and hashes exclude wall-clock fields.
 
 ## Fractal Society
 
