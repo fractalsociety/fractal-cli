@@ -1,4 +1,5 @@
 mod amendments;
+mod architect;
 mod auth;
 mod board;
 mod bridge;
@@ -8,6 +9,7 @@ mod cli;
 mod compile;
 mod contribute;
 mod coordinate;
+mod coordinator;
 mod dataevol;
 mod decompose;
 mod efficiency;
@@ -28,6 +30,7 @@ mod harness_policy;
 mod ingest;
 mod intent;
 mod interactive;
+mod join;
 mod learning_data;
 mod legacy_import;
 mod lessons;
@@ -41,6 +44,7 @@ mod project_audit;
 mod project_file;
 mod project_sync;
 mod projects;
+mod reconcile;
 mod rlvr;
 mod router;
 mod run;
@@ -48,6 +52,7 @@ mod run_control;
 mod safety;
 mod social;
 mod supervise;
+mod test_graph;
 mod ui;
 mod verify;
 mod visibility;
@@ -94,11 +99,14 @@ fn uses_stable_json_diagnostics(cli: &Cli) -> bool {
     matches!(
         cli.command,
         Some(Command::Graph(crate::cli::GraphArgs {
-            command: GraphCommand::Audit(_) | GraphCommand::Compose(_) | GraphCommand::Failure(_),
+            command: GraphCommand::Audit(_)
+                | GraphCommand::Compose(_)
+                | GraphCommand::Failure(_)
+                | GraphCommand::Reconcile(_),
         })) | Some(Command::Harness(crate::cli::HarnessArgs {
             command: HarnessCommand::Validate(crate::cli::HarnessPolicyArgs { json: true, .. })
                 | HarnessCommand::Show(crate::cli::HarnessPolicyArgs { json: true, .. }),
-        }))
+        })) | Some(Command::Join(crate::cli::JoinArgs { json: true, .. }))
     )
 }
 
@@ -167,10 +175,17 @@ fn run(cli: Cli) -> Result<()> {
             GraphCommand::Failure(args) => failure_cli::run(&args),
             GraphCommand::Audit(args) => run_graph_audit(&args),
             GraphCommand::Compose(args) => run_graph_compose(&args),
+            GraphCommand::Reconcile(args) => reconcile::run(&reconcile::ReconcileOptions {
+                inventory: args.inventory,
+                audits: args.audits,
+                baseline: args.baseline,
+                output: args.output,
+            }),
             GraphCommand::Master(args) => {
                 board::serve_master(&args.inventory, args.port, None, args.no_open)
             }
             GraphCommand::ImportLegacy(args) => legacy_import::run(&args.state, &args.repo),
+            GraphCommand::SeedParallelTest(args) => test_graph::seed(&args),
             GraphCommand::Serve(args) => board::serve_project_foreground(
                 &args.repo,
                 args.port,
@@ -207,6 +222,9 @@ fn run(cli: Cli) -> Result<()> {
         (None, Some(Command::Evolve(args))) => evolve::run_evolve(&args),
         (None, Some(Command::Efficiency(args))) => efficiency_config::run(&args),
         (None, Some(Command::Node(args))) => node::run(&args),
+        (None, Some(Command::Join(args))) => join::run(&args),
+        (None, Some(Command::Coordinator(args))) => coordinator::run(&args),
+        (None, Some(Command::Architect(args))) => architect::run(&args),
         (None, Some(Command::Clean(args))) => {
             let removed = safety::guarded_clear(&args.dir, args.yes)?;
             println!("Cleared {removed} item(s) from {}", args.dir.display());
@@ -248,9 +266,10 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 println!("Projects (resume by number, or say \"resume project N\"):");
                 for project in projects {
-                    let status = match checkpoint::find_resumable(std::path::Path::new(
-                        &project.workspace,
-                    )) {
+                    let workspace = std::path::Path::new(&project.workspace);
+                    let status = match checkpoint::from_project_state(workspace)
+                        .or_else(|| checkpoint::find_resumable(workspace))
+                    {
                         Some(cp) => format!("{}/{} done — resumable", cp.completed.len(), cp.total),
                         None => "complete / idle".to_owned(),
                     };

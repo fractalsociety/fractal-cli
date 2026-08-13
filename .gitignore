@@ -8,3 +8,14 @@
 *.tmp
 *.profraw
 .DS_Store
+.squad/
+/.fractal/*
+!/.fractal/project.fractal
+!/.fractal/lead-prd.json
+!/.fractal/closeout.json
+/tests/fixtures/**/.fractal/*
+!/tests/fixtures/**/.fractal/project.fractal
+/dist-*/
+/locks/
+/CLAUDE.md
+/GEMINI.md

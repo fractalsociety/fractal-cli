@@ -615,37 +615,10 @@ pub(crate) fn resume_project(
         anyhow::bail!("no project #{number} — run `fractal projects` to see the list");
     };
     let workspace = PathBuf::from(&project.workspace);
-    let cp = if let Some(cp) = crate::checkpoint::find_resumable(&workspace) {
+    let cp = if let Some(cp) = crate::checkpoint::from_project_state(&workspace)
+        .or_else(|| crate::checkpoint::find_resumable(&workspace))
+    {
         cp
-    } else if crate::amendments::has_pending(&workspace) {
-        let document = crate::project_file::load(&workspace)?;
-        let completed = crate::project_file::completed_nodes(&workspace);
-        let total = document
-            .graph
-            .get("nodes")
-            .and_then(serde_json::Value::as_array)
-            .map_or(0, Vec::len);
-        if total == 0 || completed.len() < total {
-            anyhow::bail!(
-                "project #{} has a pending amendment but no resumable completed graph",
-                number
-            );
-        }
-        let request = document
-            .project
-            .prompt
-            .unwrap_or_else(|| document.project.title.clone());
-        crate::checkpoint::RunCheckpoint {
-            key: crate::checkpoint::key_for(&workspace, &document.graph_hash),
-            graph_id: document.graph_hash.clone(),
-            request,
-            workspace: workspace.to_string_lossy().into_owned(),
-            current_graph_hash: document.graph_hash,
-            completed: completed.into_iter().collect(),
-            total,
-            done: false,
-            updated_at_ms: 0,
-        }
     } else {
         println!(
             "Project #{number} ({}) has nothing to resume — it is complete or hasn't started.",
@@ -658,6 +631,17 @@ pub(crate) fn resume_project(
             "project #{number} workspace {} is no longer trusted; run `fractal` there and approve trust",
             workspace.display()
         );
+    }
+    if crate::graph_store::load_graph(&cp.current_graph_hash).is_err() {
+        let document = crate::project_file::load(&workspace)?;
+        if document.graph_hash != cp.current_graph_hash {
+            anyhow::bail!(
+                "project #{} canonical graph changed during recovery",
+                number
+            );
+        }
+        crate::graph_store::commit_graph(&document.graph)
+            .context("restore canonical graph to the local content-addressed store")?;
     }
     let agents = execute::detect_agents();
     if agents.is_empty() {

@@ -1873,7 +1873,9 @@ fn graph_predecessors(graph: &Value, node_id: &str) -> Vec<String> {
 
 fn readiness_projection(
     predecessors: &[String],
-    assignments: Option<&std::collections::BTreeMap<String, crate::project_file::ExecutionAssignment>>,
+    assignments: Option<
+        &std::collections::BTreeMap<String, crate::project_file::ExecutionAssignment>,
+    >,
     node: &Value,
 ) -> Value {
     let blocked_by: Vec<String> = predecessors
@@ -1945,7 +1947,8 @@ fn canonical_expected_output(node: &Value) -> Option<String> {
     [
         node.get("output"),
         node.get("expected_output"),
-        node.get("efficiency").and_then(|efficiency| efficiency.get("expected_artifact")),
+        node.get("efficiency")
+            .and_then(|efficiency| efficiency.get("expected_artifact")),
     ]
     .into_iter()
     .flatten()
@@ -1965,9 +1968,7 @@ fn bounded_strings(values: &[String], limit: usize) -> Vec<String> {
 
 /// Keep assignments backwards compatible while excluding flattened unknown
 /// fields that could contain credentials or workspace details.
-fn safe_assignment(
-    assignment: Option<&crate::project_file::ExecutionAssignment>,
-) -> Value {
+fn safe_assignment(assignment: Option<&crate::project_file::ExecutionAssignment>) -> Value {
     let Some(assignment) = assignment else {
         return Value::Null;
     };
@@ -1997,20 +1998,28 @@ fn safe_learning_evidence(record: Option<&crate::learning_data::NodeRecord>) -> 
             "reopen_count": 0,
         });
     };
-    let verification = record.verification.as_ref().map(|verification| {
-        json!({
-            "type": bounded_text(verification.kind.as_deref(), 80),
-            "passed": verification.passed,
-            "evidence_refs": bounded_strings(&verification.evidence_refs, 32),
+    let verification = record
+        .verification
+        .as_ref()
+        .map(|verification| {
+            json!({
+                "type": bounded_text(verification.kind.as_deref(), 80),
+                "passed": verification.passed,
+                "evidence_refs": bounded_strings(&verification.evidence_refs, 32),
+            })
         })
-    }).unwrap_or_else(|| json!({"type": null, "passed": null, "evidence_refs": []}));
-    let executor = record.executor.as_ref().map(|executor| {
-        json!({
-            "agent": bounded_text(executor.agent.as_deref(), 160),
-            "model": bounded_text(executor.model.as_deref(), 160),
-            "version": bounded_text(executor.version.as_deref(), 120),
+        .unwrap_or_else(|| json!({"type": null, "passed": null, "evidence_refs": []}));
+    let executor = record
+        .executor
+        .as_ref()
+        .map(|executor| {
+            json!({
+                "agent": bounded_text(executor.agent.as_deref(), 160),
+                "model": bounded_text(executor.model.as_deref(), 160),
+                "version": bounded_text(executor.version.as_deref(), 120),
+            })
         })
-    }).unwrap_or_else(|| json!({"agent": null, "model": null, "version": null}));
+        .unwrap_or_else(|| json!({"agent": null, "model": null, "version": null}));
     json!({
         "started_at": bounded_text(record.started_at.as_deref(), 80),
         "finished_at": bounded_text(record.finished_at.as_deref(), 80),
@@ -2695,10 +2704,22 @@ mod tests {
         .unwrap();
         let planning = project_view(&workspace, "token").unwrap();
         assert_eq!(planning["execution"]["phase"], "planning");
-        assert_eq!(planning["execution"]["progress"]["message"], "Selecting eligible workers");
-        assert_eq!(planning["execution"]["progress"]["agent_label"], "Luna · Planner");
+        assert_eq!(
+            planning["execution"]["progress"]["message"],
+            "Selecting eligible workers"
+        );
+        assert_eq!(
+            planning["execution"]["progress"]["agent_label"],
+            "Luna · Planner"
+        );
 
-        crate::project_file::checkout_start_node(&workspace, "plan", "agent-plan", "Luna · Planner").unwrap();
+        crate::project_file::checkout_start_node(
+            &workspace,
+            "plan",
+            "agent-plan",
+            "Luna · Planner",
+        )
+        .unwrap();
         crate::project_file::finish_node(
             &workspace,
             "plan",
@@ -2706,7 +2727,13 @@ mod tests {
             crate::learning_data::NodeOutcome::UnverifiedSuccess,
         )
         .unwrap();
-        crate::project_file::checkout_start_node(&workspace, "build", "agent-build", "Luna · Builder").unwrap();
+        crate::project_file::checkout_start_node(
+            &workspace,
+            "build",
+            "agent-build",
+            "Luna · Builder",
+        )
+        .unwrap();
         crate::project_file::record_verification_result(
             &workspace,
             "build",
@@ -2753,13 +2780,19 @@ mod tests {
         let tasks = view["groups"][0]["tasks"].as_array().unwrap();
         let task = |id: &str| tasks.iter().find(|item| item["id"] == id).unwrap();
         assert!(task("build")["why"]["ready"].as_bool().unwrap());
-        assert_eq!(task("build")["why"]["blocked_by"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            task("build")["why"]["blocked_by"].as_array().unwrap().len(),
+            0
+        );
         assert_eq!(task("review")["why"]["ready"], false);
         assert_eq!(task("review")["why"]["blocked_by"], json!(["build"]));
         assert_eq!(task("build")["assignment"]["state"], "released");
         assert_eq!(task("build")["evidence"]["failure_code"], "weak_verifier");
         assert_eq!(task("build")["evidence"]["verification"]["passed"], false);
-        assert_eq!(task("build")["evidence"]["verification"]["evidence_refs"], json!(["evidence:build-failed"]));
+        assert_eq!(
+            task("build")["evidence"]["verification"]["evidence_refs"],
+            json!(["evidence:build-failed"])
+        );
         let encoded = serde_json::to_string(&task("build")["evidence"]).unwrap();
         assert!(!encoded.contains("unknown_flattened"));
         assert!(!encoded.contains("should-not-ship"));

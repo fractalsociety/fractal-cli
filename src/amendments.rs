@@ -68,11 +68,16 @@ fn queue_path(workspace: &Path) -> PathBuf {
     workspace.join(".fractal").join("pending-amendments.jsonl")
 }
 
+fn failure_path(workspace: &Path) -> PathBuf {
+    workspace.join(".fractal").join("failed-amendments.jsonl")
+}
+
 pub(crate) fn has_pending(workspace: &Path) -> bool {
-    let path = queue_path(workspace);
-    fs::read_to_string(path)
-        .ok()
-        .is_some_and(|raw| raw.lines().any(|line| !line.trim().is_empty()))
+    pending_files(workspace).into_iter().any(|path| {
+        fs::read_to_string(path)
+            .ok()
+            .is_some_and(|raw| raw.lines().any(|line| !line.trim().is_empty()))
+    })
 }
 
 pub(crate) fn queue(
@@ -84,7 +89,7 @@ pub(crate) fn queue(
     instruction: &str,
     source: &str,
 ) -> Result<()> {
-    if !matches!(action, "add_branch" | "add_wave_task") {
+    if !matches!(action, "add_branch" | "add_wave_task" | "add_team_wave") {
         bail!("unsupported graph amendment action `{action}`");
     }
     let task_ref = task_ref.trim();
@@ -92,7 +97,7 @@ pub(crate) fn queue(
     if action == "add_branch" && !valid_task_ref(task_ref) {
         bail!("task reference must look like 0.1 or 2.3");
     }
-    if action == "add_wave_task" && !matches!(wave, Some(1..)) {
+    if is_wave_action(action) && !matches!(wave, Some(1..)) {
         bail!("wave task amendments require wave 1 or later");
     }
     if instruction.is_empty() || instruction.len() > 4_000 {
@@ -197,10 +202,31 @@ fn is_direct_edit(action: &str) -> bool {
 }
 
 pub(crate) fn apply_pending(
+    graph: Value,
+    graph_hash: String,
+    workspace: &Path,
+    lead_agent: &str,
+) -> (Value, String) {
+    apply_pending_limit(graph, graph_hash, workspace, lead_agent, usize::MAX)
+}
+
+/// Apply one actionable amendment and preserve the rest of the claimed batch.
+/// Coordinators use this to return to worker joins between slow planner calls.
+pub(crate) fn apply_next_pending(
+    graph: Value,
+    graph_hash: String,
+    workspace: &Path,
+    lead_agent: &str,
+) -> (Value, String) {
+    apply_pending_limit(graph, graph_hash, workspace, lead_agent, 1)
+}
+
+fn apply_pending_limit(
     mut graph: Value,
     mut graph_hash: String,
     workspace: &Path,
     lead_agent: &str,
+    max_actionable: usize,
 ) -> (Value, String) {
     if graph.get("graph_hash").and_then(Value::as_str) != Some(graph_hash.as_str())
         || crate::graph_store::verify_graph_document(&graph).is_err()
@@ -208,8 +234,33 @@ pub(crate) fn apply_pending(
         eprintln!("  amendment note: refusing to mutate a graph with an invalid parent hash");
         return (graph, graph_hash);
     }
-    for request in drain(workspace) {
-        if request.action == "add_wave_task" {
+    let (pending, claimed_files) = match claim_pending(workspace) {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            eprintln!("  amendment note: could not claim pending queue: {error:#}");
+            return (graph, graph_hash);
+        }
+    };
+    if pending.is_empty() {
+        return (graph, graph_hash);
+    }
+    let mut remaining = Vec::new();
+    let mut retryable_failures = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut attempted = 0usize;
+    for request in pending {
+        if request.command_id.trim().is_empty() || !seen.insert(request.command_id.clone()) {
+            continue;
+        }
+        if amendment_already_applied(&graph, &request.command_id) {
+            continue;
+        }
+        if attempted >= max_actionable {
+            remaining.push(request);
+            continue;
+        }
+        attempted = attempted.saturating_add(1);
+        if is_wave_action(&request.action) {
             println!(
                 "  ✦ [{}] planning a new peer task for wave {}…",
                 lead_agent,
@@ -245,22 +296,23 @@ pub(crate) fn apply_pending(
                 graph_hash = applied.graph_hash;
                 if let Err(error) = crate::project_file::persist_evolved(workspace, &graph) {
                     eprintln!("  branch graph persist note: {error:#}");
-                } else {
-                    crate::project_file::record_graph_edit(
-                        workspace,
-                        &graph_before_hash,
-                        &request.action,
-                        (!request.task_ref.is_empty()).then_some(request.task_ref.as_str()),
-                        created_nodes,
-                        "human_amendment",
-                        &request.source,
-                    )
-                    .ok();
-                    if !applied.retired_nodes.is_empty() {
-                        mark_retired_nodes(workspace, &applied.retired_nodes, &request.action).ok();
-                    }
-                    crate::project_sync::maybe_sync_runtime(workspace);
+                    remaining.push(request);
+                    continue;
                 }
+                crate::project_file::record_graph_edit(
+                    workspace,
+                    &graph_before_hash,
+                    &request.action,
+                    (!request.task_ref.is_empty()).then_some(request.task_ref.as_str()),
+                    created_nodes,
+                    "human_amendment",
+                    &request.source,
+                )
+                .ok();
+                if !applied.retired_nodes.is_empty() {
+                    mark_retired_nodes(workspace, &applied.retired_nodes, &request.action).ok();
+                }
+                crate::project_sync::maybe_sync_runtime(workspace);
                 if request.command_id.starts_with("amend_") {
                     crate::project_sync::mark_amendment_result(
                         workspace,
@@ -270,7 +322,7 @@ pub(crate) fn apply_pending(
                     )
                     .ok();
                 }
-                if request.action == "add_wave_task" {
+                if is_wave_action(&request.action) {
                     println!(
                         "  ✓ added a task to wave {} — later waves now wait for it",
                         request.wave.unwrap_or_default()
@@ -283,9 +335,22 @@ pub(crate) fn apply_pending(
                 }
             }
             Err(error) => {
+                let error_text = format!("{error:#}");
+                let retryable = !is_permanent_failure(&request, &error_text);
+                // Rotate a failed request behind untouched work. Otherwise
+                // `apply_next_pending` retries the same head item forever and
+                // starves every valid amendment queued after it.
+                if retryable {
+                    retryable_failures.push(request.clone());
+                }
+                if let Err(persist_error) =
+                    record_failed(workspace, &request, &error_text, retryable)
+                {
+                    eprintln!("  amendment failure persistence note: {persist_error:#}");
+                }
                 eprintln!(
                     "  {} request could not be applied: {error:#}",
-                    if request.action == "add_wave_task" {
+                    if is_wave_action(&request.action) {
                         format!("wave {}", request.wave.unwrap_or_default())
                     } else {
                         format!("branch {}", request.task_ref)
@@ -303,22 +368,176 @@ pub(crate) fn apply_pending(
             }
         }
     }
+    remaining.extend(retryable_failures);
+    if let Err(error) = finish_claim(workspace, &claimed_files, &remaining) {
+        eprintln!("  amendment queue rewrite note: {error:#}");
+    }
     (graph, graph_hash)
 }
 
-fn drain(workspace: &Path) -> Vec<PendingAmendment> {
+fn is_permanent_failure(request: &PendingAmendment, error: &str) -> bool {
+    request.action == "add_team_wave"
+        && request.source == "master_architect"
+        && error.starts_with("wave ")
+        && error.ends_with(" is not in the current graph")
+}
+
+fn record_failed(
+    workspace: &Path,
+    request: &PendingAmendment,
+    error: &str,
+    retryable: bool,
+) -> Result<()> {
+    let path = failure_path(workspace);
+    fs::create_dir_all(path.parent().expect("amendment failure queue has parent"))?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("open amendment failure queue {}", path.display()))?;
+    serde_json::to_writer(
+        &mut file,
+        &json!({
+            "request": request,
+            "error": error,
+            "retryable": retryable,
+        }),
+    )?;
+    file.write_all(b"\n")?;
+    file.sync_data().ok();
+    Ok(())
+}
+
+fn pending_files(workspace: &Path) -> Vec<PathBuf> {
     let path = queue_path(workspace);
-    let processing = path.with_extension(format!("processing-{}", std::process::id()));
-    if fs::rename(&path, &processing).is_err() {
-        return Vec::new();
+    let mut paths = Vec::new();
+    if path.is_file() {
+        paths.push(path.clone());
     }
-    let requests = fs::read_to_string(&processing)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
-    fs::remove_file(processing).ok();
-    requests
+    if let Some(directory) = path.parent() {
+        if let Ok(entries) = fs::read_dir(directory) {
+            for entry in entries.flatten() {
+                let candidate = entry.path();
+                let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if name.starts_with("pending-amendments.processing") {
+                    paths.push(candidate);
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Atomically moves the live append queue aside before reading it. New
+/// amendments can then append to a fresh queue while a slow planner runs;
+/// finishing this claim must never rewrite or delete those concurrent writes.
+fn claim_pending(workspace: &Path) -> Result<(Vec<PendingAmendment>, Vec<PathBuf>)> {
+    let mut requests = Vec::new();
+    let path = queue_path(workspace);
+    fs::create_dir_all(path.parent().expect("amendment queue has parent"))?;
+    if path.is_file() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let processing = path.with_extension(format!("processing-{}-{nonce}", std::process::id()));
+        fs::rename(&path, &processing).with_context(|| {
+            format!(
+                "claim amendment queue {} as {}",
+                path.display(),
+                processing.display()
+            )
+        })?;
+    }
+    let claimed = pending_files(workspace)
+        .into_iter()
+        .filter(|candidate| candidate != &path)
+        .collect::<Vec<_>>();
+    for claimed_path in &claimed {
+        read_pending_file(claimed_path, &mut requests);
+    }
+    Ok((requests, claimed))
+}
+
+fn read_pending_file(path: &Path, requests: &mut Vec<PendingAmendment>) {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return;
+    };
+    requests.extend(
+        raw.lines()
+            .filter_map(|line| serde_json::from_str::<PendingAmendment>(line).ok()),
+    );
+}
+
+fn finish_claim(
+    workspace: &Path,
+    claimed_files: &[PathBuf],
+    requests: &[PendingAmendment],
+) -> Result<()> {
+    let path = queue_path(workspace);
+    fs::create_dir_all(path.parent().expect("amendment queue has parent"))?;
+    if !requests.is_empty() {
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&path)
+            .with_context(|| format!("requeue amendments in {}", path.display()))?;
+        for request in requests {
+            serde_json::to_writer(&mut file, request)?;
+            file.write_all(b"\n")?;
+        }
+        file.sync_data().ok();
+    }
+    for claimed in claimed_files {
+        let _ = fs::remove_file(claimed);
+    }
+    Ok(())
+}
+
+fn amendment_already_applied(graph: &Value, command_id: &str) -> bool {
+    let recorded = graph
+        .get("applied_amendment_command_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|value| value.as_str() == Some(command_id));
+    if recorded {
+        return true;
+    }
+    let prefix = format!("{}.", amendment_prefix(command_id));
+    graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| node.get("id").and_then(Value::as_str))
+        .any(|node_id| node_id.starts_with(&prefix))
+}
+
+fn mark_amendment_applied(graph: &mut Value, command_id: &str) {
+    let Some(object) = graph.as_object_mut() else {
+        return;
+    };
+    let entry = object
+        .entry("applied_amendment_command_ids".to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !entry.is_array() {
+        *entry = Value::Array(Vec::new());
+    }
+    let values = entry.as_array_mut().expect("array after initialization");
+    if !values
+        .iter()
+        .any(|value| value.as_str() == Some(command_id))
+    {
+        values.push(Value::String(command_id.to_owned()));
+    }
 }
 
 fn apply_one(
@@ -331,7 +550,7 @@ fn apply_one(
     if is_direct_edit(&request.action) {
         return apply_direct_edit(graph, parent_hash, request);
     }
-    let (anchor, wave_dependencies, wave_downstream) = if request.action == "add_wave_task" {
+    let (anchor, wave_dependencies, wave_downstream) = if is_wave_action(&request.action) {
         let wave = request
             .wave
             .context("wave task request is missing its wave")?;
@@ -344,7 +563,26 @@ fn apply_one(
     };
     let output_path = workspace.join(".fractal").join("fractal-amendment.json");
     fs::remove_file(&output_path).ok();
-    let prompt = if request.action == "add_wave_task" {
+    let prompt = if request.action == "add_team_wave" {
+        format!(
+            "You are the master architect forming one specialist team mission in wave {wave}. \
+             The mission request is:\n\n{instruction}\n\nWrite only \
+             `.fractal/fractal-amendment.json` using the standard amendment task schema. \
+             Produce exactly five independent, artifact-disjoint implementation or verification \
+             tasks for one coherent specialization. Every task must include bounded efficiency \
+             metadata, a concrete owned path, measurable acceptance behavior, and empty \
+             `depends_on` plus empty `efficiency.dependencies`; the controller resolves canonical \
+             wave dependencies. These five tasks will later be delegated by one team leader to \
+             five workers. This invocation is planning-only: do not join collaboration sessions, \
+             start receive loops, or wait for messages. Bound reconnaissance to twelve read-only \
+             commands and prefer the authoritative status/index documents over broad repository \
+             scans. Keep every efficiency text field credential-neutral: do not use the words \
+             authorization, api_key, apikey, password, private_key, private-key, secret, cookie, \
+             bearer, or token=. Do not edit product files or create branches now.",
+            wave = request.wave.unwrap_or_default(),
+            instruction = request.instruction,
+        )
+    } else if request.action == "add_wave_task" {
         format!(
             "You are the lead planner adding one peer task to wave {wave} of a live execution \
              graph. The user requested:\n\n{instruction}\n\nWrite only \
@@ -359,8 +597,12 @@ fn apply_one(
              \"similarity_to_other_active_nodes\":{{}},\"confidence_still_useful\":0.9}}}}]}}. \
              Produce exactly one bounded task that \
              can execute alongside the existing work in wave {wave}. Scores and confidence live \
-             in 0..=1 and file references contain no whitespace. Do not create a new feature \
-             branch and do not edit product files now.",
+             in 0..=1 and file references contain no whitespace. Keep `expected_artifact`, \
+             `verification_plan`, and each assumption at or below 480 UTF-8 bytes; use no more \
+             than 64 affected paths and 32 assumptions. Leave both `depends_on` and \
+             `efficiency.dependencies` empty because the coordinator resolves the live wave's \
+             canonical dependencies after planning. Do not create a new feature branch and do \
+             not edit product files now.",
             wave = request.wave.unwrap_or_default(),
             instruction = request.instruction,
         )
@@ -402,8 +644,9 @@ fn apply_one(
     }
     let raw = fs::read_to_string(&output_path)
         .context("lead planner did not write .fractal/fractal-amendment.json")?;
-    let document: PlannerDocument =
+    let mut document: PlannerDocument =
         serde_json::from_str(&raw).context("lead planner wrote invalid amendment JSON")?;
+    normalize_planner_metadata(&mut document.tasks);
     validate_tasks(&document.tasks, &request.action)?;
 
     let (mut harness, work, target) = crate::graph_store::load_source(parent_hash)
@@ -419,11 +662,12 @@ fn apply_one(
             )
         })
         .collect();
+    let efficiency_id_map = similarity_peer_map(graph, &id_map);
     let mut local_dependents = BTreeSet::new();
     let mut new_ids = Vec::new();
     for task in &document.tasks {
         let id = id_map[&task.id].clone();
-        let dependencies = if request.action == "add_wave_task" {
+        let dependencies = if is_wave_action(&request.action) {
             wave_dependencies.clone()
         } else if task.depends_on.is_empty() {
             vec![anchor.clone().expect("branch amendment has an anchor")]
@@ -443,7 +687,7 @@ fn apply_one(
                 })
                 .collect::<Result<Vec<_>>>()?
         };
-        let efficiency = resolve_task_efficiency(task, &dependencies, &id_map)?;
+        let efficiency = resolve_task_efficiency(task, &dependencies, &efficiency_id_map)?;
         append_harness_task(&mut harness, &id, task, &dependencies, &efficiency)?;
         new_ids.push((task.id.clone(), id));
     }
@@ -462,13 +706,15 @@ fn apply_one(
         &prefix,
         anchor.as_deref(),
         branch_depth,
-        if request.action == "add_wave_task" {
+        if request.action == "add_team_wave" {
+            "team_wave"
+        } else if request.action == "add_wave_task" {
             "wave_task"
         } else {
             "branch"
         },
     )?;
-    if request.action == "add_wave_task" && !wave_downstream.is_empty() {
+    if is_wave_action(&request.action) && !wave_downstream.is_empty() {
         connect_sinks_to_nodes(&mut harness, &sinks, &wave_downstream);
     } else {
         connect_sinks_to_closeout(&mut harness, &sinks);
@@ -478,6 +724,16 @@ fn apply_one(
         crate::compile::recompile(&work, &harness, &target).context("compile planner amendment")?;
     child["parent_graph"] = json!(parent_hash);
     child["evolution_arm"] = json!("user_branch");
+    for applied in graph
+        .get("applied_amendment_command_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        mark_amendment_applied(&mut child, applied);
+    }
+    mark_amendment_applied(&mut child, &request.command_id);
     crate::graph_store::rehash_graph(&mut child)?;
     let record = crate::graph_store::commit_graph(&child)?;
     crate::graph_store::persist_source(&record.graph_hash, &harness, &work, &target).ok();
@@ -487,6 +743,68 @@ fn apply_one(
         graph_hash: record.graph_hash,
         retired_nodes: Vec::new(),
     })
+}
+
+fn similarity_peer_map(
+    graph: &Value,
+    amendment_ids: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut resolved = amendment_ids.clone();
+    let mut suffixes: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for node in graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = node.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        resolved
+            .entry(id.to_owned())
+            .or_insert_with(|| id.to_owned());
+        if let Some(task_number) = node
+            .pointer("/execution/task_number")
+            .and_then(Value::as_str)
+        {
+            resolved
+                .entry(task_number.to_owned())
+                .or_insert_with(|| id.to_owned());
+        }
+        let suffix = id.rsplit('.').next().unwrap_or(id).to_owned();
+        suffixes
+            .entry(suffix)
+            .and_modify(|candidate| *candidate = None)
+            .or_insert_with(|| Some(id.to_owned()));
+    }
+    for (suffix, candidate) in suffixes {
+        if let Some(id) = candidate {
+            resolved.entry(suffix).or_insert(id);
+        }
+    }
+    resolved
+}
+
+fn normalize_planner_metadata(tasks: &mut [PlannerTask]) {
+    for task in tasks {
+        let Some(meta) = task.efficiency.as_mut() else {
+            continue;
+        };
+        meta.expected_artifact = bounded_planner_text(&meta.expected_artifact);
+        meta.verification_plan = bounded_planner_text(&meta.verification_plan);
+        for assumption in &mut meta.current_assumptions {
+            *assumption = bounded_planner_text(assumption);
+        }
+    }
+}
+
+fn bounded_planner_text(text: &str) -> String {
+    let text = text.trim();
+    let mut cut = text.len().min(crate::efficiency::MAX_BASIS_BYTES);
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text[..cut].to_owned()
 }
 
 /// Apply a controlled human edit directly to the immutable graph. This path
@@ -622,6 +940,7 @@ fn apply_direct_edit(
         _ => bail!("unsupported graph edit action `{}`", request.action),
     }
     rebuild_dependencies(&mut child)?;
+    mark_amendment_applied(&mut child, &request.command_id);
     crate::graph_store::rehash_graph(&mut child)?;
     let record = crate::graph_store::commit_graph(&child)?;
     Ok(AppliedAmendment {
@@ -961,6 +1280,24 @@ fn append_harness_task(
 ) -> Result<()> {
     let ready = |value: &str| format!("{value}.ready");
     let capability = normalize_capability(&task.capability);
+    let dependency_states = dependencies
+        .iter()
+        .map(|dependency| {
+            harness
+                .get("nodes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|node| node.get("id").and_then(Value::as_str) == Some(dependency))
+                .and_then(|node| node.get("produced_state"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find_map(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| ready(dependency))
+        })
+        .collect::<Vec<_>>();
     let nodes = harness
         .get_mut("nodes")
         .and_then(Value::as_array_mut)
@@ -970,7 +1307,7 @@ fn append_harness_task(
         "title": task.title.trim(),
         "capability": capability,
         "memory_scopes": ["work:goal", "workspace:root"],
-        "preconditions": dependencies.iter().map(|dependency| ready(dependency)).collect::<Vec<_>>(),
+        "preconditions": dependency_states,
         "produced_state": [ready(id)],
         "instruction": task.instruction.trim(),
         "budget": {"timeout_ms": if capability.ends_with("tests.execute") { 120_000 } else { 180_000 }},
@@ -987,11 +1324,13 @@ fn append_harness_task(
 }
 
 fn connect_sinks_to_closeout(harness: &mut Value, sinks: &[String]) {
+    let mut has_closeout = false;
     if let Some(nodes) = harness.get_mut("nodes").and_then(Value::as_array_mut) {
         if let Some(closeout) = nodes
             .iter_mut()
             .find(|node| node.get("id").and_then(Value::as_str) == Some("lead_closeout"))
         {
+            has_closeout = true;
             if let Some(preconditions) = closeout
                 .get_mut("preconditions")
                 .and_then(Value::as_array_mut)
@@ -999,6 +1338,13 @@ fn connect_sinks_to_closeout(harness: &mut Value, sinks: &[String]) {
                 preconditions.extend(sinks.iter().map(|sink| json!(format!("{sink}.ready"))));
             }
         }
+    }
+    // Recompiled source genomes for completed/evolved projects may no longer
+    // contain the original lead closeout node. In that case the amendment's
+    // sinks are valid terminal nodes; emitting edges to a missing closeout
+    // makes harness compilation fail and prevents completed graphs reopening.
+    if !has_closeout {
+        return;
     }
     if let Some(edges) = harness.get_mut("edges").and_then(Value::as_array_mut) {
         edges.extend(
@@ -1035,6 +1381,9 @@ fn validate_tasks(tasks: &[PlannerTask], action: &str) -> Result<()> {
     if action == "add_wave_task" && tasks.len() != 1 {
         bail!("wave task planner must produce exactly one task");
     }
+    if action == "add_team_wave" && tasks.len() != 5 {
+        bail!("team wave planner must produce exactly five tasks");
+    }
     if action == "add_branch" && !(2..=8).contains(&tasks.len()) {
         bail!("branch planner must produce 2-8 tasks");
     }
@@ -1047,10 +1396,11 @@ fn validate_tasks(tasks: &[PlannerTask], action: &str) -> Result<()> {
         {
             bail!("amendment tasks require unique ids, titles, and instructions");
         }
-        if task
-            .depends_on
-            .iter()
-            .any(|dependency| dependency != "anchor" && !seen.contains(dependency))
+        if !is_wave_action(action)
+            && task
+                .depends_on
+                .iter()
+                .any(|dependency| dependency != "anchor" && !seen.contains(dependency))
         {
             bail!("amendment dependencies must reference anchor or an earlier new task");
         }
@@ -1058,9 +1408,11 @@ fn validate_tasks(tasks: &[PlannerTask], action: &str) -> Result<()> {
             validate_node_metadata(meta).map_err(|error| {
                 anyhow!("amendment task `{}` efficiency metadata: {error}", task.id)
             })?;
-            if meta.dependencies.iter().any(|dependency| {
-                dependency != "anchor" && (dependency == &task.id || !seen.contains(dependency))
-            }) {
+            if !is_wave_action(action)
+                && meta.dependencies.iter().any(|dependency| {
+                    dependency != "anchor" && (dependency == &task.id || !seen.contains(dependency))
+                })
+            {
                 bail!(
                     "amendment task `{}` efficiency dependencies must reference anchor or an earlier new task",
                     task.id
@@ -1069,6 +1421,10 @@ fn validate_tasks(tasks: &[PlannerTask], action: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn is_wave_action(action: &str) -> bool {
+    matches!(action, "add_wave_task" | "add_team_wave")
 }
 
 fn normalize_capability(value: &str) -> &'static str {
@@ -1146,6 +1502,303 @@ mod tests {
         });
         crate::graph_store::rehash_graph(&mut graph).unwrap();
         graph
+    }
+
+    fn temp_workspace(name: &str) -> std::path::PathBuf {
+        let workspace = std::env::temp_dir().join(format!(
+            "fractal-amendments-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        workspace
+    }
+
+    #[test]
+    fn completed_genome_without_closeout_accepts_terminal_amendment_sinks() {
+        let mut harness = json!({
+            "nodes": [{"id": "completed", "produced_state": ["done"]}],
+            "edges": []
+        });
+
+        connect_sinks_to_closeout(&mut harness, &["branch.new_lane".to_owned()]);
+
+        assert_eq!(harness["edges"], json!([]));
+        assert!(harness["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|node| { node.get("id").and_then(Value::as_str) != Some("lead_closeout") }));
+    }
+
+    #[test]
+    fn active_genome_still_connects_amendment_sinks_to_closeout() {
+        let mut harness = json!({
+            "nodes": [{"id": "lead_closeout", "preconditions": []}],
+            "edges": []
+        });
+
+        connect_sinks_to_closeout(&mut harness, &["branch.new_lane".to_owned()]);
+
+        assert_eq!(
+            harness["nodes"][0]["preconditions"],
+            json!(["branch.new_lane.ready"])
+        );
+        assert_eq!(
+            harness["edges"],
+            json!([{"from":"branch.new_lane","to":"lead_closeout","condition":"success"}])
+        );
+    }
+
+    #[test]
+    fn peer_task_uses_the_existing_producers_declared_ready_state() {
+        let mut harness = json!({
+            "nodes": [{
+                "id": "plan",
+                "produced_state": ["plan_ready"]
+            }],
+            "edges": []
+        });
+        let task = PlannerTask {
+            id: "recovery".to_owned(),
+            title: "Recovery".to_owned(),
+            capability: "code.generate".to_owned(),
+            instruction: "Implement recovery".to_owned(),
+            depends_on: Vec::new(),
+            efficiency: None,
+        };
+        let efficiency = baseline_node_efficiency(
+            12_000,
+            vec!["plan".to_owned()],
+            "recovery artifact",
+            Vec::new(),
+            "run tests",
+        );
+
+        append_harness_task(
+            &mut harness,
+            "branch.recovery",
+            &task,
+            &["plan".to_owned()],
+            &efficiency,
+        )
+        .unwrap();
+
+        assert_eq!(harness["nodes"][1]["preconditions"], json!(["plan_ready"]));
+    }
+
+    #[test]
+    fn direct_amendment_queue_is_crash_safe_and_exactly_once_by_command_id() {
+        let workspace = temp_workspace("amend-exactly-once");
+        let graph = editable_graph();
+        crate::graph_store::commit_graph(&graph).unwrap();
+        crate::project_file::persist(&workspace, &graph, "Amend").unwrap();
+        let command_id = "cmd_exactly_once";
+        queue_edit(
+            &workspace,
+            command_id,
+            "reroute_node",
+            "build",
+            None,
+            "Build with the recovered instruction.",
+            "test",
+        )
+        .unwrap();
+        queue_edit(
+            &workspace,
+            command_id,
+            "reroute_node",
+            "build",
+            None,
+            "Build with the recovered instruction.",
+            "test",
+        )
+        .unwrap();
+
+        let previous = graph["graph_hash"].as_str().unwrap().to_owned();
+        let (first_graph, first_hash) = apply_pending(graph, previous, &workspace, "lead");
+        assert!(
+            first_graph["applied_amendment_command_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|value| value.as_str() == Some(command_id))
+                .count()
+                == 1
+        );
+        assert!(!has_pending(&workspace));
+        let applied_nodes = first_graph["nodes"].as_array().unwrap().len();
+
+        let (second_graph, second_hash) =
+            apply_pending(first_graph.clone(), first_hash.clone(), &workspace, "lead");
+        assert_eq!(second_hash, first_hash);
+        assert_eq!(
+            second_graph["nodes"].as_array().unwrap().len(),
+            applied_nodes
+        );
+        assert_eq!(
+            second_graph["applied_amendment_command_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|value| value.as_str() == Some(command_id))
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn committed_node_prefix_recovers_missing_amendment_history() {
+        let graph = json!({
+            "nodes": [
+                {"id": "branch.local-1234-99.task", "instruction": "already committed"}
+            ],
+            "applied_amendment_command_ids": []
+        });
+        assert!(amendment_already_applied(&graph, "local-1234-99"));
+        assert!(!amendment_already_applied(&graph, "local-1234-100"));
+    }
+
+    #[test]
+    fn processing_file_left_by_crash_is_recovered() {
+        let workspace = temp_workspace("amend-processing");
+        let request = PendingAmendment {
+            command_id: "cmd_processing".to_owned(),
+            action: "reroute_node".to_owned(),
+            task_ref: "build".to_owned(),
+            wave: None,
+            instruction: "Recovered from processing file.".to_owned(),
+            source: "test".to_owned(),
+            dependency: None,
+        };
+        let queue = queue_path(&workspace);
+        std::fs::create_dir_all(queue.parent().unwrap()).unwrap();
+        let processing = queue.with_extension(format!("processing-{}", std::process::id()));
+        let mut raw = Vec::new();
+        serde_json::to_writer(&mut raw, &request).unwrap();
+        raw.write_all(
+            b"
+",
+        )
+        .unwrap();
+        std::fs::write(&processing, raw).unwrap();
+        let (pending, claimed) = claim_pending(&workspace).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].command_id, "cmd_processing");
+        finish_claim(&workspace, &claimed, &[]).unwrap();
+        assert!(!processing.exists());
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn amendments_queued_during_a_claim_are_not_deleted() {
+        let workspace = temp_workspace("amend-concurrent-append");
+        queue_edit(
+            &workspace,
+            "claimed",
+            "reroute_node",
+            "build",
+            None,
+            "First instruction.",
+            "test",
+        )
+        .unwrap();
+
+        let (claimed_requests, claimed_files) = claim_pending(&workspace).unwrap();
+        assert_eq!(claimed_requests.len(), 1);
+        queue_edit(
+            &workspace,
+            "arrived_during_planning",
+            "reroute_node",
+            "build",
+            None,
+            "Second instruction.",
+            "test",
+        )
+        .unwrap();
+
+        finish_claim(&workspace, &claimed_files, &[]).unwrap();
+        assert!(has_pending(&workspace));
+        let (remaining, remaining_files) = claim_pending(&workspace).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].command_id, "arrived_during_planning");
+        finish_claim(&workspace, &remaining_files, &[]).unwrap();
+        assert!(!has_pending(&workspace));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn incremental_apply_returns_to_the_coordinator_between_requests() {
+        let workspace = temp_workspace("amend-incremental");
+        let graph = editable_graph();
+        crate::graph_store::commit_graph(&graph).unwrap();
+        crate::project_file::persist(&workspace, &graph, "Incremental").unwrap();
+        for (id, instruction) in [("first", "First route."), ("second", "Second route.")] {
+            queue_edit(
+                &workspace,
+                id,
+                "reroute_node",
+                "build",
+                None,
+                instruction,
+                "test",
+            )
+            .unwrap();
+        }
+
+        let before = graph["graph_hash"].as_str().unwrap().to_owned();
+        let (first, first_hash) = apply_next_pending(graph, before, &workspace, "lead");
+        assert!(amendment_already_applied(&first, "first"));
+        assert!(!amendment_already_applied(&first, "second"));
+        assert!(has_pending(&workspace));
+
+        let (second, _) = apply_next_pending(first, first_hash, &workspace, "lead");
+        assert!(amendment_already_applied(&second, "second"));
+        assert!(!has_pending(&workspace));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn incremental_apply_rotates_a_failed_head_behind_unattempted_work() {
+        let workspace = temp_workspace("amend-failed-head-fairness");
+        let graph = editable_graph();
+        crate::graph_store::commit_graph(&graph).unwrap();
+        crate::project_file::persist(&workspace, &graph, "Fairness").unwrap();
+        queue_edit(
+            &workspace,
+            "bad-head",
+            "reroute_node",
+            "missing-node",
+            None,
+            "This target does not exist.",
+            "test",
+        )
+        .unwrap();
+        queue_edit(
+            &workspace,
+            "valid-next",
+            "reroute_node",
+            "build",
+            None,
+            "Valid replacement instruction.",
+            "test",
+        )
+        .unwrap();
+
+        let before = graph["graph_hash"].as_str().unwrap().to_owned();
+        let (unchanged, unchanged_hash) = apply_next_pending(graph, before, &workspace, "lead");
+        assert!(!amendment_already_applied(&unchanged, "valid-next"));
+
+        let (applied, _) = apply_next_pending(unchanged, unchanged_hash, &workspace, "lead");
+        assert!(amendment_already_applied(&applied, "valid-next"));
+        let (remaining, claimed) = claim_pending(&workspace).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].command_id, "bad-head");
+        finish_claim(&workspace, &claimed, &[]).unwrap();
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]
@@ -1494,6 +2147,113 @@ mod tests {
     }
 
     #[test]
+    fn wave_task_ignores_planner_dependency_names_and_uses_canonical_wave_flow() {
+        let meta = baseline_node_efficiency(
+            5_000,
+            vec!["plan".to_owned()],
+            "the refreshed graph artifacts",
+            vec![],
+            "parse and validate both artifacts",
+        );
+        let tasks = vec![planner_task(
+            "refresh_master_graph",
+            vec!["plan".to_owned()],
+            Some(meta),
+        )];
+
+        validate_tasks(&tasks, "add_wave_task")
+            .expect("wave dependencies are replaced by canonical graph dependencies");
+    }
+
+    #[test]
+    fn team_wave_requires_exactly_five_peer_tasks() {
+        let tasks: Vec<PlannerTask> = (0..5)
+            .map(|index| planner_task(&format!("team_{index}"), Vec::new(), None))
+            .collect();
+        validate_tasks(&tasks, "add_team_wave").expect("one leader delegates five tasks");
+        assert!(validate_tasks(&tasks[..4], "add_team_wave")
+            .unwrap_err()
+            .to_string()
+            .contains("exactly five"));
+    }
+
+    #[test]
+    fn planner_metadata_is_bounded_before_contract_validation() {
+        let unicode = "é".repeat(crate::efficiency::MAX_BASIS_BYTES);
+        let mut meta = baseline_node_efficiency(5_000, Vec::new(), &unicode, vec![], &unicode);
+        meta.current_assumptions = vec![unicode];
+        let mut tasks = vec![planner_task("bounded", Vec::new(), Some(meta))];
+
+        normalize_planner_metadata(&mut tasks);
+        validate_tasks(&tasks, "add_wave_task").expect("normalized metadata is valid");
+        let meta = tasks[0].efficiency.as_ref().unwrap();
+        assert!(meta.expected_artifact.len() <= crate::efficiency::MAX_BASIS_BYTES);
+        assert!(meta.verification_plan.len() <= crate::efficiency::MAX_BASIS_BYTES);
+        assert!(meta.current_assumptions[0].len() <= crate::efficiency::MAX_BASIS_BYTES);
+        assert!(meta
+            .expected_artifact
+            .is_char_boundary(meta.expected_artifact.len()));
+    }
+
+    #[test]
+    fn failed_amendments_are_preserved_with_their_retry_context() {
+        let workspace = std::env::temp_dir().join(format!(
+            "fractal_failed_amendment_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let request = PendingAmendment {
+            command_id: "local-1".to_owned(),
+            action: "add_wave_task".to_owned(),
+            task_ref: String::new(),
+            wave: Some(2),
+            instruction: "bounded retry".to_owned(),
+            source: "explicit_amendment".to_owned(),
+            dependency: None,
+        };
+
+        record_failed(&workspace, &request, "metadata was too large", true).unwrap();
+        let line = fs::read_to_string(failure_path(&workspace)).unwrap();
+        let value: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(value["request"]["command_id"], "local-1");
+        assert_eq!(value["error"], "metadata was too large");
+        assert_eq!(value["retryable"], true);
+        fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn stale_architect_team_wave_is_quarantined_instead_of_retried_forever() {
+        let request = PendingAmendment {
+            command_id: "architect-team-0009".to_owned(),
+            action: "add_team_wave".to_owned(),
+            task_ref: String::new(),
+            wave: Some(6),
+            instruction: "form another bounded team".to_owned(),
+            source: "master_architect".to_owned(),
+            dependency: None,
+        };
+
+        assert!(is_permanent_failure(
+            &request,
+            "wave 6 is not in the current graph"
+        ));
+        assert!(!is_permanent_failure(
+            &request,
+            "planner process temporarily unavailable"
+        ));
+
+        let mut explicit = request;
+        explicit.source = "explicit_amendment".to_owned();
+        assert!(!is_permanent_failure(
+            &explicit,
+            "wave 6 is not in the current graph"
+        ));
+    }
+
+    #[test]
     fn resolved_amendment_efficiency_tracks_graph_dependencies_and_remaps_peers() {
         let mut meta = baseline_node_efficiency(
             5_000,
@@ -1526,6 +2286,26 @@ mod tests {
         assert_eq!(resolved.dependencies, vec!["build".to_owned()]);
         assert_eq!(resolved.expected_artifact, "impl title");
         assert!((resolved.confidence_still_useful - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn similarity_peer_map_resolves_only_unique_canonical_suffixes() {
+        let graph = json!({"nodes": [
+            {"id": "branch.first.rpc_adapter", "execution": {"task_number": "5.20"}},
+            {"id": "branch.first.shared"},
+            {"id": "branch.second.shared"}
+        ]});
+        let amendment_ids =
+            BTreeMap::from([("new_task".to_owned(), "branch.command.new_task".to_owned())]);
+        let peers = similarity_peer_map(&graph, &amendment_ids);
+        assert_eq!(peers["rpc_adapter"], "branch.first.rpc_adapter");
+        assert_eq!(peers["5.20"], "branch.first.rpc_adapter");
+        assert_eq!(
+            peers["branch.first.rpc_adapter"],
+            "branch.first.rpc_adapter"
+        );
+        assert_eq!(peers["new_task"], "branch.command.new_task");
+        assert!(!peers.contains_key("shared"));
     }
 
     #[test]

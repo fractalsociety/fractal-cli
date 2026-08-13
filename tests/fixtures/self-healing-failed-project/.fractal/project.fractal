@@ -1,0 +1,1053 @@
+{
+  "schema": "fractal.project.v1",
+  "project": {
+    "slug": "fractal-self-healing-graph-benchmark",
+    "title": "Fractal Self-Healing Graph Benchmark",
+    "prompt": "Improve the Fractal source in /workspace/fractalmaster so its execution graph continuously coordinates and safely repairs itself, with measured proof that changes improve speed, reliability, and efficiency.\n\nPreserve compatibility with .fractal/project.fractal and existing projects. Implement:\n\n- Self-healing coordination for dead or missing coordinators, stale worker checkouts, abandoned locks, interrupted transitions, partial local/remote synchronization, duplicate receivers, orphaned assignments, completed or disappeared workers. Recovery must be idempotent and dependency-safe, with no duplicate ownership or completion.\n- Autonomous scheduling that keeps dependency-ready work moving, chains assignments after completion, restores parallel lanes after interruption, and requests bounded non-overlapping graph expansion when available parallelism is genuinely insufficient.\n- A deterministic benchmark and fault-injection harness comparing baseline and candidate behavior across linear, wide-parallel, diamond, mixed-wave, and failure-injected graphs.\n- Metrics for throughput, p50/p95 assignment latency, coordinator recovery time, stranded tasks, duplicate assignments, dependency violations, completion rate, retries, sync conflicts, graph-expansion quality, and practical command/CPU/memory overhead.\n- One repeatable local/CI benchmark command, machine-readable results, human-readable before/after reports, correctness gates, statistically meaningful regression thresholds, and honest neutral or negative outcomes.\n- A bounded evidence-driven learning loop stored compactly in portable graph learning data, with safe rollback and no ability to weaken tests, dependency rules, acceptance criteria, or evidence requirements.\n- Automatic canonical-state convergence for worker join, project continuation, status, and graph board operations, with actionable diagnostics only when safe repair is impossible.\n- Unit, integration, stress, and fault-injection tests for multi-worker joins, coordinator termination/restart, completion chaining, stale-state recovery, synchronization races, and graph completion.\n- Full Rust formatting, tests, Clippy with warnings denied, and relevant macOS tests if touched.\n- A final before/after benchmark report identifying remaining bottlenecks and highest-value next experiments.\n\nUse Fractal's execution graph to create parallel-safe implementation, resilience, benchmarking, observability, and verification lanes. Preserve unrelated user changes. Never manually mutate Fractal-owned graph state.",
+    "visibility": "private"
+  },
+  "graph_hash": "sha256:ff592e08090f37528323cfb720e780a762f7e88d0adcdbc7dc1a9f52fb13ed66",
+  "graph": {
+    "compiler_version": "fractal-harnessc/0.1.0",
+    "edges": [
+      {
+        "condition": "success",
+        "from": "inspect",
+        "to": "patch"
+      },
+      {
+        "condition": "success",
+        "from": "locate",
+        "to": "inspect"
+      },
+      {
+        "condition": "success",
+        "from": "patch",
+        "to": "verify.patch.harness"
+      },
+      {
+        "condition": "success",
+        "from": "patch",
+        "to": "verify_target"
+      },
+      {
+        "condition": "success",
+        "from": "reproduce",
+        "to": "locate"
+      },
+      {
+        "condition": "success",
+        "from": "verify_related",
+        "to": "complete"
+      },
+      {
+        "condition": "failure",
+        "from": "verify_target",
+        "to": "inspect"
+      },
+      {
+        "condition": "success",
+        "from": "verify_target",
+        "to": "verify_related"
+      }
+    ],
+    "evolution": 1,
+    "evolution_arm": "repair.reinstruct",
+    "execution_flow": {
+      "schema": "fractal.execution_flow.v1",
+      "waves": [
+        {
+          "mode": "sequential",
+          "nodes": [
+            "reproduce"
+          ],
+          "parallel_group": null,
+          "wave": 1
+        },
+        {
+          "mode": "sequential",
+          "nodes": [
+            "locate"
+          ],
+          "parallel_group": null,
+          "wave": 2
+        },
+        {
+          "mode": "sequential",
+          "nodes": [
+            "inspect"
+          ],
+          "parallel_group": null,
+          "wave": 3
+        },
+        {
+          "mode": "sequential",
+          "nodes": [
+            "patch"
+          ],
+          "parallel_group": null,
+          "wave": 4
+        },
+        {
+          "mode": "parallel",
+          "nodes": [
+            "verify.patch.harness",
+            "verify_target"
+          ],
+          "parallel_group": "wave-5",
+          "wave": 5
+        },
+        {
+          "mode": "sequential",
+          "nodes": [
+            "verify_related"
+          ],
+          "parallel_group": null,
+          "wave": 6
+        },
+        {
+          "mode": "sequential",
+          "nodes": [
+            "complete"
+          ],
+          "parallel_group": null,
+          "wave": 7
+        }
+      ]
+    },
+    "graph_hash": "sha256:ff592e08090f37528323cfb720e780a762f7e88d0adcdbc7dc1a9f52fb13ed66",
+    "graph_id": "fg_0c29d2b67147a9f8bd329d0ae0b59f34",
+    "harness_hash": "sha256:950ad0e25ab02ea0f3f645a0d28bb5bb6a8b473865779ec8409010f4cfad0100",
+    "nodes": [
+      {
+        "artifacts_produced": [],
+        "attempt_count": 0,
+        "budget": {
+          "timeout_ms": 5000
+        },
+        "capability": "control.complete",
+        "consumed_by": [],
+        "created_at": "2026-08-13T01:18:11Z",
+        "depends_on": [
+          "verify_related"
+        ],
+        "execution": {
+          "mode": "sequential",
+          "parallel_group": null,
+          "task_number": "7.1",
+          "wave": 7
+        },
+        "human_intervention": false,
+        "id": "complete",
+        "kind": "control",
+        "memory_scopes": [
+          "harness:python_repair",
+          "repo:src",
+          "repo:tests",
+          "work:goal"
+        ],
+        "node_type": "control",
+        "objective": "complete",
+        "policy_contract": {
+          "allowed_commands": [],
+          "allowed_writes": [],
+          "budgets": {
+            "max_attempts": 1,
+            "max_cost_usd": 20,
+            "max_diff_lines": 500,
+            "max_files_changed": 6,
+            "max_input_tokens": 250000,
+            "max_minutes": 60,
+            "max_output_tokens": 50000,
+            "max_steps": 40
+          },
+          "capability": "control.complete",
+          "decision": "allow",
+          "evidence_requirements": [
+            "commands",
+            "exit_codes",
+            "stderr",
+            "stdout"
+          ],
+          "external_side_effects": false,
+          "network": {
+            "allowed_destinations": [],
+            "default": "deny"
+          },
+          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+          "provenance": "builtin:safe-default.v1",
+          "sandbox_profile": "local-work-v1",
+          "schema": "fractal.node_policy_contract.v1",
+          "verifier_ids": [
+            "independent"
+          ]
+        },
+        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+        "policy_provenance": "builtin:safe-default.v1",
+        "reopen_count": 0,
+        "requires": [
+          "related_tests_passed"
+        ],
+        "route_candidates": [
+          "control://control-complete-default"
+        ]
+      },
+      {
+        "artifacts_produced": [],
+        "attempt_count": 0,
+        "budget": {
+          "timeout_ms": 15000
+        },
+        "capability": "code.read",
+        "consumed_by": [],
+        "created_at": "2026-08-13T01:18:11Z",
+        "depends_on": [
+          "locate",
+          "verify_target"
+        ],
+        "execution": {
+          "mode": "sequential",
+          "parallel_group": null,
+          "task_number": "3.1",
+          "wave": 3
+        },
+        "human_intervention": false,
+        "id": "inspect",
+        "kind": "inference",
+        "memory_scopes": [
+          "harness:python_repair",
+          "repo:src",
+          "repo:tests",
+          "work:goal"
+        ],
+        "node_type": "implementation",
+        "objective": "inspect",
+        "policy_contract": {
+          "allowed_commands": [],
+          "allowed_writes": [],
+          "budgets": {
+            "max_attempts": 1,
+            "max_cost_usd": 20,
+            "max_diff_lines": 500,
+            "max_files_changed": 6,
+            "max_input_tokens": 250000,
+            "max_minutes": 60,
+            "max_output_tokens": 50000,
+            "max_steps": 40
+          },
+          "capability": "code.read",
+          "decision": "deny",
+          "evidence_requirements": [
+            "commands",
+            "exit_codes",
+            "stderr",
+            "stdout"
+          ],
+          "external_side_effects": false,
+          "network": {
+            "allowed_destinations": [],
+            "default": "deny"
+          },
+          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+          "provenance": "builtin:safe-default.v1",
+          "sandbox_profile": "deny",
+          "schema": "fractal.node_policy_contract.v1",
+          "verifier_ids": [
+            "independent"
+          ]
+        },
+        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+        "policy_provenance": "builtin:safe-default.v1",
+        "reopen_count": 0,
+        "requires": [
+          "source_located"
+        ],
+        "route_candidates": [
+          "mlx://code-read-default"
+        ]
+      },
+      {
+        "artifacts_produced": [],
+        "attempt_count": 0,
+        "budget": {
+          "timeout_ms": 15000
+        },
+        "capability": "code.search",
+        "consumed_by": [],
+        "created_at": "2026-08-13T01:18:11Z",
+        "depends_on": [
+          "reproduce"
+        ],
+        "execution": {
+          "mode": "sequential",
+          "parallel_group": null,
+          "task_number": "2.1",
+          "wave": 2
+        },
+        "human_intervention": false,
+        "id": "locate",
+        "kind": "inference",
+        "memory_scopes": [
+          "harness:python_repair",
+          "repo:src",
+          "repo:tests",
+          "work:goal"
+        ],
+        "node_type": "implementation",
+        "objective": "locate",
+        "policy_contract": {
+          "allowed_commands": [],
+          "allowed_writes": [],
+          "budgets": {
+            "max_attempts": 1,
+            "max_cost_usd": 20,
+            "max_diff_lines": 500,
+            "max_files_changed": 6,
+            "max_input_tokens": 250000,
+            "max_minutes": 60,
+            "max_output_tokens": 50000,
+            "max_steps": 40
+          },
+          "capability": "code.search",
+          "decision": "deny",
+          "evidence_requirements": [
+            "commands",
+            "exit_codes",
+            "stderr",
+            "stdout"
+          ],
+          "external_side_effects": false,
+          "network": {
+            "allowed_destinations": [],
+            "default": "deny"
+          },
+          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+          "provenance": "builtin:safe-default.v1",
+          "sandbox_profile": "deny",
+          "schema": "fractal.node_policy_contract.v1",
+          "verifier_ids": [
+            "independent"
+          ]
+        },
+        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+        "policy_provenance": "builtin:safe-default.v1",
+        "reopen_count": 0,
+        "requires": [
+          "failure_reproduced"
+        ],
+        "route_candidates": [
+          "mlx://code-search-default"
+        ]
+      },
+      {
+        "artifacts_produced": [],
+        "attempt_count": 0,
+        "budget": {
+          "timeout_ms": 30000
+        },
+        "capability": "code.edit",
+        "consumed_by": [],
+        "created_at": "2026-08-13T01:18:11Z",
+        "depends_on": [
+          "inspect"
+        ],
+        "execution": {
+          "mode": "sequential",
+          "parallel_group": null,
+          "task_number": "4.1",
+          "wave": 4
+        },
+        "human_intervention": false,
+        "id": "patch",
+        "instruction": "\n\nREPAIR: a previous attempt did NOT succeed at `reproduce` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.\n\nREPAIR: a previous attempt did NOT succeed at `reproduce` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
+        "kind": "container",
+        "memory_scopes": [
+          "harness:python_repair",
+          "repo:src",
+          "repo:tests",
+          "work:goal"
+        ],
+        "node_type": "implementation",
+        "objective": "REPAIR: a previous attempt did NOT succeed at `reproduce` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.\n\nREPAIR: a previous attempt did NOT succeed at `reproduce` (it failed verification, or the agent got stuck / timed out). Read any error output and fix the implementation and tests so the whole suite passes. If the earlier approach was slow, blocking, interactive, or hung, SIMPLIFY it: avoid long-running or interactive operations and produce a minimal, correct version quickly.",
+        "policy_contract": {
+          "allowed_commands": [],
+          "allowed_writes": [],
+          "budgets": {
+            "max_attempts": 1,
+            "max_cost_usd": 20,
+            "max_diff_lines": 500,
+            "max_files_changed": 6,
+            "max_input_tokens": 250000,
+            "max_minutes": 60,
+            "max_output_tokens": 50000,
+            "max_steps": 40
+          },
+          "capability": "code.edit",
+          "decision": "allow",
+          "evidence_requirements": [
+            "commands",
+            "exit_codes",
+            "stderr",
+            "stdout"
+          ],
+          "external_side_effects": false,
+          "network": {
+            "allowed_destinations": [],
+            "default": "deny"
+          },
+          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+          "provenance": "builtin:safe-default.v1",
+          "sandbox_profile": "local-work-v1",
+          "schema": "fractal.node_policy_contract.v1",
+          "verifier_ids": [
+            "independent"
+          ]
+        },
+        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+        "policy_provenance": "builtin:safe-default.v1",
+        "reopen_count": 0,
+        "requires": [
+          "incorrect_assumption_identified"
+        ],
+        "route_candidates": [
+          "apple-container://code-edit-default"
+        ],
+        "sandbox_profile": "apple-container://local-work-v1"
+      },
+      {
+        "artifacts_produced": [],
+        "attempt_count": 0,
+        "budget": {
+          "timeout_ms": 120000
+        },
+        "capability": "python.tests.execute",
+        "consumed_by": [],
+        "controlled_outcome": "accepted",
+        "created_at": "2026-08-13T01:18:11Z",
+        "depends_on": [],
+        "execution": {
+          "mode": "sequential",
+          "parallel_group": null,
+          "task_number": "1.1",
+          "wave": 1
+        },
+        "human_intervention": false,
+        "id": "reproduce",
+        "kind": "container",
+        "memory_scopes": [
+          "harness:python_repair",
+          "repo:src",
+          "repo:tests",
+          "work:goal"
+        ],
+        "node_type": "verification",
+        "objective": "reproduce",
+        "policy_contract": {
+          "allowed_commands": [],
+          "allowed_writes": [],
+          "budgets": {
+            "max_attempts": 1,
+            "max_cost_usd": 20,
+            "max_diff_lines": 500,
+            "max_files_changed": 6,
+            "max_input_tokens": 250000,
+            "max_minutes": 60,
+            "max_output_tokens": 50000,
+            "max_steps": 40
+          },
+          "capability": "python.tests.execute",
+          "decision": "allow",
+          "evidence_requirements": [
+            "commands",
+            "exit_codes",
+            "stderr",
+            "stdout"
+          ],
+          "external_side_effects": false,
+          "network": {
+            "allowed_destinations": [],
+            "default": "deny"
+          },
+          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+          "provenance": "builtin:safe-default.v1",
+          "sandbox_profile": "local-work-v1",
+          "schema": "fractal.node_policy_contract.v1",
+          "verifier_ids": [
+            "independent"
+          ]
+        },
+        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+        "policy_provenance": "builtin:safe-default.v1",
+        "ready_at": "2026-08-13T01:18:11Z",
+        "reopen_count": 0,
+        "route_candidates": [
+          "apple-container://python-tests-execute-default"
+        ],
+        "sandbox_profile": "apple-container://local-work-v1",
+        "structural_outcome": "repaired"
+      },
+      {
+        "artifacts_produced": [],
+        "attempt_count": 0,
+        "budget": {
+          "timeout_ms": 120000
+        },
+        "capability": "project.tests.execute",
+        "consumed_by": [],
+        "created_at": "2026-08-13T01:18:11Z",
+        "depends_on": [
+          "patch"
+        ],
+        "execution": {
+          "mode": "parallel",
+          "parallel_group": "wave-5",
+          "task_number": "5.1",
+          "wave": 5
+        },
+        "human_intervention": false,
+        "id": "verify.patch.harness",
+        "instruction": "Re-run the acceptance suite against the produced artifact; fail if any test fails.",
+        "kind": "container",
+        "memory_scopes": [
+          "acceptance:spec",
+          "work:goal",
+          "workspace:root"
+        ],
+        "node_type": "verification",
+        "objective": "Re-run the acceptance suite against the produced artifact; fail if any test fails.",
+        "policy_contract": {
+          "allowed_commands": [],
+          "allowed_writes": [],
+          "budgets": {
+            "max_attempts": 1,
+            "max_cost_usd": 20,
+            "max_diff_lines": 500,
+            "max_files_changed": 6,
+            "max_input_tokens": 250000,
+            "max_minutes": 60,
+            "max_output_tokens": 50000,
+            "max_steps": 40
+          },
+          "capability": "project.tests.execute",
+          "decision": "allow",
+          "evidence_requirements": [
+            "commands",
+            "exit_codes",
+            "stderr",
+            "stdout"
+          ],
+          "external_side_effects": false,
+          "network": {
+            "allowed_destinations": [],
+            "default": "deny"
+          },
+          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+          "provenance": "builtin:safe-default.v1",
+          "sandbox_profile": "local-work-v1",
+          "schema": "fractal.node_policy_contract.v1",
+          "verifier_ids": [
+            "independent"
+          ]
+        },
+        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+        "policy_provenance": "builtin:safe-default.v1",
+        "reopen_count": 0,
+        "requires": [
+          "patch_written"
+        ],
+        "route_candidates": [
+          "apple-container://project-tests-execute-default"
+        ],
+        "sandbox_profile": "apple-container://local-work-v1"
+      },
+      {
+        "artifacts_produced": [],
+        "attempt_count": 0,
+        "budget": {
+          "timeout_ms": 120000
+        },
+        "capability": "python.tests.execute",
+        "consumed_by": [],
+        "created_at": "2026-08-13T01:18:11Z",
+        "depends_on": [
+          "verify_target"
+        ],
+        "execution": {
+          "mode": "sequential",
+          "parallel_group": null,
+          "task_number": "6.1",
+          "wave": 6
+        },
+        "human_intervention": false,
+        "id": "verify_related",
+        "kind": "container",
+        "memory_scopes": [
+          "harness:python_repair",
+          "repo:src",
+          "repo:tests",
+          "work:goal"
+        ],
+        "node_type": "verification",
+        "objective": "verify_related",
+        "policy_contract": {
+          "allowed_commands": [],
+          "allowed_writes": [],
+          "budgets": {
+            "max_attempts": 1,
+            "max_cost_usd": 20,
+            "max_diff_lines": 500,
+            "max_files_changed": 6,
+            "max_input_tokens": 250000,
+            "max_minutes": 60,
+            "max_output_tokens": 50000,
+            "max_steps": 40
+          },
+          "capability": "python.tests.execute",
+          "decision": "allow",
+          "evidence_requirements": [
+            "commands",
+            "exit_codes",
+            "stderr",
+            "stdout"
+          ],
+          "external_side_effects": false,
+          "network": {
+            "allowed_destinations": [],
+            "default": "deny"
+          },
+          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+          "provenance": "builtin:safe-default.v1",
+          "sandbox_profile": "local-work-v1",
+          "schema": "fractal.node_policy_contract.v1",
+          "verifier_ids": [
+            "independent"
+          ]
+        },
+        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+        "policy_provenance": "builtin:safe-default.v1",
+        "reopen_count": 0,
+        "requires": [
+          "target_test_passed"
+        ],
+        "route_candidates": [
+          "apple-container://python-tests-execute-default"
+        ],
+        "sandbox_profile": "apple-container://local-work-v1"
+      },
+      {
+        "artifacts_produced": [],
+        "attempt_count": 0,
+        "budget": {
+          "timeout_ms": 120000
+        },
+        "capability": "python.tests.execute",
+        "consumed_by": [],
+        "created_at": "2026-08-13T01:18:11Z",
+        "depends_on": [
+          "patch"
+        ],
+        "execution": {
+          "mode": "parallel",
+          "parallel_group": "wave-5",
+          "task_number": "5.2",
+          "wave": 5
+        },
+        "human_intervention": false,
+        "id": "verify_target",
+        "kind": "container",
+        "memory_scopes": [
+          "harness:python_repair",
+          "repo:src",
+          "repo:tests",
+          "work:goal"
+        ],
+        "node_type": "verification",
+        "objective": "verify_target",
+        "policy_contract": {
+          "allowed_commands": [],
+          "allowed_writes": [],
+          "budgets": {
+            "max_attempts": 1,
+            "max_cost_usd": 20,
+            "max_diff_lines": 500,
+            "max_files_changed": 6,
+            "max_input_tokens": 250000,
+            "max_minutes": 60,
+            "max_output_tokens": 50000,
+            "max_steps": 40
+          },
+          "capability": "python.tests.execute",
+          "decision": "allow",
+          "evidence_requirements": [
+            "commands",
+            "exit_codes",
+            "stderr",
+            "stdout"
+          ],
+          "external_side_effects": false,
+          "network": {
+            "allowed_destinations": [],
+            "default": "deny"
+          },
+          "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+          "provenance": "builtin:safe-default.v1",
+          "sandbox_profile": "local-work-v1",
+          "schema": "fractal.node_policy_contract.v1",
+          "verifier_ids": [
+            "independent"
+          ]
+        },
+        "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+        "policy_provenance": "builtin:safe-default.v1",
+        "reopen_count": 0,
+        "requires": [
+          "patch_written"
+        ],
+        "route_candidates": [
+          "apple-container://python-tests-execute-default"
+        ],
+        "sandbox_profile": "apple-container://local-work-v1"
+      }
+    ],
+    "parent_graph": "sha256:ef5eda42d3a8972d93713f1bf109d4f191d2546d9b544004673d32b774282ab5",
+    "policy_hash": "sha256:27e66212cd68848d2c9ac693d60382f2715cd48857e5f0135048efde8478f968",
+    "policy_provenance": {
+      "kind": "builtin_default",
+      "source": "builtin:safe-default.v1"
+    },
+    "policy_schema": "fractal.harness_policy.v1",
+    "schema": "fractal.execution_graph.v1",
+    "target": "darwin-arm64",
+    "work_hash": "sha256:4395f3e5ea6935e89c6600c86ad4eda391cf57e8a3dd7daddd968939f3757be5"
+  },
+  "execution": {
+    "schema": "fractal.execution_state.v1",
+    "phase": "halted",
+    "assignments": {
+      "reproduce": {
+        "agent_id": "codex",
+        "agent_label": "codex",
+        "state": "released",
+        "checked_out_at": "2026-08-13T01:18:25Z",
+        "released_at": "2026-08-13T01:18:58Z"
+      }
+    },
+    "updated_at": "2026-08-13T01:25:15Z"
+  },
+  "learning": {
+    "schema": "fractal.learning.v1",
+    "nodes": {
+      "complete": {
+        "node_id": "complete",
+        "node_type": "control",
+        "objective": "complete",
+        "depends_on": [
+          "verify_related"
+        ],
+        "created_at": "2026-08-13T01:18:11Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "inspect": {
+        "node_id": "inspect",
+        "node_type": "implementation",
+        "objective": "inspect",
+        "depends_on": [
+          "locate",
+          "verify_target"
+        ],
+        "created_at": "2026-08-13T01:18:11Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "locate": {
+        "node_id": "locate",
+        "node_type": "implementation",
+        "objective": "locate",
+        "depends_on": [
+          "reproduce"
+        ],
+        "created_at": "2026-08-13T01:18:11Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "patch": {
+        "node_id": "patch",
+        "node_type": "implementation",
+        "objective": "patch",
+        "depends_on": [
+          "inspect"
+        ],
+        "created_at": "2026-08-13T01:18:11Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "reproduce": {
+        "node_id": "reproduce",
+        "node_type": "implementation",
+        "objective": "reproduce",
+        "depends_on": [],
+        "created_at": "2026-08-13T01:18:11Z",
+        "ready_at": "2026-08-13T01:18:11Z",
+        "started_at": "2026-08-13T01:18:58Z",
+        "finished_at": "2026-08-13T01:18:58Z",
+        "executor": {
+          "agent": "codex",
+          "version": "0.1.0"
+        },
+        "attempt_count": 4,
+        "outcome": "failed_execution",
+        "failure_code": "budget_exceeded",
+        "artifacts_produced": [
+          ".fractal/evidence/56e67275986e033cc49c0fd37c52621077c1469c7b6a303798659bfec8ae6308.json"
+        ],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 3
+      },
+      "verify.patch.harness": {
+        "node_id": "verify.patch.harness",
+        "node_type": "verification",
+        "objective": "Re-run the acceptance suite against the produced artifact; fail if any test fails.",
+        "depends_on": [
+          "patch"
+        ],
+        "created_at": "2026-08-13T01:18:25Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "verify_related": {
+        "node_id": "verify_related",
+        "node_type": "implementation",
+        "objective": "verify_related",
+        "depends_on": [
+          "verify_target"
+        ],
+        "created_at": "2026-08-13T01:18:11Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      },
+      "verify_target": {
+        "node_id": "verify_target",
+        "node_type": "implementation",
+        "objective": "verify_target",
+        "depends_on": [
+          "patch"
+        ],
+        "created_at": "2026-08-13T01:18:11Z",
+        "attempt_count": 0,
+        "artifacts_produced": [],
+        "consumed_by": [],
+        "human_intervention": false,
+        "reopen_count": 0
+      }
+    },
+    "graph_edits": [],
+    "outcome": {
+      "acceptance_criteria": [],
+      "maximum_parallelism": 0,
+      "retry_count": 3,
+      "reopened_node_count": 1,
+      "dead_or_unused_node_count": 2,
+      "human_intervention_count": 0,
+      "verification_coverage": 0.0,
+      "verification_coverage_denominator": 7
+    }
+  },
+  "efficiency": {
+    "schema": "fractal.efficiency.v1",
+    "mode": "suggest",
+    "aggregation_version": 1,
+    "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c",
+    "episodes": [],
+    "build": {
+      "episode_count": 0,
+      "gross_estimated_tokens_avoided": 0,
+      "confidence_adjusted_tokens_avoided": 0,
+      "realized_tokens_saved": 0,
+      "estimated_cost_avoided": 0.0,
+      "realized_cost_avoided": 0.0,
+      "estimated_agent_hours_avoided": 0.0,
+      "realized_agent_hours_avoided": 0.0,
+      "rework_prevented": 0,
+      "waste_breakdown": {},
+      "aggregation_version": 1,
+      "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c"
+    },
+    "lifetime": {
+      "episode_count": 0,
+      "gross_estimated_tokens_avoided": 0,
+      "confidence_adjusted_tokens_avoided": 0,
+      "realized_tokens_saved": 0,
+      "estimated_cost_avoided": 0.0,
+      "realized_cost_avoided": 0.0,
+      "estimated_agent_hours_avoided": 0.0,
+      "realized_agent_hours_avoided": 0.0,
+      "rework_prevented": 0,
+      "waste_breakdown": {},
+      "aggregation_version": 1,
+      "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c"
+    }
+  },
+  "failure_graph": {
+    "schema": "fractal.failure_graph.v1",
+    "failures": {
+      "failure:reproduce:budget_exceeded": {
+        "id": "failure:reproduce:budget_exceeded",
+        "node_id": "reproduce",
+        "attempt": 4,
+        "failure_code": "budget_exceeded",
+        "outcome": "failed_execution",
+        "state": "unresolved",
+        "summary": "node reproduce reported failed_execution with failure code budget_exceeded",
+        "capability": "python.tests.execute",
+        "component": "implementation",
+        "evidence": [
+          {
+            "legacy_ref": "evidence:reproduce:evidence:reproduce:fd49b",
+            "kind": "workspace_state"
+          }
+        ],
+        "observations": [
+          {
+            "attempt": 2,
+            "outcome": "failed_execution",
+            "summary": "node reproduce reported failed_execution with failure code budget_exceeded",
+            "evidence": [
+              {
+                "legacy_ref": "evidence:reproduce:evidence:reproduce:fd49b",
+                "kind": "workspace_state"
+              }
+            ],
+            "agent": "codex",
+            "version": "0.1.0",
+            "observed": {
+              "graph_hash": "sha256:70619c81b90322dc489ecd02d1fcfd534f2143ab3d23432679c27c0dc2a900a8"
+            }
+          },
+          {
+            "attempt": 3,
+            "outcome": "failed_execution",
+            "summary": "node reproduce reported failed_execution with failure code budget_exceeded",
+            "evidence": [
+              {
+                "legacy_ref": "evidence:reproduce:evidence:reproduce:fd49b",
+                "kind": "workspace_state"
+              }
+            ],
+            "agent": "codex",
+            "version": "0.1.0",
+            "observed": {
+              "graph_hash": "sha256:ef5eda42d3a8972d93713f1bf109d4f191d2546d9b544004673d32b774282ab5"
+            }
+          },
+          {
+            "attempt": 4,
+            "outcome": "failed_execution",
+            "summary": "node reproduce reported failed_execution with failure code budget_exceeded",
+            "evidence": [
+              {
+                "legacy_ref": "evidence:reproduce:evidence:reproduce:fd49b",
+                "kind": "workspace_state"
+              }
+            ],
+            "agent": "codex",
+            "version": "0.1.0",
+            "observed": {
+              "graph_hash": "sha256:ff592e08090f37528323cfb720e780a762f7e88d0adcdbc7dc1a9f52fb13ed66"
+            }
+          }
+        ],
+        "agent": "codex",
+        "version": "0.1.0",
+        "observed": {
+          "graph_hash": "sha256:ff592e08090f37528323cfb720e780a762f7e88d0adcdbc7dc1a9f52fb13ed66"
+        },
+        "objective_fingerprint": "sha256:3a0d7745c3fcf410683885fb8e9cf329d4d21a161c4976243f346668ee76771a"
+      },
+      "failure:reproduce:tool_failure": {
+        "id": "failure:reproduce:tool_failure",
+        "node_id": "reproduce",
+        "attempt": 1,
+        "failure_code": "tool_failure",
+        "outcome": "failed_execution",
+        "state": "unresolved",
+        "summary": "node reproduce reported failed_execution with failure code tool_failure",
+        "capability": "python.tests.execute",
+        "component": "implementation",
+        "evidence": [
+          {
+            "legacy_ref": ".fractal/evidence/56e67275986e033cc49c0fd37c52621077c1469c7b6a303798659bfec8ae6308.json",
+            "kind": "verification"
+          },
+          {
+            "legacy_ref": "evidence:reproduce:evidence:reproduce:fd49b",
+            "kind": "workspace_state"
+          },
+          {
+            "legacy_ref": "sha256:fd49be60ae43afe8ea52951a1f42763eb744655e157c8e4291dae3da2859163c",
+            "kind": "verification"
+          }
+        ],
+        "observations": [
+          {
+            "attempt": 1,
+            "outcome": "failed_execution",
+            "summary": "node reproduce reported failed_execution with failure code tool_failure",
+            "evidence": [
+              {
+                "legacy_ref": ".fractal/evidence/56e67275986e033cc49c0fd37c52621077c1469c7b6a303798659bfec8ae6308.json",
+                "kind": "verification"
+              },
+              {
+                "legacy_ref": "evidence:reproduce:evidence:reproduce:fd49b",
+                "kind": "workspace_state"
+              },
+              {
+                "legacy_ref": "sha256:fd49be60ae43afe8ea52951a1f42763eb744655e157c8e4291dae3da2859163c",
+                "kind": "verification"
+              }
+            ],
+            "agent": "codex",
+            "version": "0.1.0",
+            "observed": {
+              "graph_hash": "sha256:377c601d8522be5f5cb8e27cc6b650b86675902950cb74a395e0e74760191f7c"
+            }
+          }
+        ],
+        "agent": "codex",
+        "version": "0.1.0",
+        "observed": {
+          "graph_hash": "sha256:377c601d8522be5f5cb8e27cc6b650b86675902950cb74a395e0e74760191f7c"
+        },
+        "objective_fingerprint": "sha256:3a0d7745c3fcf410683885fb8e9cf329d4d21a161c4976243f346668ee76771a",
+        "policy_evidence_hash": "sha256:d3183e6c02599d84f95566b21bcdea0fd97461129f617625a10940724d2c415a",
+        "policy_report_hash": "sha256:d8516fb1e01cfbbde5a35b8042a7ee151cae89a3702de3083d07069c10c22225",
+        "policy_violation_count": 1
+      }
+    },
+    "lessons": {},
+    "edges": {},
+    "cross_project_links": {},
+    "failure_graph_hash": "sha256:98bdd857a0f55e2c855eff35646667dc63e1f7be9c640e89dc639801e9d16796"
+  },
+  "updated_at": "2026-08-13T01:25:15Z"
+}

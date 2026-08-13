@@ -140,8 +140,10 @@ fn topo_order(graph: &Value) -> Result<Vec<Value>> {
     Ok(ordered)
 }
 
-/// An optional pinned model for `kind`, from `$FRACTAL_<KIND>_MODEL`
-/// (e.g. `FRACTAL_CLAUDE_MODEL=fable`).
+/// A model for `kind`, overridden by `$FRACTAL_<KIND>_MODEL` when set.
+///
+/// Claude defaults to its rolling `opus` alias so unattended workers do not
+/// fall back to the CLI's account-dependent default model.
 fn model_for(kind: &str) -> Option<String> {
     let key = format!(
         "FRACTAL_{}_MODEL",
@@ -150,6 +152,10 @@ fn model_for(kind: &str) -> Option<String> {
     std::env::var(key)
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| match kind {
+            "claude" => Some("opus".to_owned()),
+            _ => None,
+        })
 }
 
 const INFERX_ENDPOINT: &str = "https://model.inferx.net/endpoints/v1";
@@ -220,7 +226,7 @@ fn inferx_child_environment(api_key: &str) -> BTreeMap<String, String> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AgentRole {
+pub(crate) enum AgentRole {
     Worker,
     LeadPlanner,
 }
@@ -230,7 +236,9 @@ enum AgentRole {
 /// Lead planning is deliberately a separate invocation role.  In particular,
 /// selecting Codex as the lead must not make its implementation-worker command
 /// inherit the planner's high-effort Sol configuration.
-fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> {
+pub(crate) fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> {
+    let identity = kind;
+    let kind = command_kind_for_agent(kind);
     let mut command = match kind {
         "claude" => {
             let mut c = Command::new("claude");
@@ -336,7 +344,7 @@ fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> 
             bail!("unknown worker: {other} (use claude|codex|codex-luna|cursor|hermes|inferx)")
         }
     };
-    command.env("FRACTAL_WORKER", kind);
+    command.env("FRACTAL_WORKER", identity);
     Ok(command)
 }
 
@@ -608,7 +616,7 @@ fn agent_timeout_ms(node: &Value) -> u64 {
 
 /// The binary that provides a given logical agent.
 fn agent_binary(kind: &str) -> &str {
-    match kind {
+    match command_kind_for_agent(kind) {
         "cursor" | "cursor-agent" => "cursor-agent",
         "codex-luna" => "codex",
         "inferx" => "hermes",
@@ -654,6 +662,10 @@ pub(crate) fn available_agents() -> Vec<String> {
 /// pinned to `gpt-5.6-luna` by [`worker_command`]. Keeping the logical route in
 /// the roster makes leases and board assignments truthful.
 pub(crate) fn detect_agents() -> Vec<String> {
+    if let Ok(raw) = std::env::var("FRACTAL_AGENT_POOL") {
+        return detect_pool_roster(&raw, binary_on_path)
+            .unwrap_or_else(|error| panic!("invalid FRACTAL_AGENT_POOL: {error:#}"));
+    }
     if let Ok(list) = std::env::var("FRACTAL_AGENTS") {
         let chosen: Vec<String> = list
             .split(',')
@@ -704,6 +716,241 @@ fn logical_agent_routes(agents: Vec<String>) -> Vec<String> {
         }
     }
     routes
+}
+
+/// Opt-in heterogeneous worker pool (`$FRACTAL_AGENT_POOL`). Worker slots are
+/// counted separately from the Codex lead planner, which is never part of the
+/// 20–42 worker capacity.
+const POOL_PROVIDERS: [&str; 4] = ["codex", "cursor", "claude", "hermes"];
+const POOL_MIN_WORKER_SLOTS: usize = 20;
+const POOL_MAX_WORKER_SLOTS: usize = 42;
+/// Matches the bounded repair budget in `orchestrate` (`MAX_REPAIRS`).
+const POOL_NODE_RETRY_LIMIT: u32 = 3;
+
+/// One expanded worker slot with a stable provider-qualified identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PoolSlot {
+    id: String,
+    provider: &'static str,
+    kind: &'static str,
+    index: usize,
+}
+
+/// Strip a `:N` pool suffix so command adapters keep seeing logical kinds.
+fn command_kind_for_agent(agent: &str) -> &str {
+    match agent.rsplit_once(':') {
+        Some((kind, index))
+            if !kind.is_empty()
+                && !index.is_empty()
+                && index.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            kind
+        }
+        _ => agent,
+    }
+}
+
+fn is_pool_slot_id(agent: &str) -> bool {
+    matches!(
+        command_kind_for_agent(agent),
+        "codex-luna" | "cursor" | "cursor-agent" | "claude" | "hermes"
+    ) && agent.contains(':')
+}
+
+fn slot_provider(agent: &str) -> Option<&'static str> {
+    match command_kind_for_agent(agent) {
+        "codex-luna" => Some("codex"),
+        "cursor" | "cursor-agent" => Some("cursor"),
+        "claude" => Some("claude"),
+        "hermes" => Some("hermes"),
+        _ => None,
+    }
+}
+
+fn pool_worker_kind(provider: &str) -> Option<&'static str> {
+    match provider {
+        "codex" => Some("codex-luna"),
+        "cursor" => Some("cursor"),
+        "claude" => Some("claude"),
+        "hermes" => Some("hermes"),
+        _ => None,
+    }
+}
+
+fn provider_caps_from_agents(agents: &[String]) -> BTreeMap<&'static str, usize> {
+    let mut caps = BTreeMap::new();
+    for agent in agents {
+        if let Some(provider) = slot_provider(agent) {
+            *caps.entry(provider).or_insert(0) += 1;
+        }
+    }
+    caps
+}
+
+fn slot_may_claim(
+    state: &Schedule,
+    agent: &str,
+    pool_mode: bool,
+    caps: &BTreeMap<&'static str, usize>,
+) -> bool {
+    if !pool_mode {
+        return true;
+    }
+    if state.slot_leases.contains_key(agent) {
+        return false;
+    }
+    let Some(provider) = slot_provider(agent) else {
+        return true;
+    };
+    let used = state
+        .slot_leases
+        .keys()
+        .filter(|id| slot_provider(id) == Some(provider))
+        .count();
+    used < caps.get(provider).copied().unwrap_or(0)
+}
+
+/// Record a worker failure. Returns true when the failure is terminal.
+///
+/// In pool mode, non-lead failures requeue through [`reopen_for_retry`] up to
+/// [`POOL_NODE_RETRY_LIMIT`] so other provider slots stay productive. Default
+/// (non-pool) scheduling still fails the graph immediately.
+fn pool_requeue_failure(
+    state: &mut Schedule,
+    workspace: &Path,
+    id: &str,
+    pool_mode: bool,
+    is_lead: bool,
+) -> bool {
+    if !pool_mode || is_lead {
+        state.failed = Some(id.to_owned());
+        return true;
+    }
+    let retries = state.retry_counts.entry(id.to_owned()).or_insert(0);
+    *retries = retries.saturating_add(1);
+    let retries = *retries;
+    if retries <= POOL_NODE_RETRY_LIMIT {
+        let _ = reopen_for_retry(workspace, id);
+        false
+    } else {
+        state.failed = Some(id.to_owned());
+        true
+    }
+}
+
+/// Parse `$FRACTAL_AGENT_POOL` (`codex=6,cursor=6,claude=6,hermes=6`).
+///
+/// Rejects duplicates, unknown providers, zero/overflow counts, totals outside
+/// 20–42, and any config that omits one of the four required providers.
+fn parse_agent_pool(raw: &str) -> Result<BTreeMap<String, usize>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("FRACTAL_AGENT_POOL is empty");
+    }
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for part in trimmed.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            bail!("FRACTAL_AGENT_POOL has an empty entry");
+        }
+        let Some((key, value)) = part.split_once('=') else {
+            bail!("FRACTAL_AGENT_POOL entry `{part}` must be provider=count");
+        };
+        let provider = key.trim();
+        let count_str = value.trim();
+        if !POOL_PROVIDERS.contains(&provider) {
+            bail!("unknown provider `{provider}` in FRACTAL_AGENT_POOL");
+        }
+        if !seen.insert(provider.to_owned()) {
+            bail!("duplicate provider `{provider}` in FRACTAL_AGENT_POOL");
+        }
+        if count_str.is_empty() || !count_str.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("invalid count for `{provider}` in FRACTAL_AGENT_POOL");
+        }
+        if count_str.len() > 1 && count_str.starts_with('0') {
+            bail!("invalid count for `{provider}` in FRACTAL_AGENT_POOL");
+        }
+        let count: u64 = count_str.parse().map_err(|_| {
+            anyhow::anyhow!("overflow count for `{provider}` in FRACTAL_AGENT_POOL")
+        })?;
+        if count == 0 {
+            bail!("zero count for `{provider}` in FRACTAL_AGENT_POOL");
+        }
+        if count > POOL_MAX_WORKER_SLOTS as u64 {
+            bail!("overflow count for `{provider}` in FRACTAL_AGENT_POOL");
+        }
+        counts.insert(provider.to_owned(), count as usize);
+    }
+    for provider in POOL_PROVIDERS {
+        if !counts.contains_key(provider) {
+            bail!("FRACTAL_AGENT_POOL is missing required provider `{provider}`");
+        }
+    }
+    let total: usize = counts.values().copied().sum();
+    if !(POOL_MIN_WORKER_SLOTS..=POOL_MAX_WORKER_SLOTS).contains(&total) {
+        bail!(
+            "FRACTAL_AGENT_POOL total worker slots {total} must be {POOL_MIN_WORKER_SLOTS}-{POOL_MAX_WORKER_SLOTS}"
+        );
+    }
+    Ok(counts)
+}
+
+fn expand_pool_slots(counts: &BTreeMap<String, usize>) -> Vec<PoolSlot> {
+    let mut slots = Vec::new();
+    for provider in POOL_PROVIDERS {
+        let n = counts.get(provider).copied().unwrap_or(0);
+        let kind = pool_worker_kind(provider).expect("known pool provider");
+        for index in 1..=n {
+            slots.push(PoolSlot {
+                id: format!("{kind}:{index}"),
+                provider,
+                kind,
+                index,
+            });
+        }
+    }
+    slots
+}
+
+fn resolve_agent_pool(raw: &str, available: impl Fn(&str) -> bool) -> Result<Vec<PoolSlot>> {
+    let counts = parse_agent_pool(raw)?;
+    let missing: Vec<&str> = POOL_PROVIDERS
+        .iter()
+        .copied()
+        .filter(|provider| !available(agent_binary(provider)))
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "FRACTAL_AGENT_POOL binaries unavailable for: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(expand_pool_slots(&counts))
+}
+
+fn detect_pool_roster(raw: &str, available: impl Fn(&str) -> bool) -> Result<Vec<String>> {
+    let lead = std::env::var("FRACTAL_LEAD_AGENT")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    detect_pool_roster_with_lead(raw, available, lead.as_deref())
+}
+
+fn detect_pool_roster_with_lead(
+    raw: &str,
+    available: impl Fn(&str) -> bool,
+    lead: Option<&str>,
+) -> Result<Vec<String>> {
+    let slots = resolve_agent_pool(raw, available)?;
+    let lead = lead
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("codex");
+    let mut roster = Vec::with_capacity(slots.len() + 1);
+    roster.push(lead.to_owned());
+    roster.extend(slots.into_iter().map(|slot| slot.id));
+    Ok(roster)
 }
 
 /// Result of executing one node.
@@ -1999,6 +2246,9 @@ fn workspace_digest(workspace: &Path) -> String {
 struct Schedule {
     completed: BTreeSet<String>,
     in_progress: BTreeSet<String>,
+    /// Pool slot identity → node currently leased to that slot.
+    slot_leases: BTreeMap<String, String>,
+    retry_counts: BTreeMap<String, u32>,
     failed: Option<String>,
     built: bool,
     verified: Option<bool>,
@@ -2066,10 +2316,13 @@ pub(crate) fn run_multi_agent(
     // does everything itself.
     let lead: &str = agents.first().map(String::as_str).unwrap_or("");
     let has_workers = agents.len() > 1;
+    let pool_mode = agents.iter().any(|agent| is_pool_slot_id(agent));
+    let provider_caps = provider_caps_from_agents(agents);
     std::thread::scope(|scope| {
         for agent in agents {
             let agent = agent.clone();
             let is_lead = agent.as_str() == lead;
+            let provider_caps = provider_caps.clone();
             let (schedule, ids, node_by_id, predecessors, graph) =
                 (&schedule, &ids, &node_by_id, &predecessors, graph);
             scope.spawn(move || {
@@ -2120,12 +2373,16 @@ pub(crate) fn run_multi_agent(
                             !is_root(id) && !is_control(id)
                         }
                     };
-                    let next = ids
-                        .iter()
-                        .find(|id| is_ready(id, &state) && for_this_agent(id));
+                    let next = if slot_may_claim(&state, &agent, pool_mode, &provider_caps) {
+                        ids.iter()
+                            .find(|id| is_ready(id, &state) && for_this_agent(id))
+                    } else {
+                        None
+                    };
                     match next {
                         Some(id) => {
                             state.in_progress.insert(id.clone());
+                            state.slot_leases.insert(agent.clone(), id.clone());
                             Some(id.clone())
                         }
                         None => None,
@@ -2172,6 +2429,7 @@ pub(crate) fn run_multi_agent(
                 let preds = predecessors.get(&id).cloned().unwrap_or_default();
                 let mut state = schedule.lock().expect("schedule lock");
                 state.in_progress.remove(&id);
+                state.slot_leases.remove(&agent);
                 let node_ok = match result {
                     Ok(outcome) => {
                         let NodeOutcome {
@@ -2196,24 +2454,26 @@ pub(crate) fn run_multi_agent(
                             .map(|note| format!(" — {note}"))
                             .unwrap_or_default();
                         if *ok {
-                            state.completed.insert(id.clone());
-                            mine += 1;
-                            report_node_outcome_with_lessons(
-                                board,
-                                &id,
-                                &agent,
-                                workspace,
-                                &outcome,
-                                &evidence_hex,
-                                latency_ms,
-                                &preds,
-                                lessons,
-                            );
-                            let _ = mark_ready_frontier(workspace, graph, &state.completed);
-                            if is_planning {
-                                println!("{clr}  [{agent}] ✓ plan ready — dispatching tasks to the workers.");
-                            } else {
-                                println!("{clr}  [{agent}] ✓ {id}{suffix}");
+                            let first_completion = state.completed.insert(id.clone());
+                            if first_completion {
+                                mine += 1;
+                                report_node_outcome_with_lessons(
+                                    board,
+                                    &id,
+                                    &agent,
+                                    workspace,
+                                    &outcome,
+                                    &evidence_hex,
+                                    latency_ms,
+                                    &preds,
+                                    lessons,
+                                );
+                                let _ = mark_ready_frontier(workspace, graph, &state.completed);
+                                if is_planning {
+                                    println!("{clr}  [{agent}] ✓ plan ready — dispatching tasks to the workers.");
+                                } else {
+                                    println!("{clr}  [{agent}] ✓ {id}{suffix}");
+                                }
                             }
                         } else {
                             state.failed = Some(id.clone());
@@ -2228,12 +2488,17 @@ pub(crate) fn run_multi_agent(
                                 &preds,
                                 lessons,
                             );
-                            println!("{clr}  [{agent}] ✗ {id}{suffix}");
+                            if pool_requeue_failure(&mut state, workspace, &id, pool_mode, is_lead)
+                            {
+                                println!("{clr}  [{agent}] ✗ {id}{suffix}");
+                            } else {
+                                let retries = state.retry_counts.get(&id).copied().unwrap_or(0);
+                                println!("{clr}  [{agent}] ✗ {id}{suffix} — requeued ({retries}/{POOL_NODE_RETRY_LIMIT})");
+                            }
                         }
                         *ok
                     }
                     Err(error) => {
-                        state.failed = Some(id.clone());
                         report_node_outcome(
                             board,
                             &id,
@@ -2244,7 +2509,14 @@ pub(crate) fn run_multi_agent(
                             latency_ms,
                             &preds,
                         );
-                        eprintln!("  [{agent}] ✗ {id}: {error:#}");
+                        if pool_requeue_failure(&mut state, workspace, &id, pool_mode, is_lead) {
+                            eprintln!("  [{agent}] ✗ {id}: {error:#}");
+                        } else {
+                            let retries = state.retry_counts.get(&id).copied().unwrap_or(0);
+                            eprintln!(
+                                "  [{agent}] ✗ {id}: {error:#} — requeued ({retries}/{POOL_NODE_RETRY_LIMIT})"
+                            );
+                        }
                         false
                     }
                 };
@@ -3398,6 +3670,25 @@ mod tests {
     }
 
     #[test]
+    fn pool_slot_identity_uses_existing_command_adapters() {
+        let worker = worker_command("codex-luna:3", "build", AgentRole::Worker).unwrap();
+        assert_eq!(worker.get_program().to_string_lossy(), "codex");
+        assert_eq!(
+            worker.get_envs().find_map(|(key, value)| {
+                (key.to_string_lossy() == "FRACTAL_WORKER")
+                    .then(|| value.unwrap().to_string_lossy().into_owned())
+            }),
+            Some("codex-luna:3".to_owned())
+        );
+        let cursor = worker_command("cursor:2", "build", AgentRole::Worker).unwrap();
+        assert_eq!(cursor.get_program().to_string_lossy(), "cursor-agent");
+        let claude = worker_command("claude:1", "build", AgentRole::Worker).unwrap();
+        assert_eq!(claude.get_program().to_string_lossy(), "claude");
+        let hermes = worker_command("hermes:4", "build", AgentRole::Worker).unwrap();
+        assert_eq!(hermes.get_program().to_string_lossy(), "hermes");
+    }
+
+    #[test]
     fn closeout_requires_evidence_for_every_acceptance_criterion() {
         let prd = json!({
             "acceptance_criteria": [
@@ -4202,5 +4493,689 @@ mod tests {
             json!("verified_success")
         );
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    const POOL_24: &str = "codex=6,cursor=6,claude=6,hermes=6";
+    const POOL_42: &str = "codex=12,cursor=10,claude=10,hermes=10";
+
+    fn all_binaries_available(_binary: &str) -> bool {
+        true
+    }
+
+    fn slots_from_counts(
+        codex: usize,
+        cursor: usize,
+        claude: usize,
+        hermes: usize,
+    ) -> Vec<PoolSlot> {
+        let mut counts = BTreeMap::new();
+        counts.insert("codex".to_owned(), codex);
+        counts.insert("cursor".to_owned(), cursor);
+        counts.insert("claude".to_owned(), claude);
+        counts.insert("hermes".to_owned(), hermes);
+        expand_pool_slots(&counts)
+    }
+
+    #[derive(Clone, Copy)]
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            self.0
+        }
+
+        fn in_range(&mut self, lo: u64, hi: u64) -> u64 {
+            lo + self.next() % (hi - lo + 1)
+        }
+    }
+
+    #[derive(Clone)]
+    struct SimNode {
+        id: String,
+        preds: Vec<String>,
+        duration: u64,
+    }
+
+    #[derive(Clone)]
+    struct InjectedRunner {
+        durations: BTreeMap<String, u64>,
+        fail_first: BTreeSet<String>,
+        stall_providers: BTreeSet<String>,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum InjectedOutcome {
+        Success { duration: u64 },
+        Fail { duration: u64 },
+        Stall,
+    }
+
+    impl InjectedRunner {
+        fn outcome(&self, slot: &PoolSlot, node: &str, attempt: u32) -> InjectedOutcome {
+            if self.stall_providers.contains(slot.provider) {
+                return InjectedOutcome::Stall;
+            }
+            let duration = *self.durations.get(node).unwrap_or(&1);
+            if attempt == 1 && self.fail_first.contains(node) {
+                InjectedOutcome::Fail { duration }
+            } else {
+                InjectedOutcome::Success { duration }
+            }
+        }
+    }
+
+    struct PoolMetrics {
+        makespan: u64,
+        queue_work_units: u64,
+        completed: BTreeSet<String>,
+        completions_by_provider: BTreeMap<String, usize>,
+        max_leases_by_provider: BTreeMap<String, usize>,
+        duplicate_leases: usize,
+        duplicate_completions: usize,
+        dependency_violations: usize,
+        drops: usize,
+        starvation: bool,
+        completion_log: Vec<(String, String)>,
+    }
+
+    fn seeded_48_nodes(seed: u64) -> (Vec<SimNode>, InjectedRunner) {
+        let mut rng = Lcg(seed);
+        let mut nodes = Vec::with_capacity(48);
+        let mut durations = BTreeMap::new();
+        for index in 0..48 {
+            let id = format!("n{index:02}");
+            let duration = rng.in_range(2, 9);
+            durations.insert(id.clone(), duration);
+            nodes.push(SimNode {
+                id,
+                preds: Vec::new(),
+                duration,
+            });
+        }
+        (
+            nodes,
+            InjectedRunner {
+                durations,
+                fail_first: BTreeSet::new(),
+                stall_providers: BTreeSet::new(),
+            },
+        )
+    }
+
+    fn shuffle_ids(ids: &mut [String], seed: u64) {
+        let mut rng = Lcg(seed);
+        for i in (1..ids.len()).rev() {
+            let j = (rng.next() as usize) % (i + 1);
+            ids.swap(i, j);
+        }
+    }
+
+    fn simulate_heterogeneous_pool(
+        nodes: &[SimNode],
+        slots: &[PoolSlot],
+        runner: &InjectedRunner,
+        completed_seed: &BTreeSet<String>,
+        ready_shuffle_seed: Option<u64>,
+    ) -> PoolMetrics {
+        let preds: BTreeMap<String, Vec<String>> = nodes
+            .iter()
+            .map(|node| (node.id.clone(), node.preds.clone()))
+            .collect();
+        let mut completed = completed_seed.clone();
+        let mut in_progress: BTreeMap<String, String> = BTreeMap::new();
+        let mut slot_leases: BTreeMap<String, String> = BTreeMap::new();
+        let mut retry_counts: BTreeMap<String, u32> = BTreeMap::new();
+        let mut jobs_done: BTreeMap<String, u64> = BTreeMap::new();
+        let mut events: BTreeMap<(u64, String, String), bool> = BTreeMap::new();
+        let mut completions_by_provider: BTreeMap<String, usize> = BTreeMap::new();
+        let mut max_leases_by_provider: BTreeMap<String, usize> = BTreeMap::new();
+        let mut completion_log = Vec::new();
+        let mut duplicate_leases = 0;
+        let mut duplicate_completions = 0;
+        let mut dependency_violations = 0;
+        let mut queue_work_units: u64 = 0;
+        let mut time = 0_u64;
+        let caps = {
+            let identities: Vec<String> = slots.iter().map(|slot| slot.id.clone()).collect();
+            provider_caps_from_agents(&identities)
+        };
+
+        let ready_now = |completed: &BTreeSet<String>,
+                         in_progress: &BTreeMap<String, String>,
+                         now: u64|
+         -> Vec<String> {
+            let mut ready: Vec<String> = nodes
+                .iter()
+                .filter(|node| {
+                    !completed.contains(&node.id)
+                        && !in_progress.contains_key(&node.id)
+                        && node.preds.iter().all(|pred| completed.contains(pred))
+                })
+                .map(|node| node.id.clone())
+                .collect();
+            if let Some(seed) = ready_shuffle_seed {
+                shuffle_ids(&mut ready, seed.wrapping_add(now));
+            } else {
+                ready.sort();
+            }
+            ready
+        };
+
+        loop {
+            let mut ready = ready_now(&completed, &in_progress, time);
+            let mut idle: Vec<&PoolSlot> = slots
+                .iter()
+                .filter(|slot| !slot_leases.contains_key(&slot.id))
+                .collect();
+            idle.sort_by_key(|slot| {
+                (
+                    jobs_done.get(&slot.id).copied().unwrap_or(0),
+                    slot.provider,
+                    slot.index,
+                )
+            });
+            for slot in idle {
+                if ready.is_empty() {
+                    break;
+                }
+                if slot_leases.contains_key(&slot.id) {
+                    duplicate_leases += 1;
+                    continue;
+                }
+                let used = slot_leases
+                    .keys()
+                    .filter(|id| slot_provider(id) == Some(slot.provider))
+                    .count();
+                if used >= caps.get(slot.provider).copied().unwrap_or(0) {
+                    continue;
+                }
+                let node_id = ready.remove(0);
+                if in_progress.contains_key(&node_id) {
+                    duplicate_leases += 1;
+                    continue;
+                }
+                if let Some(node) = nodes.iter().find(|node| node.id == node_id) {
+                    if !node.preds.iter().all(|pred| completed.contains(pred)) {
+                        dependency_violations += 1;
+                        continue;
+                    }
+                }
+                in_progress.insert(node_id.clone(), slot.id.clone());
+                slot_leases.insert(slot.id.clone(), node_id.clone());
+                let attempt = retry_counts.get(&node_id).copied().unwrap_or(0) + 1;
+                match runner.outcome(slot, &node_id, attempt) {
+                    InjectedOutcome::Stall => {}
+                    InjectedOutcome::Success { duration } => {
+                        events.insert((time + duration, slot.id.clone(), node_id), true);
+                    }
+                    InjectedOutcome::Fail { duration } => {
+                        events.insert((time + duration, slot.id.clone(), node_id), false);
+                    }
+                }
+            }
+            for (provider, count) in current_leases_by_provider(&slot_leases) {
+                let entry = max_leases_by_provider.entry(provider).or_insert(0);
+                *entry = (*entry).max(count);
+            }
+            let Some(((next_time, slot_id, node_id), success)) = events
+                .keys()
+                .next()
+                .cloned()
+                .and_then(|key| events.remove(&key).map(|success| (key, success)))
+            else {
+                break;
+            };
+            if next_time < time {
+                break;
+            }
+            let queued = ready_now(&completed, &in_progress, time).len() as u64;
+            queue_work_units =
+                queue_work_units.saturating_add(queued.saturating_mul(next_time - time));
+            time = next_time;
+            slot_leases.remove(&slot_id);
+            in_progress.remove(&node_id);
+            if success {
+                if !completed.insert(node_id.clone()) {
+                    duplicate_completions += 1;
+                } else {
+                    if let Some(pred) = preds.get(&node_id) {
+                        if !pred
+                            .iter()
+                            .all(|item| completed.contains(item) || item == &node_id)
+                        {
+                            dependency_violations += 1;
+                        }
+                    }
+                    *jobs_done.entry(slot_id.clone()).or_insert(0) += 1;
+                    if let Some(provider) = slot_provider(&slot_id) {
+                        *completions_by_provider
+                            .entry(provider.to_owned())
+                            .or_insert(0) += 1;
+                    }
+                    completion_log.push((node_id, slot_id));
+                }
+            } else {
+                let retries = retry_counts.entry(node_id.clone()).or_insert(0);
+                *retries = retries.saturating_add(1);
+                if *retries > POOL_NODE_RETRY_LIMIT {
+                    completed.insert(format!("failed:{node_id}"));
+                }
+            }
+        }
+
+        let remaining_ready = nodes
+            .iter()
+            .filter(|node| {
+                !completed.contains(&node.id)
+                    && !in_progress.contains_key(&node.id)
+                    && node.preds.iter().all(|pred| completed.contains(pred))
+            })
+            .count();
+        let idle_slots = slots
+            .iter()
+            .filter(|slot| !slot_leases.contains_key(&slot.id))
+            .count();
+        let drops = if idle_slots > 0 { remaining_ready } else { 0 };
+        let starvation = slots.iter().any(|slot| {
+            !runner.stall_providers.contains(slot.provider)
+                && completions_by_provider
+                    .get(slot.provider)
+                    .copied()
+                    .unwrap_or(0)
+                    == 0
+                && nodes.iter().any(|node| !completed_seed.contains(&node.id))
+        });
+
+        PoolMetrics {
+            makespan: time,
+            queue_work_units,
+            completed: completed
+                .into_iter()
+                .filter(|id| !id.starts_with("failed:"))
+                .collect(),
+            completions_by_provider,
+            max_leases_by_provider,
+            duplicate_leases,
+            duplicate_completions,
+            dependency_violations,
+            drops,
+            starvation,
+            completion_log,
+        }
+    }
+
+    fn current_leases_by_provider(leases: &BTreeMap<String, String>) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for slot in leases.keys() {
+            if let Some(provider) = slot_provider(slot) {
+                *counts.entry(provider.to_owned()).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    fn assert_safety(metrics: &PoolMetrics, expected_completed: usize) {
+        assert_eq!(metrics.duplicate_leases, 0, "duplicate leases");
+        assert_eq!(metrics.duplicate_completions, 0, "duplicate completions");
+        assert_eq!(metrics.dependency_violations, 0, "dependency violations");
+        assert_eq!(metrics.drops, 0, "dropped ready nodes: {}", metrics.drops);
+        assert!(!metrics.starvation, "provider starvation");
+        assert_eq!(metrics.completed.len(), expected_completed);
+    }
+
+    #[test]
+    fn agent_pool_parses_exact_24_and_42_slot_rosters() {
+        let slots_24 = resolve_agent_pool(POOL_24, all_binaries_available).unwrap();
+        assert_eq!(slots_24.len(), 24);
+        let ids_24: Vec<_> = slots_24.iter().map(|slot| slot.id.as_str()).collect();
+        assert_eq!(ids_24[0], "codex-luna:1");
+        assert_eq!(ids_24[5], "codex-luna:6");
+        assert_eq!(ids_24[6], "cursor:1");
+        assert_eq!(ids_24[12], "claude:1");
+        assert_eq!(ids_24[18], "hermes:1");
+        assert_eq!(ids_24[23], "hermes:6");
+        assert!(slots_24.iter().all(|slot| slot.id != "codex"));
+        assert_eq!(
+            slots_24
+                .iter()
+                .filter(|slot| slot.kind == "codex-luna")
+                .count(),
+            6
+        );
+
+        let roster =
+            detect_pool_roster_with_lead(POOL_24, all_binaries_available, Some("codex")).unwrap();
+        assert_eq!(roster[0], "codex");
+        assert_eq!(roster.len(), 25);
+        assert!(!roster[1..].contains(&"codex".to_owned()));
+
+        let slots_42 = resolve_agent_pool(POOL_42, all_binaries_available).unwrap();
+        assert_eq!(slots_42.len(), 42);
+        assert_eq!(
+            slots_42
+                .iter()
+                .filter(|slot| slot.provider == "codex")
+                .count(),
+            12
+        );
+        assert_eq!(
+            slots_42
+                .iter()
+                .filter(|slot| slot.provider == "cursor")
+                .count(),
+            10
+        );
+        let roster_42 =
+            detect_pool_roster_with_lead(POOL_42, all_binaries_available, Some("codex")).unwrap();
+        assert_eq!(roster_42[0], "codex");
+        assert_eq!(roster_42.len(), 43);
+    }
+
+    #[test]
+    fn agent_pool_rejects_malformed_configs_and_mixed_availability() {
+        let cases = [
+            ("", "empty"),
+            ("codex=6,cursor=6,claude=6,hermes=6,codex=6", "duplicate"),
+            ("codex=6,cursor=6,claude=6,gpt=6", "unknown"),
+            ("codex=0,cursor=8,claude=8,hermes=8", "zero"),
+            ("codex=100,cursor=1,claude=1,hermes=1", "overflow"),
+            (
+                "codex=18446744073709551616,cursor=1,claude=1,hermes=1",
+                "overflow-parse",
+            ),
+            ("codex=6,cursor=6,claude=6", "missing"),
+            ("codex=4,cursor=4,claude=4,hermes=4", "below-min"),
+            ("codex=12,cursor=12,claude=12,hermes=12", "above-max"),
+            ("codex=6,cursor=6,claude=6,hermes=", "invalid"),
+        ];
+        for (raw, label) in cases {
+            assert!(
+                parse_agent_pool(raw).is_err(),
+                "expected {label} to be rejected: {raw}"
+            );
+        }
+        let mixed = resolve_agent_pool(POOL_24, |binary| binary != "hermes");
+        assert!(mixed.is_err(), "mixed availability must not fall back");
+        let none = resolve_agent_pool(POOL_24, |_| false);
+        assert!(none.is_err());
+    }
+
+    #[test]
+    fn agent_pool_absent_keeps_one_slot_logical_routes() {
+        assert_eq!(
+            logical_agent_routes(vec![
+                "codex".to_owned(),
+                "cursor".to_owned(),
+                "claude".to_owned(),
+                "hermes".to_owned()
+            ]),
+            vec![
+                "codex".to_owned(),
+                "codex-luna".to_owned(),
+                "cursor".to_owned(),
+                "claude".to_owned(),
+                "hermes".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_pool_injected_24_vs_baseline_meets_makespan_and_safety() {
+        let (nodes, runner) = seeded_48_nodes(0xC0FFEE48);
+        let baseline_slots = slots_from_counts(1, 1, 1, 1);
+        let pool_slots = resolve_agent_pool(POOL_24, all_binaries_available).unwrap();
+        let baseline =
+            simulate_heterogeneous_pool(&nodes, &baseline_slots, &runner, &BTreeSet::new(), None);
+        let pooled =
+            simulate_heterogeneous_pool(&nodes, &pool_slots, &runner, &BTreeSet::new(), None);
+        assert_safety(&baseline, 48);
+        assert_safety(&pooled, 48);
+        for provider in POOL_PROVIDERS {
+            assert!(
+                pooled
+                    .completions_by_provider
+                    .get(provider)
+                    .copied()
+                    .unwrap_or(0)
+                    >= 1,
+                "{provider} completed no work"
+            );
+            assert!(
+                baseline
+                    .completions_by_provider
+                    .get(provider)
+                    .copied()
+                    .unwrap_or(0)
+                    >= 1,
+                "baseline {provider} completed no work"
+            );
+        }
+        let reduction = (baseline.makespan - pooled.makespan) as f64 / baseline.makespan as f64;
+        assert!(
+            reduction >= 0.40,
+            "makespan reduction {reduction:.3} < 0.40 (baseline={}, pool={})",
+            baseline.makespan,
+            pooled.makespan
+        );
+        let baseline_tp = 48.0 / baseline.makespan as f64;
+        let pool_tp = 48.0 / pooled.makespan as f64;
+        assert!(
+            pool_tp + f64::EPSILON >= baseline_tp,
+            "throughput regression: pool {pool_tp} < baseline {baseline_tp}"
+        );
+        assert!(
+            pooled.queue_work_units <= baseline.queue_work_units,
+            "queue work units rose: pool {} baseline {}",
+            pooled.queue_work_units,
+            baseline.queue_work_units
+        );
+        for provider in POOL_PROVIDERS {
+            let cap = pool_slots
+                .iter()
+                .filter(|slot| slot.provider == provider)
+                .count();
+            let max = pooled
+                .max_leases_by_provider
+                .get(provider)
+                .copied()
+                .unwrap_or(0);
+            assert!(max <= cap, "{provider} cap {cap} exceeded by {max}");
+        }
+    }
+
+    #[test]
+    fn agent_pool_provider_saturation_respects_caps() {
+        let (nodes, runner) = seeded_48_nodes(11);
+        let slots = resolve_agent_pool(POOL_24, all_binaries_available).unwrap();
+        let metrics = simulate_heterogeneous_pool(&nodes, &slots, &runner, &BTreeSet::new(), None);
+        assert_safety(&metrics, 48);
+        assert_eq!(
+            metrics
+                .max_leases_by_provider
+                .get("cursor")
+                .copied()
+                .unwrap_or(0),
+            6
+        );
+        assert_eq!(
+            metrics
+                .max_leases_by_provider
+                .get("codex")
+                .copied()
+                .unwrap_or(0),
+            6
+        );
+    }
+
+    #[test]
+    fn agent_pool_stalled_provider_keeps_others_productive() {
+        let (nodes, mut runner) = seeded_48_nodes(22);
+        runner.stall_providers.insert("hermes".to_owned());
+        let slots = resolve_agent_pool(POOL_24, all_binaries_available).unwrap();
+        let metrics = simulate_heterogeneous_pool(&nodes, &slots, &runner, &BTreeSet::new(), None);
+        assert_eq!(metrics.duplicate_leases, 0);
+        assert_eq!(metrics.duplicate_completions, 0);
+        assert_eq!(metrics.dependency_violations, 0);
+        assert_eq!(metrics.completed.len(), 42);
+        assert_eq!(metrics.drops, 0);
+        assert!(
+            metrics
+                .completions_by_provider
+                .get("codex")
+                .copied()
+                .unwrap_or(0)
+                >= 1
+        );
+        assert!(
+            metrics
+                .completions_by_provider
+                .get("cursor")
+                .copied()
+                .unwrap_or(0)
+                >= 1
+        );
+        assert!(
+            metrics
+                .completions_by_provider
+                .get("claude")
+                .copied()
+                .unwrap_or(0)
+                >= 1
+        );
+        assert_eq!(
+            metrics
+                .completions_by_provider
+                .get("hermes")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+        assert!(metrics.makespan > 0);
+    }
+
+    #[test]
+    fn agent_pool_worker_failure_requeues_without_duplicate_completion() {
+        let (nodes, mut runner) = seeded_48_nodes(33);
+        runner.fail_first.insert("n00".to_owned());
+        runner.fail_first.insert("n07".to_owned());
+        let slots = resolve_agent_pool(POOL_24, all_binaries_available).unwrap();
+        let metrics = simulate_heterogeneous_pool(&nodes, &slots, &runner, &BTreeSet::new(), None);
+        assert_safety(&metrics, 48);
+        let n00 = metrics
+            .completion_log
+            .iter()
+            .filter(|(node, _)| node == "n00")
+            .count();
+        assert_eq!(n00, 1);
+    }
+
+    #[test]
+    fn agent_pool_restart_replay_skips_completed_seed() {
+        let (nodes, runner) = seeded_48_nodes(44);
+        let slots = resolve_agent_pool(POOL_24, all_binaries_available).unwrap();
+        let first = simulate_heterogeneous_pool(&nodes, &slots, &runner, &BTreeSet::new(), None);
+        let seed: BTreeSet<String> = first
+            .completion_log
+            .iter()
+            .take(16)
+            .map(|(node, _)| node.clone())
+            .collect();
+        assert_eq!(seed.len(), 16);
+        let replay = simulate_heterogeneous_pool(&nodes, &slots, &runner, &seed, None);
+        assert_safety(&replay, 48);
+        for node in &seed {
+            assert!(replay.completed.contains(node));
+            assert_eq!(
+                replay
+                    .completion_log
+                    .iter()
+                    .filter(|(id, _)| id == node)
+                    .count(),
+                0,
+                "replay must not re-complete {node}"
+            );
+        }
+        assert_eq!(replay.completion_log.len(), 32);
+    }
+
+    #[test]
+    fn agent_pool_shuffled_ready_input_preserves_safety() {
+        let (nodes, runner) = seeded_48_nodes(55);
+        let slots = resolve_agent_pool(POOL_24, all_binaries_available).unwrap();
+        let a = simulate_heterogeneous_pool(&nodes, &slots, &runner, &BTreeSet::new(), Some(1));
+        let b = simulate_heterogeneous_pool(&nodes, &slots, &runner, &BTreeSet::new(), Some(99));
+        assert_safety(&a, 48);
+        assert_safety(&b, 48);
+        assert_eq!(a.completed, b.completed);
+        for provider in POOL_PROVIDERS {
+            assert!(
+                a.completions_by_provider
+                    .get(provider)
+                    .copied()
+                    .unwrap_or(0)
+                    >= 1
+            );
+            assert!(
+                b.completions_by_provider
+                    .get(provider)
+                    .copied()
+                    .unwrap_or(0)
+                    >= 1
+            );
+        }
+    }
+
+    #[test]
+    fn agent_pool_42_slot_roster_schedules_seeded_workload() {
+        let (nodes, runner) = seeded_48_nodes(0xC0FFEE48);
+        let slots = resolve_agent_pool(POOL_42, all_binaries_available).unwrap();
+        assert_eq!(slots.len(), 42);
+        let metrics = simulate_heterogeneous_pool(&nodes, &slots, &runner, &BTreeSet::new(), None);
+        assert_safety(&metrics, 48);
+        for provider in POOL_PROVIDERS {
+            assert!(
+                metrics
+                    .completions_by_provider
+                    .get(provider)
+                    .copied()
+                    .unwrap_or(0)
+                    >= 1
+            );
+        }
+    }
+
+    #[test]
+    fn agent_pool_dependency_ready_only() {
+        let mut nodes = Vec::new();
+        for chain in 0..12 {
+            for layer in 0..4 {
+                let id = format!("c{chain:02}l{layer}");
+                let preds = if layer == 0 {
+                    Vec::new()
+                } else {
+                    vec![format!("c{chain:02}l{}", layer - 1)]
+                };
+                nodes.push(SimNode {
+                    id,
+                    preds,
+                    duration: 3,
+                });
+            }
+        }
+        let durations: BTreeMap<_, _> = nodes
+            .iter()
+            .map(|node| (node.id.clone(), node.duration))
+            .collect();
+        let runner = InjectedRunner {
+            durations,
+            fail_first: BTreeSet::new(),
+            stall_providers: BTreeSet::new(),
+        };
+        let slots = resolve_agent_pool(POOL_24, all_binaries_available).unwrap();
+        let metrics =
+            simulate_heterogeneous_pool(&nodes, &slots, &runner, &BTreeSet::new(), Some(7));
+        assert_safety(&metrics, 48);
+        assert_eq!(metrics.makespan, 12);
     }
 }

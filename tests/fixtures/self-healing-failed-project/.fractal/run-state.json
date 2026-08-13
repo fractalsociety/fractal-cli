@@ -1,0 +1,8 @@
+{
+  "schema": "fractal.run_state.v1",
+  "run_id": "1786583889848-61476",
+  "status": "halted",
+  "pid": 61476,
+  "graph_hash": "sha256:ff592e08090f37528323cfb720e780a762f7e88d0adcdbc7dc1a9f52fb13ed66",
+  "updated_at_ms": 1786584315909
+}

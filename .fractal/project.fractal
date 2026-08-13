@@ -519,7 +519,7 @@
       "config_hash": "sha256:de8c7d975e69c954e05e3448e2086b7d83447a90183ee7d63de34a189384a64c"
     }
   },
-  "updated_at": "2026-08-08T02:42:22Z",
+  "updated_at": "2026-08-13T16:28:29Z",
   "catalog": {
     "audit": {
       "auditor": "fractal graph audit",
@@ -4542,7 +4542,7 @@
         "title": "Implemented _write_state_atomic"
       }
     ],
-    "catalog_hash": "sha256:072a97b75d4d4a4fad5e135c0fa85b5634d6b45952e67abc5949f235be15cdf3",
+    "catalog_hash": "sha256:ce26a309b9c2397d60e0d51e9a14ae05f21615472ada65610de3d5271e84057f",
     "components": [
       {
         "evidence": [
@@ -9180,7 +9180,7 @@
       }
     ],
     "generated_at": "2026-08-02T15:48:42Z",
-    "project_key": "fractal-cli-bbbfd315b970",
+    "project_key": "fractal-cli-3c8b9dde9efc",
     "schema": "fractal.catalog.v1",
     "source": {
       "canonical_workspace": "/workspace/fractal-cli",
@@ -9198,7 +9198,7 @@
       "registry_numbers": [
         18
       ],
-      "workspace_fingerprint": "sha256:bbbfd315b97032d8324f48b8ab1b9c749b26fffcb3b2680d26b2df797b29a0de"
+      "workspace_fingerprint": "sha256:3c8b9dde9efc0ec68bc37f293ca5da385612fdeaa1eeed3bd447a6801e2e21e2"
     },
     "tests": [
       {
