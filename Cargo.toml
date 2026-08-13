@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "CLI front door for the Fractal pipeline"
 repository = "https://github.com/fractalsociety/fractal-cli"
+license = "MIT"
 
 [[bin]]
 name = "fractal"

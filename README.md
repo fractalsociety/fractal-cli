@@ -21,6 +21,7 @@ Claude, and Hermes.
 - [Safety and repository hygiene](#safety-and-repository-hygiene)
 - [Development setup](#development-setup)
 - [Voice and external handoff](#voice)
+- [License](#license)
 
 ## Why Fractal
 
@@ -437,6 +438,10 @@ checksum manifests, and third-party license notice. From the menu bar you can re
 inspect activity, open generated projects, or stop all running Fractal builds.
 Finalized text is sent over stdin to the managed-project ingest boundary; it is
 never interpolated into a command line.
+
+## License
+
+Fractal CLI is available under the [MIT License](LICENSE).
 
 ### ChatGPT Desktop and other external apps
 
