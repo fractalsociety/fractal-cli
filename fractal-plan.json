@@ -262,7 +262,7 @@
       "id": "verify_rust_repository",
       "title": "Run the complete Rust quality gate",
       "capability": "project.tests.execute",
-      "instruction": "From /Users/jamesstar/fractal-cli run cargo fmt --all -- --check, cargo test --no-fail-fast, and cargo clippy --all-targets -- -D warnings. Also run focused tests for learning_data, project_file, graph_store, compile, execute, orchestrate, run_control, checkpoint, amendments, harness_evolution, supervise, project_sync, and projects if the full-suite output does not make their evidence individually clear. Fix only Rust source or Rust test defects caused by this feature, rerun every failed gate, and record exact passing commands in the task result. Do not weaken tests, access live services, modify Swift or any dist-* path, or perform release/signing work.",
+      "instruction": "From /workspace/fractal-cli run cargo fmt --all -- --check, cargo test --no-fail-fast, and cargo clippy --all-targets -- -D warnings. Also run focused tests for learning_data, project_file, graph_store, compile, execute, orchestrate, run_control, checkpoint, amendments, harness_evolution, supervise, project_sync, and projects if the full-suite output does not make their evidence individually clear. Fix only Rust source or Rust test defects caused by this feature, rerun every failed gate, and record exact passing commands in the task result. Do not weaken tests, access live services, modify Swift or any dist-* path, or perform release/signing work.",
       "depends_on": [
         "aggregate_graph_outcomes",
         "add_cross_boundary_rust_tests"
@@ -277,7 +277,7 @@
       "id": "verify_native_swift",
       "title": "Run the native Fractal Voice quality gate",
       "capability": "project.tests.execute",
-      "instruction": "From /Users/jamesstar/fractal-cli run swift test --package-path macos/FractalVoice. Fix only Swift source or XCTest defects caused by the enriched graph decoding/display work and rerun until the complete package suite passes. Confirm tests cover legacy, enriched, partial, and forward-compatible fixtures and report the exact passing command. Do not alter Package.swift dependency versions, generated resources, signing/notarization settings, Rust files, or any dist-* path; do not build a release app, archive, DMG, or ZIP.",
+      "instruction": "From /workspace/fractal-cli run swift test --package-path macos/FractalVoice. Fix only Swift source or XCTest defects caused by the enriched graph decoding/display work and rerun until the complete package suite passes. Confirm tests cover legacy, enriched, partial, and forward-compatible fixtures and report the exact passing command. Do not alter Package.swift dependency versions, generated resources, signing/notarization settings, Rust files, or any dist-* path; do not build a release app, archive, DMG, or ZIP.",
       "depends_on": [
         "add_native_swift_tests"
       ],

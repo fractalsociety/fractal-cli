@@ -1,8 +1,8 @@
 # Fractal Execution Efficiency Layer — Criterion Audit (AC-1…AC-14)
 
 **Audit date:** 2026-07-29
-**Primary repo:** `/Users/jamesstar/fractal-efficiency.yFzdFF`
-**Companion repo:** `/Users/jamesstar/fractalsociety-website`
+**Primary repo:** `/workspace/fractal-efficiency`
+**Companion repo:** `/workspace/fractalsociety-website`
 **Auditor role:** Fractal graph node `criterion_audit` (task 7.1)
 **INTERFACE.md:** not present; acceptance criteria taken from `.fractal/lead-prd.json`.
 

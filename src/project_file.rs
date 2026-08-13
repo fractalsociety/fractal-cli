@@ -913,6 +913,126 @@ fn refresh_terminal_outcome(document: &mut FractalProject) {
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct RecoveryReconciliation {
+    pub(crate) adopted: Vec<String>,
+    pub(crate) released: Vec<String>,
+    pub(crate) frontier: Vec<String>,
+    pub(crate) completed: Vec<String>,
+    pub(crate) phase: String,
+}
+
+/// Reconcile derived run/catalog/checkpoint views back to the canonical portable
+/// project file. Completed nodes are never rewritten. Checked-out ownership is
+/// adopted when its worker is still known-active and expired exactly once when it
+/// is not; already released nodes stay released on repeated passes.
+#[allow(dead_code)]
+pub(crate) fn reconcile_recovery(
+    workspace: &Path,
+    active_agent_ids: &BTreeSet<String>,
+) -> Result<RecoveryReconciliation> {
+    let _guard = project_file_lock();
+    let _file_guard = ProjectWriteGuard::acquire(workspace)?;
+    let mut document = load(workspace)?;
+    let now = timestamp();
+    let mut adopted = Vec::new();
+    let mut released = Vec::new();
+    let execution = document.execution.get_or_insert_with(|| ExecutionState {
+        schema: "fractal.execution_state.v1".to_owned(),
+        phase: "executing".to_owned(),
+        assignments: BTreeMap::new(),
+        progress: None,
+        updated_at: now.clone(),
+        extra: BTreeMap::new(),
+    });
+    for (node, assignment) in &mut execution.assignments {
+        if assignment.state == "checked_out" {
+            if active_agent_ids.contains(&assignment.agent_id) {
+                adopted.push(node.clone());
+            } else {
+                assignment.state = "released".to_owned();
+                assignment.released_at.get_or_insert_with(|| now.clone());
+                released.push(node.clone());
+            }
+        }
+    }
+    let completed = execution
+        .assignments
+        .iter()
+        .filter_map(|(node, assignment)| (assignment.state == "completed").then_some(node.clone()))
+        .collect::<Vec<_>>();
+    let node_count = document
+        .graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let all_completed = node_count > 0
+        && execution.assignments.len() == node_count
+        && execution
+            .assignments
+            .values()
+            .all(|assignment| assignment.state == "completed");
+    let all_terminal = node_count > 0
+        && execution.assignments.len() == node_count
+        && execution
+            .assignments
+            .values()
+            .all(|assignment| matches!(assignment.state.as_str(), "completed" | "released"));
+    execution.phase = if all_completed {
+        "completed".to_owned()
+    } else if all_terminal || !released.is_empty() {
+        "halted".to_owned()
+    } else {
+        "executing".to_owned()
+    };
+    execution.progress = None;
+    execution.updated_at = now.clone();
+    let phase = execution.phase.clone();
+    refresh_terminal_outcome(&mut document);
+    let frontier = dependency_ready_frontier_in_document(&document);
+    document.updated_at = now;
+    write_document(workspace, &document)?;
+    Ok(RecoveryReconciliation {
+        adopted,
+        released,
+        frontier,
+        completed,
+        phase,
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn dependency_ready_frontier(workspace: &Path) -> Result<Vec<String>> {
+    let document = load(workspace)?;
+    Ok(dependency_ready_frontier_in_document(&document))
+}
+
+#[allow(dead_code)]
+fn dependency_ready_frontier_in_document(document: &FractalProject) -> Vec<String> {
+    let assignments = document
+        .execution
+        .as_ref()
+        .map(|execution| &execution.assignments);
+    document
+        .graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| node.get("id").and_then(Value::as_str))
+        .filter(|id| {
+            !assignments
+                .and_then(|values| values.get(*id))
+                .is_some_and(|assignment| {
+                    assignment.state == "checked_out" || assignment.state == "completed"
+                })
+        })
+        .filter(|id| dependency_blockers(document, id).is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 pub(crate) fn transition(
     workspace: &Path,
     node: &str,
@@ -2306,6 +2426,89 @@ mod tests {
         assert_eq!(execution.phase, "executing");
         assert_eq!(execution.assignments["build"].state, "completed");
         assert!(!execution.assignments.contains_key("verify.build.harness"));
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_preserves_completed_releases_stale_once_and_restores_frontier() -> Result<()>
+    {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_recovery",
+            "nodes": [
+                {"id": "a", "capability": "code.generate", "instruction": "A"},
+                {"id": "b", "capability": "code.generate", "instruction": "B"},
+                {"id": "c", "capability": "code.generate", "instruction": "C"},
+                {"id": "d", "capability": "project.tests.execute", "instruction": "D"}
+            ],
+            "edges": [
+                {"from": "a", "to": "c"},
+                {"from": "b", "to": "c"},
+                {"from": "c", "to": "d"}
+            ]
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        persist(&workspace, &graph, "Recovery")?;
+        transition(&workspace, "a", "checkout", "live", "Live")?;
+        transition(&workspace, "a", "complete", "live", "Live")?;
+        transition(&workspace, "b", "checkout", "dead", "Dead")?;
+        transition(&workspace, "c", "checkout", "live", "Live")
+            .expect_err("c must not be ready while b is incomplete");
+
+        let first = reconcile_recovery(&workspace, &BTreeSet::new())?;
+        assert_eq!(first.completed, vec!["a".to_owned()]);
+        assert_eq!(first.released, vec!["b".to_owned()]);
+        assert_eq!(first.frontier, vec!["b".to_owned()]);
+        assert_eq!(first.phase, "halted");
+        let released_at = load(&workspace)?.execution.unwrap().assignments["b"]
+            .released_at
+            .clone();
+
+        let second = reconcile_recovery(&workspace, &BTreeSet::new())?;
+        assert!(second.released.is_empty());
+        assert_eq!(
+            load(&workspace)?.execution.unwrap().assignments["b"].released_at,
+            released_at
+        );
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_adopts_valid_checkout_and_exposes_parallel_frontier() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_parallel",
+            "nodes": [
+                {"id": "root", "capability": "code.generate", "instruction": "Root"},
+                {"id": "left", "capability": "code.generate", "instruction": "Left"},
+                {"id": "right", "capability": "code.generate", "instruction": "Right"},
+                {"id": "join", "capability": "project.tests.execute", "instruction": "Join"}
+            ],
+            "edges": [
+                {"from": "root", "to": "left"},
+                {"from": "root", "to": "right"},
+                {"from": "left", "to": "join"},
+                {"from": "right", "to": "join"}
+            ]
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        persist(&workspace, &graph, "Parallel")?;
+        transition(&workspace, "root", "checkout", "worker", "Worker")?;
+        let active = BTreeSet::from(["worker".to_owned()]);
+        let adopted = reconcile_recovery(&workspace, &active)?;
+        assert_eq!(adopted.adopted, vec!["root".to_owned()]);
+        assert!(adopted.frontier.is_empty());
+        transition(&workspace, "root", "complete", "worker", "Worker")?;
+        assert_eq!(
+            dependency_ready_frontier(&workspace)?,
+            vec!["left".to_owned(), "right".to_owned()]
+        );
         fs::remove_dir_all(workspace)?;
         Ok(())
     }

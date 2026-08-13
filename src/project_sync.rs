@@ -284,6 +284,21 @@ pub(crate) fn sync_runtime_now(workspace: &Path) -> Result<()> {
     upload(workspace, None, false, false).map(|_| ())
 }
 
+/// Publish an explicit worker transition without treating its checkout as a
+/// stale assignment merely because no long-running coordinator PID exists.
+pub(crate) fn sync_worker_transition_now(workspace: &Path) -> Result<()> {
+    if std::env::var_os("FRACTAL_OFFLINE").is_some() {
+        return Ok(());
+    }
+    match load_preference(workspace) {
+        Some(preference) if !preference.enabled => return Ok(()),
+        Some(_) => {}
+        None if crate::auth::load_session().is_err() => return Ok(()),
+        None => {}
+    }
+    upload_inner(workspace, None, false, false, false).map(|_| ())
+}
+
 /// Publish a halted graph ahead of queued routine transition uploads.
 pub(crate) fn sync_runtime_halt_now(workspace: &Path) -> Result<()> {
     if std::env::var_os("FRACTAL_OFFLINE").is_some() {
@@ -495,11 +510,27 @@ fn upload(
     priority: bool,
     authoritative_local_visibility: bool,
 ) -> Result<SyncResponse> {
+    upload_inner(
+        workspace,
+        repository,
+        priority,
+        authoritative_local_visibility,
+        true,
+    )
+}
+
+fn upload_inner(
+    workspace: &Path,
+    repository: Option<&RepositoryLink>,
+    priority: bool,
+    authoritative_local_visibility: bool,
+    reconcile_stale_assignments: bool,
+) -> Result<SyncResponse> {
     let _permit = UPLOAD_SCHEDULER
         .get_or_init(UploadScheduler::default)
         .acquire(priority);
     crate::project_file::backfill_execution(workspace).ok();
-    if !crate::run_control::workspace_is_running(workspace) {
+    if reconcile_stale_assignments && !crate::run_control::workspace_is_running(workspace) {
         crate::project_file::release_stale_assignments(workspace).ok();
     }
     let session = crate::auth::load_session()?;

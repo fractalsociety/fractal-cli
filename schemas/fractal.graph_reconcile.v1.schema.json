@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fractal.local/schemas/fractal.graph_reconcile.v1.schema.json",
+  "title": "Fractal graph reconciliation report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "reconciled",
+    "repositories",
+    "hashes",
+    "remediation_plan",
+    "summary"
+  ],
+  "properties": {
+    "schema": {
+      "const": "fractal.graph_reconcile.v1"
+    },
+    "reconciled": {
+      "type": "boolean"
+    },
+    "repositories": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "hashes": {
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          {
+            "type": "object",
+            "additionalProperties": true
+          }
+        ]
+      }
+    },
+    "composed_view_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "remediation_plan": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/action"
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository_count",
+        "expected_count",
+        "finding_count",
+        "blocked_count",
+        "unresolved_count"
+      ],
+      "properties": {
+        "repository_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expected_count": {
+          "const": 6
+        },
+        "finding_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "blocked_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unresolved_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  },
+  "$defs": {
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action_id",
+        "repository",
+        "reason_code",
+        "expected_identity_or_hash",
+        "observed_identity_or_hash",
+        "supported_command",
+        "supported_interface",
+        "preconditions",
+        "safety_classification",
+        "blocked",
+        "unresolved"
+      ],
+      "properties": {
+        "action_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason_code": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "expected": {},
+        "observed": {},
+        "expected_identity_or_hash": {},
+        "observed_identity_or_hash": {},
+        "supported_command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "supported_interface": {
+          "type": "string",
+          "minLength": 1
+        },
+        "preconditions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "safety_classification": {
+          "enum": [
+            "read_only",
+            "manual_review",
+            "unsupported"
+          ]
+        },
+        "blocked": {
+          "type": "boolean"
+        },
+        "unresolved": {
+          "type": "boolean"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

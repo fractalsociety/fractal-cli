@@ -175,10 +175,10 @@ Minimal contract (field names stable):
   "bound_project_key": "… or null",
   "projects": [
     {
-      "project_key": "fractal-cli-bbbfd315b970",
+      "project_key": "fractal-cli-3c8b9dde9efc",
       "labels": ["fractal-cli"],
       "registry_numbers": [18],
-      "canonical_workspace": "/Users/jamesstar/fractal-cli",
+      "canonical_workspace": "/workspace/fractal-cli",
       "available": true,
       "catalog_state": "valid",
       "graph_hash": "sha256:… or null",

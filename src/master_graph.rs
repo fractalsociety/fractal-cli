@@ -2652,12 +2652,12 @@ mod tests {
     #[test]
     fn project_key_matches_contract_examples() {
         assert_eq!(
-            derive_project_key("/Users/jamesstar/fractal-cli"),
-            "fractal-cli-bbbfd315b970"
+            derive_project_key("/workspace/fractal-cli"),
+            "fractal-cli-3c8b9dde9efc"
         );
         assert_eq!(
-            derive_project_key("/Users/jamesstar/fractal-efficiency.yFzdFF"),
-            "fractal-efficiency-yfzdff-fe96f21dda82"
+            derive_project_key("/workspace/fractal-efficiency"),
+            "fractal-efficiency-5793dcf94336"
         );
     }
 }

@@ -11,7 +11,7 @@ All worker commands are argv arrays (`shell=False`); no shell interpolation or
 network fallback is permitted.
 
 ```sh
-cd /Users/jamesstar/fractal-cli
+cd /workspace/fractal-cli
 python3 experiments/project-graph-context/cli.py calibrate \
   --output /tmp/pgc-calibration
 python3 experiments/project-graph-context/cli.py scripted-pilot \

@@ -366,3 +366,7 @@ swift test --package-path macos/FractalVoice
 
 Preserve existing user changes in a dirty worktree. Make source edits with
 small, reviewable patches and report any check that could not be run.
+
+## Squad Collaboration
+
+This project uses squad for multi-agent collaboration. Run `squad help` for all commands and usage guide.

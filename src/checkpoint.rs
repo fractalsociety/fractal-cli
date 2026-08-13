@@ -82,6 +82,9 @@ pub(crate) fn discard(key: &str) {
 /// The most recent resumable (not-done, not-fully-complete, graph still present)
 /// checkpoint for `workspace`, if any.
 pub(crate) fn find_resumable(workspace: &Path) -> Option<RunCheckpoint> {
+    if canonical_project_is_terminal(workspace) {
+        return None;
+    }
     let ws = workspace.to_string_lossy();
     let mut best: Option<RunCheckpoint> = None;
     for entry in std::fs::read_dir(runs_dir()).ok()?.flatten() {
@@ -93,7 +96,6 @@ pub(crate) fn find_resumable(workspace: &Path) -> Option<RunCheckpoint> {
         };
         if cp.done
             || cp.workspace != ws
-            || cp.completed.is_empty()
             || cp.completed.len() >= cp.total
             || crate::graph_store::load_graph(&cp.current_graph_hash).is_err()
         {
@@ -124,8 +126,8 @@ pub(crate) fn list_resumable() -> Vec<RunCheckpoint> {
             continue;
         };
         if cp.done
-            || cp.completed.is_empty()
             || cp.completed.len() >= cp.total
+            || canonical_project_is_terminal(Path::new(&cp.workspace))
             || crate::graph_store::load_graph(&cp.current_graph_hash).is_err()
         {
             continue;
@@ -133,6 +135,63 @@ pub(crate) fn list_resumable() -> Vec<RunCheckpoint> {
         out.push(cp);
     }
     out
+}
+
+fn canonical_project_is_terminal(workspace: &Path) -> bool {
+    !crate::amendments::has_pending(workspace)
+        && crate::project_file::load(workspace)
+            .ok()
+            .and_then(|document| document.execution)
+            .is_some_and(|execution| execution.phase == "completed")
+}
+
+/// Reconstruct a resumable checkpoint from the canonical project document.
+///
+/// A coordinator may die before it writes its first ordinary checkpoint. In
+/// that case zero nodes are complete, but `project.fractal` still contains the
+/// committed graph and authoritative execution phase. Treating 0/N as idle
+/// strands early failures and joined workers. Pending amendments are also
+/// resumable even when the previous graph is already complete.
+pub(crate) fn from_project_state(workspace: &Path) -> Option<RunCheckpoint> {
+    let document = crate::project_file::load(workspace).ok()?;
+    let total = document
+        .graph
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    if total == 0 {
+        return None;
+    }
+
+    let completed: Vec<String> = crate::project_file::completed_nodes(workspace)
+        .into_iter()
+        .collect();
+    let pending_amendment = crate::amendments::has_pending(workspace);
+    let recoverable_phase = document.execution.as_ref().is_some_and(|execution| {
+        matches!(
+            execution.phase.as_str(),
+            "planning" | "executing" | "halted"
+        )
+    });
+    if !pending_amendment && (!recoverable_phase || completed.len() >= total) {
+        return None;
+    }
+
+    let request = document
+        .project
+        .prompt
+        .unwrap_or_else(|| document.project.title.clone());
+    Some(RunCheckpoint {
+        key: key_for(workspace, &document.graph_hash),
+        graph_id: document.graph_hash.clone(),
+        request,
+        workspace: workspace.to_string_lossy().into_owned(),
+        current_graph_hash: document.graph_hash,
+        completed,
+        total,
+        done: false,
+        updated_at_ms: 0,
+    })
 }
 
 /// A live recorder that persists run progress each wave. Owned by `run_end_to_end`
@@ -266,5 +325,49 @@ mod tests {
         assert!(after.learning.nodes["build"].reopen_count >= 1);
         assert!(after.learning.nodes["build"].ready_at.is_some());
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn canonical_state_recovers_a_zero_progress_halted_graph() {
+        let workspace = temp_workspace("zero-progress");
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_zero_progress",
+            "nodes": [
+                {"id": "plan", "capability": "code.generate", "instruction": "Plan", "title": "Plan"},
+                {"id": "build", "capability": "code.generate", "instruction": "Build", "title": "Build"}
+            ],
+            "edges": [{"from": "plan", "to": "build"}]
+        });
+        graph["graph_hash"] =
+            serde_json::Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::graph_store::commit_graph(&graph).unwrap();
+        crate::project_file::persist(&workspace, &graph, "Zero progress").unwrap();
+        crate::project_file::set_execution_phase(&workspace, "halted").unwrap();
+
+        let checkpoint = from_project_state(&workspace).expect("halted 0/N graph is resumable");
+        assert_eq!(checkpoint.completed.len(), 0);
+        assert_eq!(checkpoint.total, 2);
+        assert_eq!(checkpoint.current_graph_hash, graph["graph_hash"]);
+
+        crate::project_file::set_execution_phase(&workspace, "completed").unwrap();
+        assert!(from_project_state(&workspace).is_none());
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn failed_project_fixture_preserves_recovery_contradictions() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/self-healing-failed-project");
+        let document = crate::project_file::load(&workspace).expect("load recovery fixture");
+        let execution = document.execution.expect("fixture execution state");
+        assert_eq!(execution.phase, "halted");
+        assert!(execution
+            .assignments
+            .values()
+            .any(|assignment| assignment.state == "released"));
+        assert!(crate::amendments::has_pending(&workspace));
+        assert!(from_project_state(&workspace).is_some());
     }
 }
