@@ -1257,6 +1257,10 @@ pub(crate) struct ArchitectArgs {
     #[arg(long, default_value_t = 10)]
     pub(crate) poll_secs: u64,
 
+    /// Keep this many independent specialist-team objectives queued for concurrent planning.
+    #[arg(long, default_value_t = 4)]
+    pub(crate) planning_lanes: usize,
+
     /// Refuse a new team above this one-minute-load/logical-core ratio.
     #[arg(long, default_value_t = 1.25)]
     pub(crate) max_load_per_core: f64,
@@ -1727,6 +1731,8 @@ mod tests {
             "1.5",
             "--min-free-memory-gib",
             "12",
+            "--planning-lanes",
+            "8",
             "--launch",
             "--once",
             "--json",
@@ -1738,6 +1744,7 @@ mod tests {
         assert_eq!(args.max_teams, 7);
         assert_eq!(args.max_load_per_core, 1.5);
         assert_eq!(args.min_free_memory_gib, 12.0);
+        assert_eq!(args.planning_lanes, 8);
         assert!(args.launch && args.once && args.json);
         assert!(Cli::try_parse_from(["fractal", "architect", "--launch", "--stop"]).is_err());
     }

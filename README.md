@@ -148,9 +148,16 @@ fractal architect --repo . --once --json
 Launch continuously until stopped or constrained by policy:
 
 ```sh
-fractal architect --repo . --launch
+fractal architect --repo . --launch --planning-lanes 4
 fractal architect --repo . --stop
 ```
+
+The master architect keeps multiple coherent team objectives queued. Specialist
+sub-planners decompose up to `--planning-lanes` objectives concurrently into
+five artifact-disjoint tasks each; graph commits remain serialized and
+hash-chained. The default is four lanes (configurable for the coordinator with
+`FRACTAL_PLANNING_LANES`), and each batch records measured parallel wall time,
+serial-equivalent time, and speedup in `.fractal/planning-metrics.json`.
 
 Use `--max-teams`, `--max-load-per-core`, `--min-free-memory-gib`, and
 `--min-improvement-bps` to tune the envelope. A zero `--max-teams` means there

@@ -4,11 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::compile::{baseline_node_efficiency, node_efficiency_to_graph_value};
 use crate::efficiency::{validate_node_metadata, NodeEfficiencyMetadata};
@@ -36,12 +38,12 @@ fn default_action() -> String {
     "add_branch".to_owned()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct PlannerDocument {
     tasks: Vec<PlannerTask>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct PlannerTask {
     id: String,
     title: String,
@@ -212,6 +214,7 @@ pub(crate) fn apply_pending(
 
 /// Apply one actionable amendment and preserve the rest of the claimed batch.
 /// Coordinators use this to return to worker joins between slow planner calls.
+#[allow(dead_code)]
 pub(crate) fn apply_next_pending(
     graph: Value,
     graph_hash: String,
@@ -219,6 +222,25 @@ pub(crate) fn apply_next_pending(
     lead_agent: &str,
 ) -> (Value, String) {
     apply_pending_limit(graph, graph_hash, workspace, lead_agent, 1)
+}
+
+/// Plan several independent architect objectives concurrently, then commit
+/// their graph mutations in queue order. Parallel work is planning-only;
+/// canonical graph writes remain serialized and hash chained.
+pub(crate) fn apply_planning_batch(
+    graph: Value,
+    graph_hash: String,
+    workspace: &Path,
+    lead_agent: &str,
+    planning_lanes: usize,
+) -> (Value, String) {
+    apply_pending_limit(
+        graph,
+        graph_hash,
+        workspace,
+        lead_agent,
+        planning_lanes.clamp(1, 16),
+    )
 }
 
 fn apply_pending_limit(
@@ -244,6 +266,12 @@ fn apply_pending_limit(
     if pending.is_empty() {
         return (graph, graph_hash);
     }
+    preplan_team_waves(
+        &graph,
+        workspace,
+        lead_agent,
+        pending.iter().take(max_actionable),
+    );
     let mut remaining = Vec::new();
     let mut retryable_failures = Vec::new();
     let mut seen = BTreeSet::new();
@@ -540,6 +568,158 @@ fn mark_amendment_applied(graph: &mut Value, command_id: &str) {
     }
 }
 
+fn preplan_team_waves<'a>(
+    graph: &Value,
+    workspace: &Path,
+    lead_agent: &str,
+    requests: impl Iterator<Item = &'a PendingAmendment>,
+) {
+    let requests = requests
+        .filter(|request| request.action == "add_team_wave")
+        .filter(|request| {
+            request
+                .wave
+                .is_some_and(|wave| resolve_wave_flow(graph, wave).is_ok())
+        })
+        .take(planning_lane_limit())
+        .cloned()
+        .collect::<Vec<_>>();
+    if requests.len() < 2 {
+        return;
+    }
+    println!(
+        "  ✦ [{}] planning {} specialist objectives across parallel lanes…",
+        lead_agent,
+        requests.len()
+    );
+    let wall_started = Instant::now();
+    let durations = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(requests.len());
+        for request in requests {
+            handles.push((
+                request.command_id.clone(),
+                scope.spawn(move || {
+                    let started = Instant::now();
+                    let result = preplan_team_wave(workspace, lead_agent, &request);
+                    (result, started.elapsed().as_millis() as u64)
+                }),
+            ));
+        }
+        let mut durations = Vec::with_capacity(handles.len());
+        for (command_id, handle) in handles {
+            match handle.join() {
+                Ok((Ok(()), elapsed_ms)) => durations.push(elapsed_ms),
+                Ok((Err(error), elapsed_ms)) => {
+                    durations.push(elapsed_ms);
+                    eprintln!(
+                        "  parallel planning note: {command_id} will retry serially: {error:#}"
+                    );
+                }
+                Err(_) => eprintln!(
+                    "  parallel planning note: {command_id} planner panicked and will retry serially"
+                ),
+            }
+        }
+        durations
+    });
+    let parallel_wall_ms = wall_started.elapsed().as_millis() as u64;
+    let serial_equivalent_ms = durations.iter().sum::<u64>();
+    let speedup = if parallel_wall_ms == 0 {
+        0.0
+    } else {
+        serial_equivalent_ms as f64 / parallel_wall_ms as f64
+    };
+    let metrics = json!({
+        "schema": "fractal.planning_metrics.v1",
+        "measured_at_ms": now_epoch_ms(),
+        "planning_lanes": durations.len(),
+        "serial_equivalent_ms": serial_equivalent_ms,
+        "parallel_wall_ms": parallel_wall_ms,
+        "measured_speedup_x": speedup,
+    });
+    if let Err(error) = fs::write(
+        workspace.join(".fractal").join("planning-metrics.json"),
+        serde_json::to_vec_pretty(&metrics).unwrap_or_default(),
+    ) {
+        eprintln!("  parallel planning metrics note: {error}");
+    }
+}
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn planning_lane_limit() -> usize {
+    std::env::var("FRACTAL_PLANNING_LANES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4)
+        .clamp(1, 16)
+}
+
+fn preplan_team_wave(workspace: &Path, lead_agent: &str, request: &PendingAmendment) -> Result<()> {
+    let output_path = planner_output_path(workspace, &request.command_id)?;
+    fs::remove_file(&output_path).ok();
+    let prompt = format!(
+        "You are a specialist sub-planner operating as one parallel planning lane for wave {wave}. \
+         Your master architect assigned this single coherent objective:\n\n{instruction}\n\nWrite only \
+         `{output}` using the standard amendment task schema. Produce exactly five independent, \
+         artifact-disjoint implementation or verification tasks for this objective. Every task \
+         must include bounded efficiency metadata, a concrete owned path, measurable acceptance \
+         behavior, and empty `depends_on` plus empty `efficiency.dependencies`; the controller \
+         resolves canonical wave dependencies. These tasks belong to one leader and five workers. \
+         Do not broaden into another objective, join collaboration sessions, start receive loops, \
+         edit product files, or create branches. Bound reconnaissance to twelve read-only commands.",
+        wave = request.wave.unwrap_or_default(),
+        instruction = request.instruction,
+        output = output_path.display(),
+    );
+    let timeout = std::env::var("FRACTAL_AGENT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(900_000);
+    let run = crate::execute::run_lead_agent_prompt(lead_agent, &prompt, workspace, timeout)
+        .with_context(|| format!("launch parallel sub-planner `{lead_agent}`"))?;
+    if !run.ok {
+        fs::remove_file(&output_path).ok();
+        bail!(
+            "lead planner {}",
+            if run.timed_out { "timed out" } else { "failed" }
+        );
+    }
+    let document = read_planner_document(&output_path, &request.action);
+    if document.is_err() {
+        fs::remove_file(&output_path).ok();
+    }
+    let document = document?;
+    fs::write(&output_path, serde_json::to_vec(&document)?)?;
+    Ok(())
+}
+
+fn planner_output_path(workspace: &Path, command_id: &str) -> Result<PathBuf> {
+    let output_directory = workspace.join(".fractal").join("planner-output");
+    fs::create_dir_all(&output_directory)?;
+    let digest = Sha256::digest(command_id.as_bytes());
+    let suffix = digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(output_directory.join(format!("{}-{suffix}.json", sanitize_id(command_id))))
+}
+
+fn read_planner_document(output_path: &Path, action: &str) -> Result<PlannerDocument> {
+    let raw = fs::read_to_string(output_path)
+        .with_context(|| format!("lead planner did not write {}", output_path.display()))?;
+    let mut document: PlannerDocument =
+        serde_json::from_str(&raw).context("lead planner wrote invalid amendment JSON")?;
+    normalize_planner_metadata(&mut document.tasks);
+    validate_tasks(&document.tasks, action)?;
+    Ok(document)
+}
+
 fn apply_one(
     graph: &Value,
     parent_hash: &str,
@@ -561,13 +741,14 @@ fn apply_one(
             .with_context(|| format!("task {} is not in the current graph", request.task_ref))?;
         (Some(anchor), Vec::new(), Vec::new())
     };
-    let output_path = workspace.join(".fractal").join("fractal-amendment.json");
-    fs::remove_file(&output_path).ok();
+    let output_path = planner_output_path(workspace, &request.command_id)?;
+    let output_ready = output_path.is_file();
+    let output = output_path.display();
     let prompt = if request.action == "add_team_wave" {
         format!(
             "You are the master architect forming one specialist team mission in wave {wave}. \
              The mission request is:\n\n{instruction}\n\nWrite only \
-             `.fractal/fractal-amendment.json` using the standard amendment task schema. \
+             `{output}` using the standard amendment task schema. \
              Produce exactly five independent, artifact-disjoint implementation or verification \
              tasks for one coherent specialization. Every task must include bounded efficiency \
              metadata, a concrete owned path, measurable acceptance behavior, and empty \
@@ -581,12 +762,13 @@ fn apply_one(
              bearer, or token=. Do not edit product files or create branches now.",
             wave = request.wave.unwrap_or_default(),
             instruction = request.instruction,
+            output = output,
         )
     } else if request.action == "add_wave_task" {
         format!(
             "You are the lead planner adding one peer task to wave {wave} of a live execution \
              graph. The user requested:\n\n{instruction}\n\nWrite only \
-             `.fractal/fractal-amendment.json` as \
+             `{output}` as \
              {{\"tasks\":[{{\"id\":\"short_id\",\"title\":\"...\",\"capability\":\"code.generate\",\
              \"instruction\":\"concrete standalone implementation instruction with files and \
              acceptance behavior\",\"depends_on\":[],\"efficiency\":{{\
@@ -605,12 +787,13 @@ fn apply_one(
              not edit product files now.",
             wave = request.wave.unwrap_or_default(),
             instruction = request.instruction,
+            output = output,
         )
     } else {
         format!(
             "You are the lead planner amending a live execution graph. The user requested a \
              complete new build branch from task {task_ref} (internal node `{anchor}`):\n\n\
-             {instruction}\n\nWrite only `.fractal/fractal-amendment.json`. It must be JSON shaped \
+             {instruction}\n\nWrite only `{output}`. It must be JSON shaped \
              as {{\"tasks\":[{{\"id\":\"short_id\",\"title\":\"...\",\
              \"capability\":\"code.generate\",\"instruction\":\"concrete standalone implementation \
              instruction with files and acceptance behavior\",\"depends_on\":[\"anchor\"],\
@@ -628,26 +811,28 @@ fn apply_one(
             task_ref = request.task_ref,
             anchor = anchor.as_deref().unwrap_or_default(),
             instruction = request.instruction,
+            output = output,
         )
     };
     let timeout = std::env::var("FRACTAL_AGENT_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(900_000);
-    let run = crate::execute::run_lead_agent_prompt(lead_agent, &prompt, workspace, timeout)
-        .with_context(|| format!("launch lead planner `{lead_agent}`"))?;
-    if !run.ok {
-        bail!(
-            "lead planner {}",
-            if run.timed_out { "timed out" } else { "failed" }
-        );
+    if !output_ready {
+        let run = crate::execute::run_lead_agent_prompt(lead_agent, &prompt, workspace, timeout)
+            .with_context(|| format!("launch lead planner `{lead_agent}`"))?;
+        if !run.ok {
+            bail!(
+                "lead planner {}",
+                if run.timed_out { "timed out" } else { "failed" }
+            );
+        }
     }
-    let raw = fs::read_to_string(&output_path)
-        .context("lead planner did not write .fractal/fractal-amendment.json")?;
-    let mut document: PlannerDocument =
-        serde_json::from_str(&raw).context("lead planner wrote invalid amendment JSON")?;
-    normalize_planner_metadata(&mut document.tasks);
-    validate_tasks(&document.tasks, &request.action)?;
+    let document = read_planner_document(&output_path, &request.action);
+    if document.is_err() {
+        fs::remove_file(&output_path).ok();
+    }
+    let document = document?;
 
     let (mut harness, work, target) = crate::graph_store::load_source(parent_hash)
         .context("current graph has no recompilable source genome")?;
@@ -722,6 +907,20 @@ fn apply_one(
 
     let mut child =
         crate::compile::recompile(&work, &harness, &target).context("compile planner amendment")?;
+    if let Some(existing) = graph.get("architect_team_objectives") {
+        child["architect_team_objectives"] = existing.clone();
+    }
+    if request.action == "add_team_wave" {
+        let objectives = child
+            .as_object_mut()
+            .context("compiled graph must be an object")?
+            .entry("architect_team_objectives")
+            .or_insert_with(|| json!({}));
+        objectives
+            .as_object_mut()
+            .context("architect team objectives must be an object")?
+            .insert(request.command_id.clone(), json!(request.instruction));
+    }
     child["parent_graph"] = json!(parent_hash);
     child["evolution_arm"] = json!("user_branch");
     for applied in graph
@@ -737,6 +936,7 @@ fn apply_one(
     crate::graph_store::rehash_graph(&mut child)?;
     let record = crate::graph_store::commit_graph(&child)?;
     crate::graph_store::persist_source(&record.graph_hash, &harness, &work, &target).ok();
+    fs::remove_file(&output_path).ok();
     Ok(AppliedAmendment {
         command_id: request.command_id.clone(),
         graph: child,
@@ -2175,6 +2375,17 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exactly five"));
+    }
+
+    #[test]
+    fn concurrent_planner_outputs_are_command_scoped_and_collision_resistant() {
+        let workspace = temp_workspace("planner-output-paths");
+        let first = planner_output_path(&workspace, "architect-team-0001").unwrap();
+        let second = planner_output_path(&workspace, "architect_team_0001").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), second.parent());
+        assert!(first.starts_with(workspace.join(".fractal/planner-output")));
+        std::fs::remove_dir_all(workspace).ok();
     }
 
     #[test]

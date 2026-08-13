@@ -750,6 +750,9 @@ fn durable_checkouts(workspace: &Path) -> Result<Vec<(String, String, String)>> 
 }
 
 fn apply_pending_amendments(workspace: &Path) -> Result<()> {
+    // Architect process records must converge under the durable coordinator;
+    // otherwise a dead admission loop leaves phantom active teams forever.
+    crate::architect::reconcile_runtime(workspace)?;
     if !crate::amendments::has_pending(workspace) {
         return Ok(());
     }
@@ -759,11 +762,17 @@ fn apply_pending_amendments(workspace: &Path) -> Result<()> {
         .context("accepted graph amendments are pending but no lead agent is available")?;
     let document = crate::project_file::load(workspace)?;
     let previous_hash = document.graph_hash.clone();
-    let (_, graph_hash) = crate::amendments::apply_next_pending(
+    let planning_lanes = std::env::var("FRACTAL_PLANNING_LANES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4)
+        .clamp(1, 16);
+    let (_, graph_hash) = crate::amendments::apply_planning_batch(
         document.graph,
         previous_hash.clone(),
         workspace,
         &lead_agent,
+        planning_lanes,
     );
     if graph_hash != previous_hash {
         let persisted = crate::project_file::load(workspace)?;

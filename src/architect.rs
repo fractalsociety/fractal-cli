@@ -59,6 +59,10 @@ struct MissionTask {
     title: String,
     capability: String,
     instruction: String,
+    #[serde(default)]
+    cohort: Option<String>,
+    #[serde(default)]
+    objective: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -190,15 +194,22 @@ pub(crate) fn run(args: &ArchitectArgs) -> Result<()> {
                 formed = Some(team);
             } else {
                 decision = Admission::Refuse(vec!["fragmented_specialist_frontier"]);
-                if snapshot.planner_backlog == 0 && !crate::amendments::has_pending(&workspace) {
-                    queue_team_mission(&workspace, &state)?;
-                }
+                queue_team_missions(
+                    &workspace,
+                    &state,
+                    args.planning_lanes,
+                    snapshot.planner_backlog,
+                )?;
             }
         } else if decision == Admission::Refuse(vec!["insufficient_specialist_frontier"])
-            && snapshot.planner_backlog == 0
-            && !crate::amendments::has_pending(&workspace)
+            && snapshot.planner_backlog < args.planning_lanes
         {
-            queue_team_mission(&workspace, &state)?;
+            queue_team_missions(
+                &workspace,
+                &state,
+                args.planning_lanes,
+                snapshot.planner_backlog,
+            )?;
         }
         emit_status(args, &workspace, &state, formed.as_ref(), decision)?;
         if args.once {
@@ -210,6 +221,9 @@ pub(crate) fn run(args: &ArchitectArgs) -> Result<()> {
 }
 
 fn validate_args(args: &ArchitectArgs) -> Result<()> {
+    if !(1..=16).contains(&args.planning_lanes) {
+        bail!("--planning-lanes must be between 1 and 16");
+    }
     if !args.max_load_per_core.is_finite() || args.max_load_per_core <= 0.0 {
         bail!("--max-load-per-core must be finite and positive");
     }
@@ -265,6 +279,19 @@ pub(crate) fn enabled(workspace: &Path) -> bool {
     load_state(&state_path(workspace))
         .ok()
         .is_some_and(|state| !state.stop_requested)
+}
+
+/// Let the durable coordinator converge architect-owned process state even if
+/// the optional architect admission loop has exited. This maintenance pass
+/// never admits or launches a new team.
+pub(crate) fn reconcile_runtime(workspace: &Path) -> Result<()> {
+    let path = state_path(workspace);
+    if !path.is_file() {
+        return Ok(());
+    }
+    let mut state = load_state(&path)?;
+    reconcile_teams(workspace, &mut state)?;
+    persist_state(&path, &state)
 }
 
 pub(crate) fn checkout_authorized(workspace: &Path, agent_id: &str, node_id: &str) -> bool {
@@ -639,6 +666,8 @@ fn stranded_team_assignments(
                 title: node_id.clone(),
                 capability: "code.generate".to_owned(),
                 instruction: "Finish and verify the already checked-out graph node.".to_owned(),
+                cohort: None,
+                objective: None,
             },
             |node| MissionTask {
                 node_id: node_id.clone(),
@@ -659,6 +688,8 @@ fn stranded_team_assignments(
                         .unwrap_or("Finish and verify the already checked-out graph node."),
                     12_000,
                 ),
+                cohort: architect_team_cohort(node_id).map(str::to_owned),
+                objective: None,
             },
         );
         stranded.push((member.to_owned(), task));
@@ -712,6 +743,9 @@ fn ready_tasks(workspace: &Path) -> Result<Vec<MissionTask>> {
         .pointer("/execution/assignments")
         .and_then(Value::as_object);
     let graph = document.get("graph").unwrap_or(&document);
+    let objectives = graph
+        .get("architect_team_objectives")
+        .and_then(Value::as_object);
     let edges = graph
         .get("edges")
         .and_then(Value::as_array)
@@ -747,6 +781,12 @@ fn ready_tasks(workspace: &Path) -> Result<Vec<MissionTask>> {
                     == Some("completed")
             });
         if ready {
+            let cohort = architect_team_cohort(id).map(str::to_owned);
+            let objective = cohort
+                .as_deref()
+                .and_then(|cohort| objectives.and_then(|values| values.get(cohort)))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             tasks.push(MissionTask {
                 node_id: id.to_owned(),
                 title: node
@@ -765,6 +805,8 @@ fn ready_tasks(workspace: &Path) -> Result<Vec<MissionTask>> {
                         .unwrap_or("Execute the graph node."),
                     12_000,
                 ),
+                cohort,
+                objective,
             });
         }
     }
@@ -799,7 +841,9 @@ fn form_team(tasks: &[MissionTask], state: &ArchitectState) -> Result<Option<Tea
         .iter()
         .filter(|task| !occupied.contains(task.node_id.as_str()))
     {
-        let bucket = architect_team_cohort(&task.node_id)
+        let bucket = task
+            .cohort
+            .as_deref()
             .map(|cohort| format!("cross-functional-{cohort}"))
             .unwrap_or_else(|| specialization(&task.capability));
         buckets.entry(bucket).or_default().push(task.clone());
@@ -833,10 +877,17 @@ fn form_team(tasks: &[MissionTask], state: &ArchitectState) -> Result<Option<Tea
         .map(|index| format!("{team_id}-worker-{index}"))
         .collect();
     let member_clients = mixed_worker_roster(WORKERS_PER_TEAM);
+    let mission = selected
+        .first()
+        .and_then(|task| task.objective.as_deref())
+        .map(|objective| bounded(objective, 4_000))
+        .unwrap_or_else(|| {
+            format!("Complete and verify five independent {skill} graph nodes with preserved ownership and evidence.")
+        });
     Ok(Some(TeamRecord {
         team_id,
         specialization: skill.clone(),
-        mission: format!("Complete and verify five independent {skill} graph nodes with preserved ownership and evidence."),
+        mission,
         leader_id,
         member_ids,
         member_clients,
@@ -1008,7 +1059,10 @@ fn planner_backlog(workspace: &Path) -> Result<usize> {
         {
             count += fs::read_to_string(entry.path())?
                 .lines()
-                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|request| {
+                    request.get("action").and_then(Value::as_str) == Some("add_team_wave")
+                })
                 .count();
         }
     }
@@ -1068,29 +1122,84 @@ fn worker_launch_prompt(workspace: &Path, team: &TeamRecord, index: usize) -> Re
     ))
 }
 
-fn queue_team_mission(workspace: &Path, state: &ArchitectState) -> Result<()> {
+fn queue_team_missions(
+    workspace: &Path,
+    state: &ArchitectState,
+    planning_lanes: usize,
+    planner_backlog: usize,
+) -> Result<()> {
     let document = crate::project_file::load(workspace)?;
     // Team amendments graft peers onto the latest existing wave; they do not
     // create a structurally new wave number. Downstream dependencies are
     // rewired by the amendment compiler. Asking for max+1 permanently retries
     // a wave that cannot exist yet and stalls autonomous graph growth.
     let wave = latest_expandable_wave(&document.graph)?;
-    let generation = state.teams.len() + 1;
-    let command_id = format!("architect-team-{generation:04}");
-    let focus = prd_mission_focus(generation);
-    let instruction = format!(
-        "Continuously improve the product and network with specialist team {generation}. Reconcile the graph project prompt with authoritative PRD, PRD_INDEX, MASTER_PRD, and status documents available in project-related repositories. Prioritize explicitly unfinished original acceptance criteria over more synthetic verification. This team's coherent focus is: {focus}. Use current graph, benchmark, regression, failure, and resource evidence. Produce exactly five implementation-heavy, artifact-disjoint, independently measurable tasks that can be delegated one-per-worker. Every task must name its owned paths, preserve existing authority boundaries, include a deterministic baseline, performance or feature acceptance evidence, rollback/fail-closed behavior, and full regression verification. Do not duplicate completed graph work and do not weaken a gate."
-    );
-    crate::amendments::queue(
-        workspace,
-        command_id,
-        "add_team_wave",
-        "",
-        Some(wave),
-        &instruction,
-        "master_architect",
-    )?;
+    let lanes_to_fill = planning_lanes
+        .min(MAX_PLANNER_BACKLOG)
+        .saturating_sub(planner_backlog);
+    let next_generation = latest_architect_generation(workspace, &document.graph)
+        .max(state.teams.len())
+        .saturating_add(1);
+    for offset in 0..lanes_to_fill {
+        let generation = next_generation + offset;
+        let command_id = format!("architect-team-{generation:04}");
+        let focus = prd_mission_focus(generation);
+        let instruction = format!(
+            "Continuously improve the product and network with specialist team {generation}. Reconcile the graph project prompt with authoritative PRD, PRD_INDEX, MASTER_PRD, and status documents available in project-related repositories. Prioritize explicitly unfinished original acceptance criteria over more synthetic verification. This team's coherent focus is: {focus}. Use current graph, benchmark, regression, failure, and resource evidence. Produce exactly five implementation-heavy, artifact-disjoint, independently measurable tasks that can be delegated one-per-worker. Every task must name its owned paths, preserve existing authority boundaries, include a deterministic baseline, performance or feature acceptance evidence, rollback/fail-closed behavior, and full regression verification. Do not duplicate completed graph work and do not weaken a gate."
+        );
+        crate::amendments::queue(
+            workspace,
+            command_id,
+            "add_team_wave",
+            "",
+            Some(wave),
+            &instruction,
+            "master_architect",
+        )?;
+    }
     Ok(())
+}
+
+fn latest_architect_generation(workspace: &Path, graph: &Value) -> usize {
+    let graph_generations = graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| node.get("id").and_then(Value::as_str))
+        .filter_map(architect_team_cohort)
+        .filter_map(architect_generation)
+        .max()
+        .unwrap_or(0);
+    let queued_generations = fs::read_dir(workspace.join(".fractal"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name == "pending-amendments.jsonl" || name.starts_with("pending-amendments.processing-")
+        })
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .flat_map(|raw| {
+            raw.lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter_map(|value| {
+                    value
+                        .get("command_id")
+                        .and_then(Value::as_str)
+                        .and_then(architect_generation)
+                })
+                .collect::<Vec<_>>()
+        })
+        .max()
+        .unwrap_or(0);
+    graph_generations.max(queued_generations)
+}
+
+fn architect_generation(value: &str) -> Option<usize> {
+    value.strip_prefix("architect-team-")?.parse::<usize>().ok()
 }
 
 fn prd_mission_focus(generation: usize) -> &'static str {
@@ -1211,6 +1320,9 @@ fn emit_status(
         Admission::Admit => Vec::new(),
         Admission::Refuse(reasons) => reasons.clone(),
     };
+    let planning_metrics = fs::read(workspace.join(".fractal/planning-metrics.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
     let report = json!({
         "schema": STATUS_SCHEMA,
         "workspace": workspace,
@@ -1221,6 +1333,7 @@ fn emit_status(
         "formed_team": formed,
         "active_teams": active_teams,
         "launched_agents": launched_agents,
+        "planning_metrics": planning_metrics,
     });
     if args.json {
         println!("{}", serde_json::to_string(&report)?);
@@ -1339,6 +1452,8 @@ mod tests {
             title: "Repair CI regression".to_owned(),
             capability: "code.generate".to_owned(),
             instruction: "Repair CI; all must pass and do not weaken tests.".to_owned(),
+            cohort: None,
+            objective: None,
         };
         assert_eq!(
             allow_bounded_regression_remediation(
@@ -1359,6 +1474,8 @@ mod tests {
             title: "Add feature".to_owned(),
             capability: "code.generate".to_owned(),
             instruction: "Implement it.".to_owned(),
+            cohort: None,
+            objective: None,
         };
         assert_eq!(
             allow_bounded_regression_remediation(
@@ -1377,6 +1494,8 @@ mod tests {
                 title: format!("N{index}"),
                 capability: "code.generate".to_owned(),
                 instruction: "work".to_owned(),
+                cohort: None,
+                objective: None,
             })
             .collect();
         let team = form_team(&tasks, &ArchitectState::default())
@@ -1392,6 +1511,63 @@ mod tests {
     }
 
     #[test]
+    fn architect_cohorts_never_mix_and_preserve_the_subplanner_objective() {
+        let tasks: Vec<MissionTask> = (0..10)
+            .map(|index| {
+                let cohort = if index < 5 {
+                    "architect-team-0007"
+                } else {
+                    "architect-team-0008"
+                };
+                MissionTask {
+                    node_id: format!("branch.{cohort}.task-{index}"),
+                    title: format!("Task {index}"),
+                    capability: "code.generate".to_owned(),
+                    instruction: "Implement the bounded task.".to_owned(),
+                    cohort: Some(cohort.to_owned()),
+                    objective: Some(format!("Objective for {cohort}")),
+                }
+            })
+            .collect();
+        let team = form_team(&tasks, &ArchitectState::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(team.tasks.len(), 5);
+        assert!(team
+            .tasks
+            .iter()
+            .all(|task| task.cohort.as_deref() == Some("architect-team-0007")));
+        assert_eq!(team.mission, "Objective for architect-team-0007");
+    }
+
+    #[test]
+    fn partial_architect_cohorts_do_not_merge_by_broad_capability() {
+        let tasks: Vec<MissionTask> = (0..5)
+            .map(|index| MissionTask {
+                node_id: format!(
+                    "branch.architect-team-000{}.task-{index}",
+                    if index < 3 { 7 } else { 8 }
+                ),
+                title: format!("Task {index}"),
+                capability: "code.generate".to_owned(),
+                instruction: "Implement the bounded task.".to_owned(),
+                cohort: Some(
+                    if index < 3 {
+                        "architect-team-0007"
+                    } else {
+                        "architect-team-0008"
+                    }
+                    .to_owned(),
+                ),
+                objective: Some("cohort-specific objective".to_owned()),
+            })
+            .collect();
+        assert!(form_team(&tasks, &ArchitectState::default())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn regression_repair_is_prioritized_into_a_bounded_team() {
         let mut tasks: Vec<MissionTask> = (0..5)
             .map(|index| MissionTask {
@@ -1399,6 +1575,8 @@ mod tests {
                 title: format!("Feature {index}"),
                 capability: "code.generate".to_owned(),
                 instruction: "Implement it.".to_owned(),
+                cohort: None,
+                objective: None,
             })
             .collect();
         tasks.push(MissionTask {
@@ -1406,6 +1584,8 @@ mod tests {
             title: "Repair CI regression".to_owned(),
             capability: "code.generate".to_owned(),
             instruction: "Repair CI; all must pass and do not weaken tests.".to_owned(),
+            cohort: None,
+            objective: None,
         });
         let team = form_team(&tasks, &ArchitectState::default())
             .unwrap()
@@ -1427,6 +1607,8 @@ mod tests {
                 }
                 .to_owned(),
                 instruction: "work".to_owned(),
+                cohort: None,
+                objective: None,
             })
             .collect();
         assert!(form_team(&tasks, &ArchitectState::default())
@@ -1448,6 +1630,8 @@ mod tests {
                 title: format!("N{index}"),
                 capability: "code.generate".to_owned(),
                 instruction: "work".to_owned(),
+                cohort: None,
+                objective: None,
             })
             .collect();
         let mut state = ArchitectState::default();
@@ -1469,6 +1653,8 @@ mod tests {
                 title: format!("N{index}"),
                 capability: "code.generate".to_owned(),
                 instruction: "work".to_owned(),
+                cohort: None,
+                objective: None,
             })
             .collect();
         let mut state = ArchitectState::default();
@@ -1541,6 +1727,17 @@ mod tests {
         assert!(prd_mission_focus(3).contains("capability economics"));
         assert!(prd_mission_focus(4).contains("agent life economy"));
         assert_eq!(prd_mission_focus(1), prd_mission_focus(5));
+    }
+
+    #[test]
+    fn architect_generation_advances_past_graph_and_queued_cohorts() {
+        assert_eq!(architect_generation("architect-team-0042"), Some(42));
+        assert_eq!(
+            architect_team_cohort("branch.architect-team-0042.runtime")
+                .and_then(architect_generation),
+            Some(42)
+        );
+        assert_eq!(architect_generation("other-team-0042"), None);
     }
 
     #[test]
@@ -1617,6 +1814,8 @@ mod tests {
                 title: format!("Done {index}"),
                 capability: "code.generate".to_owned(),
                 instruction: "done".to_owned(),
+                cohort: None,
+                objective: None,
             })
             .collect();
         let mut team = form_team(&original, &ArchitectState::default())
