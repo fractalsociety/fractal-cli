@@ -439,10 +439,6 @@ inspect activity, open generated projects, or stop all running Fractal builds.
 Finalized text is sent over stdin to the managed-project ingest boundary; it is
 never interpolated into a command line.
 
-## License
-
-Fractal CLI is available under the [MIT License](LICENSE).
-
 ### ChatGPT Desktop and other external apps
 
 Sandboxed desktop apps can start the same managed build without using Fractal's
@@ -460,3 +456,7 @@ LaunchServices. The native app validates the file, deletes it after one read,
 creates the named managed project, and starts the normal PRD, execution-graph,
 agent checkout, verification, GitHub, and Fractal Society pipeline. Request text
 is never placed in a URL or shell argument.
+
+## License
+
+Fractal CLI is available under the [MIT License](LICENSE).
