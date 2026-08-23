@@ -145,7 +145,7 @@ pub(crate) fn run(args: &ArchitectArgs) -> Result<()> {
             )?;
             break;
         }
-        let tasks = ready_tasks(&workspace)?;
+        let (tasks, dependency_closed) = frontier_tasks(&workspace)?;
         let governed_prd_incomplete = governed_numbered_prd_incomplete(&workspace)?;
         let snapshot = resource_snapshot(&workspace, tasks.len(), state.last_team_started_ms)?;
         let active_teams = state
@@ -155,9 +155,15 @@ pub(crate) fn run(args: &ArchitectArgs) -> Result<()> {
             .count();
         let mut decision = admission_decision(&policy, &snapshot, active_teams);
         decision = allow_bounded_regression_remediation(decision, &tasks);
+        decision = allow_dependency_closed_frontier(decision, &dependency_closed);
         let mut formed = None;
         if decision == Admission::Admit {
-            if let Some(mut team) = form_team(&tasks, &state)? {
+            let team_tasks = if dependency_closed.len() >= WORKERS_PER_TEAM {
+                &dependency_closed
+            } else {
+                &tasks
+            };
+            if let Some(mut team) = form_team(team_tasks, &state)? {
                 if args.launch {
                     team.status = "launched".to_owned();
                     state.teams.push(team.clone());
@@ -803,9 +809,106 @@ fn tracked_agent_process_record_alive(record: &str) -> bool {
         || (command.contains("claude") && command.contains(" -p"))
 }
 
+#[allow(dead_code)]
 fn ready_tasks(workspace: &Path) -> Result<Vec<MissionTask>> {
+    Ok(frontier_tasks(workspace)?.0)
+}
+
+fn frontier_tasks(workspace: &Path) -> Result<(Vec<MissionTask>, Vec<MissionTask>)> {
     let document: Value =
         serde_json::from_slice(&fs::read(workspace.join(".fractal/project.fractal"))?)?;
+    let reserved = reserved_node_ids(workspace);
+    let immediate = ready_tasks_from_document(&document, &reserved);
+    let dependency_closed = if immediate.len() < WORKERS_PER_TEAM {
+        dependency_closed_tasks_from_document(&document, &reserved, &immediate)
+    } else {
+        Vec::new()
+    };
+    Ok((immediate, dependency_closed))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct GraphTaskCandidate {
+    task: MissionTask,
+    dependencies: Vec<String>,
+}
+
+fn ready_tasks_from_document(document: &Value, reserved: &BTreeSet<String>) -> Vec<MissionTask> {
+    let (candidates, completed) = graph_task_candidates(document, reserved);
+    let mut immediate = candidates
+        .values()
+        .filter(|candidate| {
+            candidate
+                .dependencies
+                .iter()
+                .all(|dependency| completed.contains(dependency))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    immediate.sort_by(|left, right| left.task.node_id.cmp(&right.task.node_id));
+    immediate
+        .into_iter()
+        .map(|candidate| candidate.task)
+        .collect()
+}
+
+fn dependency_closed_tasks_from_document(
+    document: &Value,
+    reserved: &BTreeSet<String>,
+    immediate: &[MissionTask],
+) -> Vec<MissionTask> {
+    if immediate.len() >= WORKERS_PER_TEAM {
+        return immediate.to_vec();
+    }
+    let (candidates, completed) = graph_task_candidates(document, reserved);
+    let mut selected = immediate
+        .iter()
+        .map(|task| task.node_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut tasks = immediate.to_vec();
+
+    // When the frontier has a short tail, keep an exact Team-6 pod alive by
+    // selecting only a dependency-closed chain. A follower remains assigned
+    // to its exact node and waits for the selected predecessor to complete;
+    // it must never claim a different node to work around that gate.
+    while tasks.len() < WORKERS_PER_TEAM {
+        let next = candidates
+            .values()
+            .filter(|candidate| !selected.contains(&candidate.task.node_id))
+            .filter(|candidate| {
+                candidate.dependencies.iter().all(|dependency| {
+                    completed.contains(dependency) || selected.contains(dependency)
+                })
+            })
+            .filter(|candidate| {
+                candidate
+                    .dependencies
+                    .iter()
+                    .any(|dependency| selected.contains(dependency))
+            })
+            .min_by(|left, right| left.task.node_id.cmp(&right.task.node_id))
+            .cloned();
+        let Some(candidate) = next else {
+            break;
+        };
+        let in_team_dependencies = candidate
+            .dependencies
+            .iter()
+            .filter(|dependency| selected.contains(*dependency))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut task = candidate.task;
+        task.instruction = dependency_closed_instruction(&task.instruction, &in_team_dependencies);
+        selected.insert(task.node_id.clone());
+        tasks.push(task);
+    }
+    tasks
+}
+
+fn graph_task_candidates(
+    document: &Value,
+    reserved: &BTreeSet<String>,
+) -> (BTreeMap<String, GraphTaskCandidate>, BTreeSet<String>) {
     let assignments = document
         .pointer("/execution/assignments")
         .and_then(Value::as_object);
@@ -815,7 +918,38 @@ fn ready_tasks(workspace: &Path) -> Result<Vec<MissionTask>> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut tasks = Vec::new();
+    let mut dependencies = BTreeMap::<String, Vec<String>>::new();
+    for edge in &edges {
+        // A failure edge is an alternative branch rather than a prerequisite;
+        // checkout uses the same success-edge semantics below.
+        if edge.get("condition").and_then(Value::as_str) == Some("failure") {
+            continue;
+        }
+        let (Some(from), Some(to)) = (
+            edge.get("from").and_then(Value::as_str),
+            edge.get("to").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        dependencies
+            .entry(to.to_owned())
+            .or_default()
+            .push(from.to_owned());
+    }
+    for values in dependencies.values_mut() {
+        values.sort();
+        values.dedup();
+    }
+
+    let completed = assignments
+        .into_iter()
+        .flat_map(|values| values.iter())
+        .filter_map(|(id, assignment)| {
+            (assignment.get("state").and_then(Value::as_str) == Some("completed"))
+                .then_some(id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut candidates = BTreeMap::<String, GraphTaskCandidate>::new();
     for node in graph
         .get("nodes")
         .and_then(Value::as_array)
@@ -825,49 +959,63 @@ fn ready_tasks(workspace: &Path) -> Result<Vec<MissionTask>> {
         let Some(id) = node.get("id").and_then(Value::as_str) else {
             continue;
         };
-        if assignments
+        let state = assignments
             .and_then(|values| values.get(id))
             .and_then(|value| value.get("state"))
-            .and_then(Value::as_str)
-            .is_some_and(|state| state == "checked_out" || state == "completed")
-        {
+            .and_then(Value::as_str);
+        // Only unassigned and explicitly released nodes are claimable. Any
+        // other durable state represents an in-flight reservation that must
+        // not be silently displaced by the architect.
+        if !state.is_none_or(|state| state == "released") {
             continue;
         }
-        let ready = edges
-            .iter()
-            .filter(|edge| edge.get("to").and_then(Value::as_str) == Some(id))
-            .filter_map(|edge| edge.get("from").and_then(Value::as_str))
-            .all(|dependency| {
-                assignments
-                    .and_then(|values| values.get(dependency))
-                    .and_then(|value| value.get("state"))
-                    .and_then(Value::as_str)
-                    == Some("completed")
-            });
-        if ready {
-            tasks.push(MissionTask {
-                node_id: id.to_owned(),
-                title: node
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .unwrap_or(id)
-                    .to_owned(),
-                capability: node
-                    .get("capability")
-                    .and_then(Value::as_str)
-                    .unwrap_or("code.generate")
-                    .to_owned(),
-                instruction: bounded(
-                    node.get("instruction")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Execute the graph node."),
-                    12_000,
-                ),
-            });
+        if reserved.contains(id) || has_external_gates(node) {
+            continue;
         }
+        candidates.insert(
+            id.to_owned(),
+            GraphTaskCandidate {
+                task: MissionTask {
+                    node_id: id.to_owned(),
+                    title: node
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or(id)
+                        .to_owned(),
+                    capability: node
+                        .get("capability")
+                        .and_then(Value::as_str)
+                        .unwrap_or("code.generate")
+                        .to_owned(),
+                    instruction: bounded(
+                        node.get("instruction")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Execute the graph node."),
+                        12_000,
+                    ),
+                },
+                dependencies: dependencies.get(id).cloned().unwrap_or_default(),
+            },
+        );
     }
-    tasks.sort_by(|left, right| left.node_id.cmp(&right.node_id));
-    Ok(tasks)
+    (candidates, completed)
+}
+
+fn has_external_gates(node: &Value) -> bool {
+    match node.get("external_gates") {
+        None | Some(Value::Null) => false,
+        Some(Value::Array(values)) => !values.is_empty(),
+        Some(Value::Object(values)) => !values.is_empty(),
+        Some(Value::String(value)) => !value.trim().is_empty(),
+        Some(_) => true,
+    }
+}
+
+fn dependency_closed_instruction(instruction: &str, dependencies: &[String]) -> String {
+    let dependencies = dependencies.join(", ");
+    format!(
+        "{instruction}\n\nIn-team dependency gate: {dependencies}. Do not modify source or run task work before atomically checking out this exact node. If any in-team dependency is incomplete, wait and retry checkout of this exact node until it becomes ready; never release this assignment or claim another node solely because the dependency is incomplete. If checkout reports an ownership conflict, stop and report the conflict to the leader rather than retrying with another node."
+    )
 }
 
 fn governed_numbered_prd_incomplete(workspace: &Path) -> Result<bool> {
@@ -961,6 +1109,18 @@ fn form_team(tasks: &[MissionTask], state: &ArchitectState) -> Result<Option<Tea
             .then(left.node_id.cmp(&right.node_id))
     });
     let selected: Vec<MissionTask> = candidates.into_iter().take(WORKERS_PER_TEAM).collect();
+    let mission = if selected
+        .iter()
+        .any(|task| task.instruction.contains("In-team dependency gate:"))
+    {
+        format!(
+            "Complete and verify five dependency-closed {skill} graph nodes in prerequisite order with preserved ownership and evidence."
+        )
+    } else {
+        format!(
+            "Complete and verify five independent {skill} graph nodes with preserved ownership and evidence."
+        )
+    };
     let mut team_identity = selected
         .iter()
         .flat_map(|task| task.node_id.as_bytes())
@@ -981,7 +1141,7 @@ fn form_team(tasks: &[MissionTask], state: &ArchitectState) -> Result<Option<Tea
     Ok(Some(TeamRecord {
         team_id,
         specialization: skill.clone(),
-        mission: format!("Complete and verify five independent {skill} graph nodes with preserved ownership and evidence."),
+        mission,
         leader_id,
         member_ids,
         member_clients,
@@ -1064,6 +1224,25 @@ fn allow_bounded_regression_remediation(decision: Admission, tasks: &[MissionTas
     let has_explicit_repair = tasks.iter().any(is_explicit_regression_repair);
     if has_explicit_repair {
         reasons.retain(|reason| *reason != "regression_gate_failed");
+    }
+    if reasons.is_empty() {
+        Admission::Admit
+    } else {
+        Admission::Refuse(reasons)
+    }
+}
+
+fn allow_dependency_closed_frontier(
+    decision: Admission,
+    dependency_closed: &[MissionTask],
+) -> Admission {
+    let Admission::Refuse(mut reasons) = decision else {
+        return decision;
+    };
+    if dependency_closed.len() == WORKERS_PER_TEAM {
+        // A closed in-graph chain supplies the fifth worker, but it does not
+        // waive any resource, quality, cap, or cooldown gate.
+        reasons.retain(|reason| *reason != "insufficient_specialist_frontier");
     }
     if reasons.is_empty() {
         Admission::Admit
@@ -1220,7 +1399,7 @@ fn leader_launch_prompt(team: &TeamRecord) -> Result<String> {
         })
         .collect();
     Ok(format!(
-        "You are specialist squad leader {leader} for mission {mission:?}. Join Squad with this exact ID as role manager. Immediately assign exactly one of these five graph tasks to each named member using direct squad send messages; include the exact node ID and checkout/verification acceptance criteria. Do not create a redundant structured-task acknowledgement gate: atomic Fractal checkout is authoritative ownership. Track readiness and results, inspect every result, request rework on failure, and report the team outcome to master-architect. Keep receiving until all five graph nodes are complete or explicitly released. Do not implement member tasks yourself. Assignments: {assignments}",
+        "You are specialist squad leader {leader} for mission {mission:?}. Join Squad with this exact ID as role manager. Immediately assign exactly one of these five graph tasks to each named member using direct squad send messages; include the exact node ID and checkout/verification acceptance criteria. Do not create a redundant structured-task acknowledgement gate: atomic Fractal checkout is authoritative ownership. Some assignments may include an in-team dependency gate. For those, instruct the member to wait and retry checkout of that exact assigned node until its listed dependencies complete; never release or substitute another node solely for an incomplete dependency. An ownership conflict is different: stop that assignment and report the conflict. Track readiness and results, inspect every result, request bounded rework on failure, and report the team outcome to master-architect. Keep receiving until all five graph nodes are complete or explicitly released. Do not implement member tasks yourself or allow work before successful checkout. Assignments: {assignments}",
         leader = team.leader_id,
         mission = team.mission,
         assignments = serde_json::to_string(&assignments)?
@@ -1234,7 +1413,7 @@ fn worker_launch_prompt(workspace: &Path, team: &TeamRecord, index: usize) -> Re
         .context("team member is missing")?;
     let task = team.tasks.get(index).context("team task is missing")?;
     Ok(format!(
-        "You are specialist team member {member} in team {team_id}. Your master-authorized leader assignment is node {node_id} ({title:?}) from {leader}. Join Squad with this exact ID as role worker, send {leader} a ready message, and receive its assignment message. Do not add a second acknowledgement gate: the leader message plus atomic Fractal checkout is the ownership record. If receive times out, retry instead of exiting. Atomically checkout exactly {node_id} in {repo} with agent ID and label {member}, implement only this instruction: {instruction:?}. While working, send a direct WORKER_HEARTBEAT for {node_id} to {leader} at least once every 60 seconds and after every long-running verification command. Verify it, complete or release it with evidence using the same identity, report the result to {leader}, then wait for rework or closure. Never claim another graph node.",
+        "You are specialist team member {member} in team {team_id}. Your master-authorized leader assignment is node {node_id} ({title:?}) from {leader}. Join Squad with this exact ID as role worker, send {leader} a ready message, and receive its assignment message. Do not add a second acknowledgement gate: the leader message plus atomic Fractal checkout is the ownership record. If receive times out, retry instead of exiting. Do not modify source or run task work before successful checkout. Atomically checkout exactly {node_id} in {repo} with agent ID and label {member}, implementing only this instruction: {instruction:?}. If the instruction names an in-team dependency and checkout reports it incomplete, wait and retry checkout of this exact node; never release or claim another node solely because that dependency is incomplete. If checkout reports an ownership conflict, stop and report the conflict to {leader}. While working, send a direct WORKER_HEARTBEAT for {node_id} to {leader} at least once every 60 seconds and after every long-running verification command. Verify it, complete or release it with evidence using the same identity, report the result to {leader}, then wait for rework or closure. Never claim another graph node.",
         team_id = team.team_id,
         leader = team.leader_id,
         node_id = task.node_id,
@@ -1487,6 +1666,30 @@ mod tests {
         team
     }
 
+    fn graph_document(nodes: Value, edges: Value, assignments: Value) -> Value {
+        json!({
+            "graph": {"nodes": nodes, "edges": edges},
+            "execution": {"assignments": assignments}
+        })
+    }
+
+    fn node(id: &str, capability: &str) -> Value {
+        json!({
+            "id": id,
+            "title": id,
+            "capability": capability,
+            "instruction": format!("Work on {id}.")
+        })
+    }
+
+    fn completed(ids: &[&str]) -> Value {
+        let mut assignments = serde_json::Map::new();
+        for id in ids {
+            assignments.insert((*id).to_owned(), json!({"state": "completed"}));
+        }
+        Value::Object(assignments)
+    }
+
     #[test]
     fn admits_only_a_healthy_complete_team_frontier() {
         assert_eq!(
@@ -1498,6 +1701,49 @@ mod tests {
         assert_eq!(
             admission_decision(&policy(), &snapshot, 0),
             Admission::Refuse(vec!["insufficient_specialist_frontier"])
+        );
+    }
+
+    #[test]
+    fn dependency_closed_frontier_only_relaxes_specialist_frontier_gate() {
+        let mut snapshot = healthy();
+        snapshot.ready_nodes = 4;
+        let fallback = vec![
+            MissionTask {
+                node_id: "follower".to_owned(),
+                title: "follower".to_owned(),
+                capability: "code.generate".to_owned(),
+                instruction: "wait".to_owned(),
+            };
+            WORKERS_PER_TEAM
+        ];
+        assert_eq!(
+            allow_dependency_closed_frontier(
+                admission_decision(&policy(), &snapshot, 0),
+                &fallback,
+            ),
+            Admission::Admit
+        );
+
+        snapshot.ci_green = false;
+        assert_eq!(
+            allow_dependency_closed_frontier(
+                admission_decision(&policy(), &snapshot, 0),
+                &fallback,
+            ),
+            Admission::Refuse(vec!["regression_gate_failed"])
+        );
+
+        snapshot.load_1m = 20.0;
+        let mut capped = policy();
+        capped.max_teams = 1;
+        assert_eq!(
+            allow_dependency_closed_frontier(admission_decision(&capped, &snapshot, 1), &fallback,),
+            Admission::Refuse(vec![
+                "team_cap_reached",
+                "cpu_load_limit",
+                "regression_gate_failed"
+            ])
         );
     }
 
@@ -1544,6 +1790,205 @@ mod tests {
             "execution": {"assignments": {}}
         });
         assert!(!governed_numbered_prd_document_incomplete(&document));
+    }
+
+    #[test]
+    fn dependency_closed_frontier_fills_live_shaped_four_plus_one_pod() {
+        let nodes = json!([
+            node("INT-009", "code.generate"),
+            node("verify.INT-013", "test.verify"),
+            node("verify.INT-014", "test.verify"),
+            node("verify.INT-049", "test.verify"),
+            node("verify.INT-009", "test.verify"),
+            node("INT-010", "code.generate")
+        ]);
+        let edges = json!([
+            {"from": "verify.INT-008", "to": "INT-009", "condition": "success"},
+            {"from": "INT-009", "to": "verify.INT-009", "condition": "success"},
+            {"from": "verify.INT-009", "to": "INT-010", "condition": "success"}
+        ]);
+        let document = graph_document(
+            nodes,
+            edges,
+            completed(&["verify.INT-008", "INT-013", "INT-014", "INT-049"]),
+        );
+        let immediate = ready_tasks_from_document(&document, &BTreeSet::new());
+        assert_eq!(immediate.len(), 4);
+        let tasks = dependency_closed_tasks_from_document(&document, &BTreeSet::new(), &immediate);
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.node_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "INT-009",
+                "verify.INT-013",
+                "verify.INT-014",
+                "verify.INT-049",
+                "verify.INT-009"
+            ]
+        );
+        let follower = tasks
+            .iter()
+            .find(|task| task.node_id == "verify.INT-009")
+            .expect("dependency follower is selected");
+        assert!(follower
+            .instruction
+            .contains("In-team dependency gate: INT-009"));
+        assert!(follower
+            .instruction
+            .contains("wait and retry checkout of this exact node"));
+        assert!(follower
+            .instruction
+            .contains("never release this assignment or claim another node"));
+        assert!(!tasks.iter().any(|task| task.node_id == "INT-010"));
+    }
+
+    #[test]
+    fn dependency_closed_filler_excludes_unresolved_unselected_dependencies() {
+        let nodes = json!([
+            node("ready-1", "code.generate"),
+            node("ready-2", "code.generate"),
+            node("ready-3", "code.generate"),
+            node("ready-4", "code.generate"),
+            node("blocked", "code.generate")
+        ]);
+        let edges = json!([
+            {"from": "missing", "to": "blocked", "condition": "success"}
+        ]);
+        let document = graph_document(nodes, edges, json!({}));
+        let immediate = ready_tasks_from_document(&document, &BTreeSet::new());
+        let tasks = dependency_closed_tasks_from_document(&document, &BTreeSet::new(), &immediate);
+        assert_eq!(tasks.len(), 4);
+        assert!(!tasks.iter().any(|task| task.node_id == "blocked"));
+    }
+
+    #[test]
+    fn dependency_closed_frontier_excludes_external_gate_nodes() {
+        let mut gated = node("gated", "code.generate");
+        gated["external_gates"] = json!(["security_review"]);
+        let nodes = json!([
+            node("ready-1", "code.generate"),
+            node("ready-2", "code.generate"),
+            node("ready-3", "code.generate"),
+            node("ready-4", "code.generate"),
+            gated
+        ]);
+        let edges = json!([
+            {"from": "ready-1", "to": "gated", "condition": "success"}
+        ]);
+        let document = graph_document(nodes, edges, json!({}));
+        let immediate = ready_tasks_from_document(&document, &BTreeSet::new());
+        let tasks = dependency_closed_tasks_from_document(&document, &BTreeSet::new(), &immediate);
+        assert_eq!(tasks.len(), 4);
+        assert!(!tasks.iter().any(|task| task.node_id == "gated"));
+    }
+
+    #[test]
+    fn immediate_ready_frontier_of_five_is_returned_unchanged_and_preferred() {
+        let nodes = json!([
+            node("ready-1", "code.generate"),
+            node("ready-2", "code.generate"),
+            node("ready-3", "code.generate"),
+            node("ready-4", "code.generate"),
+            node("ready-5", "code.generate"),
+            node("follower", "code.generate")
+        ]);
+        let edges = json!([
+            {"from": "ready-1", "to": "follower", "condition": "success"}
+        ]);
+        let document = graph_document(nodes, edges, json!({}));
+        let tasks = ready_tasks_from_document(&document, &BTreeSet::new());
+        assert_eq!(tasks.len(), 5);
+        assert_eq!(tasks[0].node_id, "ready-1");
+        assert!(tasks
+            .iter()
+            .all(|task| !task.instruction.contains("In-team dependency gate")));
+        assert!(!tasks.iter().any(|task| task.node_id == "follower"));
+    }
+
+    #[test]
+    fn dependency_closed_frontier_excludes_reserved_nodes() {
+        let nodes = json!([
+            node("ready-1", "code.generate"),
+            node("ready-2", "code.generate"),
+            node("ready-3", "code.generate"),
+            node("ready-4", "code.generate"),
+            node("reserved", "code.generate"),
+            node("follower", "code.generate")
+        ]);
+        let edges = json!([
+            {"from": "reserved", "to": "follower", "condition": "success"}
+        ]);
+        let document = graph_document(nodes, edges, json!({}));
+        let mut reserved = BTreeSet::new();
+        reserved.insert("reserved".to_owned());
+        let immediate = ready_tasks_from_document(&document, &reserved);
+        let tasks = dependency_closed_tasks_from_document(&document, &reserved, &immediate);
+        assert_eq!(tasks.len(), 4);
+        assert!(!tasks.iter().any(|task| task.node_id == "reserved"));
+        assert!(!tasks.iter().any(|task| task.node_id == "follower"));
+    }
+
+    #[test]
+    fn leader_and_worker_prompts_preserve_dependency_retry_contract() {
+        let tasks = vec![MissionTask {
+            node_id: "follower".to_owned(),
+            title: "Follower".to_owned(),
+            capability: "code.generate".to_owned(),
+            instruction: dependency_closed_instruction(
+                "Work on follower.",
+                &["leader-node".to_owned()],
+            ),
+        }];
+        let mut team = form_team(
+            &[
+                tasks[0].clone(),
+                MissionTask {
+                    node_id: "n2".to_owned(),
+                    title: "n2".to_owned(),
+                    capability: "code.generate".to_owned(),
+                    instruction: "work".to_owned(),
+                },
+                MissionTask {
+                    node_id: "n3".to_owned(),
+                    title: "n3".to_owned(),
+                    capability: "code.generate".to_owned(),
+                    instruction: "work".to_owned(),
+                },
+                MissionTask {
+                    node_id: "n4".to_owned(),
+                    title: "n4".to_owned(),
+                    capability: "code.generate".to_owned(),
+                    instruction: "work".to_owned(),
+                },
+                MissionTask {
+                    node_id: "n5".to_owned(),
+                    title: "n5".to_owned(),
+                    capability: "code.generate".to_owned(),
+                    instruction: "work".to_owned(),
+                },
+            ],
+            &ArchitectState::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(team.mission.contains("dependency-closed"));
+        assert!(!team.mission.contains("independent"));
+        team.status = "launched".to_owned();
+        let leader = leader_launch_prompt(&team).unwrap();
+        let worker = worker_launch_prompt(Path::new("/repo"), &team, 0).unwrap();
+        for prompt in [leader, worker] {
+            assert!(
+                prompt.contains("wait and retry checkout of that exact assigned node")
+                    || prompt.contains("wait and retry checkout of this exact node")
+            );
+            assert!(prompt.contains("ownership conflict"));
+            assert!(
+                prompt.contains("Do not modify source")
+                    || prompt.contains("Do not implement member tasks")
+            );
+        }
     }
 
     #[test]
