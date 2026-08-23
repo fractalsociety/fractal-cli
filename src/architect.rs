@@ -493,6 +493,43 @@ fn heartbeat_is_fresh(heartbeat: Option<&WorkerHeartbeat>, now_secs: u64) -> boo
     })
 }
 
+/// Return the freshest Squad heartbeat belonging to one canonical Fractal
+/// worker identity. Squad appends a numeric collision suffix when another
+/// live session already owns the canonical ID (for example,
+/// `team-worker-1-2`). Only the exact ID and an ASCII-numeric `-N` suffix are
+/// aliases; arbitrary prefixes and textual suffixes must never keep a stale
+/// checkout alive.
+fn freshest_worker_heartbeat<'a>(
+    heartbeats: &'a BTreeMap<String, WorkerHeartbeat>,
+    member: &str,
+    now_secs: u64,
+) -> Option<&'a WorkerHeartbeat> {
+    let alias_prefix = format!("{member}-");
+    heartbeats
+        .iter()
+        .filter(|(id, _)| {
+            id.as_str() == member
+                || id.strip_prefix(&alias_prefix).is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        })
+        .max_by(|(left_id, left), (right_id, right)| {
+            heartbeat_is_fresh(Some(left), now_secs)
+                .cmp(&heartbeat_is_fresh(Some(right), now_secs))
+                .then_with(|| {
+                    left.last_seen
+                        .cmp(&right.last_seen)
+                        // Prefer the canonical ID for an equal timestamp so the
+                        // selection is deterministic without changing freshness.
+                        .then_with(|| {
+                            (left_id.as_str() == member).cmp(&(right_id.as_str() == member))
+                        })
+                        .then_with(|| left_id.cmp(right_id))
+                })
+        })
+        .map(|(_, heartbeat)| heartbeat)
+}
+
 fn worker_requires_recovery(
     owns_checkout: bool,
     heartbeat: Option<&WorkerHeartbeat>,
@@ -531,13 +568,14 @@ fn recover_stale_checked_out_workers(
             assignment.get("state").and_then(Value::as_str) == Some("checked_out")
                 && assignment.get("agent_id").and_then(Value::as_str) == Some(member.as_str())
         });
-        if !owns_checkout || heartbeat_is_fresh(heartbeats.get(&member), now_secs) {
+        let heartbeat = freshest_worker_heartbeat(heartbeats, &member, now_secs);
+        if !owns_checkout || heartbeat_is_fresh(heartbeat, now_secs) {
             team.recovery_started_ms.remove(&member);
             continue;
         }
         if !worker_requires_recovery(
             owns_checkout,
-            heartbeats.get(&member),
+            heartbeat,
             now_secs,
             team.recovery_started_ms.get(&member).copied(),
             current_ms,
@@ -2035,6 +2073,130 @@ mod tests {
             1_000,
             Some(800_000),
             1_000_000
+        ));
+    }
+
+    #[test]
+    fn fresh_numeric_collision_alias_prevents_recovery() {
+        let member = "team-worker-1";
+        let mut heartbeats = BTreeMap::new();
+        heartbeats.insert(
+            member.to_owned(),
+            WorkerHeartbeat {
+                status: "active".to_owned(),
+                last_seen: 699,
+                archived: false,
+            },
+        );
+        heartbeats.insert(
+            format!("{member}-2"),
+            WorkerHeartbeat {
+                status: "idle".to_owned(),
+                last_seen: 999,
+                archived: false,
+            },
+        );
+
+        let heartbeat = freshest_worker_heartbeat(&heartbeats, member, 1_000);
+        assert_eq!(heartbeat.map(|value| value.last_seen), Some(999));
+        assert!(!worker_requires_recovery(
+            true, heartbeat, 1_000, None, 1_000_000
+        ));
+    }
+
+    #[test]
+    fn archived_or_stale_collision_alias_does_not_prevent_recovery() {
+        for heartbeat in [
+            WorkerHeartbeat {
+                status: "active".to_owned(),
+                last_seen: 999,
+                archived: true,
+            },
+            WorkerHeartbeat {
+                status: "active".to_owned(),
+                last_seen: 699,
+                archived: false,
+            },
+        ] {
+            let mut heartbeats = BTreeMap::new();
+            heartbeats.insert("team-worker-1-2".to_owned(), heartbeat);
+            let selected = freshest_worker_heartbeat(&heartbeats, "team-worker-1", 1_000);
+            assert!(worker_requires_recovery(
+                true, selected, 1_000, None, 1_000_000
+            ));
+        }
+    }
+
+    #[test]
+    fn nonnumeric_and_lookalike_ids_do_not_count_as_collision_aliases() {
+        let member = "team-worker-1";
+        let fresh = WorkerHeartbeat {
+            status: "active".to_owned(),
+            last_seen: 999,
+            archived: false,
+        };
+        let mut heartbeats = BTreeMap::new();
+        heartbeats.insert(format!("{member}-recovery"), fresh.clone());
+        heartbeats.insert("other-team-worker-1-2".to_owned(), fresh);
+
+        let selected = freshest_worker_heartbeat(&heartbeats, member, 1_000);
+        assert!(selected.is_none());
+        assert!(worker_requires_recovery(
+            true, selected, 1_000, None, 1_000_000
+        ));
+    }
+
+    #[test]
+    fn freshest_valid_collision_alias_is_selected() {
+        let member = "team-worker-1";
+        let mut heartbeats = BTreeMap::new();
+        for (id, last_seen) in [
+            (member.to_owned(), 900),
+            (format!("{member}-2"), 950),
+            (format!("{member}-3"), 940),
+            (format!("{member}-not-numeric"), 9_999),
+        ] {
+            heartbeats.insert(
+                id,
+                WorkerHeartbeat {
+                    status: "active".to_owned(),
+                    last_seen,
+                    archived: false,
+                },
+            );
+        }
+
+        assert_eq!(
+            freshest_worker_heartbeat(&heartbeats, member, 1_000).map(|value| value.last_seen),
+            Some(950)
+        );
+    }
+
+    #[test]
+    fn fresh_collision_alias_wins_over_newer_invalid_alias() {
+        let member = "team-worker-1";
+        let mut heartbeats = BTreeMap::new();
+        heartbeats.insert(
+            format!("{member}-2"),
+            WorkerHeartbeat {
+                status: "active".to_owned(),
+                last_seen: 999,
+                archived: true,
+            },
+        );
+        heartbeats.insert(
+            format!("{member}-3"),
+            WorkerHeartbeat {
+                status: "active".to_owned(),
+                last_seen: 950,
+                archived: false,
+            },
+        );
+
+        let selected = freshest_worker_heartbeat(&heartbeats, member, 1_000);
+        assert_eq!(selected.map(|value| value.last_seen), Some(950));
+        assert!(!worker_requires_recovery(
+            true, selected, 1_000, None, 1_000_000
         ));
     }
 
