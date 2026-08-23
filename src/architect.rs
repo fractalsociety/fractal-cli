@@ -146,6 +146,7 @@ pub(crate) fn run(args: &ArchitectArgs) -> Result<()> {
             break;
         }
         let tasks = ready_tasks(&workspace)?;
+        let governed_prd_incomplete = governed_numbered_prd_incomplete(&workspace)?;
         let snapshot = resource_snapshot(&workspace, tasks.len(), state.last_team_started_ms)?;
         let active_teams = state
             .teams
@@ -190,11 +191,15 @@ pub(crate) fn run(args: &ArchitectArgs) -> Result<()> {
                 formed = Some(team);
             } else {
                 decision = Admission::Refuse(vec!["fragmented_specialist_frontier"]);
-                if snapshot.planner_backlog == 0 && !crate::amendments::has_pending(&workspace) {
+                if !governed_prd_incomplete
+                    && snapshot.planner_backlog == 0
+                    && !crate::amendments::has_pending(&workspace)
+                {
                     queue_team_mission(&workspace, &state)?;
                 }
             }
         } else if decision == Admission::Refuse(vec!["insufficient_specialist_frontier"])
+            && !governed_prd_incomplete
             && snapshot.planner_backlog == 0
             && !crate::amendments::has_pending(&workspace)
         {
@@ -827,6 +832,40 @@ fn ready_tasks(workspace: &Path) -> Result<Vec<MissionTask>> {
     Ok(tasks)
 }
 
+fn governed_numbered_prd_incomplete(workspace: &Path) -> Result<bool> {
+    let document: Value =
+        serde_json::from_slice(&fs::read(workspace.join(".fractal/project.fractal"))?)?;
+    Ok(governed_numbered_prd_document_incomplete(&document))
+}
+
+fn governed_numbered_prd_document_incomplete(document: &Value) -> bool {
+    if document
+        .pointer("/graph/source/kind")
+        .and_then(Value::as_str)
+        != Some("numbered_markdown_prd")
+    {
+        return false;
+    }
+    let assignments = document
+        .pointer("/execution/assignments")
+        .and_then(Value::as_object);
+    document
+        .pointer("/graph/nodes")
+        .and_then(Value::as_array)
+        .is_some_and(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|node| node.get("id").and_then(Value::as_str))
+                .any(|node_id| {
+                    assignments
+                        .and_then(|values| values.get(node_id))
+                        .and_then(|assignment| assignment.get("state"))
+                        .and_then(Value::as_str)
+                        != Some("completed")
+                })
+        })
+}
+
 fn specialization(capability: &str) -> String {
     if capability.contains("test") || capability.contains("verify") {
         "verification"
@@ -1422,6 +1461,51 @@ mod tests {
             admission_decision(&policy(), &snapshot, 0),
             Admission::Refuse(vec!["insufficient_specialist_frontier"])
         );
+    }
+
+    #[test]
+    fn incomplete_numbered_prd_suppresses_synthetic_missions() {
+        let document = json!({
+            "graph": {
+                "source": {"kind": "numbered_markdown_prd"},
+                "nodes": [{"id": "INT-008"}, {"id": "verify.INT-008"}]
+            },
+            "execution": {
+                "assignments": {
+                    "INT-008": {"state": "completed"}
+                }
+            }
+        });
+        assert!(governed_numbered_prd_document_incomplete(&document));
+    }
+
+    #[test]
+    fn completed_numbered_prd_allows_post_graph_evolution() {
+        let document = json!({
+            "graph": {
+                "source": {"kind": "numbered_markdown_prd"},
+                "nodes": [{"id": "INT-008"}, {"id": "verify.INT-008"}]
+            },
+            "execution": {
+                "assignments": {
+                    "INT-008": {"state": "completed"},
+                    "verify.INT-008": {"state": "completed"}
+                }
+            }
+        });
+        assert!(!governed_numbered_prd_document_incomplete(&document));
+    }
+
+    #[test]
+    fn non_prd_graph_keeps_existing_synthetic_mission_behavior() {
+        let document = json!({
+            "graph": {
+                "source": {"kind": "interactive_request"},
+                "nodes": [{"id": "feature"}]
+            },
+            "execution": {"assignments": {}}
+        });
+        assert!(!governed_numbered_prd_document_incomplete(&document));
     }
 
     #[test]
