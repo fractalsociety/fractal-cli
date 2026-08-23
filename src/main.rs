@@ -37,6 +37,7 @@ mod mobile;
 mod node;
 mod orchestrate;
 mod pipeline;
+mod prd_graph;
 mod project_audit;
 mod project_file;
 mod project_sync;
@@ -58,7 +59,7 @@ mod work_builder;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -96,7 +97,10 @@ fn uses_stable_json_diagnostics(cli: &Cli) -> bool {
     matches!(
         cli.command,
         Some(Command::Graph(crate::cli::GraphArgs {
-            command: GraphCommand::Audit(_) | GraphCommand::Compose(_) | GraphCommand::Reconcile(_),
+            command: GraphCommand::Audit(_)
+                | GraphCommand::Compose(_)
+                | GraphCommand::Reconcile(_)
+                | GraphCommand::PlanPrd(crate::cli::GraphPlanPrdArgs { json: true, .. }),
         })) | Some(Command::Harness(crate::cli::HarnessArgs {
             command: HarnessCommand::Validate(crate::cli::HarnessPolicyArgs { json: true, .. })
                 | HarnessCommand::Show(crate::cli::HarnessPolicyArgs { json: true, .. }),
@@ -170,6 +174,7 @@ fn run(cli: Cli) -> Result<()> {
             ),
             GraphCommand::Status(args) => board::status(&args.url, args.json),
             GraphCommand::Show(args) => graph_store::show(&args.graph_hash, args.json),
+            GraphCommand::PlanPrd(args) => run_graph_plan_prd(&args),
             GraphCommand::Audit(args) => run_graph_audit(&args),
             GraphCommand::Compose(args) => run_graph_compose(&args),
             GraphCommand::Reconcile(args) => reconcile::run(&reconcile::ReconcileOptions {
@@ -313,6 +318,10 @@ const AMENDMENT_CLI_SCHEMA: &str = "fractal.amendment.cli.v1";
 const AMENDMENT_REJECTION_PREVIEW_READY: &str = "AMENDMENT_REJECTION_PREVIEW_READY";
 const AMENDMENT_REJECTION_APPLIED: &str = "AMENDMENT_REJECTION_APPLIED";
 
+const PRD_GRAPH_PLAN_SCHEMA: &str = "fractal.prd_graph_plan.v1";
+const PRD_GRAPH_REPLACEMENT_PREVIEW_READY: &str = "PRD_GRAPH_REPLACEMENT_PREVIEW_READY";
+const PRD_GRAPH_REPLACEMENT_APPLIED: &str = "PRD_GRAPH_REPLACEMENT_APPLIED";
+
 fn run_amendment(args: &crate::cli::AmendmentArgs) -> Result<()> {
     match &args.command {
         AmendmentCommand::List(args) => run_amendment_list(args),
@@ -447,6 +456,281 @@ fn validate_amendment_rejection_reason(reason: &str) -> Result<()> {
         anyhow::bail!("rejection reason contains control characters");
     }
     Ok(())
+}
+
+fn run_graph_plan_prd(args: &crate::cli::GraphPlanPrdArgs) -> Result<()> {
+    let repo = canonicalize_prd_repo(&args.repo)?;
+    let prd_relative = validate_prd_relative_path(&args.prd)?;
+    let prd_path = resolve_prd_path(&repo, &prd_relative)?;
+    let expected_parent_hash = args.expected_parent_hash.trim();
+    validate_prd_parent_hash(expected_parent_hash)?;
+
+    // The first load/check is deliberately before reading or compiling the PRD.
+    // A stale caller therefore cannot accidentally compile against an obsolete
+    // project graph, even when the PRD itself is unchanged.
+    let project = project_file::load(&repo)
+        .with_context(|| format!("load canonical project graph in {}", repo.display()))?;
+    ensure_prd_parent_hash(&project, expected_parent_hash)?;
+
+    let markdown = fs::read_to_string(&prd_path)
+        .with_context(|| format!("read PRD {}", prd_relative.display()))?;
+    let preview = prd_graph::compile_prd(
+        &markdown,
+        &prd_relative.to_string_lossy(),
+        &args.from,
+        &args.through,
+        Some(expected_parent_hash),
+    )
+    .with_context(|| format!("compile PRD {}", prd_relative.display()))?;
+    let graph_hash = preview
+        .graph
+        .get("graph_hash")
+        .and_then(serde_json::Value::as_str)
+        .context("compiled PRD graph is missing graph_hash")?;
+    let summary = preview
+        .graph
+        .get("summary")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    if !args.yes {
+        print_prd_graph_plan_preview(
+            args,
+            &repo,
+            &prd_relative,
+            expected_parent_hash,
+            graph_hash,
+            &summary,
+        )?;
+        return Ok(());
+    }
+
+    // Re-check after compilation before touching the content-addressed store.
+    // This is also useful for callers that hold the project lock only briefly.
+    let current = project_file::load(&repo)
+        .with_context(|| format!("recheck canonical project graph in {}", repo.display()))?;
+    ensure_prd_parent_hash(&current, expected_parent_hash)?;
+    let commit = graph_store::commit_graph(&preview.graph)
+        .context("commit compiled PRD graph to the content-addressed store")?;
+
+    // Commit may involve filesystem I/O. The final parent check and project
+    // replacement must therefore share one canonical project-file lock.
+    let project_path =
+        project_file::persist_evolved_if_parent(&repo, &preview.graph, expected_parent_hash)
+            .context("persist evolved PRD graph through the canonical project boundary")?;
+
+    print_prd_graph_plan_applied(
+        args,
+        &repo,
+        &prd_relative,
+        expected_parent_hash,
+        graph_hash,
+        &summary,
+        &commit,
+        &project_path,
+    )
+}
+
+fn canonicalize_prd_repo(repo: &Path) -> Result<std::path::PathBuf> {
+    let canonical = fs::canonicalize(repo)
+        .with_context(|| format!("canonicalize project repository {}", repo.display()))?;
+    if !canonical.is_dir() {
+        anyhow::bail!("project repository {} is not a directory", repo.display());
+    }
+    Ok(canonical)
+}
+
+fn validate_prd_relative_path(path: &Path) -> Result<std::path::PathBuf> {
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("PRD path must not be empty");
+    }
+    if path.is_absolute() {
+        anyhow::bail!("PRD path must be relative to --repo");
+    }
+
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) => normalized.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                anyhow::bail!("PRD path must not contain traversal component `..`");
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("PRD path must be relative to --repo");
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        anyhow::bail!("PRD path must name a file relative to --repo");
+    }
+    Ok(normalized)
+}
+
+fn resolve_prd_path(repo: &Path, relative: &Path) -> Result<std::path::PathBuf> {
+    let mut candidate = repo.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(segment) = component else {
+            continue;
+        };
+        candidate.push(segment);
+        let metadata = fs::symlink_metadata(&candidate)
+            .with_context(|| format!("inspect PRD path component {}", candidate.display()))?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "PRD path must not traverse a symlink: {}",
+                relative.display()
+            );
+        }
+    }
+
+    let metadata = fs::metadata(&candidate)
+        .with_context(|| format!("inspect PRD file {}", relative.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("PRD path {} is not a regular file", relative.display());
+    }
+    let canonical = fs::canonicalize(&candidate)
+        .with_context(|| format!("canonicalize PRD {}", relative.display()))?;
+    if !canonical.starts_with(repo) {
+        anyhow::bail!("PRD path must remain inside --repo: {}", relative.display());
+    }
+    Ok(canonical)
+}
+
+fn validate_prd_parent_hash(hash: &str) -> Result<()> {
+    let Some(digest) = hash.strip_prefix("sha256:") else {
+        anyhow::bail!("expected parent hash must start with `sha256:`");
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        anyhow::bail!("expected parent hash must contain 64 lowercase hexadecimal characters");
+    }
+    Ok(())
+}
+
+fn ensure_prd_parent_hash(
+    project: &project_file::FractalProject,
+    expected_parent_hash: &str,
+) -> Result<()> {
+    if project.graph_hash != expected_parent_hash {
+        anyhow::bail!(
+            "current project graph hash mismatch: expected {expected_parent_hash}, found {}",
+            project.graph_hash
+        );
+    }
+    Ok(())
+}
+
+fn print_prd_graph_plan_preview(
+    args: &crate::cli::GraphPlanPrdArgs,
+    repo: &Path,
+    prd_relative: &Path,
+    expected_parent_hash: &str,
+    graph_hash: &str,
+    summary: &serde_json::Value,
+) -> Result<()> {
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": PRD_GRAPH_PLAN_SCHEMA,
+                "operation": "plan-prd",
+                "status": "preview",
+                "mutation": "none",
+                "repo": repo.display().to_string(),
+                "prd": prd_relative.to_string_lossy(),
+                "from": args.from,
+                "through": args.through,
+                "expected_parent_hash": expected_parent_hash,
+                "graph_hash": graph_hash,
+                "summary": summary,
+                "readiness_marker": PRD_GRAPH_REPLACEMENT_PREVIEW_READY,
+            }))?
+        );
+    } else {
+        println!("PRD graph replacement preview (no mutation performed)");
+        println!("  Repo: {}", repo.display());
+        println!("  PRD: {}", prd_relative.display());
+        println!("  Range: {} through {}", args.from, args.through);
+        println!("  Expected parent graph: {expected_parent_hash}");
+        println!("  Compiled graph: {graph_hash}");
+        print_prd_graph_summary(summary);
+        println!("{PRD_GRAPH_REPLACEMENT_PREVIEW_READY}");
+        println!("Re-run this exact command with --yes to commit the child graph.");
+    }
+    Ok(())
+}
+
+fn print_prd_graph_plan_applied(
+    args: &crate::cli::GraphPlanPrdArgs,
+    repo: &Path,
+    prd_relative: &Path,
+    expected_parent_hash: &str,
+    graph_hash: &str,
+    summary: &serde_json::Value,
+    commit: &graph_store::CommitRecord,
+    project_path: &Path,
+) -> Result<()> {
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": PRD_GRAPH_PLAN_SCHEMA,
+                "operation": "plan-prd",
+                "status": "applied",
+                "mutation": "applied",
+                "repo": repo.display().to_string(),
+                "prd": prd_relative.to_string_lossy(),
+                "from": args.from,
+                "through": args.through,
+                "expected_parent_hash": expected_parent_hash,
+                "graph_hash": graph_hash,
+                "summary": summary,
+                "commit": {
+                    "graph_hash": commit.graph_hash,
+                    "path": commit.path,
+                    "bytes": commit.bytes,
+                },
+                "readiness_marker": PRD_GRAPH_REPLACEMENT_APPLIED,
+            }))?
+        );
+    } else {
+        println!("PRD graph replacement applied");
+        println!("  Repo: {}", repo.display());
+        println!("  PRD: {}", prd_relative.display());
+        println!("  Range: {} through {}", args.from, args.through);
+        println!("  Parent graph: {expected_parent_hash}");
+        println!("  Child graph: {graph_hash}");
+        print_prd_graph_summary(summary);
+        println!(
+            "  Commit: {} ({} bytes)",
+            commit.path.display(),
+            commit.bytes
+        );
+        println!("  Project: {}", project_path.display());
+        println!("{PRD_GRAPH_REPLACEMENT_APPLIED}");
+    }
+    Ok(())
+}
+
+fn print_prd_graph_summary(summary: &serde_json::Value) {
+    let count = |field: &str| {
+        summary
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    println!(
+        "  Summary: tasks={} nodes={} edges={} waves={} initial-ready={}",
+        count("selected_tasks"),
+        count("node_count"),
+        count("edge_count"),
+        count("wave_count"),
+        count("initial_ready_nodes")
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1525,6 +1809,7 @@ fn catalog_from_audit_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn dispatches_version() {
@@ -1724,6 +2009,173 @@ mod tests {
         let error = run(cli).unwrap_err();
         assert!(format!("{error:#}").contains("frozen fractal.repository_inventory.v1"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prd_plan_path_validation_rejects_absolute_and_traversal_paths() {
+        assert!(validate_prd_relative_path(Path::new("/tmp/plan.md")).is_err());
+        assert!(validate_prd_relative_path(Path::new("docs/../plan.md")).is_err());
+        assert!(validate_prd_relative_path(Path::new("./docs/plan.md")).is_ok());
+    }
+
+    #[test]
+    fn prd_plan_parent_hash_validation_requires_canonical_sha256() {
+        assert!(validate_prd_parent_hash("sha256:").is_err());
+        assert!(validate_prd_parent_hash(&format!("sha256:{}", "a".repeat(64))).is_ok());
+        assert!(validate_prd_parent_hash(&format!("sha256:{}", "A".repeat(64))).is_err());
+        assert!(validate_prd_parent_hash(&"0".repeat(64)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prd_plan_path_resolution_rejects_symlink_components() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("prd-symlink");
+        fs::write(root.join("outside.md"), "outside").unwrap();
+        symlink(root.join("outside.md"), root.join("plan.md")).unwrap();
+        assert!(resolve_prd_path(&root, Path::new("plan.md")).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn graph_plan_prd_preview_is_read_only() -> Result<()> {
+        let _env_lock = graph_store::ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph-store test environment lock poisoned"))?;
+        let _home = graph_store::TestHome::new("prd-plan-preview")?;
+        let root = temp_root("prd-plan-preview");
+        let (parent, parent_hash) = seed_prd_plan_project(&root)?;
+        fs::create_dir_all(root.join("docs"))?;
+        fs::write(root.join("docs/plan.md"), sample_prd_markdown())?;
+        let before = fs::read(project_file::path(&root))?;
+
+        let args = prd_plan_args(&root, &parent_hash, false);
+        run_graph_plan_prd(&args)?;
+
+        assert_eq!(fs::read(project_file::path(&root))?, before);
+        assert_eq!(project_file::load(&root)?.graph_hash, parent_hash);
+        let expected_child = prd_graph::compile_prd(
+            &sample_prd_markdown(),
+            "docs/plan.md",
+            "INT-002",
+            "INT-003",
+            Some(&parent_hash),
+        )?
+        .graph_hash;
+        assert!(graph_store::load_graph(&expected_child).is_err());
+        assert_eq!(graph_store::load_graph(&parent_hash)?, parent);
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_plan_prd_apply_preserves_parent_and_persists_child() -> Result<()> {
+        let _env_lock = graph_store::ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph-store test environment lock poisoned"))?;
+        let _home = graph_store::TestHome::new("prd-plan-apply")?;
+        let root = temp_root("prd-plan-apply");
+        let (parent, parent_hash) = seed_prd_plan_project(&root)?;
+        fs::create_dir_all(root.join("docs"))?;
+        fs::write(root.join("docs/plan.md"), sample_prd_markdown())?;
+        let expected_child = prd_graph::compile_prd(
+            &sample_prd_markdown(),
+            "docs/plan.md",
+            "INT-002",
+            "INT-003",
+            Some(&parent_hash),
+        )?;
+        let child_hash = expected_child.graph_hash.clone();
+
+        let args = prd_plan_args(&root, &parent_hash, true);
+        run_graph_plan_prd(&args)?;
+
+        assert_eq!(project_file::load(&root)?.graph_hash, child_hash);
+        assert_eq!(graph_store::load_graph(&parent_hash)?, parent);
+        assert_eq!(graph_store::load_graph(&child_hash)?, expected_child.graph);
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_plan_prd_rejects_parent_hash_drift_before_compile() -> Result<()> {
+        let _env_lock = graph_store::ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph-store test environment lock poisoned"))?;
+        let _home = graph_store::TestHome::new("prd-plan-parent-drift")?;
+        let root = temp_root("prd-plan-parent-drift");
+        let (_parent, parent_hash) = seed_prd_plan_project(&root)?;
+        fs::create_dir_all(root.join("docs"))?;
+        fs::write(root.join("docs/plan.md"), sample_prd_markdown())?;
+        let before = fs::read(project_file::path(&root))?;
+        let wrong_hash = format!("sha256:{}", "f".repeat(64));
+        let args = prd_plan_args(&root, &wrong_hash, true);
+        let error = run_graph_plan_prd(&args).expect_err("parent hash drift must fail");
+        assert!(format!("{error:#}").contains("current project graph hash mismatch"));
+        assert_eq!(fs::read(project_file::path(&root))?, before);
+        assert_eq!(project_file::load(&root)?.graph_hash, parent_hash);
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    fn sample_prd_markdown() -> String {
+        concat!(
+            "1. [x] **INT-001 [SEQ] — Foundation**\n",
+            "   - **Owner:** Lead\n",
+            "   - **Depends on:** none\n",
+            "   - Establish the foundation.\n",
+            "   - **Acceptance:** Foundation is complete.\n",
+            "2. [ ] **INT-002 [PAR-A] — Adapter**\n",
+            "   - **Owner:** Worker\n",
+            "   - **Depends on:** INT-001\n",
+            "   - Build the adapter.\n",
+            "   - **Acceptance:** Adapter is complete.\n",
+            "3. [ ] **INT-003 [SEQ] — Compose**\n",
+            "   - **Owner:** Lead\n",
+            "   - **Depends on:** INT-002\n",
+            "   - Compose the adapter.\n",
+            "   - **Acceptance:** Composition is complete.\n",
+        )
+        .to_owned()
+    }
+
+    fn seed_prd_plan_project(root: &Path) -> Result<(serde_json::Value, String)> {
+        let mut parent = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "prd-plan-parent",
+            "nodes": [{
+                "id": "parent-node",
+                "capability": "code.generate",
+                "instruction": "Parent fixture"
+            }],
+            "edges": []
+        });
+        let parent_hash = fractal_contracts::canonical_sha256(&parent)
+            .map_err(|error| anyhow::anyhow!("hash PRD parent fixture: {error}"))?;
+        parent["graph_hash"] = json!(parent_hash);
+        graph_store::commit_graph(&parent)?;
+        project_file::persist(root, &parent, "PRD plan test")?;
+        Ok((parent, parent_hash))
+    }
+
+    fn prd_plan_args(
+        root: &Path,
+        expected_parent_hash: &str,
+        yes: bool,
+    ) -> crate::cli::GraphPlanPrdArgs {
+        crate::cli::GraphPlanPrdArgs {
+            repo: root.to_owned(),
+            prd: Path::new("docs/plan.md").to_owned(),
+            from: "INT-002".to_owned(),
+            through: "INT-003".to_owned(),
+            expected_parent_hash: expected_parent_hash.to_owned(),
+            yes,
+            json: false,
+        }
     }
 
     fn temp_root(name: &str) -> std::path::PathBuf {

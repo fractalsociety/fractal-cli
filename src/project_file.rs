@@ -219,6 +219,43 @@ pub(crate) fn configure_managed_identity(workspace: &Path, name: &str, prompt: &
 pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<PathBuf> {
     let _guard = project_file_lock();
     let _file_guard = ProjectWriteGuard::acquire(workspace)?;
+    persist_locked(workspace, graph, title, None)
+}
+
+/// Persist an evolved graph only when the project still points at the expected
+/// parent. The parent check and document write happen under the same in-process
+/// and canonical project-file locks, so a newer writer cannot slip between the
+/// check and the replacement.
+pub(crate) fn persist_evolved_if_parent(
+    workspace: &Path,
+    graph: &Value,
+    expected_parent_hash: &str,
+) -> Result<PathBuf> {
+    let _guard = project_file_lock();
+    let _file_guard = ProjectWriteGuard::acquire(workspace)?;
+    let expected_parent_hash = expected_parent_hash.trim();
+    let current = load(workspace)?;
+    if current.graph_hash != expected_parent_hash {
+        bail!(
+            "current project graph hash mismatch: expected {expected_parent_hash}, found {}",
+            current.graph_hash
+        );
+    }
+    let graph_parent = graph.get("parent_graph").and_then(Value::as_str);
+    if graph_parent != Some(expected_parent_hash) {
+        let found = graph_parent.unwrap_or("<missing>");
+        bail!("evolved graph parent hash mismatch: expected {expected_parent_hash}, found {found}");
+    }
+    let title = current.project.title.clone();
+    persist_locked(workspace, graph, &title, Some(current))
+}
+
+fn persist_locked(
+    workspace: &Path,
+    graph: &Value,
+    title: &str,
+    current: Option<FractalProject>,
+) -> Result<PathBuf> {
     let graph_hash = graph
         .get("graph_hash")
         .and_then(Value::as_str)
@@ -243,7 +280,7 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
         .and_then(|identity| identity.prompt.clone())
         .unwrap_or_else(|| title.clone());
     let now = timestamp();
-    let current = load(workspace).ok();
+    let current = current.or_else(|| load(workspace).ok());
     let execution = current
         .as_ref()
         .filter(|current| current.graph_hash == graph_hash)
@@ -2402,7 +2439,7 @@ mod tests {
 
         let parent_hash = parent["graph_hash"].as_str().unwrap().to_owned();
         let mut child = parent.clone();
-        child["parent_graph"] = Value::String(parent_hash);
+        child["parent_graph"] = Value::String(parent_hash.clone());
         child["nodes"].as_array_mut().unwrap().push(json!({
             "id": "verify.build.harness",
             "capability": "project.tests.execute",
@@ -2418,7 +2455,7 @@ mod tests {
                 .map_err(|error| anyhow::anyhow!("hash fixture: {error}"))?,
         );
 
-        persist_evolved(&workspace, &child)?;
+        persist_evolved_if_parent(&workspace, &child, &parent_hash)?;
         let document = load(&workspace)?;
         crate::graph_store::verify_graph_document(&document.graph)?;
         assert_eq!(document.graph_hash, child["graph_hash"]);
@@ -2426,6 +2463,57 @@ mod tests {
         assert_eq!(execution.phase, "executing");
         assert_eq!(execution.assignments["build"].state, "completed");
         assert!(!execution.assignments.contains_key("verify.build.harness"));
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn evolved_parent_guard_rejects_stale_writer_without_overwrite() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut parent = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_parent_guard",
+            "nodes": [{"id": "build", "capability": "code.generate", "instruction": "Build"}],
+            "edges": []
+        });
+        parent["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&parent)?);
+        persist(&workspace, &parent, "Build")?;
+        let parent_hash = parent["graph_hash"].as_str().unwrap().to_owned();
+
+        let mut first_child = parent.clone();
+        first_child["parent_graph"] = Value::String(parent_hash.clone());
+        first_child["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id": "verify-first", "capability": "project.tests.execute", "instruction": "Verify first"}));
+        first_child.as_object_mut().unwrap().remove("graph_hash");
+        first_child["graph_hash"] =
+            Value::String(fractal_contracts::canonical_sha256(&first_child)?);
+
+        // A newer writer wins before this stale writer reaches the guarded
+        // boundary. The stale child must not replace that newer graph.
+        let workspace_for_writer = workspace.clone();
+        let first_child_for_writer = first_child.clone();
+        let parent_hash_for_writer = parent_hash.clone();
+        let writer = std::thread::spawn(move || {
+            persist_evolved_if_parent(
+                &workspace_for_writer,
+                &first_child_for_writer,
+                &parent_hash_for_writer,
+            )
+        });
+        writer.join().expect("newer writer thread must not panic")?;
+        let before = fs::read(path(&workspace))?;
+
+        let error = persist_evolved_if_parent(&workspace, &first_child, &parent_hash)
+            .expect_err("stale parent must be rejected atomically");
+        assert!(error
+            .to_string()
+            .contains("current project graph hash mismatch"));
+        assert_eq!(fs::read(path(&workspace))?, before);
+        assert_eq!(load(&workspace)?.graph_hash, first_child["graph_hash"]);
+
         fs::remove_dir_all(workspace)?;
         Ok(())
     }

@@ -692,6 +692,8 @@ pub(crate) enum GraphCommand {
     Status(GraphStatusArgs),
     /// Load a committed execution graph from the local store.
     Show(GraphShowArgs),
+    /// Compile a bounded PRD task range into a canonical child graph.
+    PlanPrd(GraphPlanPrdArgs),
     /// Audit projects from a frozen repository inventory shard.
     Audit(GraphAuditArgs),
     /// Compose a read-only master graph from a frozen repository inventory.
@@ -896,6 +898,38 @@ pub(crate) struct GraphShowArgs {
     pub(crate) graph_hash: String,
 
     /// Print the complete stored execution graph as JSON.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+/// Arguments accepted by `fractal graph plan-prd`.
+#[derive(Debug, Args)]
+pub(crate) struct GraphPlanPrdArgs {
+    /// Project workspace containing `.fractal/project.fractal`.
+    #[arg(long, required = true, value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+
+    /// PRD Markdown path relative to the project workspace.
+    #[arg(long, required = true, value_name = "RELATIVE_PATH")]
+    pub(crate) prd: PathBuf,
+
+    /// First inclusive PRD task identifier.
+    #[arg(long, required = true, value_name = "INT-NNN")]
+    pub(crate) from: String,
+
+    /// Last inclusive PRD task identifier.
+    #[arg(long, required = true, value_name = "INT-NNN")]
+    pub(crate) through: String,
+
+    /// Expected current project graph hash.
+    #[arg(long = "expected-parent-hash", required = true, value_name = "SHA256")]
+    pub(crate) expected_parent_hash: String,
+
+    /// Commit the compiled child graph and repoint the project at it.
+    #[arg(long)]
+    pub(crate) yes: bool,
+
+    /// Print a stable JSON report instead of human-readable diagnostics.
     #[arg(long)]
     pub(crate) json: bool,
 }
@@ -1355,6 +1389,37 @@ mod tests {
         };
         assert!(args.json);
         assert!(args.graph_hash.starts_with("sha256:"));
+
+        let plan = Cli::try_parse_from([
+            "fractal",
+            "graph",
+            "plan-prd",
+            "--repo",
+            "/tmp/project",
+            "--prd",
+            "docs/implementation.md",
+            "--from",
+            "INT-008",
+            "--through",
+            "INT-061",
+            "--expected-parent-hash",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--yes",
+            "--json",
+        ])
+        .unwrap();
+        let Some(Command::Graph(GraphArgs {
+            command: GraphCommand::PlanPrd(args),
+        })) = plan.command
+        else {
+            panic!("expected graph plan-prd command");
+        };
+        assert_eq!(args.repo, PathBuf::from("/tmp/project"));
+        assert_eq!(args.prd, PathBuf::from("docs/implementation.md"));
+        assert_eq!(args.from, "INT-008");
+        assert_eq!(args.through, "INT-061");
+        assert!(args.yes);
+        assert!(args.json);
 
         let board = Cli::try_parse_from([
             "fractal",
