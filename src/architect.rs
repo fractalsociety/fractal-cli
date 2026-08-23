@@ -394,9 +394,7 @@ where
     validate_team_launch_shape(team)?;
     let fallback = mixed_worker_roster(WORKERS_PER_TEAM);
     for index in 0..WORKERS_PER_TEAM {
-        let Some(task) = team.tasks.get(index) else {
-            continue;
-        };
+        let task = &team.tasks[index];
         if assignments.is_some_and(|values| values.contains_key(&task.node_id))
             || process_alive(team.process_ids[index])
         {
