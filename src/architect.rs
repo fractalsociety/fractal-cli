@@ -256,9 +256,13 @@ pub(crate) fn reserved_node_ids(workspace: &Path) -> BTreeSet<String> {
         .ok()
         .into_iter()
         .flat_map(|state| state.teams)
-        .filter(|team| team.status == "launched")
+        .filter(|team| team_reserves_nodes(team))
         .flat_map(|team| team.tasks.into_iter().map(|task| task.node_id))
         .collect()
+}
+
+fn team_reserves_nodes(team: &TeamRecord) -> bool {
+    matches!(team.status.as_str(), "planned" | "launched")
 }
 
 pub(crate) fn enabled(workspace: &Path) -> bool {
@@ -318,8 +322,8 @@ fn reconcile_teams(workspace: &Path, state: &mut ArchitectState) -> Result<()> {
                     .and_then(Value::as_str)
                     == Some("completed")
             });
-        if complete {
-            team.status = "completed".to_owned();
+        if let Some(status) = team_terminal_status(team, owned_checked_out, complete) {
+            team.status = status.to_owned();
             continue;
         }
         if !team.process_ids.iter().any(|pid| process_alive(*pid)) {
@@ -842,7 +846,7 @@ fn form_team(tasks: &[MissionTask], state: &ArchitectState) -> Result<Option<Tea
     let occupied: BTreeSet<&str> = state
         .teams
         .iter()
-        .filter(|team| team.status != "failed_released")
+        .filter(|team| team_reserves_nodes(team))
         .flat_map(|team| team.tasks.iter().map(|task| task.node_id.as_str()))
         .collect();
     let mut buckets: BTreeMap<String, Vec<MissionTask>> = BTreeMap::new();
@@ -909,6 +913,24 @@ fn form_team(tasks: &[MissionTask], state: &ArchitectState) -> Result<Option<Tea
         process_ids: Vec::new(),
         recovery_started_ms: BTreeMap::new(),
     }))
+}
+
+fn team_terminal_status(
+    team: &TeamRecord,
+    owned_checked_out: bool,
+    complete: bool,
+) -> Option<&'static str> {
+    if complete {
+        return Some("completed");
+    }
+    if team.status == "launched"
+        && !owned_checked_out
+        && !team.process_ids.is_empty()
+        && team.process_ids.len() != TEAM_SIZE
+    {
+        return Some("failed_released");
+    }
+    None
 }
 
 fn architect_team_cohort(node_id: &str) -> Option<&str> {
@@ -1738,6 +1760,86 @@ mod tests {
         let retry = form_team(&tasks, &state).unwrap().unwrap();
         assert_eq!(retry.tasks, tasks);
         assert_ne!(retry.team_id, failed_id);
+    }
+
+    #[test]
+    fn active_planned_and_launched_teams_reserve_nodes_but_terminal_history_does_not() {
+        let tasks: Vec<MissionTask> = (0..9)
+            .map(|index| MissionTask {
+                node_id: format!("n{index}"),
+                title: format!("N{index}"),
+                capability: "code.generate".to_owned(),
+                instruction: "work".to_owned(),
+            })
+            .collect();
+        let mut state = ArchitectState::default();
+        for (index, status) in ["planned", "launched", "completed", "failed_released"]
+            .into_iter()
+            .enumerate()
+        {
+            state.teams.push(TeamRecord {
+                team_id: format!("team-{status}"),
+                specialization: "implementation".to_owned(),
+                mission: "existing".to_owned(),
+                leader_id: format!("team-{status}-leader"),
+                member_ids: Vec::new(),
+                member_clients: Vec::new(),
+                tasks: vec![tasks[index].clone()],
+                status: status.to_owned(),
+                process_ids: Vec::new(),
+                recovery_started_ms: BTreeMap::new(),
+            });
+        }
+
+        let formed = form_team(&tasks, &state)
+            .unwrap()
+            .expect("five nodes remain after active reservations");
+        let selected: BTreeSet<&str> = formed
+            .tasks
+            .iter()
+            .map(|task| task.node_id.as_str())
+            .collect();
+        assert!(!selected.contains("n0"));
+        assert!(!selected.contains("n1"));
+        assert!(selected.contains("n2"));
+        assert!(selected.contains("n3"));
+    }
+
+    #[test]
+    fn partial_recovery_without_owned_checkout_becomes_terminal_and_releases_frontier() {
+        let tasks: Vec<MissionTask> = (0..5)
+            .map(|index| MissionTask {
+                node_id: format!("requeue-{index}"),
+                title: format!("Requeue {index}"),
+                capability: "code.generate".to_owned(),
+                instruction: "finish".to_owned(),
+            })
+            .collect();
+        let mut state = ArchitectState::default();
+        let mut recovered = form_team(&tasks, &state).unwrap().unwrap();
+        recovered.status = "launched".to_owned();
+        recovered.process_ids = vec![100, 900];
+        state.teams.push(recovered);
+
+        // While the partial recovery remains active, its remaining
+        // null/released assignments stay reserved.
+        assert!(form_team(&tasks, &state).unwrap().is_none());
+        let terminal = team_terminal_status(&state.teams[0], false, false)
+            .expect("partial recovery with no owned checkout must terminate");
+        assert_eq!(terminal, "failed_released");
+        state.teams[0].status = terminal.to_owned();
+
+        let retry = form_team(&tasks, &state)
+            .unwrap()
+            .expect("released and unassigned tasks re-enter the frontier");
+        assert_eq!(retry.tasks, tasks);
+    }
+
+    #[test]
+    fn fresh_team_six_record_is_not_mistaken_for_partial_recovery() {
+        let team = recovery_team();
+        assert_eq!(team.process_ids.len(), TEAM_SIZE);
+        assert_eq!(team_terminal_status(&team, false, false), None);
     }
 
     #[test]
