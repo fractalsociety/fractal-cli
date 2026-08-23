@@ -855,11 +855,24 @@ fn form_team(tasks: &[MissionTask], state: &ArchitectState) -> Result<Option<Tea
             .unwrap_or_else(|| specialization(&task.capability));
         buckets.entry(bucket).or_default().push(task.clone());
     }
-    let Some((skill, mut candidates)) = buckets
-        .into_iter()
+    // Keep the existing specialist-lane preference whenever one complete lane
+    // is available. Only a genuinely fragmented frontier may use the mixed
+    // fallback; this prevents a mixed team from displacing a coherent one.
+    let homogeneous_skill = buckets
+        .iter()
         .find(|(_, candidates)| candidates.len() >= WORKERS_PER_TEAM)
-    else {
-        return Ok(None);
+        .map(|(skill, _)| skill.clone());
+    let (skill, mut candidates) = if let Some(skill) = homogeneous_skill {
+        let candidates = buckets
+            .remove(&skill)
+            .expect("homogeneous bucket was found in the bucket map");
+        (skill, candidates)
+    } else {
+        let candidates = buckets.into_values().flatten().collect::<Vec<_>>();
+        if candidates.len() < WORKERS_PER_TEAM {
+            return Ok(None);
+        }
+        ("cross-functional-frontier".to_owned(), candidates)
     };
     candidates.sort_by(|left, right| {
         (!is_explicit_regression_repair(left))
@@ -1575,15 +1588,70 @@ mod tests {
     }
 
     #[test]
-    fn mixed_skills_do_not_form_an_incoherent_team() {
+    fn fragmented_frontier_forms_deterministic_cross_functional_team() {
         let tasks: Vec<MissionTask> = (0..5)
             .map(|index| MissionTask {
                 node_id: format!("n{index}"),
                 title: "n".to_owned(),
-                capability: if index == 0 {
-                    "project.tests.execute"
-                } else {
+                capability: if index < 3 {
                     "code.generate"
+                } else {
+                    "project.tests.execute"
+                }
+                .to_owned(),
+                instruction: "work".to_owned(),
+            })
+            .collect();
+        let team = form_team(&tasks, &ArchitectState::default())
+            .unwrap()
+            .expect("five fragmented ready nodes should form a fallback team");
+        assert_eq!(team.specialization, "cross-functional-frontier");
+        assert_eq!(
+            team.tasks
+                .iter()
+                .map(|task| task.node_id.as_str())
+                .collect::<Vec<_>>(),
+            ["n0", "n1", "n2", "n3", "n4"]
+        );
+        assert_eq!(team.tasks.len(), WORKERS_PER_TEAM);
+    }
+
+    #[test]
+    fn homogeneous_specialist_lane_is_preferred_over_fragmented_frontier() {
+        let mut tasks: Vec<MissionTask> = (0..WORKERS_PER_TEAM)
+            .map(|index| MissionTask {
+                node_id: format!("implementation-{index}"),
+                title: "implementation".to_owned(),
+                capability: "code.generate".to_owned(),
+                instruction: "work".to_owned(),
+            })
+            .collect();
+        tasks.extend((0..4).map(|index| MissionTask {
+            node_id: format!("verification-{index}"),
+            title: "verification".to_owned(),
+            capability: "project.tests.execute".to_owned(),
+            instruction: "work".to_owned(),
+        }));
+        let team = form_team(&tasks, &ArchitectState::default())
+            .unwrap()
+            .expect("complete homogeneous lane should be preferred");
+        assert_eq!(team.specialization, "implementation");
+        assert!(team
+            .tasks
+            .iter()
+            .all(|task| task.capability == "code.generate"));
+    }
+
+    #[test]
+    fn fragmented_frontier_below_five_does_not_form_a_team() {
+        let tasks: Vec<MissionTask> = (0..4)
+            .map(|index| MissionTask {
+                node_id: format!("n{index}"),
+                title: "n".to_owned(),
+                capability: if index < 2 {
+                    "code.generate"
+                } else {
+                    "project.tests.execute"
                 }
                 .to_owned(),
                 instruction: "work".to_owned(),
@@ -1592,6 +1660,37 @@ mod tests {
         assert!(form_team(&tasks, &ArchitectState::default())
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn occupied_nodes_are_excluded_before_frontier_fallback() {
+        let tasks: Vec<MissionTask> = (0..6)
+            .map(|index| MissionTask {
+                node_id: format!("n{index}"),
+                title: "n".to_owned(),
+                capability: "code.generate".to_owned(),
+                instruction: "work".to_owned(),
+            })
+            .collect();
+        let mut state = ArchitectState::default();
+        state.teams.push(TeamRecord {
+            team_id: "existing-team".to_owned(),
+            specialization: "implementation".to_owned(),
+            mission: "existing".to_owned(),
+            leader_id: "existing-team-leader".to_owned(),
+            member_ids: Vec::new(),
+            member_clients: Vec::new(),
+            tasks: vec![tasks[0].clone()],
+            status: "launched".to_owned(),
+            process_ids: Vec::new(),
+            recovery_started_ms: BTreeMap::new(),
+        });
+        let team = form_team(&tasks, &state)
+            .unwrap()
+            .expect("five unoccupied ready nodes should form a team");
+        assert_eq!(team.specialization, "implementation");
+        assert_eq!(team.tasks.len(), WORKERS_PER_TEAM);
+        assert!(team.tasks.iter().all(|task| task.node_id != "n0"));
     }
 
     #[test]
