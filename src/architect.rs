@@ -818,9 +818,54 @@ fn frontier_tasks(workspace: &Path) -> Result<(Vec<MissionTask>, Vec<MissionTask
     let document: Value =
         serde_json::from_slice(&fs::read(workspace.join(".fractal/project.fractal"))?)?;
     let reserved = reserved_node_ids(workspace);
-    let immediate = ready_tasks_from_document(&document, &reserved);
+    let graph_hash = document
+        .get("graph_hash")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let ledger = document
+        .get("external_gate_ledger")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    let immediate = ready_tasks_from_document_with_gates(&document, &reserved, true)
+        .into_iter()
+        .filter(|task| {
+            let node = document
+                .pointer("/graph/nodes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|node| node.get("id").and_then(Value::as_str) == Some(task.node_id.as_str()));
+            node.is_some_and(|node| {
+                crate::external_gates::scheduler_admitted(
+                    workspace,
+                    graph_hash,
+                    node,
+                    ledger.as_ref(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
     let dependency_closed = if immediate.len() < WORKERS_PER_TEAM {
-        dependency_closed_tasks_from_document(&document, &reserved, &immediate)
+        dependency_closed_tasks_from_document_with_gates(&document, &reserved, &immediate, true)
+            .into_iter()
+            .filter(|task| {
+                let node = document
+                    .pointer("/graph/nodes")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find(|node| {
+                        node.get("id").and_then(Value::as_str) == Some(task.node_id.as_str())
+                    });
+                node.is_some_and(|node| {
+                    crate::external_gates::scheduler_admitted(
+                        workspace,
+                        graph_hash,
+                        node,
+                        ledger.as_ref(),
+                    )
+                })
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -833,8 +878,17 @@ struct GraphTaskCandidate {
     dependencies: Vec<String>,
 }
 
+#[allow(dead_code)]
 fn ready_tasks_from_document(document: &Value, reserved: &BTreeSet<String>) -> Vec<MissionTask> {
-    let (candidates, completed) = graph_task_candidates(document, reserved);
+    ready_tasks_from_document_with_gates(document, reserved, false)
+}
+
+fn ready_tasks_from_document_with_gates(
+    document: &Value,
+    reserved: &BTreeSet<String>,
+    allow_gated: bool,
+) -> Vec<MissionTask> {
+    let (candidates, completed) = graph_task_candidates_with_gates(document, reserved, allow_gated);
     let mut immediate = candidates
         .values()
         .filter(|candidate| {
@@ -852,15 +906,25 @@ fn ready_tasks_from_document(document: &Value, reserved: &BTreeSet<String>) -> V
         .collect()
 }
 
+#[allow(dead_code)]
 fn dependency_closed_tasks_from_document(
     document: &Value,
     reserved: &BTreeSet<String>,
     immediate: &[MissionTask],
 ) -> Vec<MissionTask> {
+    dependency_closed_tasks_from_document_with_gates(document, reserved, immediate, false)
+}
+
+fn dependency_closed_tasks_from_document_with_gates(
+    document: &Value,
+    reserved: &BTreeSet<String>,
+    immediate: &[MissionTask],
+    allow_gated: bool,
+) -> Vec<MissionTask> {
     if immediate.len() >= WORKERS_PER_TEAM {
         return immediate.to_vec();
     }
-    let (candidates, completed) = graph_task_candidates(document, reserved);
+    let (candidates, completed) = graph_task_candidates_with_gates(document, reserved, allow_gated);
     let mut selected = immediate
         .iter()
         .map(|task| task.node_id.clone())
@@ -905,9 +969,18 @@ fn dependency_closed_tasks_from_document(
     tasks
 }
 
+#[allow(dead_code)]
 fn graph_task_candidates(
     document: &Value,
     reserved: &BTreeSet<String>,
+) -> (BTreeMap<String, GraphTaskCandidate>, BTreeSet<String>) {
+    graph_task_candidates_with_gates(document, reserved, false)
+}
+
+fn graph_task_candidates_with_gates(
+    document: &Value,
+    reserved: &BTreeSet<String>,
+    allow_gated: bool,
 ) -> (BTreeMap<String, GraphTaskCandidate>, BTreeSet<String>) {
     let assignments = document
         .pointer("/execution/assignments")
@@ -969,7 +1042,7 @@ fn graph_task_candidates(
         if !state.is_none_or(|state| state == "released") {
             continue;
         }
-        if reserved.contains(id) || has_external_gates(node) {
+        if reserved.contains(id) || (!allow_gated && has_external_gates(node)) {
             continue;
         }
         candidates.insert(

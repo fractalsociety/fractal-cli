@@ -59,6 +59,8 @@ pub(crate) enum Command {
     Graph(GraphArgs),
     /// Validate or inspect the repository harness policy without writing.
     Harness(HarnessArgs),
+    /// Record, inspect, or revoke external human-review gates.
+    Gate(GateArgs),
     /// Inspect or govern queued graph amendments.
     Amendment(AmendmentArgs),
     /// Run a compiled graph through Coordinate (stub).
@@ -166,6 +168,110 @@ pub(crate) struct HarnessArgs {
     /// Harness policy operation.
     #[command(subcommand)]
     pub(crate) command: HarnessCommand,
+}
+
+/// Arguments accepted by fractal gate.
+#[derive(Debug, Args)]
+pub(crate) struct GateArgs {
+    #[command(subcommand)]
+    pub(crate) command: GateCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum GateCommand {
+    /// Preview or append one immutable external-gate approval.
+    Record(GateRecordArgs),
+    /// Show the append-only external-gate ledger.
+    Show(GateShowArgs),
+    /// Preview or append one exact approval revocation.
+    Revoke(GateRevokeArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GateRecordArgs {
+    /// Project workspace containing .fractal/project.fractal.
+    #[arg(long, default_value = ".", value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+    /// Graph node that declares the external gate.
+    #[arg(long, visible_alias = "node-id", value_name = "NODE")]
+    pub(crate) node: String,
+    /// Exact declared gate name (for example security_review).
+    #[arg(long, value_name = "GATE")]
+    pub(crate) gate: String,
+    /// Repo-relative evidence file.
+    #[arg(long, visible_alias = "evidence-path", value_name = "PATH")]
+    pub(crate) evidence: PathBuf,
+    /// Local reviewer identity; never taken from a worker checkout.
+    #[arg(long, value_name = "ID")]
+    pub(crate) reviewer_id: String,
+    /// Human-readable reviewer label.
+    #[arg(long, default_value = "", value_name = "LABEL")]
+    pub(crate) reviewer_label: String,
+    /// Bounded reviewer role (security_review requires security_reviewer).
+    #[arg(long, value_name = "ROLE")]
+    pub(crate) role: String,
+    /// Local attestation text or reference.
+    #[arg(long, value_name = "TEXT")]
+    pub(crate) attestation: String,
+    /// Apply the exact previewed record. Without this flag the command is read-only.
+    #[arg(long)]
+    pub(crate) yes: bool,
+    /// Content hash printed by the preview; required with --yes to detect
+    /// document, ledger, or evidence drift between commands.
+    #[arg(long, visible_alias = "expected-hash", value_name = "HASH")]
+    pub(crate) expected_content_hash: Option<String>,
+    /// Print a stable JSON report.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GateShowArgs {
+    /// Project workspace containing .fractal/project.fractal.
+    #[arg(long, default_value = ".", value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+    /// Restrict output to one node.
+    #[arg(long, visible_alias = "node-id", value_name = "NODE")]
+    pub(crate) node: Option<String>,
+    /// Restrict output to one gate.
+    #[arg(long, value_name = "GATE")]
+    pub(crate) gate: Option<String>,
+    /// Print a stable JSON report.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GateRevokeArgs {
+    /// Project workspace containing .fractal/project.fractal.
+    #[arg(long, default_value = ".", value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+    /// Exact content hash printed by gate record/show.
+    #[arg(long, visible_alias = "record-hash", value_name = "HASH")]
+    pub(crate) approval_hash: String,
+    /// Local revoker identity.
+    #[arg(long, value_name = "ID")]
+    pub(crate) reviewer_id: String,
+    /// Human-readable revoker label.
+    #[arg(long, default_value = "", value_name = "LABEL")]
+    pub(crate) reviewer_label: String,
+    /// Bounded revoker role.
+    #[arg(long, value_name = "ROLE")]
+    pub(crate) role: String,
+    /// Local revocation attestation text or reference.
+    #[arg(long, value_name = "TEXT")]
+    pub(crate) attestation: String,
+    /// Apply the exact previewed revocation. Without this flag it is read-only.
+    #[arg(long)]
+    pub(crate) yes: bool,
+    /// Content hash printed by the preview; required with --yes to detect
+    /// approval, project, or ledger drift. Old approval evidence may drift or
+    /// be deleted without blocking an exact revocation.
+    #[arg(long, visible_alias = "expected-hash", value_name = "HASH")]
+    pub(crate) expected_content_hash: Option<String>,
+    /// Print a stable JSON report.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1529,6 +1635,66 @@ mod tests {
                 "shard {shard:?} should fail"
             );
         }
+    }
+
+    #[test]
+    fn parses_gate_preview_tokens_for_record_and_revoke() {
+        let token = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let record = Cli::try_parse_from([
+            "fractal",
+            "gate",
+            "record",
+            "--node",
+            "secure",
+            "--gate",
+            "security_review",
+            "--evidence",
+            "review.txt",
+            "--reviewer-id",
+            "reviewer",
+            "--role",
+            "security_reviewer",
+            "--attestation",
+            "approve:graph:secure:security_review",
+            "--yes",
+            "--expected-content-hash",
+            token,
+        ])
+        .unwrap();
+        let Some(Command::Gate(GateArgs {
+            command: GateCommand::Record(args),
+        })) = record.command
+        else {
+            panic!("expected gate record command");
+        };
+        assert!(args.yes);
+        assert_eq!(args.expected_content_hash.as_deref(), Some(token));
+
+        let revoke = Cli::try_parse_from([
+            "fractal",
+            "gate",
+            "revoke",
+            "--approval-hash",
+            token,
+            "--reviewer-id",
+            "revoker",
+            "--role",
+            "security_reviewer",
+            "--attestation",
+            "revoke:graph:secure:security_review:approval",
+            "--yes",
+            "--expected-content-hash",
+            token,
+        ])
+        .unwrap();
+        let Some(Command::Gate(GateArgs {
+            command: GateCommand::Revoke(args),
+        })) = revoke.command
+        else {
+            panic!("expected gate revoke command");
+        };
+        assert!(args.yes);
+        assert_eq!(args.expected_content_hash.as_deref(), Some(token));
     }
 
     #[test]

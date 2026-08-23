@@ -776,6 +776,18 @@ impl NodeOutcome {
 fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> {
     let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
     let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
+    // Defense in depth: callers must atomically checkout first, but this
+    // worker seam is also private authority against direct execution paths.
+    // A malformed declaration, missing ledger, stale evidence, or reviewer
+    // self-checkout therefore fails before any worker or verifier runs.
+    let required = crate::external_gates::required_gates(node)
+        .context("malformed external gate declaration")?;
+    if !required.is_empty() {
+        let document = crate::project_file::load(workspace)
+            .context("load canonical project before gated execution")?;
+        crate::external_gates::enforce_checkout(workspace, &document, id, agent)
+            .with_context(|| format!("external gate denied execution of node {}", id))?;
+    }
     let instruction = node
         .get("instruction")
         .and_then(Value::as_str)
@@ -902,12 +914,17 @@ fn validate_closeout(prd: &Value, closeout: &Value) -> Result<usize> {
 
 /// Commit a node transition through the central learning mutation APIs.
 /// The local and hosted boards are projections of that same file.
-fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str, workspace: &Path) {
+fn report_node(
+    board: Option<&str>,
+    node: &str,
+    action: &str,
+    agent: &str,
+    workspace: &Path,
+) -> Result<()> {
     let board_action = match action {
         "failed_execution" | "failed_verification" | "timeout" | "cancelled" => "release",
         other => other,
     };
-    crate::run_control::node_transition(board, node, board_action, agent);
     if action == "checkout" {
         // A direct checkout can implicitly clear a prior terminal learning
         // outcome.  Capture that typed failure before the overwrite; this is
@@ -955,10 +972,17 @@ fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str, works
         other => Err(anyhow::anyhow!("unsupported learning transition `{other}`")),
     };
     if let Err(error) = result {
+        // Checkout is the execution authority. Do not swallow a denied
+        // checkout: callers must skip run_node and never execute unowned work.
+        if action == "checkout" {
+            return Err(error);
+        }
         eprintln!("  live graph state note: {error:#}");
     } else {
+        crate::run_control::node_transition(board, node, board_action, agent);
         crate::project_sync::maybe_sync_runtime(workspace);
     }
+    Ok(())
 }
 
 /// Record a full success/failure transition with measured evidence and costs.
@@ -1761,6 +1785,11 @@ pub(crate) fn run_multi_agent(
         }
     }
     let total = ids.len();
+    let graph_hash = graph
+        .get("graph_hash")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     // Resume: pre-mark already-completed tasks so they are skipped (the ready
     // check treats them as done) but still counted toward `total`.
     let schedule = Mutex::new(Schedule {
@@ -1787,8 +1816,14 @@ pub(crate) fn run_multi_agent(
             let agent = agent.clone();
             let is_lead = agent.as_str() == lead;
             let provider_caps = provider_caps.clone();
-            let (schedule, ids, node_by_id, predecessors, graph) =
-                (&schedule, &ids, &node_by_id, &predecessors, graph);
+            let (schedule, ids, node_by_id, predecessors, graph, graph_hash) = (
+                &schedule,
+                &ids,
+                &node_by_id,
+                &predecessors,
+                graph,
+                &graph_hash,
+            );
             scope.spawn(move || {
               let mut mine: u64 = 0;
               loop {
@@ -1819,10 +1854,33 @@ pub(crate) fn run_multi_agent(
                             .unwrap_or("")
                             .to_owned()
                     };
+                    let gate_admitted = |id: &String| {
+                        let Some(node) = node_by_id.get(id) else {
+                            return false;
+                        };
+                        let Ok(required) = crate::external_gates::required_gates(node) else {
+                            return false;
+                        };
+                        if required.is_empty() {
+                            return true;
+                        }
+                        let Ok(document) = crate::project_file::load(workspace) else {
+                            return false;
+                        };
+                        crate::external_gates::scheduler_admitted(
+                            workspace,
+                            graph_hash,
+                            node,
+                            document.external_gate_ledger.as_ref(),
+                        )
+                    };
                     let is_ready = |id: &String, state: &Schedule| {
                         !state.completed.contains(id)
                             && !state.in_progress.contains(id)
-                            && predecessors[id].iter().all(|pred| state.completed.contains(pred))
+                            && predecessors[id]
+                                .iter()
+                                .all(|pred| state.completed.contains(pred))
+                            && gate_admitted(id)
                     };
                     let is_root = |id: &String| predecessors[id].is_empty();
                     let is_control = |id: &String| capability_of(id).starts_with("control.");
@@ -1843,6 +1901,22 @@ pub(crate) fn run_multi_agent(
                     } else {
                         None
                     };
+                    if next.is_none() && state.in_progress.is_empty() {
+                        // No worker can make progress. If a dependency-ready
+                        // node is denied by the external-gate predicate,
+                        // terminate the run instead of polling forever.
+                        if let Some(denied) = ids.iter().find(|id| {
+                            !state.completed.contains(*id)
+                                && !state.in_progress.contains(*id)
+                                && predecessors[*id]
+                                    .iter()
+                                    .all(|pred| state.completed.contains(pred))
+                                && !gate_admitted(id)
+                        }) {
+                            state.failed = Some(denied.clone());
+                            break;
+                        }
+                    }
                     match next {
                         Some(id) => {
                             state.in_progress.insert(id.clone());
@@ -1869,7 +1943,24 @@ pub(crate) fn run_multi_agent(
                 } else {
                     println!("{clr}  [{agent}] ▸ checked out {id} ({capability})");
                 }
-                report_node(board, &id, "checkout", &agent, workspace);
+                if let Err(error) = report_node(board, &id, "checkout", &agent, workspace) {
+                    let evidence_hex = workspace_digest(workspace);
+                    let mut state = schedule.lock().expect("schedule lock");
+                    state.in_progress.remove(&id);
+                    state.slot_leases.remove(&agent);
+                    state.failed = Some(id.clone());
+                    state.log.push(NodeRun {
+                        node: id.clone(),
+                        agent: agent.clone(),
+                        is_verify: is_verify(capability),
+                        ok: false,
+                        verified: None,
+                        evidence_hex,
+                        latency_ms: 0,
+                    });
+                    eprintln!("  [{agent}] ✗ {id}: checkout denied: {error:#}");
+                    break;
+                }
                 let started = std::time::Instant::now();
                 let result = run_node(node, &agent, workspace);
                 let latency_ms = started.elapsed().as_millis() as u64;
@@ -2635,7 +2726,18 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
     // inspection/repair holds the scheduler barrier.
     {
         let _barrier = lock_scheduler();
-        report_node(board, &id, "checkout", agent, workspace);
+        if let Err(error) = report_node(board, &id, "checkout", agent, workspace) {
+            eprintln!("  [{agent}] ✗ {id}: checkout denied: {error:#}");
+            return NodeRun {
+                node: id,
+                agent: agent.to_owned(),
+                is_verify: is_verify(capability),
+                ok: false,
+                verified: None,
+                evidence_hex: workspace_digest(workspace),
+                latency_ms: 0,
+            };
+        }
     }
     let started = std::time::Instant::now();
     let result = run_node(node, agent, workspace);
@@ -3234,6 +3336,95 @@ mod tests {
         graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
         crate::project_file::persist(workspace, &graph, "Lifecycle").unwrap();
         graph
+    }
+
+    fn persist_gated_graph(workspace: &std::path::Path) -> (Value, String) {
+        fs::create_dir_all(workspace).unwrap();
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_external_gate_execute",
+            "nodes": [{
+                "id": "secure",
+                "capability": "code.generate",
+                "instruction": "Secure build",
+                "external_gates": ["security_review"]
+            }],
+            "edges": []
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::project_file::persist(workspace, &graph, "External gate").unwrap();
+        fs::write(workspace.join("review.txt"), b"review evidence").unwrap();
+        (graph, "review.txt".to_owned())
+    }
+
+    #[test]
+    fn gated_execution_paths_fail_closed_before_worker_invocation() {
+        let workspace = lifecycle_workspace("gated-execution");
+        let (graph, _) = persist_gated_graph(&workspace);
+        let node = graph["nodes"][0].clone();
+
+        // Missing ledger is denied by the direct worker seam and therefore
+        // cannot invoke a worker command.
+        assert!(run_node(&node, "worker", &workspace).is_err());
+        assert!(report_node(None, "secure", "checkout", "worker", &workspace).is_err());
+        assert!(crate::project_file::load(&workspace)
+            .unwrap()
+            .execution
+            .unwrap()
+            .assignments
+            .get("secure")
+            .is_none());
+        let run = run_and_record(&node, "worker", &workspace, None);
+        assert!(!run.ok);
+
+        // Record one approval, then the reviewer remains forbidden from
+        // executing the same node (separation of duties).
+        let document = crate::project_file::load(&workspace).unwrap();
+        let input = crate::external_gates::RecordApprovalInput {
+            node_id: "secure".to_owned(),
+            gate: "security_review".to_owned(),
+            evidence_path: std::path::PathBuf::from("review.txt"),
+            reviewer_id: "reviewer".to_owned(),
+            reviewer_label: "Reviewer".to_owned(),
+            role: "security_reviewer".to_owned(),
+            attestation: format!("approve:{}:secure:security_review", document.graph_hash),
+        };
+        let approval = crate::external_gates::record_approval(&workspace, input).unwrap();
+        assert!(!run_and_record(&node, "reviewer", &workspace, None).ok);
+
+        // Tampering after approval is caught before execution.
+        fs::write(workspace.join("review.txt"), b"drift").unwrap();
+        assert!(run_node(&node, "worker", &workspace).is_err());
+        assert_eq!(
+            crate::project_file::load(&workspace)
+                .unwrap()
+                .external_gate_ledger
+                .unwrap()
+                .records
+                .iter()
+                .filter(|record| record.kind == "approval")
+                .count(),
+            1
+        );
+        assert!(!approval.content_hash.is_empty());
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn multi_agent_scheduler_terminates_denied_gated_frontier() {
+        let workspace = lifecycle_workspace("gated-scheduler");
+        let (graph, _) = persist_gated_graph(&workspace);
+        let result = run_multi_agent(
+            &graph,
+            &workspace,
+            &["codex".to_owned()],
+            None,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(result.failed_node.as_deref(), Some("secure"));
+        assert!(result.log.iter().all(|run| !run.ok));
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]

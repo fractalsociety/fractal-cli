@@ -19,6 +19,7 @@ mod efficiency_detector;
 mod efficiency_policy;
 mod evolve;
 mod execute;
+mod external_gates;
 mod failure_graph;
 mod graph_store;
 mod handoff;
@@ -67,7 +68,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sha2::{Digest, Sha256};
 
-use crate::cli::{AmendmentCommand, BridgeCommand, Cli, Command, GraphCommand, HarnessCommand};
+use crate::cli::{
+    AmendmentCommand, BridgeCommand, Cli, Command, GateCommand, GraphCommand, HarnessCommand,
+};
 use crate::work_builder::IntentClassification;
 
 fn main() -> ExitCode {
@@ -105,6 +108,11 @@ fn uses_stable_json_diagnostics(cli: &Cli) -> bool {
             command: HarnessCommand::Validate(crate::cli::HarnessPolicyArgs { json: true, .. })
                 | HarnessCommand::Show(crate::cli::HarnessPolicyArgs { json: true, .. }),
         })) | Some(Command::Join(crate::cli::JoinArgs { json: true, .. }))
+            | Some(Command::Gate(crate::cli::GateArgs {
+                command: GateCommand::Record(crate::cli::GateRecordArgs { json: true, .. })
+                    | GateCommand::Show(crate::cli::GateShowArgs { json: true, .. })
+                    | GateCommand::Revoke(crate::cli::GateRevokeArgs { json: true, .. }),
+            }))
             | Some(Command::Amendment(crate::cli::AmendmentArgs {
                 command: AmendmentCommand::List(crate::cli::AmendmentListArgs { json: true, .. })
                     | AmendmentCommand::Reject(crate::cli::AmendmentRejectArgs { json: true, .. }),
@@ -198,6 +206,7 @@ fn run(cli: Cli) -> Result<()> {
             HarnessCommand::Validate(args) => harness_policy::validate(&args.repo, args.json),
             HarnessCommand::Show(args) => harness_policy::show(&args.repo, args.json),
         },
+        (None, Some(Command::Gate(args))) => run_gate(&args),
         (None, Some(Command::Amendment(args))) => run_amendment(&args),
         (None, Some(Command::Run(args))) if args.local => {
             let efficiency = efficiency_config::resolve(&args.efficiency)?;
@@ -321,6 +330,263 @@ const AMENDMENT_REJECTION_APPLIED: &str = "AMENDMENT_REJECTION_APPLIED";
 const PRD_GRAPH_PLAN_SCHEMA: &str = "fractal.prd_graph_plan.v1";
 const PRD_GRAPH_REPLACEMENT_PREVIEW_READY: &str = "PRD_GRAPH_REPLACEMENT_PREVIEW_READY";
 const PRD_GRAPH_REPLACEMENT_APPLIED: &str = "PRD_GRAPH_REPLACEMENT_APPLIED";
+const EXTERNAL_GATE_CLI_SCHEMA: &str = "fractal.external_gate.cli.v1";
+const EXTERNAL_GATE_RECORD_PREVIEW_READY: &str = "EXTERNAL_GATE_RECORD_PREVIEW_READY";
+const EXTERNAL_GATE_RECORD_APPLIED: &str = "EXTERNAL_GATE_RECORD_APPLIED";
+const EXTERNAL_GATE_REVOKE_PREVIEW_READY: &str = "EXTERNAL_GATE_REVOKE_PREVIEW_READY";
+const EXTERNAL_GATE_REVOKE_APPLIED: &str = "EXTERNAL_GATE_REVOKE_APPLIED";
+
+fn gate_preview_guidance(operation: &str, token: &str) -> String {
+    let mut guidance = format!(
+        "Preview token: {token}\nRe-run this exact command with --yes --expected-content-hash {token} to append the exact {operation}."
+    );
+    if operation == "revocation" {
+        guidance.push_str(
+            " The token binds the exact approval, project snapshot, and ledger; revocation remains possible if the old approval evidence drifts or is deleted.",
+        );
+    }
+    guidance
+}
+
+fn run_gate(args: &crate::cli::GateArgs) -> Result<()> {
+    match &args.command {
+        GateCommand::Record(args) => run_gate_record(args),
+        GateCommand::Show(args) => run_gate_show(args),
+        GateCommand::Revoke(args) => run_gate_revoke(args),
+    }
+}
+
+fn gate_record_input(args: &crate::cli::GateRecordArgs) -> external_gates::RecordApprovalInput {
+    external_gates::RecordApprovalInput {
+        node_id: args.node.clone(),
+        gate: args.gate.clone(),
+        evidence_path: args.evidence.clone(),
+        reviewer_id: args.reviewer_id.clone(),
+        reviewer_label: if args.reviewer_label.trim().is_empty() {
+            args.reviewer_id.clone()
+        } else {
+            args.reviewer_label.clone()
+        },
+        role: args.role.clone(),
+        attestation: args.attestation.clone(),
+    }
+}
+
+fn gate_revoke_input(args: &crate::cli::GateRevokeArgs) -> external_gates::RevokeApprovalInput {
+    external_gates::RevokeApprovalInput {
+        approval_hash: args.approval_hash.clone(),
+        reviewer_id: args.reviewer_id.clone(),
+        reviewer_label: if args.reviewer_label.trim().is_empty() {
+            args.reviewer_id.clone()
+        } else {
+            args.reviewer_label.clone()
+        },
+        role: args.role.clone(),
+        attestation: args.attestation.clone(),
+    }
+}
+
+fn run_gate_record(args: &crate::cli::GateRecordArgs) -> Result<()> {
+    let input = gate_record_input(args);
+    if !args.yes {
+        let record = external_gates::preview_approval(&args.repo, &input)?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": EXTERNAL_GATE_CLI_SCHEMA,
+                    "operation": "record",
+                    "status": "preview",
+                    "mutation": "none",
+                    "ready": true,
+                    "readiness_marker": EXTERNAL_GATE_RECORD_PREVIEW_READY,
+                    "record": record,
+                }))?
+            );
+        } else {
+            println!("External gate approval preview (no mutation performed)");
+            println!("  Node: {}", record.node_id);
+            println!("  Gate: {}", record.gate);
+            println!("  Graph hash: {}", record.graph_hash);
+            println!(
+                "  Evidence: {} ({} bytes)",
+                record.evidence_path, record.evidence_length
+            );
+            println!("  Evidence hash: {}", record.evidence_hash);
+            println!(
+                "  Reviewer: {} ({})",
+                record.reviewer_label, record.reviewer_id
+            );
+            println!("  Role: {}", record.role);
+            println!("  Authority: {} / {}", record.authority, record.assurance);
+            println!(
+                "{}",
+                gate_preview_guidance("approval", &record.content_hash)
+            );
+            println!("{EXTERNAL_GATE_RECORD_PREVIEW_READY}");
+        }
+        return Ok(());
+    }
+    let expected = args
+        .expected_content_hash
+        .as_deref()
+        .context("--yes requires --expected-content-hash from the preview")?;
+    let record = external_gates::record_approval_with_expected(&args.repo, input, expected)?;
+    if record.content_hash != expected {
+        anyhow::bail!("applied external gate record does not match preview token");
+    }
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": EXTERNAL_GATE_CLI_SCHEMA,
+                "operation": "record",
+                "status": "recorded",
+                "mutation": "applied",
+                "ready": true,
+                "readiness_marker": EXTERNAL_GATE_RECORD_APPLIED,
+                "record": record,
+            }))?
+        );
+    } else {
+        println!("Recorded external gate approval");
+        println!("  Node: {}  Gate: {}", record.node_id, record.gate);
+        println!("  Content hash: {}", record.content_hash);
+        println!("  Graph hash: {}", record.graph_hash);
+        println!("{EXTERNAL_GATE_RECORD_APPLIED}");
+    }
+    Ok(())
+}
+
+fn run_gate_show(args: &crate::cli::GateShowArgs) -> Result<()> {
+    let workspace = args
+        .repo
+        .canonicalize()
+        .context("resolve gate repository")?;
+    let document = project_file::load(&workspace)?;
+    let ledger = document
+        .external_gate_ledger
+        .clone()
+        .unwrap_or_else(external_gates::ExternalGateLedger::empty);
+    external_gates::validate_ledger(&ledger)?;
+    let records = ledger
+        .records
+        .iter()
+        .filter(|record| {
+            args.node
+                .as_deref()
+                .is_none_or(|node| node == record.node_id)
+        })
+        .filter(|record| args.gate.as_deref().is_none_or(|gate| gate == record.gate))
+        .cloned()
+        .collect::<Vec<_>>();
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": EXTERNAL_GATE_CLI_SCHEMA,
+                "operation": "show",
+                "status": "ok",
+                "repo": workspace.display().to_string(),
+                "graph_hash": document.graph_hash,
+                "ledger_present": document.external_gate_ledger.is_some(),
+                "records": records,
+            }))?
+        );
+    } else if records.is_empty() {
+        println!(
+            "No external gate ledger records in {} (ledger {} ).",
+            workspace.display(),
+            if document.external_gate_ledger.is_some() {
+                "present"
+            } else {
+                "missing; gated checkout remains denied"
+            }
+        );
+    } else {
+        println!("External gate ledger in {}:", workspace.display());
+        for record in records {
+            println!(
+                "  {} {} · {} · {} · {}",
+                record.kind, record.content_hash, record.node_id, record.gate, record.reviewer_id
+            );
+            println!(
+                "    graph={} evidence={} ({}, {} bytes)",
+                record.graph_hash,
+                record.evidence_path,
+                record.evidence_hash,
+                record.evidence_length
+            );
+            if let Some(target) = record.revokes {
+                println!("    revokes={target}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_gate_revoke(args: &crate::cli::GateRevokeArgs) -> Result<()> {
+    let input = gate_revoke_input(args);
+    if !args.yes {
+        let record = external_gates::preview_revoke(&args.repo, &input)?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": EXTERNAL_GATE_CLI_SCHEMA,
+                    "operation": "revoke",
+                    "status": "preview",
+                    "mutation": "none",
+                    "ready": true,
+                    "readiness_marker": EXTERNAL_GATE_REVOKE_PREVIEW_READY,
+                    "record": record,
+                }))?
+            );
+        } else {
+            println!("External gate revocation preview (no mutation performed)");
+            println!("  Target approval: {}", args.approval_hash);
+            println!("  Node: {}  Gate: {}", record.node_id, record.gate);
+            println!(
+                "  Revoker: {} ({})",
+                record.reviewer_label, record.reviewer_id
+            );
+            println!(
+                "{}",
+                gate_preview_guidance("revocation", &record.content_hash)
+            );
+            println!("{EXTERNAL_GATE_REVOKE_PREVIEW_READY}");
+        }
+        return Ok(());
+    }
+    let expected = args
+        .expected_content_hash
+        .as_deref()
+        .context("--yes requires --expected-content-hash from the preview")?;
+    let record = external_gates::revoke_approval_with_expected(&args.repo, input, expected)?;
+    if record.content_hash != expected {
+        anyhow::bail!("applied external gate revocation does not match preview token");
+    }
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": EXTERNAL_GATE_CLI_SCHEMA,
+                "operation": "revoke",
+                "status": "revoked",
+                "mutation": "applied",
+                "ready": true,
+                "readiness_marker": EXTERNAL_GATE_REVOKE_APPLIED,
+                "record": record,
+            }))?
+        );
+    } else {
+        println!("Revoked external gate approval");
+        println!("  Revocation hash: {}", record.content_hash);
+        println!("  Revokes: {}", record.revokes.unwrap_or_default());
+        println!("{EXTERNAL_GATE_REVOKE_APPLIED}");
+    }
+    Ok(())
+}
 
 fn run_amendment(args: &crate::cli::AmendmentArgs) -> Result<()> {
     match &args.command {
@@ -1821,6 +2087,46 @@ mod tests {
     fn dispatches_efficiency_status_with_defaults() {
         let cli = Cli::try_parse_from(["fractal", "efficiency"]).unwrap();
         assert!(run(cli).is_ok());
+    }
+
+    #[test]
+    fn gate_preview_guidance_prints_token_and_exact_rerun_flags() {
+        let token = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let approval = gate_preview_guidance("approval", token);
+        assert!(approval.contains(&format!("Preview token: {token}")));
+        assert!(approval.contains(&format!("--yes --expected-content-hash {token}")));
+        assert!(approval.contains("exact approval"));
+
+        let revocation = gate_preview_guidance("revocation", token);
+        assert!(revocation.contains(&format!("Preview token: {token}")));
+        assert!(revocation.contains(&format!("--yes --expected-content-hash {token}")));
+        assert!(revocation.contains("exact approval, project snapshot, and ledger"));
+        assert!(revocation.contains("old approval evidence drifts or is deleted"));
+    }
+
+    #[test]
+    fn gate_apply_requires_preview_token() {
+        let cli = Cli::try_parse_from([
+            "fractal",
+            "gate",
+            "record",
+            "--node",
+            "secure",
+            "--gate",
+            "security_review",
+            "--evidence",
+            "review.txt",
+            "--reviewer-id",
+            "reviewer",
+            "--role",
+            "security_reviewer",
+            "--attestation",
+            "approve:graph:secure:security_review",
+            "--yes",
+        ])
+        .unwrap();
+        let error = run(cli).expect_err("--yes without a preview token must fail");
+        assert!(format!("{error:#}").contains("--yes requires --expected-content-hash"));
     }
 
     #[test]

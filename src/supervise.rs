@@ -330,7 +330,15 @@ pub(crate) fn run_supervised_with_efficiency(
             }
         }
 
-        let frontier = execute::ready_frontier_filtered(&graph, &completed, Some(&runtime));
+        let project = crate::project_file::load(workspace).ok();
+        let frontier = crate::external_gates::filter_frontier(
+            workspace,
+            &hash,
+            execute::ready_frontier_filtered(&graph, &completed, Some(&runtime)),
+            project
+                .as_ref()
+                .and_then(|document| document.external_gate_ledger.as_ref()),
+        );
         if frontier.is_empty() {
             break;
         }

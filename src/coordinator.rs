@@ -1259,6 +1259,14 @@ fn ready_nodes(workspace: &Path) -> Result<Vec<String>> {
         if architect_reserved.contains(id) {
             continue;
         }
+        if !crate::external_gates::scheduler_admitted(
+            workspace,
+            &document.graph_hash,
+            node,
+            document.external_gate_ledger.as_ref(),
+        ) {
+            continue;
+        }
         if assignments
             .and_then(|values| values.get(id))
             .is_some_and(|assignment| {

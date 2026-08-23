@@ -34,6 +34,11 @@ pub(crate) struct FractalProject {
     /// `graph_hash`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) failure_graph: Option<crate::failure_graph::FailureGraph>,
+    /// Additive external-review approval/revocation audit. This field is
+    /// deliberately outside the immutable execution graph and never changes
+    /// graph_hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) external_gate_ledger: Option<crate::external_gates::ExternalGateLedger>,
     pub(crate) updated_at: String,
     #[serde(default, flatten)]
     pub(crate) extra: BTreeMap<String, Value>,
@@ -305,9 +310,12 @@ fn persist_locked(
                 extra: BTreeMap::new(),
             })
         });
+    let same_graph = current
+        .as_ref()
+        .is_some_and(|document| document.graph_hash == graph_hash);
     let mut learning = current
         .as_ref()
-        .map(|document| merge_learning(&document.learning, graph, &now))
+        .map(|document| merge_learning(&document.learning, graph, &now, same_graph))
         .unwrap_or_else(|| learning_from_graph(graph, &now));
     if let Some(criteria) = load_acceptance_criteria(workspace) {
         learning.extra.insert(
@@ -325,7 +333,7 @@ fn persist_locked(
                 &config.config_hash(),
             ))
         });
-    let document = FractalProject {
+    let mut document = FractalProject {
         schema: "fractal.project.v1".to_owned(),
         project: ProjectIdentity {
             slug,
@@ -348,12 +356,20 @@ fn persist_locked(
         failure_graph: current
             .as_ref()
             .and_then(|document| document.failure_graph.clone()),
+        external_gate_ledger: current
+            .as_ref()
+            .and_then(|document| document.external_gate_ledger.clone()),
         updated_at: now,
         extra: current
             .as_ref()
             .map(|document| document.extra.clone())
             .unwrap_or_default(),
     };
+    // A verifier may have completed before a coordinator persisted the next
+    // lifecycle snapshot. Reconcile those durable records before deciding
+    // whether this graph is terminal so old verifier completions participate
+    // in the next aggregate without replaying the node.
+    refresh_terminal_outcome(&mut document);
     let destination = path(workspace);
     let directory = destination.parent().expect("project file has parent");
     fs::create_dir_all(directory).with_context(|| format!("create {}", directory.display()))?;
@@ -422,7 +438,7 @@ pub(crate) fn checkout_start_node(
     agent_label: &str,
 ) -> Result<()> {
     mutate_execution_document(workspace, |document, now| {
-        checkout_start_node_in_document(document, node, agent_id, agent_label, now)
+        checkout_start_node_in_document(workspace, document, node, agent_id, agent_label, now)
     })
 }
 
@@ -678,6 +694,7 @@ fn execution_state<'a>(document: &'a mut FractalProject, now: &str) -> &'a mut E
 
 #[allow(dead_code)]
 fn checkout_start_node_in_document(
+    workspace: &Path,
     document: &mut FractalProject,
     node: &str,
     agent_id: &str,
@@ -685,6 +702,7 @@ fn checkout_start_node_in_document(
     now: &str,
 ) -> Result<()> {
     ensure_known_node(document, node)?;
+    crate::external_gates::enforce_checkout(workspace, document, node, agent_id)?;
     let blocked = dependency_blockers(document, node);
     if !blocked.is_empty() {
         bail!(
@@ -911,11 +929,253 @@ fn complete_graph_if_terminal(document: &mut FractalProject) {
     refresh_terminal_outcome(document);
 }
 
+/// Reconcile successful verification records to their one intended
+/// implementation target. The relation is deliberately conservative: an
+/// explicit `verifies`/target field wins, otherwise graph incoming topology
+/// must identify exactly one implementation predecessor. Ambiguous, missing,
+/// malformed, or non-implementation targets are ignored (fail closed).
+fn reconcile_successful_verifications(document: &mut FractalProject) {
+    let verifier_ids = document
+        .learning
+        .nodes
+        .iter()
+        .filter(|(id, record)| {
+            is_verification_graph_node(document, id)
+                && record.outcome == Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+                && record.verification.as_ref().and_then(|v| v.passed) == Some(true)
+        })
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+
+    for verifier_id in verifier_ids {
+        let Some(target_id) = verification_target(document, &verifier_id) else {
+            continue;
+        };
+        if !is_implementation_graph_node(document, &target_id) {
+            continue;
+        }
+        let Some(verifier) = document.learning.nodes.get(&verifier_id) else {
+            continue;
+        };
+        let Some(verifier_check) = verifier.verification.as_ref() else {
+            continue;
+        };
+        let evidence_refs = verifier_check.evidence_refs.clone();
+        let verifier_finished_at = verifier.finished_at.clone();
+        let fallback_finished_at = document.updated_at.clone();
+        let Some(target) = document.learning.nodes.get_mut(&target_id) else {
+            continue;
+        };
+
+        // A successful automated verifier adds verification evidence, but it
+        // must not erase a stronger explicit human decision or a superseded
+        // lifecycle state already recorded for the implementation target.
+        let upgrade_outcome = !matches!(
+            target.outcome,
+            Some(crate::learning_data::NodeOutcome::HumanCompleted)
+                | Some(crate::learning_data::NodeOutcome::Superseded)
+        );
+        if upgrade_outcome {
+            target.outcome = Some(crate::learning_data::NodeOutcome::VerifiedSuccess);
+            target.failure_code = None;
+        }
+        if target.finished_at.is_none() {
+            target.finished_at = verifier_finished_at
+                .or(Some(fallback_finished_at))
+                .or_else(|| Some(timestamp()));
+        }
+        let mut verification = target.verification.take().unwrap_or_default();
+        verification.kind = Some("automated".to_owned());
+        verification.passed = Some(true);
+        verification.evidence_refs = evidence_refs;
+        target.verification = Some(verification);
+    }
+}
+
+/// Resolve a verifier's target from an explicit relation or a uniquely
+/// identifying incoming graph dependency. The boolean distinguishes an
+/// explicitly declared but malformed/ambiguous relation from an absent one so
+/// malformed declarations cannot silently fall back to guessed topology.
+fn verification_target(document: &FractalProject, verifier_id: &str) -> Option<String> {
+    let verifier = graph_node(document, verifier_id)?;
+    let (explicit, target) = explicit_verification_target(verifier);
+    if explicit {
+        return target.filter(|target| is_implementation_graph_node(document, target));
+    }
+
+    let mut dependencies = BTreeSet::new();
+    let mut saw_graph_edge = false;
+    if let Some(edges) = document.graph.get("edges").and_then(Value::as_array) {
+        for edge in edges {
+            if edge.get("to").and_then(Value::as_str) != Some(verifier_id) {
+                continue;
+            }
+            saw_graph_edge = true;
+            if edge.get("condition").and_then(Value::as_str) == Some("failure") {
+                continue;
+            }
+            if let Some(from) = edge.get("from").and_then(Value::as_str) {
+                dependencies.insert(from.to_owned());
+            }
+        }
+    }
+    if let Some(values) = verifier.get("depends_on").and_then(Value::as_array) {
+        dependencies.extend(values.iter().filter_map(Value::as_str).map(str::to_owned));
+    }
+    if dependencies.is_empty() && !saw_graph_edge {
+        dependencies.extend(
+            document
+                .learning
+                .nodes
+                .get(verifier_id)
+                .into_iter()
+                .flat_map(|record| record.depends_on.iter().cloned()),
+        );
+    }
+    // A dangling dependency makes the relation untrustworthy even if another
+    // dependency happens to look like an implementation.
+    if dependencies
+        .iter()
+        .any(|dependency| graph_node(document, dependency).is_none())
+    {
+        return None;
+    }
+    let implementations = dependencies
+        .iter()
+        .filter(|dependency| is_implementation_graph_node(document, dependency))
+        .cloned()
+        .collect::<Vec<_>>();
+    (implementations.len() == 1).then(|| implementations[0].clone())
+}
+
+fn graph_node<'a>(document: &'a FractalProject, id: &str) -> Option<&'a Value> {
+    document
+        .graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|node| node.get("id").and_then(Value::as_str) == Some(id))
+}
+
+fn is_verification_graph_node(document: &FractalProject, id: &str) -> bool {
+    let record_type = document
+        .learning
+        .nodes
+        .get(id)
+        .map(|record| record.node_type.as_str());
+    if record_type == Some("verification") {
+        return true;
+    }
+    let Some(node) = graph_node(document, id) else {
+        return false;
+    };
+    node.get("node_type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "verification")
+        || node
+            .get("capability")
+            .and_then(Value::as_str)
+            .is_some_and(|capability| {
+                capability.starts_with("project.tests")
+                    || capability.starts_with("python.tests")
+                    || capability.contains("verify")
+                    || capability.contains("test")
+            })
+}
+
+fn is_implementation_graph_node(document: &FractalProject, id: &str) -> bool {
+    let record_type = document
+        .learning
+        .nodes
+        .get(id)
+        .map(|record| record.node_type.as_str());
+    if record_type == Some("control") || record_type == Some("verification") {
+        return false;
+    }
+    let Some(node) = graph_node(document, id) else {
+        return false;
+    };
+    if node.get("node_type").and_then(Value::as_str) == Some("control")
+        || node.get("node_type").and_then(Value::as_str) == Some("verification")
+    {
+        return false;
+    }
+    !is_verification_graph_node(document, id)
+}
+
+fn explicit_verification_target(node: &Value) -> (bool, Option<String>) {
+    const KEYS: [&str; 8] = [
+        "verifies",
+        "verifies_node_ids",
+        "verifies_node_id",
+        "verifies_node",
+        "verification_target",
+        "target_implementation",
+        "target_node",
+        "target",
+    ];
+    let mut saw_declaration = false;
+    let mut malformed_declaration = false;
+    let mut candidates = BTreeSet::new();
+    let mut inspect = |container: &Value| {
+        let Some(object) = container.as_object() else {
+            return;
+        };
+        for key in KEYS {
+            let Some(value) = object.get(key) else {
+                continue;
+            };
+            saw_declaration = true;
+            let Some(values) = relation_values(value) else {
+                malformed_declaration = true;
+                continue;
+            };
+            candidates.extend(values);
+        }
+    };
+    inspect(node);
+    for key in ["verification", "efficiency", "execution"] {
+        if let Some(value) = node.get(key) {
+            inspect(value);
+        }
+    }
+    if !saw_declaration || malformed_declaration || candidates.len() != 1 {
+        (saw_declaration, None)
+    } else {
+        (true, candidates.into_iter().next())
+    }
+}
+
+fn relation_values(value: &Value) -> Option<Vec<String>> {
+    if let Some(id) = value.as_str() {
+        return (!id.trim().is_empty()).then(|| vec![id.to_owned()]);
+    }
+    if let Some(values) = value.as_array() {
+        let mut ids = Vec::with_capacity(values.len());
+        for value in values {
+            ids.push(value.as_str()?.to_owned());
+        }
+        return Some(ids);
+    }
+    value.as_object().and_then(|object| {
+        ["node_id", "target_node", "id"]
+            .into_iter()
+            .find_map(|key| object.get(key).and_then(Value::as_str))
+            .map(|id| vec![id.to_owned()])
+    })
+}
+
 /// Recompute the graph-level outcome whenever a terminal state is observed.
 /// Replacing the prior value is intentional: event eventual effects and late
 /// lifecycle facts may arrive after the first terminal write, and aggregation
 /// reads only source records so it cannot double-count a refresh.
 fn refresh_terminal_outcome(document: &mut FractalProject) {
+    // Reconcile every durable successful verifier, not just the verifier that
+    // triggered this write. This makes the lifecycle seam self-healing for
+    // records written by an older binary before verifier→implementation
+    // propagation existed.
+    reconcile_successful_verifications(document);
     let Some(execution) = document.execution.as_ref() else {
         return;
     };
@@ -1091,6 +1351,13 @@ pub(crate) fn transition(
         bail!("execution transition references unknown graph node `{node}`");
     }
     let now = timestamp();
+    let is_verifier_node = is_verification_graph_node(&document, node);
+    if action == "checkout" {
+        // This is the final TOCTOU authority. Scheduler/frontier filters are
+        // advisory; verify the gate ledger while the canonical project lock is
+        // held immediately before ownership is written.
+        crate::external_gates::enforce_checkout(workspace, &document, node, agent_id)?;
+    }
     let execution = document.execution.get_or_insert_with(|| ExecutionState {
         schema: "fractal.execution_state.v1".to_owned(),
         phase: "executing".to_owned(),
@@ -1209,18 +1476,22 @@ pub(crate) fn transition(
                 },
             );
             if let Some(record) = document.learning.nodes.get_mut(node) {
-                let is_verifier = record.node_type == "verification";
+                let existing_evidence = record
+                    .verification
+                    .as_ref()
+                    .map(|verification| verification.evidence_refs.clone())
+                    .unwrap_or_default();
                 record.finished_at = Some(now.clone());
-                record.outcome = Some(if is_verifier {
+                record.outcome = Some(if is_verifier_node {
                     crate::learning_data::NodeOutcome::VerifiedSuccess
                 } else {
                     crate::learning_data::NodeOutcome::UnverifiedSuccess
                 });
-                if is_verifier {
+                if is_verifier_node {
                     record.verification = Some(crate::learning_data::Verification {
                         kind: Some("automated".to_owned()),
                         passed: Some(true),
-                        evidence_refs: Vec::new(),
+                        evidence_refs: existing_evidence,
                         ..crate::learning_data::Verification::default()
                     });
                 }
@@ -1605,6 +1876,14 @@ fn validate(document: &FractalProject) -> Result<()> {
         crate::failure_graph::validate_unknown_fields(failure_graph)
             .context("failure graph unknown fields contain forbidden credentials")?;
     }
+    if let Some(ledger) = &document.external_gate_ledger {
+        crate::external_gates::validate_ledger(ledger)
+            .context("invalid fractal.external_gate_ledger.v1 document")?;
+        let encoded =
+            serde_json::to_value(ledger).context("encode fractal.external_gate_ledger.v1")?;
+        reject_secret_fields(&encoded)
+            .context("external gate ledger contains forbidden credential-shaped fields")?;
+    }
     if let Some(catalog) = document.extra.get("catalog") {
         let schema = catalog.get("schema").and_then(Value::as_str).unwrap_or("");
         if schema == project_catalog::CATALOG_SCHEMA {
@@ -1669,6 +1948,7 @@ fn merge_learning(
     current: &crate::learning_data::LearningData,
     graph: &Value,
     now: &str,
+    same_graph: bool,
 ) -> crate::learning_data::LearningData {
     let mut merged = learning_from_graph(graph, now);
     for (id, record) in &mut merged.nodes {
@@ -1679,7 +1959,11 @@ fn merge_learning(
         }
     }
     merged.graph_edits = current.graph_edits.clone();
-    merged.outcome = current.outcome.clone();
+    // Graph outcomes summarize one immutable graph. Carrying a terminal
+    // parent's result into an evolved child makes a nonterminal graph appear
+    // complete. A same-graph rewrite may retain it; a changed graph starts
+    // without an outcome and is recomputed only after terminal assignments.
+    merged.outcome = same_graph.then(|| current.outcome.clone()).flatten();
     merged.extra = current.extra.clone();
     merged
 }
@@ -2919,6 +3203,394 @@ mod tests {
         );
         assert_eq!(document.graph["nodes"][1]["future_child_field"], json!(7));
         assert_eq!(document.learning.nodes["repair"].depends_on, vec!["build"]);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn evolved_nonterminal_child_discards_parent_graph_outcome() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut parent = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_terminal_parent",
+            "nodes": [
+                {"id": "build", "capability": "code.generate", "instruction": "Build"},
+                {"id": "verify.build", "capability": "project.tests.execute", "instruction": "Verify", "verifies": ["build"]}
+            ],
+            "edges": [{"from": "build", "to": "verify.build", "condition": "success"}]
+        });
+        parent["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&parent)?);
+        persist(&workspace, &parent, "Terminal parent")?;
+        transition(&workspace, "build", "checkout", "worker", "Worker")?;
+        transition(&workspace, "build", "complete", "worker", "Worker")?;
+        transition(&workspace, "verify.build", "checkout", "worker", "Worker")?;
+        transition(&workspace, "verify.build", "complete", "worker", "Worker")?;
+        let parent_document = load(&workspace)?;
+        assert_eq!(
+            parent_document
+                .learning
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.final_verified_success),
+            Some(true)
+        );
+
+        let mut child = parent.clone();
+        child["parent_graph"] = parent["graph_hash"].clone();
+        child["nodes"]
+            .as_array_mut()
+            .expect("parent nodes")
+            .push(json!({
+                "id": "repair",
+                "capability": "code.generate",
+                "instruction": "Repair"
+            }));
+        child["edges"]
+            .as_array_mut()
+            .expect("parent edges")
+            .push(json!({"from": "verify.build", "to": "repair", "condition": "success"}));
+        child
+            .as_object_mut()
+            .expect("child object")
+            .remove("graph_hash");
+        child["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&child)?);
+        persist_evolved(&workspace, &child)?;
+
+        let evolved = load(&workspace)?;
+        assert!(
+            evolved.learning.outcome.is_none(),
+            "an evolved graph with an unassigned repair node must not retain the parent's terminal outcome"
+        );
+        assert_eq!(
+            evolved.learning.nodes["verify.build"].outcome,
+            Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+        );
+        assert!(evolved.learning.nodes["repair"].outcome.is_none());
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn successful_verification_propagates_to_one_explicit_target() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_pair",
+            "nodes": [
+                {"id": "build", "capability": "code.generate", "instruction": "Build"},
+                {"id": "verify.build", "capability": "project.tests.execute", "instruction": "Verify", "verifies": ["build"]}
+            ],
+            "edges": [{"from": "build", "to": "verify.build", "condition": "success"}]
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph)?);
+        persist(&workspace, &graph, "Pair")?;
+        transition(&workspace, "build", "checkout", "worker", "Worker")?;
+        transition(&workspace, "build", "complete", "worker", "Worker")?;
+        transition(&workspace, "verify.build", "checkout", "worker", "Worker")?;
+        transition(&workspace, "verify.build", "complete", "worker", "Worker")?;
+
+        let document = load(&workspace)?;
+        let build = &document.learning.nodes["build"];
+        assert_eq!(
+            build.outcome,
+            Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+        );
+        assert_eq!(
+            build
+                .verification
+                .as_ref()
+                .and_then(|verification| verification.passed),
+            Some(true)
+        );
+        assert_eq!(
+            build
+                .verification
+                .as_ref()
+                .and_then(|verification| verification.kind.as_deref()),
+            Some("automated")
+        );
+        assert_eq!(
+            document.learning.nodes["verify.build"].outcome,
+            Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+        );
+        assert_eq!(
+            document
+                .learning
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.final_verified_success),
+            Some(true)
+        );
+        assert_eq!(
+            document
+                .learning
+                .outcome
+                .as_ref()
+                .map(|outcome| outcome.verification_coverage_denominator),
+            Some(2)
+        );
+        assert_eq!(
+            document
+                .learning
+                .outcome
+                .as_ref()
+                .unwrap()
+                .verification_coverage,
+            1.0
+        );
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn successful_verification_preserves_human_and_superseded_target_outcomes() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_preserve_target_outcome",
+            "nodes": [
+                {"id": "build", "capability": "code.generate", "instruction": "Build"},
+                {"id": "verify.build", "capability": "project.tests.execute", "instruction": "Verify", "verifies": ["build"]}
+            ],
+            "edges": [{"from": "build", "to": "verify.build", "condition": "success"}]
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph)?);
+        persist(&workspace, &graph, "Preserve target")?;
+        transition(&workspace, "build", "checkout", "worker", "Worker")?;
+        record_human_intervention(&workspace, "build", Some("human acceptance"))?;
+        finish_node(
+            &workspace,
+            "build",
+            "worker",
+            crate::learning_data::NodeOutcome::HumanCompleted,
+        )?;
+        transition(&workspace, "verify.build", "checkout", "worker", "Worker")?;
+        transition(&workspace, "verify.build", "complete", "worker", "Worker")?;
+        let document = load(&workspace)?;
+        assert_eq!(
+            document.learning.nodes["build"].outcome,
+            Some(crate::learning_data::NodeOutcome::HumanCompleted)
+        );
+        assert_eq!(
+            document.learning.nodes["build"]
+                .verification
+                .as_ref()
+                .and_then(|verification| verification.passed),
+            Some(true)
+        );
+        fs::remove_dir_all(&workspace)?;
+
+        // Repeat the verifier flow with a target explicitly marked
+        // superseded. Successful verification should attach evidence while
+        // preserving that lifecycle outcome too.
+        let superseded_workspace = temp_workspace();
+        fs::create_dir_all(&superseded_workspace)?;
+        persist(&superseded_workspace, &graph, "Preserve superseded target")?;
+        transition(
+            &superseded_workspace,
+            "build",
+            "checkout",
+            "worker",
+            "Worker",
+        )?;
+        finish_node(
+            &superseded_workspace,
+            "build",
+            "worker",
+            crate::learning_data::NodeOutcome::Superseded,
+        )?;
+        transition(
+            &superseded_workspace,
+            "verify.build",
+            "checkout",
+            "worker",
+            "Worker",
+        )?;
+        transition(
+            &superseded_workspace,
+            "verify.build",
+            "complete",
+            "worker",
+            "Worker",
+        )?;
+        let superseded_document = load(&superseded_workspace)?;
+        assert_eq!(
+            superseded_document.learning.nodes["build"].outcome,
+            Some(crate::learning_data::NodeOutcome::Superseded)
+        );
+        assert_eq!(
+            superseded_document.learning.nodes["build"]
+                .verification
+                .as_ref()
+                .and_then(|verification| verification.passed),
+            Some(true)
+        );
+        fs::remove_dir_all(superseded_workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn verification_target_resolution_fails_closed_when_missing_or_ambiguous() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_pair_fail_closed",
+            "nodes": [
+                {"id": "build-a", "capability": "code.generate", "instruction": "Build A"},
+                {"id": "build-b", "capability": "code.generate", "instruction": "Build B"},
+                {"id": "build-c", "capability": "code.generate", "instruction": "Build C"},
+                {"id": "verify-ambiguous", "capability": "project.tests.execute", "instruction": "Verify A or B"},
+                {"id": "verify-missing", "capability": "project.tests.execute", "instruction": "Verify without target"}
+            ],
+            "edges": [
+                {"from": "build-a", "to": "verify-ambiguous", "condition": "success"},
+                {"from": "build-b", "to": "verify-ambiguous", "condition": "success"}
+            ]
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph)?);
+        persist(&workspace, &graph, "Fail closed")?;
+        for node in ["build-a", "build-b"] {
+            transition(&workspace, node, "checkout", "worker", "Worker")?;
+            transition(&workspace, node, "complete", "worker", "Worker")?;
+        }
+        transition(
+            &workspace,
+            "verify-ambiguous",
+            "checkout",
+            "worker",
+            "Worker",
+        )?;
+        transition(
+            &workspace,
+            "verify-ambiguous",
+            "complete",
+            "worker",
+            "Worker",
+        )?;
+        transition(&workspace, "verify-missing", "checkout", "worker", "Worker")?;
+        transition(&workspace, "verify-missing", "complete", "worker", "Worker")?;
+
+        let document = load(&workspace)?;
+        for node in ["build-a", "build-b", "build-c"] {
+            assert_ne!(
+                document.learning.nodes[node].outcome,
+                Some(crate::learning_data::NodeOutcome::VerifiedSuccess),
+                "{node} must not be guessed as an ambiguous/missing verifier target"
+            );
+        }
+        assert_eq!(
+            document.learning.nodes["verify-ambiguous"].outcome,
+            Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+        );
+        assert_eq!(
+            document.learning.nodes["verify-missing"].outcome,
+            Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+        );
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn historical_successful_verifier_is_reconciled_on_next_refresh() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_historical_pair",
+            "nodes": [
+                {"id": "build", "capability": "code.generate", "instruction": "Build"},
+                {"id": "verify.build", "capability": "project.tests.execute", "instruction": "Verify"}
+            ],
+            "edges": [{"from": "build", "to": "verify.build", "condition": "success"}]
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph)?);
+        persist(&workspace, &graph, "Historical")?;
+        transition(&workspace, "build", "checkout", "worker", "Worker")?;
+        transition(&workspace, "build", "complete", "worker", "Worker")?;
+        transition(&workspace, "verify.build", "checkout", "worker", "Worker")?;
+        transition(&workspace, "verify.build", "complete", "worker", "Worker")?;
+
+        // Emulate a project written by the old binary: the verifier is
+        // terminal, but its implementation target is still unverified.
+        let mut raw: Value = serde_json::from_slice(&fs::read(path(&workspace))?)?;
+        raw["learning"]["nodes"]["build"]["outcome"] = json!("unverified_success");
+        raw["learning"]["nodes"]["build"]
+            .as_object_mut()
+            .expect("build record")
+            .remove("verification");
+        fs::write(path(&workspace), serde_json::to_vec_pretty(&raw)?)?;
+        assert_eq!(
+            load(&workspace)?.learning.nodes["build"].outcome,
+            Some(crate::learning_data::NodeOutcome::UnverifiedSuccess)
+        );
+
+        set_execution_phase(&workspace, "completed")?;
+        let reconciled = load(&workspace)?;
+        assert_eq!(
+            reconciled.learning.nodes["build"].outcome,
+            Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+        );
+        assert_eq!(
+            reconciled.learning.nodes["build"]
+                .verification
+                .as_ref()
+                .and_then(|verification| verification.passed),
+            Some(true)
+        );
+        assert_eq!(
+            reconciled
+                .learning
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.final_verified_success),
+            Some(true)
+        );
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fully_paired_graph_aggregates_every_implementation_and_verifier() -> Result<()> {
+        const PAIRS: usize = 54;
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut nodes = Vec::with_capacity(PAIRS * 2);
+        let mut edges = Vec::with_capacity(PAIRS);
+        for index in 0..PAIRS {
+            let implementation = format!("implementation-{index}");
+            let verifier = format!("verification-{index}");
+            nodes.push(json!({"id": implementation, "capability": "code.generate", "instruction": "Implement"}));
+            nodes.push(json!({"id": verifier, "capability": "project.tests.execute", "instruction": "Verify"}));
+            edges.push(json!({"from": implementation, "to": verifier, "condition": "success"}));
+        }
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_fifty_four_pairs",
+            "nodes": nodes,
+            "edges": edges
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph)?);
+        persist(&workspace, &graph, "54 pairs")?;
+        for index in 0..PAIRS {
+            let implementation = format!("implementation-{index}");
+            let verifier = format!("verification-{index}");
+            transition(&workspace, &implementation, "checkout", "worker", "Worker")?;
+            transition(&workspace, &implementation, "complete", "worker", "Worker")?;
+            transition(&workspace, &verifier, "checkout", "worker", "Worker")?;
+            transition(&workspace, &verifier, "complete", "worker", "Worker")?;
+        }
+        let document = load(&workspace)?;
+        let outcome = document.learning.outcome.expect("terminal aggregate");
+        assert_eq!(
+            outcome.verification_coverage_denominator,
+            (PAIRS * 2) as u32
+        );
+        assert_eq!(outcome.verification_coverage, 1.0);
+        assert_eq!(outcome.final_verified_success, Some(true));
         fs::remove_dir_all(workspace)?;
         Ok(())
     }
