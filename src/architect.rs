@@ -363,12 +363,35 @@ fn recover_dead_unstarted_workers(
     assignments: Option<&serde_json::Map<String, Value>>,
     current_ms: u64,
 ) -> Result<()> {
+    recover_dead_unstarted_workers_with(
+        workspace,
+        team,
+        assignments,
+        current_ms,
+        |workspace, client, prompt| spawn_agent(workspace, client, prompt),
+    )
+}
+
+fn recover_dead_unstarted_workers_with<Spawn>(
+    workspace: &Path,
+    team: &mut TeamRecord,
+    assignments: Option<&serde_json::Map<String, Value>>,
+    current_ms: u64,
+    mut spawn_worker: Spawn,
+) -> Result<()>
+where
+    Spawn: FnMut(&Path, &str, &str) -> Result<u32>,
+{
     // Fresh teams store five worker PIDs in member order plus one leader PID.
     // Older partial-recovery records did not preserve that shape; leave them
     // to the checked-out recovery path instead of guessing PID ownership.
     if team.process_ids.len() != TEAM_SIZE {
         return Ok(());
     }
+    // A full PID vector is not sufficient evidence of a fresh Team-6 record:
+    // persisted partial records may still have missing members, clients, or
+    // tasks. Validate before any indexed access or worker spawn.
+    validate_team_launch_shape(team)?;
     let fallback = mixed_worker_roster(WORKERS_PER_TEAM);
     for index in 0..WORKERS_PER_TEAM {
         let Some(task) = team.tasks.get(index) else {
@@ -387,7 +410,7 @@ fn recover_dead_unstarted_workers(
         }
         let client = fallback.get(index).map(String::as_str).unwrap_or("codex");
         let prompt = worker_launch_prompt(workspace, team, index)?;
-        team.process_ids[index] = spawn_agent(workspace, client, &prompt)?;
+        team.process_ids[index] = spawn_worker(workspace, client, &prompt)?;
         if index < team.member_clients.len() {
             team.member_clients[index] = client.to_owned();
         }
@@ -1447,53 +1470,169 @@ fn measured_improvement_bps(workspace: &Path) -> i64 {
 }
 
 fn launch_team(workspace: &Path, team: &TeamRecord) -> Result<Vec<u32>> {
+    launch_team_with(
+        workspace,
+        team,
+        |workspace, client, prompt| spawn_agent(workspace, client, prompt),
+        |workspace, model, effort, prompt| spawn_codex(workspace, model, effort, prompt),
+    )
+}
+
+fn launch_team_with<SpawnWorker, SpawnLeader>(
+    workspace: &Path,
+    team: &TeamRecord,
+    mut spawn_worker: SpawnWorker,
+    mut spawn_leader: SpawnLeader,
+) -> Result<Vec<u32>>
+where
+    SpawnWorker: FnMut(&Path, &str, &str) -> Result<u32>,
+    SpawnLeader: FnMut(&Path, &str, &str, &str) -> Result<u32>,
+{
+    // Validate the complete assignment/client set before starting any worker.
+    // A malformed pod must fail closed rather than leaving workers running
+    // with no leader or falling back to a parent planner identity.
+    validate_team_launch_shape(team)?;
     let mut pids = Vec::with_capacity(TEAM_SIZE);
-    for (index, _assignment) in team.member_ids.iter().zip(&team.tasks).enumerate() {
-        let client = team
-            .member_clients
-            .get(index)
-            .map(String::as_str)
-            .unwrap_or("codex");
+    for index in 0..WORKERS_PER_TEAM {
+        let client = team.member_clients[index].as_str();
         let prompt = worker_launch_prompt(workspace, team, index)?;
-        pids.push(spawn_agent(workspace, client, &prompt)?);
+        pids.push(spawn_worker(workspace, client, &prompt)?);
     }
     let prompt = leader_launch_prompt(team)?;
-    pids.push(spawn_codex(workspace, LEADER_MODEL, "high", &prompt)?);
+    pids.push(spawn_leader(workspace, LEADER_MODEL, "high", &prompt)?);
     Ok(pids)
 }
 
 fn leader_launch_prompt(team: &TeamRecord) -> Result<String> {
-    let assignments: Vec<Value> = team
-        .tasks
-        .iter()
-        .zip(&team.member_ids)
-        .map(|(task, member)| {
-            json!({"member":member,"node_id":task.node_id,"title":task.title,"instruction":task.instruction})
+    validate_team_launch_shape(team)?;
+    let assignments: Vec<Value> = (0..WORKERS_PER_TEAM)
+        .map(|index| {
+            let task = &team.tasks[index];
+            let member = &team.member_ids[index];
+            let member_label = member_agent_label(member);
+            let checkout_command = member_checkout_command(task, member, &member_label);
+            json!({
+                "member": member,
+                "member_id": member,
+                "member_label": member_label,
+                "agent_id": member,
+                "agent_label": member_label,
+                "node_id": task.node_id,
+                "title": task.title,
+                "instruction": task.instruction,
+                "checkout_command": checkout_command,
+            })
         })
         .collect();
+    let checkout_commands = (0..WORKERS_PER_TEAM)
+        .map(|index| {
+            let task = &team.tasks[index];
+            let member = &team.member_ids[index];
+            member_checkout_command(task, member, &member_agent_label(member))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     Ok(format!(
-        "You are specialist squad leader {leader} for mission {mission:?}. Join Squad with this exact ID as role manager. Immediately assign exactly one of these five graph tasks to each named member using direct squad send messages; include the exact node ID and checkout/verification acceptance criteria. Do not create a redundant structured-task acknowledgement gate: atomic Fractal checkout is authoritative ownership. Some assignments may include an in-team dependency gate. For those, instruct the member to wait and retry checkout of that exact assigned node until its listed dependencies complete; never release or substitute another node solely for an incomplete dependency. An ownership conflict is different: stop that assignment and report the conflict. Track readiness and results, inspect every result, request bounded rework on failure, and report the team outcome to master-architect. Keep receiving until all five graph nodes are complete or explicitly released. Do not implement member tasks yourself or allow work before successful checkout. Assignments: {assignments}",
+        "You are specialist squad leader {leader} for mission {mission:?}. Join Squad with this exact ID as role manager. Immediately assign exactly one of these five graph tasks to each named member using direct squad send messages; include the exact node ID, the immutable checkout_command, and checkout/verification acceptance criteria. Send each member's checkout_command verbatim; its --agent-id and --agent-label values are that member's canonical identity and must never be replaced with your own identity or with FRACTAL_AGENT_ID/FRACTAL_AGENT_LABEL from the parent planner environment. A member must run only its own command after receiving the assignment. Do not create a redundant structured-task acknowledgement gate: atomic Fractal checkout is authoritative ownership. Some assignments may include an in-team dependency gate. For those, instruct the member to wait and retry checkout of that exact assigned node until its listed dependencies complete; never release or substitute another node solely for an incomplete dependency. An ownership conflict is different: stop that assignment and report the conflict. Track readiness and results, inspect every result, request bounded rework on failure, and report the team outcome to master-architect. Keep receiving until all five graph nodes are complete or explicitly released. Do not implement member tasks yourself or allow work before successful checkout. Canonical checkout commands (copy verbatim, one per member):\n{checkout_commands}\nAssignments: {assignments}",
         leader = team.leader_id,
         mission = team.mission,
+        checkout_commands = checkout_commands,
         assignments = serde_json::to_string(&assignments)?
     ))
 }
 
-fn worker_launch_prompt(workspace: &Path, team: &TeamRecord, index: usize) -> Result<String> {
+fn worker_launch_prompt(_workspace: &Path, team: &TeamRecord, index: usize) -> Result<String> {
     let member = team
         .member_ids
         .get(index)
         .context("team member is missing")?;
     let task = team.tasks.get(index).context("team task is missing")?;
+    let member_label = member_agent_label(member);
+    let checkout_command = member_checkout_command(task, member, &member_label);
     Ok(format!(
-        "You are specialist team member {member} in team {team_id}. Your master-authorized leader assignment is node {node_id} ({title:?}) from {leader}. Join Squad with this exact ID as role worker, send {leader} a ready message, and receive its assignment message. Do not add a second acknowledgement gate: the leader message plus atomic Fractal checkout is the ownership record. If receive times out, retry instead of exiting. Do not modify source or run task work before successful checkout. Atomically checkout exactly {node_id} in {repo} with agent ID and label {member}, implementing only this instruction: {instruction:?}. If the instruction names an in-team dependency and checkout reports it incomplete, wait and retry checkout of this exact node; never release or claim another node solely because that dependency is incomplete. If checkout reports an ownership conflict, stop and report the conflict to {leader}. While working, send a direct WORKER_HEARTBEAT for {node_id} to {leader} at least once every 60 seconds and after every long-running verification command. Verify it, complete or release it with evidence using the same identity, report the result to {leader}, then wait for rework or closure. Never claim another graph node.",
+        "You are specialist team member {member} in team {team_id}. Your master-authorized leader assignment is node {node_id} ({title:?}) from {leader}. Join Squad with this exact ID as role worker, send {leader} a ready message, and receive its assignment message. Do not add a second acknowledgement gate: the leader message plus atomic Fractal checkout is the ownership record. If receive times out, retry instead of exiting. Do not modify source or run task work before successful checkout. Atomically run this exact checkout command (including this member's ID and stable label), never a command reconstructed from FRACTAL_AGENT_ID or FRACTAL_AGENT_LABEL: {checkout_command}. Implement only this instruction: {instruction:?}. If the instruction names an in-team dependency and checkout reports it incomplete, wait and retry checkout of this exact node; never release or claim another node solely because that dependency is incomplete. If checkout reports an ownership conflict, stop and report the conflict to {leader}. While working, send a direct WORKER_HEARTBEAT for {node_id} to {leader} at least once every 60 seconds and after every long-running verification command. Verify it, complete or release it with evidence using the same identity, report the result to {leader}, then wait for rework or closure. Never claim another graph node.",
         team_id = team.team_id,
         leader = team.leader_id,
         node_id = task.node_id,
         title = task.title,
-        repo = workspace.display(),
-        instruction = task.instruction
+        instruction = task.instruction,
+        checkout_command = checkout_command,
     ))
+}
+
+/// The worker identity used by a Team-6 assignment is owned by the architect,
+/// not inherited from the planner process environment. Keep this label stable
+/// across launches and recovery so Squad and graph records refer to the same
+/// worker even when the parent planner has a different FRACTAL_AGENT_ID.
+fn member_agent_label(member: &str) -> String {
+    format!("Fractal · worker · {member}")
+}
+
+/// Build the only checkout command a leader may send for a task. IDs and labels
+/// are embedded as explicit values so a worker cannot accidentally fall back to
+/// the top-level planner's FRACTAL_AGENT_ID/FRACTAL_AGENT_LABEL.
+fn member_checkout_command(task: &MissionTask, member: &str, member_label: &str) -> String {
+    format!(
+        "fractal node {} --checkout --repo \"$PWD\" --agent-id {} --agent-label {}",
+        posix_shell_single_quote(&task.node_id),
+        posix_shell_single_quote(member),
+        posix_shell_single_quote(member_label),
+    )
+}
+
+/// Quote an arbitrary value as one POSIX shell argument. A single-quoted
+/// argument treats `$`, backticks, whitespace, and control characters as
+/// literal data; the only character requiring a boundary escape is `'`.
+fn posix_shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// Leader prompts are the authority for all five assignments. Refuse to emit
+/// a partial prompt if identity/task cardinality is malformed: a partial
+/// mapping could otherwise leave one task without a canonical checkout
+/// identity and make the worker inherit the planner's environment.
+fn validate_team_launch_shape(team: &TeamRecord) -> Result<()> {
+    if team.tasks.len() != WORKERS_PER_TEAM || team.member_ids.len() != WORKERS_PER_TEAM {
+        bail!("Team-6 requires exactly {WORKERS_PER_TEAM} tasks and unique members");
+    }
+    if team.member_clients.len() != WORKERS_PER_TEAM {
+        bail!("Team-6 requires exactly {WORKERS_PER_TEAM} worker clients");
+    }
+    let mut members = BTreeSet::new();
+    for member in &team.member_ids {
+        if member.trim().is_empty() {
+            bail!("Team-6 cannot assign an empty member identity");
+        }
+        if !members.insert(member) {
+            bail!("Team-6 cannot assign duplicate member {member:?}");
+        }
+        if member.contains('\0') {
+            bail!("Team-6 member identity cannot contain NUL");
+        }
+    }
+    let mut nodes = BTreeSet::new();
+    for task in &team.tasks {
+        if task.node_id.trim().is_empty() {
+            bail!("Team-6 cannot assign an empty graph node ID");
+        }
+        if !nodes.insert(&task.node_id) {
+            bail!(
+                "Team-6 cannot assign duplicate graph node {:?}",
+                task.node_id
+            );
+        }
+        if task.node_id.contains('\0') {
+            bail!("Team-6 graph node ID cannot contain NUL");
+        }
+    }
+    if team
+        .member_clients
+        .iter()
+        .any(|client| client.trim().is_empty())
+    {
+        bail!("Team-6 cannot launch with an empty worker client");
+    }
+    Ok(())
 }
 
 fn queue_team_mission(workspace: &Path, state: &ArchitectState) -> Result<()> {
@@ -2060,6 +2199,170 @@ mod tests {
             assert!(
                 prompt.contains("Do not modify source")
                     || prompt.contains("Do not implement member tasks")
+            );
+        }
+    }
+
+    #[test]
+    fn leader_prompt_pins_every_member_checkout_identity_independent_of_master_env() {
+        let previous_id = std::env::var_os("FRACTAL_AGENT_ID");
+        let previous_label = std::env::var_os("FRACTAL_AGENT_LABEL");
+        std::env::set_var("FRACTAL_AGENT_ID", "codex/sol-planner");
+        std::env::set_var("FRACTAL_AGENT_LABEL", "Codex Sol Planner");
+
+        let team = recovery_team();
+        let prompt = leader_launch_prompt(&team).unwrap();
+        let commands = (0..WORKERS_PER_TEAM)
+            .map(|index| {
+                let task = &team.tasks[index];
+                let member = &team.member_ids[index];
+                member_checkout_command(task, member, &member_agent_label(member))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(commands.len(), WORKERS_PER_TEAM);
+        for (index, command) in commands.iter().enumerate() {
+            let member = &team.member_ids[index];
+            let label = member_agent_label(member);
+            assert!(
+                prompt.contains(command),
+                "missing command for {member}: {command}"
+            );
+            assert_eq!(prompt.matches(command).count(), 1);
+            assert!(prompt.contains(&format!("\"member_id\":\"{member}\"")));
+            assert!(prompt.contains(&format!("\"member_label\":\"{label}\"")));
+            assert!(!command.contains("codex/sol-planner"));
+            assert!(!command.contains("Codex Sol Planner"));
+
+            let worker = worker_launch_prompt(Path::new("/repo"), &team, index).unwrap();
+            assert_eq!(worker.matches(command).count(), 1);
+        }
+        assert!(prompt.matches("--agent-id").count() >= WORKERS_PER_TEAM);
+        assert!(prompt.matches("--agent-label").count() >= WORKERS_PER_TEAM);
+        assert!(!prompt.contains("codex/sol-planner"));
+        assert!(!prompt.contains("Codex Sol Planner"));
+
+        match previous_id {
+            Some(value) => std::env::set_var("FRACTAL_AGENT_ID", value),
+            None => std::env::remove_var("FRACTAL_AGENT_ID"),
+        }
+        match previous_label {
+            Some(value) => std::env::set_var("FRACTAL_AGENT_LABEL", value),
+            None => std::env::remove_var("FRACTAL_AGENT_LABEL"),
+        }
+    }
+
+    #[test]
+    fn leader_prompt_fails_closed_for_duplicate_or_partial_member_identity() {
+        let mut team = recovery_team();
+        team.member_ids[1] = team.member_ids[0].clone();
+        assert!(leader_launch_prompt(&team).is_err());
+
+        let mut team = recovery_team();
+        team.member_ids.pop();
+        assert!(leader_launch_prompt(&team).is_err());
+    }
+
+    #[test]
+    fn checkout_command_single_quotes_adversarial_identity_data() {
+        let task = MissionTask {
+            node_id: "$HOME `echo nope`\tline\nnext'".to_owned(),
+            title: "adversarial".to_owned(),
+            capability: "code.generate".to_owned(),
+            instruction: "work".to_owned(),
+        };
+        let member = "worker $() `tick`\tline\nnext'";
+        let label = "label with spaces\tand\n'quote";
+        let command = member_checkout_command(&task, member, label);
+
+        assert!(command.contains(&format!("--agent-id {}", posix_shell_single_quote(member))));
+        assert!(command.contains(&format!(
+            "--agent-label {}",
+            posix_shell_single_quote(label)
+        )));
+        assert!(command.contains(&format!(
+            "fractal node {}",
+            posix_shell_single_quote(&task.node_id)
+        )));
+        assert!(!command.contains("--agent-id \"") && !command.contains("--agent-label \""));
+    }
+
+    #[test]
+    fn launch_team_rejects_malformed_shape_before_any_spawn() {
+        for malformed in ["clients", "tasks", "members", "duplicate-node"] {
+            let mut team = recovery_team();
+            match malformed {
+                "clients" => {
+                    team.member_clients.pop();
+                }
+                "tasks" => {
+                    team.tasks.pop();
+                }
+                "members" => {
+                    team.member_ids.pop();
+                }
+                "duplicate-node" => {
+                    team.tasks[1].node_id = team.tasks[0].node_id.clone();
+                }
+                _ => unreachable!(),
+            }
+            let mut worker_spawns = 0;
+            let mut leader_spawns = 0;
+            let result = launch_team_with(
+                Path::new("/repo"),
+                &team,
+                |_, _, _| {
+                    worker_spawns += 1;
+                    Ok(1)
+                },
+                |_, _, _, _| {
+                    leader_spawns += 1;
+                    Ok(2)
+                },
+            );
+            assert!(
+                result.is_err(),
+                "malformed {malformed} shape unexpectedly launched"
+            );
+            assert_eq!(worker_spawns, 0, "malformed {malformed} spawned workers");
+            assert_eq!(leader_spawns, 0, "malformed {malformed} spawned leader");
+        }
+    }
+
+    #[test]
+    fn unstarted_worker_recovery_rejects_partial_team_before_any_spawn() {
+        for malformed in ["clients", "tasks", "members"] {
+            let mut team = recovery_team();
+            match malformed {
+                "clients" => {
+                    team.member_clients.pop();
+                }
+                "tasks" => {
+                    team.tasks.pop();
+                }
+                "members" => {
+                    team.member_ids.pop();
+                }
+                _ => unreachable!(),
+            }
+            let mut worker_spawns = 0;
+            let result = recover_dead_unstarted_workers_with(
+                Path::new("/repo"),
+                &mut team,
+                None,
+                500_000,
+                |_, _, _| {
+                    worker_spawns += 1;
+                    Ok(1)
+                },
+            );
+            assert!(
+                result.is_err(),
+                "partial {malformed} record unexpectedly recovered"
+            );
+            assert_eq!(
+                worker_spawns, 0,
+                "partial {malformed} record spawned a worker"
             );
         }
     }
