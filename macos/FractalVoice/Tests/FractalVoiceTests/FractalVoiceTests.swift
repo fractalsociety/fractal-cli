@@ -166,6 +166,33 @@ final class FractalVoiceTests: XCTestCase {
         XCTAssertTrue(path.contains("/opt/homebrew/bin"))
     }
 
+    func testVoiceBuildsUseNativeTextIngestWithoutBridgeRouting() throws {
+        let arguments = BuildCoordinator.nativeTextIngestArguments(projectName: "Hello World")
+        XCTAssertEqual(
+            Array(arguments.prefix(10)),
+            [
+                "ingest",
+                "--source", "fractal-mac-app",
+                "--format", "text",
+                "--stdin",
+                "--managed-project",
+                "--project-name", "Hello World",
+            ]
+        )
+        XCTAssertFalse(arguments.contains("bridge"))
+
+        let sourceRoot = packageRoot.appendingPathComponent("Sources/FractalVoice")
+        for filename in ["OnboardingView.swift", "SetupReadiness.swift", "BuildCoordinator.swift"] {
+            let source = try String(
+                contentsOf: sourceRoot.appendingPathComponent(filename),
+                encoding: .utf8
+            )
+            XCTAssertFalse(source.contains("fractal bridge"), "(filename) exposes the retired bridge")
+            XCTAssertFalse(source.contains("LocalBridge"), "(filename) routes through LocalBridge")
+            XCTAssertFalse(source.contains("pairing token"), "(filename) asks for a bridge token")
+        }
+    }
+
     func testProjectLocationDefaultsAndPersistsAChosenFolder() throws {
         let suite = "FractalVoiceTests.ProjectsDirectory.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))

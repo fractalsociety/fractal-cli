@@ -320,7 +320,6 @@ final class BuildCoordinator: ObservableObject {
     private var outputLineBuffer = ""
     private var hud: RecordingHUD?
     private var stopCommand: Process?
-    private var bridgeBuildTask: Task<Void, Never>?
     private var stopRequested = false
     private var restartRequested = false
     private var activeWorkspace: URL?
@@ -347,7 +346,7 @@ final class BuildCoordinator: ObservableObject {
     let logURL = AppRuntime.logURL
 
     var hasActiveBuild: Bool {
-        process?.isRunning == true || bridgeBuildTask != nil
+        process?.isRunning == true
     }
 
     var canAcceptExternalBuild: Bool {
@@ -602,8 +601,6 @@ final class BuildCoordinator: ObservableObject {
 
     func shutdown() {
         recordingTimeout?.cancel()
-        bridgeBuildTask?.cancel()
-        bridgeBuildTask = nil
         graniteServerBaseURL = nil
         if graniteServerProcess?.isRunning == true {
             graniteServerProcess?.terminate()
@@ -683,7 +680,7 @@ final class BuildCoordinator: ObservableObject {
                 beginDialogueRecording(purpose: .nameConfirmation)
                 return
             default:
-                if process != nil || bridgeBuildTask != nil {
+                if process != nil {
                     beginAmendmentRecording()
                     return
                 }
@@ -1089,13 +1086,6 @@ final class BuildCoordinator: ObservableObject {
     }
 
     func stopAllBuilds() {
-        #if APP_STORE
-        Task.detached(priority: .userInitiated) {
-            try? LocalBridge.stop(project: nil, all: true)
-        }
-        latestActivity = "Stop requested for all Fractal builds"
-        return
-        #else
         guard let executable = Self.fractalExecutable() else { return }
         let stop = Process()
         stop.executableURL = executable
@@ -1103,7 +1093,6 @@ final class BuildCoordinator: ObservableObject {
         stop.environment = Self.processEnvironment()
         try? stop.run()
         latestActivity = "Stop requested for all Fractal builds"
-        #endif
     }
 
     func stopCurrentBuild() {
@@ -1526,23 +1515,6 @@ final class BuildCoordinator: ObservableObject {
     private func submitAmendment(_ transcript: String) {
         state = .building
         presentBuildingStatus("Sending graph change to the lead planner…")
-        #if APP_STORE
-        Task { [weak self] in
-            do {
-                let result = try await Task.detached(priority: .userInitiated) {
-                    try LocalBridge.amend(transcript)
-                }.value
-                guard let self else { return }
-                let message = result.output
-                    .split(separator: "\n")
-                    .last
-                    .map(String.init) ?? "Branch request accepted"
-                self.setActivity(message)
-            } catch {
-                self?.setActivity("Branch request was not accepted: \(error.localizedDescription)")
-            }
-        }
-        #else
         guard let executable = Self.fractalExecutable() else {
             setActivity("Fractal CLI is missing")
             return
@@ -1578,7 +1550,6 @@ final class BuildCoordinator: ObservableObject {
                 }
             }
         }
-        #endif
     }
 
     private func amendmentFailed(_ error: Error) {
@@ -1728,6 +1699,23 @@ final class BuildCoordinator: ObservableObject {
         "Okay, I will call it “\(compact(name, limit: 80))”. Is that correct?"
     }
 
+    /// Native voice and external text requests share the stdin ingest boundary.
+    /// Keeping the argv construction in one pure helper makes it impossible for
+    /// an App Store build to silently fall back to the retired loopback bridge.
+    nonisolated static func nativeTextIngestArguments(
+        projectName: String,
+        efficiency: EfficiencyControls = .default
+    ) -> [String] {
+        [
+            "ingest",
+            "--source", "fractal-mac-app",
+            "--format", "text",
+            "--stdin",
+            "--managed-project",
+            "--project-name", projectName,
+        ] + Self.efficiencyCLIArguments(efficiency)
+    }
+
     private func startBuild(
         transcript: String,
         projectName: String,
@@ -1748,19 +1736,6 @@ final class BuildCoordinator: ObservableObject {
             recordingFailed(VoiceAppError.noSpeech)
             return
         }
-        #if APP_STORE
-        startBridgeBuild(transcript: transcript, projectName: projectName)
-        if vocabularyResult?.appliedCorrections.isEmpty ?? true {
-            setActivity("Heard: “\(Self.compact(transcript, limit: 180))”")
-        } else {
-            appendLog(
-                "[voice] applied \(vocabularyResult?.appliedCorrections.count ?? 0) "
-                + "local vocabulary correction(s)\n"
-            )
-            setActivity("Understood: “\(Self.compact(transcript, limit: 180))”")
-        }
-        return
-        #else
         guard let executable = Self.fractalExecutable() else {
             recordingFailed(VoiceAppError.cliMissing)
             return
@@ -1770,14 +1745,10 @@ final class BuildCoordinator: ObservableObject {
         let stdin = Pipe()
         let combinedOutput = Pipe()
         task.executableURL = executable
-        task.arguments = [
-            "ingest",
-            "--source", "fractal-mac-app",
-            "--format", "text",
-            "--stdin",
-            "--managed-project",
-            "--project-name", projectName,
-        ] + Self.efficiencyCLIArguments(efficiencyControls)
+        task.arguments = Self.nativeTextIngestArguments(
+            projectName: projectName,
+            efficiency: efficiencyControls
+        )
         var environment = Self.processEnvironment()
         if isExternalBuild {
             environment["FRACTAL_EXTERNAL_TEXT"] = "1"
@@ -1821,32 +1792,7 @@ final class BuildCoordinator: ObservableObject {
         } catch {
             recordingFailed(error)
         }
-        #endif
     }
-
-    #if APP_STORE
-    private func startBridgeBuild(transcript: String, projectName: String) {
-        outputBuffer = ""
-        outputLineBuffer = ""
-        activeWorkspace = nil
-        bridgeBuildTask?.cancel()
-        bridgeBuildTask = Task { [weak self] in
-            do {
-                let result = try await Task.detached(priority: .userInitiated) {
-                    try LocalBridge.build(request: transcript, projectName: projectName)
-                }.value
-                guard !Task.isCancelled, let self else { return }
-                self.consume(result.output)
-                self.finished(exitCode: result.exitCode)
-            } catch is CancellationError {
-                return
-            } catch {
-                guard !Task.isCancelled else { return }
-                self?.recordingFailed(error)
-            }
-        }
-    }
-    #endif
 
     private func recordingFailed(_ error: Error) {
         recordingTimeout?.cancel()
@@ -2004,12 +1950,6 @@ final class BuildCoordinator: ObservableObject {
             transcribing.terminate()
             return
         }
-        #if APP_STORE
-        Task.detached(priority: .userInitiated) {
-            try? LocalBridge.stop(project: nil, all: false)
-        }
-        return
-        #else
         guard let running = process else {
             return
         }
@@ -2046,7 +1986,6 @@ final class BuildCoordinator: ObservableObject {
         } catch {
             running.terminate()
         }
-        #endif
     }
 
     private func finishRequestedStopBeforeBuild() {
@@ -2084,7 +2023,6 @@ final class BuildCoordinator: ObservableObject {
     private func finished(exitCode: Int32) {
         process = nil
         stopCommand = nil
-        bridgeBuildTask = nil
         if stopRequested {
             let restart = restartRequested
             stopRequested = false

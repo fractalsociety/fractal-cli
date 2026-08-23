@@ -441,7 +441,7 @@ never interpolated into a command line.
 ### ChatGPT Desktop and other external apps
 
 Sandboxed desktop apps can start the same managed build without using Fractal's
-interactive trust flow or the deprecated local bridge:
+interactive trust flow or any local bridge:
 
 ```sh
 fractal handoff --name 'Hello World' <<'FRACTAL_REQUEST'

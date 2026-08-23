@@ -2,7 +2,6 @@ mod amendments;
 mod architect;
 mod auth;
 mod board;
-mod bridge;
 mod chain;
 mod checkpoint;
 mod cli;
@@ -68,9 +67,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sha2::{Digest, Sha256};
 
-use crate::cli::{
-    AmendmentCommand, BridgeCommand, Cli, Command, GateCommand, GraphCommand, HarnessCommand,
-};
+use crate::cli::{AmendmentCommand, Cli, Command, GateCommand, GraphCommand, HarnessCommand};
 use crate::work_builder::IntentClassification;
 
 fn main() -> ExitCode {
@@ -307,14 +304,10 @@ fn run(cli: Cli) -> Result<()> {
         (None, Some(Command::ShareX(args))) => social::share_x(&args),
         (None, Some(Command::ConnectX(args))) => social::connect_x(&args),
         (None, Some(Command::Visibility(args))) => visibility::run(&args),
-        (None, Some(Command::Bridge(args))) => match args.command {
-            BridgeCommand::Serve { port } => {
-                bridge::serve(port, fractalwork.as_deref(), coordinate)
-            }
-            BridgeCommand::Install { port } => bridge::install(port),
-            BridgeCommand::Token => bridge::print_token(),
-            BridgeCommand::Status { port } => bridge::status(port),
-        },
+        (None, Some(Command::Bridge(_args))) => {
+            println!("{}", crate::cli::BRIDGE_MIGRATION_MESSAGE);
+            Ok(())
+        }
         (None, Some(Command::Version)) => {
             println!("fractal {}", env!("CARGO_PKG_VERSION"));
             Ok(())

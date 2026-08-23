@@ -110,7 +110,9 @@ pub(crate) enum Command {
     ConnectX(ConnectXArgs),
     /// Preview or confirm a project and GitHub repository visibility change.
     Visibility(VisibilityArgs),
-    /// Deprecated compatibility bridge; external desktop apps should use `handoff`.
+    /// Deprecated compatibility parser. Use `handoff`; this command is hidden
+    /// and never starts the removed loopback bridge.
+    #[command(hide = true)]
     Bridge(BridgeArgs),
     /// Print the Fractal CLI version.
     Version,
@@ -403,24 +405,35 @@ pub(crate) struct VisibilityArgs {
 #[derive(Debug, clap::Args)]
 pub(crate) struct BridgeArgs {
     #[command(subcommand)]
-    pub(crate) command: BridgeCommand,
+    pub(crate) command: Option<BridgeCommand>,
 }
+
+/// Stable migration output for scripts that still invoke the removed bridge
+/// command. Keep the parser above so old invocations receive this message
+/// instead of an opaque unknown-command error, but never dispatch a bridge
+/// server, launch agent, or pairing-token operation.
+pub(crate) const BRIDGE_MIGRATION_MESSAGE: &str =
+    "`fractal bridge` is no longer available. Use `fractal handoff --name 'PROJECT NAME'` and pass the build request on stdin.";
 
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub(crate) enum BridgeCommand {
     /// Run the loopback-only bridge in the foreground.
+    #[command(hide = true)]
     Serve {
         #[arg(long, default_value_t = 18_372)]
         port: u16,
     },
     /// Install and start the per-user launch agent.
+    #[command(hide = true)]
     Install {
         #[arg(long, default_value_t = 18_372)]
         port: u16,
     },
     /// Print the pairing token for entry into Fractal Voice.
+    #[command(hide = true)]
     Token,
     /// Verify that the local bridge is reachable.
+    #[command(hide = true)]
     Status {
         #[arg(long, default_value_t = 18_372)]
         port: u16,
@@ -1387,6 +1400,7 @@ pub(crate) struct ArchitectArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn parses_bare_request() {
@@ -2177,6 +2191,27 @@ mod tests {
                 ref project_name
             })) if project_name == "Hello World"
         ));
+    }
+
+    #[test]
+    fn legacy_bridge_is_parseable_only_for_deterministic_migration() {
+        let bare = Cli::try_parse_from(["fractal", "bridge"]).unwrap();
+        assert!(matches!(bare.command, Some(Command::Bridge(_))));
+        for command in ["serve", "install", "token", "status"] {
+            let cli = Cli::try_parse_from(["fractal", "bridge", command]).unwrap();
+            assert!(matches!(cli.command, Some(Command::Bridge(_))));
+        }
+
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("bridge"));
+        let bridge_help = Cli::try_parse_from(["fractal", "bridge", "--help"])
+            .expect_err("bridge help exits through clap");
+        let bridge_help = bridge_help.to_string();
+        assert!(bridge_help.contains("Deprecated compatibility parser"));
+        assert!(!bridge_help.contains("serve"));
+        assert!(!bridge_help.contains("install"));
+        assert!(!bridge_help.contains("token"));
+        assert!(BRIDGE_MIGRATION_MESSAGE.contains("fractal handoff"));
     }
 
     #[test]
