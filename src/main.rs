@@ -930,6 +930,7 @@ fn print_prd_graph_plan_preview(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_prd_graph_plan_applied(
     args: &crate::cli::GraphPlanPrdArgs,
     repo: &Path,

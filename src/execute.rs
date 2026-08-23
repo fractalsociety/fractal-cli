@@ -3367,13 +3367,12 @@ mod tests {
         // cannot invoke a worker command.
         assert!(run_node(&node, "worker", &workspace).is_err());
         assert!(report_node(None, "secure", "checkout", "worker", &workspace).is_err());
-        assert!(crate::project_file::load(&workspace)
+        assert!(!crate::project_file::load(&workspace)
             .unwrap()
             .execution
             .unwrap()
             .assignments
-            .get("secure")
-            .is_none());
+            .contains_key("secure"));
         let run = run_and_record(&node, "worker", &workspace, None);
         assert!(!run.ok);
 

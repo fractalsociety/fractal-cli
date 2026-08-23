@@ -118,10 +118,7 @@ impl TaskBuilder {
             ),
             None => "cross-project".to_owned(),
         };
-        let depends_on = match self.depends_on {
-            Some(value) => value,
-            None => Vec::new(),
-        };
+        let depends_on = self.depends_on.unwrap_or_default();
         let mut instruction = if self.instruction_parts.is_empty() {
             self.title.clone()
         } else {

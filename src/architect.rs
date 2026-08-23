@@ -267,7 +267,7 @@ pub(crate) fn reserved_node_ids(workspace: &Path) -> BTreeSet<String> {
         .ok()
         .into_iter()
         .flat_map(|state| state.teams)
-        .filter(|team| team_reserves_nodes(team))
+        .filter(team_reserves_nodes)
         .flat_map(|team| team.tasks.into_iter().map(|task| task.node_id))
         .collect()
 }
@@ -363,13 +363,7 @@ fn recover_dead_unstarted_workers(
     assignments: Option<&serde_json::Map<String, Value>>,
     current_ms: u64,
 ) -> Result<()> {
-    recover_dead_unstarted_workers_with(
-        workspace,
-        team,
-        assignments,
-        current_ms,
-        |workspace, client, prompt| spawn_agent(workspace, client, prompt),
-    )
+    recover_dead_unstarted_workers_with(workspace, team, assignments, current_ms, spawn_agent)
 }
 
 fn recover_dead_unstarted_workers_with<Spawn>(
@@ -418,13 +412,7 @@ where
 }
 
 fn recover_dead_leader(workspace: &Path, team: &mut TeamRecord, current_ms: u64) -> Result<()> {
-    recover_dead_leader_with(
-        workspace,
-        team,
-        current_ms,
-        process_alive,
-        |workspace, model, effort, prompt| spawn_codex(workspace, model, effort, prompt),
-    )
+    recover_dead_leader_with(workspace, team, current_ms, process_alive, spawn_codex)
 }
 
 fn recover_dead_leader_with<Alive, Spawn>(
@@ -1006,7 +994,7 @@ fn graph_task_candidates_with_gates(
     let assignments = document
         .pointer("/execution/assignments")
         .and_then(Value::as_object);
-    let graph = document.get("graph").unwrap_or(&document);
+    let graph = document.get("graph").unwrap_or(document);
     let edges = graph
         .get("edges")
         .and_then(Value::as_array)
@@ -1060,7 +1048,7 @@ fn graph_task_candidates_with_gates(
         // Only unassigned and explicitly released nodes are claimable. Any
         // other durable state represents an in-flight reservation that must
         // not be silently displaced by the architect.
-        if !state.is_none_or(|state| state == "released") {
+        if state.is_some_and(|state| state != "released") {
             continue;
         }
         if reserved.contains(id) || (!allow_gated && has_external_gates(node)) {
@@ -1468,12 +1456,7 @@ fn measured_improvement_bps(workspace: &Path) -> i64 {
 }
 
 fn launch_team(workspace: &Path, team: &TeamRecord) -> Result<Vec<u32>> {
-    launch_team_with(
-        workspace,
-        team,
-        |workspace, client, prompt| spawn_agent(workspace, client, prompt),
-        |workspace, model, effort, prompt| spawn_codex(workspace, model, effort, prompt),
-    )
+    launch_team_with(workspace, team, spawn_agent, spawn_codex)
 }
 
 fn launch_team_with<SpawnWorker, SpawnLeader>(
@@ -2142,7 +2125,7 @@ mod tests {
 
     #[test]
     fn leader_and_worker_prompts_preserve_dependency_retry_contract() {
-        let tasks = vec![MissionTask {
+        let tasks = [MissionTask {
             node_id: "follower".to_owned(),
             title: "Follower".to_owned(),
             capability: "code.generate".to_owned(),

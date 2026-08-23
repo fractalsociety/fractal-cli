@@ -1,0 +1,16 @@
+{
+  "consent_scope": "dataevol:promotion",
+  "evidence_root": "sha256:abababababababababababababababababababababababababababababababab",
+  "export_commitment": "sha256:efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+  "graph_id": "freeze-offline-verified",
+  "mode": "offline",
+  "public_fields": [
+    [
+      "summary",
+      "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+    ]
+  ],
+  "redacted_count": 1,
+  "schema": "fractal.dataevol_export.v1",
+  "settle": false
+}

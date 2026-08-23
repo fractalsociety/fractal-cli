@@ -1431,6 +1431,7 @@ pub(crate) fn reject_pending_amendment(
 }
 
 /// Compatibility alias for command handlers.
+#[allow(dead_code)]
 pub(crate) fn reject_pending(
     workspace: &Path,
     command_id: &str,
