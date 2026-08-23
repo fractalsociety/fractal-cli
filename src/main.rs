@@ -66,7 +66,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sha2::{Digest, Sha256};
 
-use crate::cli::{BridgeCommand, Cli, Command, GraphCommand, HarnessCommand};
+use crate::cli::{AmendmentCommand, BridgeCommand, Cli, Command, GraphCommand, HarnessCommand};
 use crate::work_builder::IntentClassification;
 
 fn main() -> ExitCode {
@@ -101,6 +101,10 @@ fn uses_stable_json_diagnostics(cli: &Cli) -> bool {
             command: HarnessCommand::Validate(crate::cli::HarnessPolicyArgs { json: true, .. })
                 | HarnessCommand::Show(crate::cli::HarnessPolicyArgs { json: true, .. }),
         })) | Some(Command::Join(crate::cli::JoinArgs { json: true, .. }))
+            | Some(Command::Amendment(crate::cli::AmendmentArgs {
+                command: AmendmentCommand::List(crate::cli::AmendmentListArgs { json: true, .. })
+                    | AmendmentCommand::Reject(crate::cli::AmendmentRejectArgs { json: true, .. }),
+            }))
     )
 }
 
@@ -189,6 +193,7 @@ fn run(cli: Cli) -> Result<()> {
             HarnessCommand::Validate(args) => harness_policy::validate(&args.repo, args.json),
             HarnessCommand::Show(args) => harness_policy::show(&args.repo, args.json),
         },
+        (None, Some(Command::Amendment(args))) => run_amendment(&args),
         (None, Some(Command::Run(args))) if args.local => {
             let efficiency = efficiency_config::resolve(&args.efficiency)?;
             run_local(&args, &efficiency)
@@ -302,6 +307,146 @@ fn run(cli: Cli) -> Result<()> {
         }
         _ => Ok(()),
     }
+}
+
+const AMENDMENT_CLI_SCHEMA: &str = "fractal.amendment.cli.v1";
+const AMENDMENT_REJECTION_PREVIEW_READY: &str = "AMENDMENT_REJECTION_PREVIEW_READY";
+const AMENDMENT_REJECTION_APPLIED: &str = "AMENDMENT_REJECTION_APPLIED";
+
+fn run_amendment(args: &crate::cli::AmendmentArgs) -> Result<()> {
+    match &args.command {
+        AmendmentCommand::List(args) => run_amendment_list(args),
+        AmendmentCommand::Reject(args) => run_amendment_reject(args),
+    }
+}
+
+fn run_amendment_list(args: &crate::cli::AmendmentListArgs) -> Result<()> {
+    let records = amendments::list_pending(&args.repo)
+        .with_context(|| format!("list pending amendments in {}", args.repo.display()))?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": AMENDMENT_CLI_SCHEMA,
+                "operation": "list",
+                "status": "ok",
+                "repo": args.repo.display().to_string(),
+                "count": records.len(),
+                "amendments": records,
+            }))?
+        );
+        return Ok(());
+    }
+
+    if records.is_empty() {
+        println!("No pending amendments in {}.", args.repo.display());
+        return Ok(());
+    }
+    println!(
+        "Pending amendments in {} ({}):",
+        args.repo.display(),
+        records.len()
+    );
+    for record in records {
+        println!(
+            "  {} · {} · task {}",
+            record.amendment.command_id, record.amendment.action, record.amendment.task_ref
+        );
+        println!("    Content hash: {}", record.content_hash);
+        println!("    Queue: {} ({})", record.queue, record.queue_file);
+        println!("    Instruction: {}", record.amendment.instruction);
+    }
+    Ok(())
+}
+
+fn run_amendment_reject(args: &crate::cli::AmendmentRejectArgs) -> Result<()> {
+    let reason = args.reason.trim();
+    validate_amendment_rejection_reason(reason)?;
+    let records = amendments::list_pending(&args.repo)
+        .with_context(|| format!("inspect pending amendments in {}", args.repo.display()))?;
+    let target = records
+        .iter()
+        .find(|record| record.amendment.command_id == args.command_id)
+        .with_context(|| {
+            format!(
+                "pending amendment command_id `{}` was not found in {}",
+                args.command_id,
+                args.repo.display()
+            )
+        })?;
+
+    if !args.yes {
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": AMENDMENT_CLI_SCHEMA,
+                    "operation": "reject",
+                    "status": "preview",
+                    "mutation": "none",
+                    "repo": args.repo.display().to_string(),
+                    "ready": true,
+                    "readiness_marker": AMENDMENT_REJECTION_PREVIEW_READY,
+                    "target": target,
+                    "reason": reason,
+                }))?
+            );
+        } else {
+            println!("Amendment rejection preview (no mutation performed)");
+            println!("  Target command ID: {}", target.amendment.command_id);
+            println!("  Content hash: {}", target.content_hash);
+            println!("  Queue: {} ({})", target.queue, target.queue_file);
+            println!("  Reason: {reason}");
+            println!("{AMENDMENT_REJECTION_PREVIEW_READY}");
+            println!("Re-run this exact command with --yes to reject only this pending amendment.");
+        }
+        return Ok(());
+    }
+
+    let rejection = amendments::reject_pending_amendment(&args.repo, &args.command_id, reason)
+        .with_context(|| {
+            format!(
+                "reject pending amendment `{}` in {}",
+                args.command_id,
+                args.repo.display()
+            )
+        })?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": AMENDMENT_CLI_SCHEMA,
+                "operation": "reject",
+                "status": "rejected",
+                "mutation": "applied",
+                "repo": args.repo.display().to_string(),
+                "ready": true,
+                "readiness_marker": AMENDMENT_REJECTION_APPLIED,
+                "rejection": rejection,
+            }))?
+        );
+    } else {
+        println!("Rejected pending amendment");
+        println!("  Target command ID: {}", rejection.command_id);
+        println!("  Content hash: {}", rejection.content_hash);
+        println!("  Queue: {} ({})", rejection.queue, rejection.queue_file);
+        println!("  Reason: {}", rejection.reason);
+        println!("{AMENDMENT_REJECTION_APPLIED}");
+    }
+    Ok(())
+}
+
+fn validate_amendment_rejection_reason(reason: &str) -> Result<()> {
+    if reason.is_empty() {
+        anyhow::bail!("rejection reason must not be empty");
+    }
+    if reason.len() > 1_024 {
+        anyhow::bail!("rejection reason exceeds 1024 bytes");
+    }
+    if reason.chars().any(char::is_control) {
+        anyhow::bail!("rejection reason contains control characters");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -59,6 +59,8 @@ pub(crate) enum Command {
     Graph(GraphArgs),
     /// Validate or inspect the repository harness policy without writing.
     Harness(HarnessArgs),
+    /// Inspect or govern queued graph amendments.
+    Amendment(AmendmentArgs),
     /// Run a compiled graph through Coordinate (stub).
     Run(RunArgs),
     /// Run the graph morphogenesis loop (stub).
@@ -110,6 +112,52 @@ pub(crate) enum Command {
     Bridge(BridgeArgs),
     /// Print the Fractal CLI version.
     Version,
+}
+
+/// Arguments accepted by `fractal amendment`.
+#[derive(Debug, Args)]
+pub(crate) struct AmendmentArgs {
+    /// Amendment control-plane operation.
+    #[command(subcommand)]
+    pub(crate) command: AmendmentCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AmendmentCommand {
+    /// List every pending graph amendment without changing the queue.
+    List(AmendmentListArgs),
+    /// Reject one pending graph amendment. Without `--yes`, print a read-only
+    /// preview that can be reviewed before the exact target is removed.
+    Reject(AmendmentRejectArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct AmendmentListArgs {
+    /// Project workspace containing the pending amendment queue.
+    #[arg(long, required = true, value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+    /// Print a stable JSON report.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct AmendmentRejectArgs {
+    /// Exact pending amendment command ID to reject.
+    #[arg(value_name = "COMMAND_ID")]
+    pub(crate) command_id: String,
+    /// Project workspace containing the pending amendment queue.
+    #[arg(long, required = true, value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+    /// Human-readable reason recorded in the owner-only rejection audit.
+    #[arg(long, required = true, value_name = "TEXT")]
+    pub(crate) reason: String,
+    /// Apply the rejection. Without this flag the command is read-only.
+    #[arg(long)]
+    pub(crate) yes: bool,
+    /// Print a stable JSON report.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 /// Arguments accepted by `fractal harness`.
@@ -2079,5 +2127,82 @@ mod tests {
                 command: HarnessCommand::Show(HarnessPolicyArgs { ref repo, json: false })
             })) if repo == &PathBuf::from(".")
         ));
+    }
+
+    #[test]
+    fn parses_amendment_list_and_reject_controls() {
+        let list = Cli::try_parse_from([
+            "fractal",
+            "amendment",
+            "list",
+            "--repo",
+            "/tmp/project",
+            "--json",
+        ])
+        .unwrap();
+        let Some(Command::Amendment(AmendmentArgs {
+            command:
+                AmendmentCommand::List(AmendmentListArgs {
+                    ref repo,
+                    json: true,
+                }),
+        })) = list.command
+        else {
+            panic!("expected amendment list command");
+        };
+        assert_eq!(repo, &PathBuf::from("/tmp/project"));
+
+        let reject = Cli::try_parse_from([
+            "fractal",
+            "amendment",
+            "reject",
+            "command-7",
+            "--repo",
+            "/tmp/project",
+            "--reason",
+            "stale request",
+            "--yes",
+            "--json",
+        ])
+        .unwrap();
+        let Some(Command::Amendment(AmendmentArgs {
+            command:
+                AmendmentCommand::Reject(AmendmentRejectArgs {
+                    ref command_id,
+                    ref repo,
+                    ref reason,
+                    yes: true,
+                    json: true,
+                }),
+        })) = reject.command
+        else {
+            panic!("expected amendment reject command");
+        };
+        assert_eq!(command_id, "command-7");
+        assert_eq!(repo, &PathBuf::from("/tmp/project"));
+        assert_eq!(reason, "stale request");
+    }
+
+    #[test]
+    fn amendment_reject_requires_safe_inputs() {
+        assert!(Cli::try_parse_from(["fractal", "amendment", "list"]).is_err());
+        assert!(Cli::try_parse_from([
+            "fractal",
+            "amendment",
+            "reject",
+            "command-7",
+            "--repo",
+            "/tmp/project",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "fractal",
+            "amendment",
+            "reject",
+            "command-7",
+            "--reason",
+            "stale request",
+        ])
+        .is_err());
     }
 }
