@@ -320,9 +320,13 @@ fn reconcile_teams(workspace: &Path, state: &mut ArchitectState) -> Result<()> {
             });
         if complete {
             team.status = "completed".to_owned();
-        } else if !team.process_ids.iter().any(|pid| process_alive(*pid)) {
+            continue;
+        }
+        if !team.process_ids.iter().any(|pid| process_alive(*pid)) {
             team.status = "failed_released".to_owned();
-        } else if let Some(heartbeats) = heartbeats.as_ref() {
+            continue;
+        }
+        if let Some(heartbeats) = heartbeats.as_ref() {
             recover_stale_checked_out_workers(
                 workspace,
                 team,
@@ -333,6 +337,7 @@ fn reconcile_teams(workspace: &Path, state: &mut ArchitectState) -> Result<()> {
             )?;
         }
         recover_dead_unstarted_workers(workspace, team, assignments, now_ms)?;
+        recover_dead_leader(workspace, team, now_ms)?;
     }
     Ok(())
 }
@@ -373,6 +378,52 @@ fn recover_dead_unstarted_workers(
         }
         team.recovery_started_ms.insert(member.clone(), current_ms);
     }
+    Ok(())
+}
+
+fn recover_dead_leader(workspace: &Path, team: &mut TeamRecord, current_ms: u64) -> Result<()> {
+    recover_dead_leader_with(
+        workspace,
+        team,
+        current_ms,
+        process_alive,
+        |workspace, model, effort, prompt| spawn_codex(workspace, model, effort, prompt),
+    )
+}
+
+fn recover_dead_leader_with<Alive, Spawn>(
+    workspace: &Path,
+    team: &mut TeamRecord,
+    current_ms: u64,
+    process_is_alive: Alive,
+    mut spawn_leader: Spawn,
+) -> Result<()>
+where
+    Alive: Fn(u32) -> bool,
+    Spawn: FnMut(&Path, &str, &str, &str) -> Result<u32>,
+{
+    // Fresh teams store five worker PIDs followed by one leader PID. Older
+    // partial records cannot safely identify the leader, so leave them alone.
+    if team.process_ids.len() != TEAM_SIZE {
+        return Ok(());
+    }
+    let leader_index = WORKERS_PER_TEAM;
+    if process_is_alive(team.process_ids[leader_index]) {
+        return Ok(());
+    }
+    if team
+        .recovery_started_ms
+        .get(&team.leader_id)
+        .is_some_and(|started| current_ms.saturating_sub(*started) < WORKER_RECOVERY_COOLDOWN_MS)
+    {
+        return Ok(());
+    }
+
+    let prompt = leader_launch_prompt(team)?;
+    let replacement = spawn_leader(workspace, LEADER_MODEL, "high", &prompt)?;
+    team.process_ids[leader_index] = replacement;
+    team.recovery_started_ms
+        .insert(team.leader_id.clone(), current_ms);
     Ok(())
 }
 
@@ -1042,13 +1093,26 @@ fn launch_team(workspace: &Path, team: &TeamRecord) -> Result<Vec<u32>> {
         let prompt = worker_launch_prompt(workspace, team, index)?;
         pids.push(spawn_agent(workspace, client, &prompt)?);
     }
-    let assignments: Vec<Value> = team.tasks.iter().zip(&team.member_ids)
-        .map(|(task, member)| json!({"member":member,"node_id":task.node_id,"title":task.title,"instruction":task.instruction})).collect();
-    let prompt = format!(
-        "You are specialist squad leader {leader} for mission {mission:?}. Join Squad with this exact ID as role manager. Immediately assign exactly one of these five graph tasks to each named member using direct squad send messages; include the exact node ID and checkout/verification acceptance criteria. Do not create a redundant structured-task acknowledgement gate: atomic Fractal checkout is authoritative ownership. Track readiness and results, inspect every result, request rework on failure, and report the team outcome to master-architect. Keep receiving until all five graph nodes are complete or explicitly released. Do not implement member tasks yourself. Assignments: {assignments}",
-        leader = team.leader_id, mission = team.mission, assignments = serde_json::to_string(&assignments)?);
+    let prompt = leader_launch_prompt(team)?;
     pids.push(spawn_codex(workspace, LEADER_MODEL, "high", &prompt)?);
     Ok(pids)
+}
+
+fn leader_launch_prompt(team: &TeamRecord) -> Result<String> {
+    let assignments: Vec<Value> = team
+        .tasks
+        .iter()
+        .zip(&team.member_ids)
+        .map(|(task, member)| {
+            json!({"member":member,"node_id":task.node_id,"title":task.title,"instruction":task.instruction})
+        })
+        .collect();
+    Ok(format!(
+        "You are specialist squad leader {leader} for mission {mission:?}. Join Squad with this exact ID as role manager. Immediately assign exactly one of these five graph tasks to each named member using direct squad send messages; include the exact node ID and checkout/verification acceptance criteria. Do not create a redundant structured-task acknowledgement gate: atomic Fractal checkout is authoritative ownership. Track readiness and results, inspect every result, request rework on failure, and report the team outcome to master-architect. Keep receiving until all five graph nodes are complete or explicitly released. Do not implement member tasks yourself. Assignments: {assignments}",
+        leader = team.leader_id,
+        mission = team.mission,
+        assignments = serde_json::to_string(&assignments)?
+    ))
 }
 
 fn worker_launch_prompt(workspace: &Path, team: &TeamRecord, index: usize) -> Result<String> {
@@ -1294,6 +1358,23 @@ mod tests {
         }
     }
 
+    fn recovery_team() -> TeamRecord {
+        let tasks: Vec<MissionTask> = (0..WORKERS_PER_TEAM)
+            .map(|index| MissionTask {
+                node_id: format!("recovery-{index}"),
+                title: format!("Recovery {index}"),
+                capability: "code.generate".to_owned(),
+                instruction: format!("Finish recovery task {index}."),
+            })
+            .collect();
+        let mut team = form_team(&tasks, &ArchitectState::default())
+            .unwrap()
+            .unwrap();
+        team.status = "launched".to_owned();
+        team.process_ids = (100..106).collect();
+        team
+    }
+
     #[test]
     fn admits_only_a_healthy_complete_team_frontier() {
         assert_eq!(
@@ -1389,6 +1470,85 @@ mod tests {
             .member_ids
             .iter()
             .all(|member| member.starts_with(&team.team_id)));
+    }
+
+    #[test]
+    fn recovers_a_dead_leader_without_replacing_workers() {
+        let mut team = recovery_team();
+        let expected_prompt = leader_launch_prompt(&team).unwrap();
+        let mut calls = Vec::new();
+        recover_dead_leader_with(
+            Path::new("/repo"),
+            &mut team,
+            500_000,
+            |_| false,
+            |workspace, model, effort, prompt| {
+                calls.push((
+                    workspace.to_owned(),
+                    model.to_owned(),
+                    effort.to_owned(),
+                    prompt.to_owned(),
+                ));
+                Ok(900)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(team.process_ids, vec![100, 101, 102, 103, 104, 900]);
+        assert_eq!(
+            team.recovery_started_ms.get(&team.leader_id),
+            Some(&500_000)
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, Path::new("/repo"));
+        assert_eq!(calls[0].1, LEADER_MODEL);
+        assert_eq!(calls[0].2, "high");
+        assert_eq!(calls[0].3, expected_prompt);
+    }
+
+    #[test]
+    fn dead_leader_recovery_obeys_cooldown() {
+        let mut team = recovery_team();
+        team.recovery_started_ms.insert(
+            team.leader_id.clone(),
+            500_000 - (WORKER_RECOVERY_COOLDOWN_MS - 1),
+        );
+        let mut spawned = false;
+        recover_dead_leader_with(
+            Path::new("/repo"),
+            &mut team,
+            500_000,
+            |_| false,
+            |_, _, _, _| {
+                spawned = true;
+                Ok(900)
+            },
+        )
+        .unwrap();
+
+        assert!(!spawned);
+        assert_eq!(team.process_ids, vec![100, 101, 102, 103, 104, 105]);
+    }
+
+    #[test]
+    fn live_leader_is_left_alongside_workers() {
+        let mut team = recovery_team();
+        let mut spawned = false;
+        recover_dead_leader_with(
+            Path::new("/repo"),
+            &mut team,
+            500_000,
+            |pid| pid == 105,
+            |_, _, _, _| {
+                spawned = true;
+                Ok(900)
+            },
+        )
+        .unwrap();
+
+        assert!(!spawned);
+        assert_eq!(team.process_ids, vec![100, 101, 102, 103, 104, 105]);
+        assert!(team.recovery_started_ms.is_empty());
     }
 
     #[test]
