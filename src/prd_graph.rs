@@ -22,6 +22,9 @@ pub(crate) struct PrdTask {
     pub depends_on: Vec<String>,
     pub instruction: String,
     pub acceptance: String,
+    /// Human-authored completion notes. Evidence is retained as PRD metadata,
+    /// but it is deliberately not used to derive graph nodes or dependencies.
+    pub evidence: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,6 +84,7 @@ struct TaskBuilder {
     dependency_context: Vec<String>,
     instruction_parts: Vec<String>,
     acceptance: Option<String>,
+    evidence: Option<String>,
     header_line: usize,
 }
 
@@ -97,6 +101,7 @@ impl TaskBuilder {
             dependency_context: Vec::new(),
             instruction_parts: Vec::new(),
             acceptance: None,
+            evidence: None,
             header_line,
         }
     }
@@ -150,6 +155,9 @@ impl TaskBuilder {
         ] {
             reject_secret_shaped_string(value, field)?;
         }
+        if let Some(evidence) = &self.evidence {
+            reject_secret_shaped_string(evidence, "evidence")?;
+        }
         for dependency in &depends_on {
             reject_secret_shaped_string(dependency, "depends_on")?;
         }
@@ -163,6 +171,7 @@ impl TaskBuilder {
             depends_on,
             instruction,
             acceptance,
+            evidence: self.evidence,
         })
     }
 }
@@ -244,6 +253,15 @@ pub(crate) fn parse_numbered_prd(markdown: &str) -> Result<Vec<PrdTask>> {
                         bail!("Instruction metadata must not be empty on line {line_number}");
                     }
                     builder.instruction_parts.push(value.trim().to_owned());
+                }
+                "evidence" => {
+                    if builder.evidence.is_some() {
+                        bail!("duplicate Evidence metadata on line {line_number}");
+                    }
+                    if value.trim().is_empty() {
+                        bail!("Evidence metadata must not be empty on line {line_number}");
+                    }
+                    builder.evidence = Some(value.trim().to_owned());
                 }
                 other => bail!("unknown PRD metadata label `{other}` on line {line_number}"),
             }
@@ -509,6 +527,7 @@ pub(crate) fn compile_prd(
                 "depends_on": task.depends_on,
                 "instruction": task.instruction,
                 "acceptance": task.acceptance,
+                "evidence": task.evidence,
             })
         })
         .collect::<Vec<_>>();
@@ -1004,6 +1023,37 @@ fn reject_secret_shaped_string(value: &str, field: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn normalize_selected_task_checkboxes(markdown: &str, from: u32, through: u32) -> String {
+        markdown
+            .split_inclusive('\n')
+            .map(|line| {
+                let without_newline = line.strip_suffix('\n').unwrap_or(line);
+                let Some((number, body)) = ordered_line(without_newline) else {
+                    return line.to_owned();
+                };
+                if !(from..=through).contains(&number)
+                    || !(body.starts_with("[x]") || body.starts_with("[X]"))
+                {
+                    return line.to_owned();
+                }
+                let marker = if body.starts_with("[x]") {
+                    "[x]"
+                } else {
+                    "[X]"
+                };
+                let Some(marker_offset) = without_newline.find(marker) else {
+                    return line.to_owned();
+                };
+                let mut normalized = without_newline.to_owned();
+                normalized.replace_range(marker_offset..marker_offset + marker.len(), "[ ]");
+                if line.ends_with('\n') {
+                    normalized.push('\n');
+                }
+                normalized
+            })
+            .collect()
+    }
+
     fn block(
         number: u32,
         complete: bool,
@@ -1028,6 +1078,84 @@ mod tests {
         let tasks = parse_numbered_prd(&text).unwrap();
         assert_eq!(tasks[0].id, "INT-001");
         assert_eq!(tasks[1].depends_on, vec!["INT-001"]);
+    }
+
+    #[test]
+    fn completed_evidence_is_retained_without_affecting_graph_topology() {
+        let evidence = "verified by the adapter regression suite and fixture replay";
+        let with_evidence = format!(
+            "{}   - **Evidence:** {evidence}\n{}",
+            block(1, true, "SEQ", "Foundation", "A", "none"),
+            block(2, false, "SEQ", "Adapter", "B", "INT-001")
+        );
+        let without_evidence = format!(
+            "{}{}",
+            block(1, true, "SEQ", "Foundation", "A", "none"),
+            block(2, false, "SEQ", "Adapter", "B", "INT-001")
+        );
+        let parsed = parse_numbered_prd(&with_evidence).unwrap();
+        assert_eq!(parsed[0].evidence.as_deref(), Some(evidence));
+        assert!(!parsed[0].instruction.contains(evidence));
+        assert!(!parsed[0].acceptance.contains(evidence));
+
+        let documented = compile_prd(
+            &with_evidence,
+            "fixture://evidence",
+            "INT-002",
+            "INT-002",
+            None,
+        )
+        .unwrap();
+        let plain = compile_prd(
+            &without_evidence,
+            "fixture://evidence",
+            "INT-002",
+            "INT-002",
+            None,
+        )
+        .unwrap();
+        assert_eq!(documented.summary, plain.summary);
+        assert_eq!(documented.graph["edges"], plain.graph["edges"]);
+        let documented_ids = documented.graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        let plain_ids = plain.graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(documented_ids, plain_ids);
+    }
+
+    #[test]
+    fn evidence_metadata_is_non_topology_and_unknown_labels_stay_rejected() {
+        let incomplete = format!(
+            "{}   - **Evidence:** completion note may be retained before checkbox sync\n",
+            block(1, false, "SEQ", "Foundation", "A", "none")
+        );
+        let parsed = parse_numbered_prd(&incomplete).unwrap();
+        assert_eq!(
+            parsed[0].evidence.as_deref(),
+            Some("completion note may be retained before checkbox sync")
+        );
+
+        let duplicate = format!(
+            "{}   - **Evidence:** first\n   - **Evidence:** second\n",
+            block(1, true, "SEQ", "Foundation", "A", "none")
+        );
+        let error = parse_numbered_prd(&duplicate).unwrap_err().to_string();
+        assert!(error.contains("duplicate Evidence metadata"));
+
+        let unknown = format!(
+            "{}   - **Completion note:** unsupported\n",
+            block(1, true, "SEQ", "Foundation", "A", "none")
+        );
+        let error = parse_numbered_prd(&unknown).unwrap_err().to_string();
+        assert!(error.contains("unknown PRD metadata label `completion note`"));
     }
 
     #[test]
@@ -1084,6 +1212,11 @@ mod tests {
     fn real_prd_compiles_to_exact_dag_and_initial_frontier() {
         let path = "/Users/jamesstar/fractalmaster/docs/2026-08-23_FRACTAL_EVOLVING_INTELLIGENCE_UPGRADE_IMPLEMENTATION_PRD.md";
         let markdown = std::fs::read_to_string(path).expect("dated implementation PRD must exist");
+        // The live PRD is updated by workers as they finish tasks. Compile a
+        // stable synthetic unfinished range so this structural regression test
+        // remains valid while still parsing all real metadata, including
+        // completion Evidence bullets.
+        let markdown = normalize_selected_task_checkboxes(&markdown, 8, 61);
         let parsed = parse_numbered_prd(&markdown).expect("real PRD task metadata normalizes");
         let parsed_task = |id: &str| parsed.iter().find(|task| task.id == id).unwrap();
         assert!(parsed_task("INT-019")
