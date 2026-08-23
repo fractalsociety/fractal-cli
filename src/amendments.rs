@@ -1379,8 +1379,17 @@ pub(crate) fn reject_pending_amendment(
             remove_nofollow(&temporary, "staged amendment queue rewrite").ok();
             bail!("rejected amendment audit conflicts with queued request");
         }
-        remove_nofollow(&temporary, "staged amendment queue rewrite").ok();
-        bail!("amendment command_id `{command_id}` was already rejected");
+        // The request was durably rejected before, but an identical request
+        // may have been requeued by a producer.  The queue snapshot and race
+        // checks above still protect this atomic removal; because the audit
+        // already exists, do not append a duplicate record or create a
+        // recovery transaction for it.
+        if let Err(error) = queue_snapshot_still_matches(snapshot, &original_bytes[target_index]) {
+            remove_nofollow(&temporary, "staged amendment queue rewrite").ok();
+            return Err(error);
+        }
+        rename_nofollow(&temporary, &snapshot.path, "amendment queue rejection")?;
+        return Ok(existing);
     }
     let original_content = String::from_utf8(original_bytes[target_index].clone())
         .context("pending amendment queue is not valid UTF-8")?;
@@ -3450,6 +3459,48 @@ mod tests {
             serde_json::from_str(fs::read_to_string(audit).unwrap().trim()).unwrap();
         assert_eq!(encoded, rejection);
         assert!(reject_pending_amendment(&workspace, "reject-me", "again").is_err());
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn control_rejection_cleans_up_an_identical_requeued_request_idempotently() {
+        let workspace = temp_workspace("control-reject-requeue");
+        queue_edit(
+            &workspace,
+            "requeue-me",
+            "reroute_node",
+            "build",
+            None,
+            "same route",
+            "control-test",
+        )
+        .unwrap();
+        let first = reject_pending_amendment(&workspace, "requeue-me", "stale request")
+            .expect("initial rejection succeeds");
+
+        // Requeue the byte-identical request after its durable audit exists.
+        // The second rejection must remove this target without publishing a
+        // second audit record.
+        queue_edit(
+            &workspace,
+            "requeue-me",
+            "reroute_node",
+            "build",
+            None,
+            "same route",
+            "control-test",
+        )
+        .unwrap();
+        let second = reject_pending_amendment(&workspace, "requeue-me", "retry request")
+            .expect("identical requeued request is cleaned up");
+        assert_eq!(second, first);
+        assert!(list_pending_amendments(&workspace).unwrap().is_empty());
+
+        let audit_lines = fs::read_to_string(rejection_path(&workspace))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(audit_lines, 1);
         fs::remove_dir_all(workspace).unwrap();
     }
 
