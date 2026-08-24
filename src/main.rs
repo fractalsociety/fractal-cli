@@ -100,7 +100,8 @@ fn uses_stable_json_diagnostics(cli: &Cli) -> bool {
             command: GraphCommand::Audit(_)
                 | GraphCommand::Compose(_)
                 | GraphCommand::Reconcile(_)
-                | GraphCommand::PlanPrd(crate::cli::GraphPlanPrdArgs { json: true, .. }),
+                | GraphCommand::PlanPrd(crate::cli::GraphPlanPrdArgs { json: true, .. })
+                | GraphCommand::CompilePlan(crate::cli::GraphCompilePlanArgs { json: true, .. }),
         })) | Some(Command::Harness(crate::cli::HarnessArgs {
             command: HarnessCommand::Validate(crate::cli::HarnessPolicyArgs { json: true, .. })
                 | HarnessCommand::Show(crate::cli::HarnessPolicyArgs { json: true, .. }),
@@ -185,6 +186,7 @@ fn run(cli: Cli) -> Result<()> {
             GraphCommand::Status(args) => board::status(&args.url, args.json),
             GraphCommand::Show(args) => graph_store::show(&args.graph_hash, args.json),
             GraphCommand::PlanPrd(args) => run_graph_plan_prd(&args),
+            GraphCommand::CompilePlan(args) => run_graph_compile_plan(&args),
             GraphCommand::Audit(args) => run_graph_audit(&args),
             GraphCommand::Compose(args) => run_graph_compose(&args),
             GraphCommand::Reconcile(args) => reconcile::run(&reconcile::ReconcileOptions {
@@ -328,6 +330,9 @@ const AMENDMENT_REJECTION_APPLIED: &str = "AMENDMENT_REJECTION_APPLIED";
 const PRD_GRAPH_PLAN_SCHEMA: &str = "fractal.prd_graph_plan.v1";
 const PRD_GRAPH_REPLACEMENT_PREVIEW_READY: &str = "PRD_GRAPH_REPLACEMENT_PREVIEW_READY";
 const PRD_GRAPH_REPLACEMENT_APPLIED: &str = "PRD_GRAPH_REPLACEMENT_APPLIED";
+const COMPILE_PLAN_SCHEMA: &str = "fractal.compile_plan.v1";
+const COMPILE_PLAN_PREVIEW_READY: &str = "COMPILE_PLAN_PREVIEW_READY";
+const COMPILE_PLAN_APPLIED: &str = "COMPILE_PLAN_APPLIED";
 const EXTERNAL_GATE_CLI_SCHEMA: &str = "fractal.external_gate.cli.v1";
 const EXTERNAL_GATE_RECORD_PREVIEW_READY: &str = "EXTERNAL_GATE_RECORD_PREVIEW_READY";
 const EXTERNAL_GATE_RECORD_APPLIED: &str = "EXTERNAL_GATE_RECORD_APPLIED";
@@ -720,6 +725,207 @@ fn validate_amendment_rejection_reason(reason: &str) -> Result<()> {
         anyhow::bail!("rejection reason contains control characters");
     }
     Ok(())
+}
+
+fn run_graph_compile_plan(args: &crate::cli::GraphCompilePlanArgs) -> Result<()> {
+    let repo = canonicalize_compile_plan_repo(&args.repo)?;
+    let plan_path = resolve_existing_plan_path(&repo, &args.plan)?;
+    let compilation = decompose::compile_existing_plan(&plan_path)?;
+    let graph_hash = compilation
+        .graph
+        .get("graph_hash")
+        .and_then(serde_json::Value::as_str)
+        .context("compiled existing plan graph is missing graph_hash")?
+        .to_owned();
+    let node_count = compilation
+        .graph
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let edge_count = compilation
+        .graph
+        .get("edges")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+
+    if !args.yes {
+        print_compile_plan_result(
+            args,
+            &repo,
+            &plan_path,
+            &compilation,
+            &graph_hash,
+            node_count,
+            edge_count,
+            None,
+        )?;
+        return Ok(());
+    }
+
+    let commit = graph_store::commit_graph(&compilation.graph)
+        .context("commit graph compiled from existing plan")?;
+    graph_store::persist_source(
+        &commit.graph_hash,
+        &compilation.harness,
+        &compilation.work,
+        compilation.target_id,
+    )
+    .context("persist compiler inputs for existing plan graph")?;
+    let prd_path = decompose::persist_existing_plan_prd(&repo, &compilation)?;
+    let project_path = project_file::persist(&repo, &compilation.graph, &compilation.title)
+        .context("update canonical project with graph compiled from existing plan")?;
+    let applied = CompilePlanApplied {
+        commit,
+        project_path,
+        prd_path,
+    };
+    print_compile_plan_result(
+        args,
+        &repo,
+        &plan_path,
+        &compilation,
+        &graph_hash,
+        node_count,
+        edge_count,
+        Some(&applied),
+    )
+}
+
+struct CompilePlanApplied {
+    commit: graph_store::CommitRecord,
+    project_path: std::path::PathBuf,
+    prd_path: std::path::PathBuf,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_compile_plan_result(
+    args: &crate::cli::GraphCompilePlanArgs,
+    repo: &Path,
+    plan_path: &Path,
+    compilation: &decompose::ExistingPlanCompilation,
+    graph_hash: &str,
+    node_count: usize,
+    edge_count: usize,
+    applied: Option<&CompilePlanApplied>,
+) -> Result<()> {
+    let (status, mutation, readiness_marker) = if applied.is_some() {
+        ("applied", "applied", COMPILE_PLAN_APPLIED)
+    } else {
+        ("preview", "none", COMPILE_PLAN_PREVIEW_READY)
+    };
+    if args.json {
+        let commit = applied.map(|applied| {
+            serde_json::json!({
+                "graph_hash": applied.commit.graph_hash,
+                "path": applied.commit.path,
+                "bytes": applied.commit.bytes,
+            })
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": COMPILE_PLAN_SCHEMA,
+                "operation": "compile-plan",
+                "status": status,
+                "mutation": mutation,
+                "repo": repo.display().to_string(),
+                "plan": plan_path.display().to_string(),
+                "title": compilation.title,
+                "graph_hash": graph_hash,
+                "summary": {
+                    "planned_tasks": compilation.task_count,
+                    "acceptance_criteria": compilation.acceptance_criteria_count,
+                    "node_count": node_count,
+                    "edge_count": edge_count,
+                },
+                "commit": commit,
+                "project_path": applied.map(|value| value.project_path.display().to_string()),
+                "prd_path": applied.map(|value| value.prd_path.display().to_string()),
+                "readiness_marker": readiness_marker,
+            }))?
+        );
+    } else {
+        println!(
+            "Existing plan compilation {}{}",
+            status,
+            if applied.is_none() {
+                " (no mutation performed)"
+            } else {
+                ""
+            }
+        );
+        println!("  Repo: {}", repo.display());
+        println!("  Plan: {}", plan_path.display());
+        println!("  Title: {}", compilation.title);
+        println!("  Compiled graph: {graph_hash}");
+        println!(
+            "  Summary: tasks={} acceptance={} nodes={} edges={}",
+            compilation.task_count, compilation.acceptance_criteria_count, node_count, edge_count
+        );
+        if let Some(applied) = applied {
+            println!(
+                "  Commit: {} ({} bytes)",
+                applied.commit.path.display(),
+                applied.commit.bytes
+            );
+            println!("  Project: {}", applied.project_path.display());
+            println!("  Structured PRD: {}", applied.prd_path.display());
+        } else {
+            println!("Re-run this exact command with --yes to commit the graph.");
+        }
+        println!("{readiness_marker}");
+    }
+    Ok(())
+}
+
+fn canonicalize_compile_plan_repo(repo: &Path) -> Result<std::path::PathBuf> {
+    let canonical = fs::canonicalize(repo)
+        .with_context(|| format!("canonicalize project repository {}", repo.display()))?;
+    if !canonical.is_dir() {
+        anyhow::bail!("project repository {} is not a directory", repo.display());
+    }
+    Ok(canonical)
+}
+
+fn resolve_existing_plan_path(repo: &Path, plan: &Path) -> Result<std::path::PathBuf> {
+    if plan.as_os_str().is_empty() {
+        anyhow::bail!("existing plan path must not be empty");
+    }
+    let candidate = if plan.is_absolute() {
+        plan.to_owned()
+    } else {
+        let mut relative = std::path::PathBuf::new();
+        for component in plan.components() {
+            match component {
+                Component::Normal(segment) => relative.push(segment),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    anyhow::bail!("relative existing plan path must not contain `..`");
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    anyhow::bail!("invalid relative existing plan path {}", plan.display());
+                }
+            }
+        }
+        if relative.as_os_str().is_empty() {
+            anyhow::bail!("existing plan path must name a file");
+        }
+        repo.join(relative)
+    };
+    let canonical = fs::canonicalize(&candidate)
+        .with_context(|| format!("canonicalize existing plan {}", candidate.display()))?;
+    let metadata = fs::metadata(&canonical)
+        .with_context(|| format!("inspect existing plan {}", canonical.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "existing plan {} is not a regular file",
+            canonical.display()
+        );
+    }
+    if !plan.is_absolute() && !canonical.starts_with(repo) {
+        anyhow::bail!("relative existing plan path must remain inside --repo");
+    }
+    Ok(canonical)
 }
 
 fn run_graph_plan_prd(args: &crate::cli::GraphPlanPrdArgs) -> Result<()> {
@@ -2340,6 +2546,94 @@ mod tests {
     }
 
     #[test]
+    fn compile_plan_resolves_repo_relative_and_absolute_paths() -> Result<()> {
+        let root = temp_root("compile-plan-paths");
+        let plan = root.join("fractal-plan.json");
+        fs::write(&plan, sample_existing_plan(false))?;
+        let canonical_root = fs::canonicalize(&root)?;
+        let canonical_plan = fs::canonicalize(&plan)?;
+
+        assert_eq!(
+            resolve_existing_plan_path(&canonical_root, Path::new("fractal-plan.json"))?,
+            canonical_plan
+        );
+        assert_eq!(
+            resolve_existing_plan_path(&canonical_root, &plan)?,
+            canonical_plan
+        );
+        assert!(resolve_existing_plan_path(&canonical_root, Path::new("../plan.json")).is_err());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_compile_plan_preview_is_read_only() -> Result<()> {
+        let _env_lock = graph_store::ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph-store test environment lock poisoned"))?;
+        let home = graph_store::TestHome::new("compile-plan-preview")?;
+        let root = temp_root("compile-plan-preview");
+        fs::write(root.join("fractal-plan.json"), sample_existing_plan(false))?;
+
+        run_graph_compile_plan(&compile_plan_args(&root, false))?;
+
+        assert!(!project_file::path(&root).exists());
+        assert!(!root.join(".fractal/lead-prd.json").exists());
+        assert!(!home.path.join("graphs").exists());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_compile_plan_apply_commits_source_prd_and_project() -> Result<()> {
+        let _env_lock = graph_store::ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph-store test environment lock poisoned"))?;
+        let _home = graph_store::TestHome::new("compile-plan-apply")?;
+        let root = temp_root("compile-plan-apply");
+        fs::write(root.join("fractal-plan.json"), sample_existing_plan(false))?;
+
+        run_graph_compile_plan(&compile_plan_args(&root, true))?;
+
+        let project = project_file::load(&root)?;
+        assert_eq!(project.project.title, "Existing plan project");
+        assert_eq!(graph_store::load_graph(&project.graph_hash)?, project.graph);
+        assert!(graph_store::source_path(&project.graph_hash).is_file());
+        let prd: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join(".fractal/lead-prd.json"))?)?;
+        assert_eq!(prd["title"], "Existing plan project");
+        assert!(project.graph["nodes"]
+            .as_array()
+            .is_some_and(|nodes| nodes.iter().any(|node| node["id"] == "implement")));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_compile_plan_invalid_input_fails_closed_without_fallback() -> Result<()> {
+        let _env_lock = graph_store::ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph-store test environment lock poisoned"))?;
+        let home = graph_store::TestHome::new("compile-plan-invalid")?;
+        let root = temp_root("compile-plan-invalid");
+        fs::write(root.join("fractal-plan.json"), sample_existing_plan(true))?;
+
+        let error = run_graph_compile_plan(&compile_plan_args(&root, true))
+            .expect_err("cyclic existing plan must fail");
+
+        assert!(format!("{error:#}").contains("dependency cycle"));
+        assert!(!project_file::path(&root).exists());
+        assert!(!root.join(".fractal/lead-prd.json").exists());
+        assert!(!home.path.join("graphs").exists());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn prd_plan_parent_hash_validation_requires_canonical_sha256() {
         assert!(validate_prd_parent_hash("sha256:").is_err());
         assert!(validate_prd_parent_hash(&format!("sha256:{}", "a".repeat(64))).is_ok());
@@ -2510,6 +2804,59 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn compile_plan_args(root: &Path, yes: bool) -> crate::cli::GraphCompilePlanArgs {
+        crate::cli::GraphCompilePlanArgs {
+            repo: root.to_owned(),
+            plan: Path::new("fractal-plan.json").to_owned(),
+            yes,
+            json: false,
+        }
+    }
+
+    fn sample_existing_plan(cyclic: bool) -> String {
+        let implement_dependencies = if cyclic {
+            serde_json::json!(["verify"])
+        } else {
+            serde_json::json!([])
+        };
+        serde_json::json!({
+            "prd": {
+                "schema": "fractal.prd.v1",
+                "title": "Existing plan project",
+                "summary": "Compile an already approved plan.",
+                "architecture": {
+                    "approach": "Use the existing repository architecture.",
+                    "rationale": "The plan was reviewed before compilation.",
+                    "components": [{
+                        "name": "compiler",
+                        "responsibility": "Compile the validated plan",
+                        "technology": "Rust"
+                    }]
+                },
+                "acceptance_criteria": [{
+                    "id": "AC-1",
+                    "criterion": "The existing plan becomes the project graph.",
+                    "verification": "Load the committed canonical project."
+                }],
+                "non_goals": []
+            },
+            "tasks": [{
+                "id": "implement",
+                "title": "Implement",
+                "capability": "code.generate",
+                "instruction": "Implement the approved change.",
+                "depends_on": implement_dependencies
+            }, {
+                "id": "verify",
+                "title": "Verify",
+                "capability": "project.tests.execute",
+                "instruction": "Run the repository test suite.",
+                "depends_on": ["implement"]
+            }]
+        })
+        .to_string()
     }
 
     fn write_empty_inventory(root: &Path) -> std::path::PathBuf {

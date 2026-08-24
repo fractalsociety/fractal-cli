@@ -107,6 +107,20 @@ struct Task {
     declared_execution: Option<TaskExecution>,
 }
 
+/// Validated, compiled inputs produced from an existing lead plan. Keeping the
+/// PRD and compiler inputs together lets the CLI preview without writing and
+/// apply the exact same artifact later without invoking a planner.
+pub(crate) struct ExistingPlanCompilation {
+    pub(crate) graph: Value,
+    pub(crate) harness: Value,
+    pub(crate) work: Value,
+    pub(crate) target_id: &'static str,
+    pub(crate) title: String,
+    pub(crate) task_count: usize,
+    pub(crate) acceptance_criteria_count: usize,
+    prd: StructuredPrd,
+}
+
 /// Expand any ordinary request into a structured PRD and committed task graph.
 /// A referenced PRD/spec becomes the source; otherwise the user's request is the
 /// source. The caller owns deterministic fallback when planning is unavailable.
@@ -134,6 +148,51 @@ pub(crate) fn plan_and_commit(
         None => (request.to_owned(), "user request".to_owned()),
     };
     decompose_and_commit(&source_text, &source_name, request, workspace, &agents[0])
+}
+
+/// Validate and compile an existing `fractal-plan.json` without calling a lead
+/// agent. Validation errors are returned directly; this path never substitutes
+/// the deterministic fallback harness used by interactive planning.
+pub(crate) fn compile_existing_plan(plan_path: &Path) -> Result<ExistingPlanCompilation> {
+    let raw = std::fs::read_to_string(plan_path)
+        .with_context(|| format!("read existing plan {}", plan_path.display()))?;
+    let planned = parse_and_validate(&raw)
+        .with_context(|| format!("validate existing plan {}", plan_path.display()))?;
+    let source_name = plan_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| plan_path.display().to_string());
+    let harness = build_harness_genome(&planned.tasks, &source_name);
+    let goal = format!(
+        "Execute the validated existing project plan `{}` from {source_name}.",
+        planned.prd.title
+    );
+    // Existing-plan compilation is intentionally deterministic so a preview and
+    // the subsequent `--yes` apply name the same content-addressed graph.
+    let work = build_work_value_at(&goal, 0)?;
+    let target_id = "darwin-arm64";
+    let graph = crate::compile::recompile(&work, &harness, target_id)
+        .context("compile the validated existing task graph")?;
+
+    Ok(ExistingPlanCompilation {
+        graph,
+        harness,
+        work,
+        target_id,
+        title: planned.prd.title.clone(),
+        task_count: planned.tasks.len(),
+        acceptance_criteria_count: planned.prd.acceptance_criteria.len(),
+        prd: planned.prd,
+    })
+}
+
+/// Persist the validated product contract only after the caller has opted into
+/// applying the compiled graph.
+pub(crate) fn persist_existing_plan_prd(
+    workspace: &Path,
+    compilation: &ExistingPlanCompilation,
+) -> Result<PathBuf> {
+    write_structured_prd(workspace, &compilation.prd)
 }
 
 /// Commit a minimal graph before the lead starts its potentially multi-minute
@@ -280,6 +339,10 @@ fn build_work_value(goal: &str) -> Result<Value> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
+    build_work_value_at(goal, created_at_ms)
+}
+
+fn build_work_value_at(goal: &str, created_at_ms: u64) -> Result<Value> {
     let (work, _source) = build_work_from_nl(&NlWorkRequest {
         request: goal.to_owned(),
         requester: "local:cli".to_owned(),
@@ -732,6 +795,12 @@ fn structured_prd_path(workspace: &Path) -> PathBuf {
 }
 
 fn persist_structured_prd(workspace: &Path, prd: &StructuredPrd) -> Result<()> {
+    let path = write_structured_prd(workspace, prd)?;
+    println!("  ◇ Structured PRD: {}", path.display());
+    Ok(())
+}
+
+fn write_structured_prd(workspace: &Path, prd: &StructuredPrd) -> Result<PathBuf> {
     let path = structured_prd_path(workspace);
     let directory = path.parent().expect("structured PRD has parent");
     std::fs::create_dir_all(directory)?;
@@ -739,8 +808,7 @@ fn persist_structured_prd(workspace: &Path, prd: &StructuredPrd) -> Result<()> {
     std::fs::write(&temporary, serde_json::to_vec_pretty(prd)?)
         .with_context(|| format!("write {}", temporary.display()))?;
     std::fs::rename(&temporary, &path).with_context(|| format!("replace {}", path.display()))?;
-    println!("  ◇ Structured PRD: {}", path.display());
-    Ok(())
+    Ok(path)
 }
 
 /// Assemble a `fractal.compiled_harness.v1` genome from the task DAG. Each task is

@@ -813,6 +813,8 @@ pub(crate) enum GraphCommand {
     Show(GraphShowArgs),
     /// Compile a bounded PRD task range into a canonical child graph.
     PlanPrd(GraphPlanPrdArgs),
+    /// Validate and compile an existing fractal-plan.json without invoking a planner.
+    CompilePlan(GraphCompilePlanArgs),
     /// Audit projects from a frozen repository inventory shard.
     Audit(GraphAuditArgs),
     /// Compose a read-only master graph from a frozen repository inventory.
@@ -1045,6 +1047,26 @@ pub(crate) struct GraphPlanPrdArgs {
     pub(crate) expected_parent_hash: String,
 
     /// Commit the compiled child graph and repoint the project at it.
+    #[arg(long)]
+    pub(crate) yes: bool,
+
+    /// Print a stable JSON report instead of human-readable diagnostics.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+/// Arguments accepted by `fractal graph compile-plan`.
+#[derive(Debug, Args)]
+pub(crate) struct GraphCompilePlanArgs {
+    /// Project workspace that will receive `.fractal/project.fractal` on apply.
+    #[arg(long, required = true, value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+
+    /// Existing fractal-plan.json path, absolute or relative to the project workspace.
+    #[arg(long, required = true, value_name = "RELATIVE_OR_ABSOLUTE_PATH")]
+    pub(crate) plan: PathBuf,
+
+    /// Commit the compiled graph and repoint the project at it.
     #[arg(long)]
     pub(crate) yes: bool,
 
@@ -1543,6 +1565,29 @@ mod tests {
         assert_eq!(args.prd, PathBuf::from("docs/implementation.md"));
         assert_eq!(args.from, "INT-008");
         assert_eq!(args.through, "INT-061");
+        assert!(args.yes);
+        assert!(args.json);
+
+        let compile_plan = Cli::try_parse_from([
+            "fractal",
+            "graph",
+            "compile-plan",
+            "--repo",
+            "/tmp/project",
+            "--plan",
+            "fractal-plan.json",
+            "--yes",
+            "--json",
+        ])
+        .unwrap();
+        let Some(Command::Graph(GraphArgs {
+            command: GraphCommand::CompilePlan(args),
+        })) = compile_plan.command
+        else {
+            panic!("expected graph compile-plan command");
+        };
+        assert_eq!(args.repo, PathBuf::from("/tmp/project"));
+        assert_eq!(args.plan, PathBuf::from("fractal-plan.json"));
         assert!(args.yes);
         assert!(args.json);
 
