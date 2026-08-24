@@ -290,7 +290,7 @@ pub(crate) fn run_end_to_end_with_efficiency(
 
         // (3) Self-evolving harness after a verified failure: attribute → bandit-
         // select a governed morphogen (grow/repair) → apply → re-run.
-        if !succeeded && attempt < MAX_REPAIRS {
+        if !succeeded && outcome.retryable && attempt < MAX_REPAIRS {
             let failed_node = outcome
                 .failed_node
                 .clone()
