@@ -76,6 +76,7 @@ pub(crate) fn run(
             fractalwork_override,
             DEFAULT_GRAPH_PORT,
             coordinate,
+            false,
         )?;
         return Ok(());
     }

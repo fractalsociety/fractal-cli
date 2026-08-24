@@ -79,6 +79,7 @@ pub(crate) fn run(fractalwork_override: Option<&Path>, coordinate_flag: bool) ->
                     &completed,
                     Some(&completed),
                     false,
+                    false,
                     None,
                 );
             } else {
@@ -431,7 +432,7 @@ pub(crate) fn execute_ingested(
     // Voice/typed control command: "resume project 3" continues that numbered
     // project regardless of the current folder, instead of starting a build.
     if let Some(number) = crate::projects::parse_resume_command(request) {
-        return resume_project(number, fractalwork_override, port, coordinate_flag);
+        return resume_project(number, fractalwork_override, port, coordinate_flag, false);
     }
 
     let workspace = match workspace_override {
@@ -479,6 +480,7 @@ pub(crate) fn execute_ingested(
             &task_group,
             &completed,
             Some(&completed),
+            false,
             false,
             efficiency,
         ));
@@ -610,6 +612,7 @@ pub(crate) fn resume_project(
     fractalwork_override: Option<&Path>,
     port: u16,
     coordinate_flag: bool,
+    hybrid: bool,
 ) -> Result<Option<crate::execute::RunOutcome>> {
     let Some(project) = crate::projects::by_number(number) else {
         anyhow::bail!("no project #{number} — run `fractal projects` to see the list");
@@ -631,6 +634,13 @@ pub(crate) fn resume_project(
             "project #{number} workspace {} is no longer trusted; run `fractal` there and approve trust",
             workspace.display()
         );
+    }
+    let backend = Backend::resolve(coordinate_flag);
+    if hybrid && backend == Backend::Coordinate {
+        anyhow::bail!("hybrid resume requires the in-process backend, not Coordinate");
+    }
+    if hybrid {
+        crate::execute::validate_hybrid_workspace(&workspace)?;
     }
     if crate::graph_store::load_graph(&cp.current_graph_hash).is_err() {
         let document = crate::project_file::load(&workspace)?;
@@ -663,12 +673,13 @@ pub(crate) fn resume_project(
         &cp.request,
         &workspace,
         &agents,
-        Backend::resolve(coordinate_flag),
+        backend,
         port,
         &task_group,
         &completed,
         Some(&completed),
         false,
+        hybrid,
         None,
     ))
 }
@@ -759,6 +770,7 @@ fn execute_request(
                 &BTreeSet::new(),
                 None,
                 planning_browser_opened,
+                false,
                 efficiency,
             )
         }
@@ -785,6 +797,7 @@ fn drive_committed_graph(
     resume_completed: &BTreeSet<String>,
     board_preseed: Option<&BTreeSet<String>>,
     browser_already_open: bool,
+    hybrid: bool,
     efficiency: Option<&crate::efficiency_config::EfficiencyConfig>,
 ) -> Option<crate::execute::RunOutcome> {
     let _run = match crate::run_control::RunGuard::start_or_join(workspace, request, port) {
@@ -921,6 +934,7 @@ fn drive_committed_graph(
             &facts,
             request,
             resume_completed,
+            hybrid,
             Some(efficiency),
         ),
         None => crate::orchestrate::run_end_to_end(
@@ -932,6 +946,7 @@ fn drive_committed_graph(
             &facts,
             request,
             resume_completed,
+            hybrid,
         ),
     };
     let elapsed = crate::ui::format_elapsed(spinner.stop());

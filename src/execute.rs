@@ -789,6 +789,13 @@ impl HybridSession {
     }
 }
 
+/// Validate the hybrid integration boundary before a resume starts any durable
+/// run/board side effects. `run_multi_agent_hybrid` repeats this check when it
+/// creates the actual session so a workspace change cannot race the preflight.
+pub(crate) fn validate_hybrid_workspace(workspace: &Path) -> Result<()> {
+    HybridSession::initialize(workspace).map(|_| ())
+}
+
 fn hybrid_path_component(value: &str) -> String {
     let component: String = value
         .chars()
@@ -3458,6 +3465,44 @@ mod tests {
         assert!(hybrid_git_status(&root, &["add", "README.md"]).unwrap());
         assert!(hybrid_git_status(&root, &["commit", "--quiet", "-m", "base"]).unwrap());
         root
+    }
+
+    #[test]
+    fn hybrid_resume_preflight_rejects_dirty_tracked_workspace() {
+        let root = hybrid_test_repository("dirty-resume");
+        fs::write(root.join("README.md"), "uncommitted tracked edit\n").unwrap();
+
+        let error = validate_hybrid_workspace(&root).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("requires a clean tracked workspace"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_resume_skips_every_completed_seed_assignment() {
+        let root = hybrid_test_repository("completed-seed");
+        let mut graph = json!({
+            "schema":"fractal.execution_graph.v1",
+            "graph_id":"fg_hybrid_resume",
+            "goal":"Resume only unfinished work",
+            "nodes":[
+                {"id":"already_done","capability":"code.generate","instruction":"must not run"},
+                {"id":"also_done","capability":"project.tests.execute","instruction":"must not run"}
+            ],
+            "edges":[{"from":"already_done","to":"also_done"}]
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::project_file::persist(&root, &graph, "Hybrid resume").unwrap();
+        let completed = BTreeSet::from(["already_done".to_owned(), "also_done".to_owned()]);
+
+        let outcome =
+            run_multi_agent_hybrid(&graph, &root, &["codex".to_owned()], None, &completed).unwrap();
+
+        assert!(outcome.log.is_empty(), "completed nodes must not run again");
+        assert!(outcome.failed_node.is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

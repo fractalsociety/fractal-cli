@@ -102,6 +102,7 @@ pub(crate) fn run_end_to_end(
     facts: &crate::router::RunFacts,
     request: &str,
     resume_completed: &std::collections::BTreeSet<String>,
+    hybrid: bool,
 ) -> Result<execute::RunOutcome> {
     run_end_to_end_with_efficiency(
         graph_hash,
@@ -112,6 +113,7 @@ pub(crate) fn run_end_to_end(
         facts,
         request,
         resume_completed,
+        hybrid,
         None,
     )
 }
@@ -128,6 +130,7 @@ pub(crate) fn run_end_to_end_with_efficiency(
     facts: &crate::router::RunFacts,
     request: &str,
     resume_completed: &std::collections::BTreeSet<String>,
+    hybrid: bool,
     efficiency: Option<&crate::efficiency_config::EfficiencyConfig>,
 ) -> Result<execute::RunOutcome> {
     let mut graph = graph_store::load_graph(graph_hash)?;
@@ -159,6 +162,30 @@ pub(crate) fn run_end_to_end_with_efficiency(
     )> = None;
     let outcome = loop {
         let outcome = match backend {
+            Backend::InProcess if hybrid => {
+                // Hybrid resume deliberately bypasses the mid-run supervisor:
+                // every remaining model-driven node must cross the isolated
+                // worktree integration boundary instead of sharing a checkout.
+                let default_efficiency = crate::efficiency_config::EfficiencyConfig {
+                    mode: crate::efficiency::EfficiencyMode::Suggest,
+                    approved: Vec::new(),
+                    overridden: Vec::new(),
+                    high_impact_autonomy: Vec::new(),
+                };
+                let efficiency = efficiency.unwrap_or(&default_efficiency);
+                let mut runtime = execute::EfficiencyRuntime::default();
+                if let Err(error) = execute::run_efficiency_boundary(
+                    &graph,
+                    &current_hash,
+                    &run_completed,
+                    workspace,
+                    efficiency,
+                    &mut runtime,
+                ) {
+                    eprintln!("  efficiency boundary note: {error:#}");
+                }
+                execute::run_multi_agent_hybrid(&graph, workspace, agents, board, &run_completed)?
+            }
             // Mid-run morphogenesis supervisor: drives the graph wave-by-wave and
             // fires proactive governed morphogens between waves (adapting the graph
             // continuously), returning the possibly-evolved graph to continue from.

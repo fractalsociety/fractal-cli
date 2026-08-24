@@ -294,10 +294,14 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        (None, Some(Command::Resume(args))) => {
-            interactive::resume_project(args.number, fractalwork.as_deref(), args.port, coordinate)
-                .map(|_| ())
-        }
+        (None, Some(Command::Resume(args))) => interactive::resume_project(
+            args.number,
+            fractalwork.as_deref(),
+            args.port,
+            coordinate,
+            args.hybrid,
+        )
+        .map(|_| ()),
         (None, Some(Command::Stop(args))) => run_control::stop(&args),
         (None, Some(Command::Status(args))) => run_control::status(&args),
         (None, Some(Command::Login(args))) => auth::run_login(&args),

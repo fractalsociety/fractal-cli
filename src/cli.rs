@@ -504,6 +504,11 @@ pub(crate) struct ResumeArgs {
     /// Board port to serve the resumed graph on.
     #[arg(long, default_value_t = DEFAULT_GRAPH_PORT)]
     pub(crate) port: u16,
+
+    /// Run remaining worker nodes in isolated Git worktrees and integrate their
+    /// declared outputs serially into the canonical workspace.
+    #[arg(long)]
+    pub(crate) hybrid: bool,
 }
 
 /// Arguments accepted by `fractal clean`.
@@ -2041,6 +2046,16 @@ mod tests {
                 .unwrap()
                 .command,
             Some(Command::Status(StatusArgs { running: true }))
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["fractal", "resume", "45", "--hybrid"])
+                .unwrap()
+                .command,
+            Some(Command::Resume(ResumeArgs {
+                number: 45,
+                hybrid: true,
+                ..
+            }))
         ));
         assert!(Cli::try_parse_from(["fractal", "stop", "--all", "--project", "app"]).is_err());
     }
