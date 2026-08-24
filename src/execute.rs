@@ -1301,7 +1301,19 @@ fn hybrid_ownership_available(
 }
 
 fn reject_hybrid_scope_escape(worktree: &Path, node: &str) -> Result<()> {
-    let unstaged = hybrid_git_output(worktree, &["diff", "--name-only"])?;
+    let unstaged = hybrid_git_output(
+        worktree,
+        &[
+            "diff",
+            "--name-only",
+            "--",
+            ".",
+            ":(exclude).fractal/project.fractal",
+            ":(exclude).fractal/run-state.json",
+            ":(exclude).fractal/sync-state.json",
+            ":(exclude).fractal/pending-amendments.claim",
+        ],
+    )?;
     if let Some(path) = unstaged.lines().find(|path| !path.trim().is_empty()) {
         return Err(hybrid_failure(
             crate::learning_data::IntegrationFailureKind::ScopeEscape,
@@ -4122,12 +4134,19 @@ esac
         let worktree = session
             .create_worktree("runtime-safe", "opencode:1")
             .unwrap();
-        fs::write(worktree.join("runtime-safe.txt"), "worker result\n").unwrap();
         fs::write(
             root.join(".fractal/project.fractal"),
             "{\"phase\":\"running\"}\n",
         )
         .unwrap();
+        copy_hybrid_context(&root, &worktree).unwrap();
+        assert!(hybrid_git_output(
+            &worktree,
+            &["status", "--porcelain=v1", "--untracked-files=no"]
+        )
+        .unwrap()
+        .contains(".fractal/project.fractal"));
+        fs::write(worktree.join("runtime-safe.txt"), "worker result\n").unwrap();
 
         session
             .integrate_worker_result(&node, "opencode:1", &worktree)
