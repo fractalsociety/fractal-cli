@@ -509,6 +509,17 @@ pub(crate) struct ResumeArgs {
     /// declared outputs serially into the canonical workspace.
     #[arg(long)]
     pub(crate) hybrid: bool,
+
+    /// Explicitly reroute eligible released tool-failure nodes from one pinned
+    /// provider to another active provider (for example claude=codex-luna).
+    /// May be repeated; valid only with `--hybrid`.
+    #[arg(
+        long,
+        value_name = "SOURCE=TARGET",
+        requires = "hybrid",
+        action = clap::ArgAction::Append
+    )]
+    pub(crate) reroute_unavailable: Vec<String>,
 }
 
 /// Arguments accepted by `fractal clean`.
@@ -2057,6 +2068,32 @@ mod tests {
                 ..
             }))
         ));
+        let rerouted = Cli::try_parse_from([
+            "fractal",
+            "resume",
+            "45",
+            "--hybrid",
+            "--reroute-unavailable",
+            "claude=codex-luna",
+        ])
+        .unwrap();
+        assert!(matches!(
+            rerouted.command,
+            Some(Command::Resume(ResumeArgs {
+                number: 45,
+                hybrid: true,
+                ref reroute_unavailable,
+                ..
+            })) if reroute_unavailable == &["claude=codex-luna"]
+        ));
+        assert!(Cli::try_parse_from([
+            "fractal",
+            "resume",
+            "45",
+            "--reroute-unavailable",
+            "claude=codex-luna",
+        ])
+        .is_err());
         assert!(Cli::try_parse_from(["fractal", "stop", "--all", "--project", "app"]).is_err());
     }
 

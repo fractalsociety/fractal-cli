@@ -542,7 +542,7 @@ fn node_required_agent(node: &Value) -> Option<&str> {
         .filter(|agent| !agent.is_empty())
 }
 
-fn agent_matches_requirement(agent: &str, required: &str) -> bool {
+pub(crate) fn agent_matches_requirement(agent: &str, required: &str) -> bool {
     let actual = command_kind_for_agent(agent);
     match required {
         "cursor" | "cursor-agent" => matches!(actual, "cursor" | "cursor-agent"),
@@ -560,16 +560,45 @@ fn node_allows_agent(node: &Value, agent: &str) -> bool {
         .unwrap_or(true)
 }
 
-fn validate_node_agent_requirements(nodes: &[Value], agents: &[String]) -> Result<()> {
+fn node_allows_agent_with_reroutes(
+    node: &Value,
+    agent: &str,
+    reroutes: &BTreeMap<String, String>,
+) -> bool {
+    let rerouted = node
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(|id| reroutes.get(id));
+    rerouted
+        .map(|required| agent_matches_requirement(agent, required))
+        .unwrap_or_else(|| node_allows_agent(node, agent))
+}
+
+fn validate_node_agent_requirements(
+    nodes: &[Value],
+    agents: &[String],
+    reroutes: &BTreeMap<String, String>,
+) -> Result<()> {
+    let node_ids: BTreeSet<&str> = nodes
+        .iter()
+        .filter_map(|node| node.get("id").and_then(Value::as_str))
+        .collect();
+    if let Some(unknown) = reroutes.keys().find(|id| !node_ids.contains(id.as_str())) {
+        bail!("resume reroute names unknown graph node `{unknown}`");
+    }
     for node in nodes {
-        let Some(required) = node_required_agent(node) else {
+        let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
+        let required = reroutes
+            .get(id)
+            .map(String::as_str)
+            .or_else(|| node_required_agent(node));
+        let Some(required) = required else {
             continue;
         };
         if !agents
             .iter()
             .any(|agent| agent_matches_requirement(agent, required))
         {
-            let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
             bail!(
                 "node `{id}` requires worker `{required}`, but the active roster is [{}]",
                 agents.join(", ")
@@ -2279,7 +2308,15 @@ pub(crate) fn run_multi_agent(
     board: Option<&str>,
     completed_seed: &BTreeSet<String>,
 ) -> Result<RunOutcome> {
-    run_multi_agent_inner(graph, workspace, agents, board, completed_seed, None)
+    run_multi_agent_inner(
+        graph,
+        workspace,
+        agents,
+        board,
+        completed_seed,
+        None,
+        &BTreeMap::new(),
+    )
 }
 
 pub(crate) fn run_multi_agent_hybrid(
@@ -2289,6 +2326,24 @@ pub(crate) fn run_multi_agent_hybrid(
     board: Option<&str>,
     completed_seed: &BTreeSet<String>,
 ) -> Result<RunOutcome> {
+    run_multi_agent_hybrid_with_reroutes(
+        graph,
+        workspace,
+        agents,
+        board,
+        completed_seed,
+        &BTreeMap::new(),
+    )
+}
+
+pub(crate) fn run_multi_agent_hybrid_with_reroutes(
+    graph: &Value,
+    workspace: &Path,
+    agents: &[String],
+    board: Option<&str>,
+    completed_seed: &BTreeSet<String>,
+    reroutes: &BTreeMap<String, String>,
+) -> Result<RunOutcome> {
     let hybrid = HybridSession::initialize(workspace)?;
     run_multi_agent_inner(
         graph,
@@ -2297,6 +2352,7 @@ pub(crate) fn run_multi_agent_hybrid(
         board,
         completed_seed,
         Some(&hybrid),
+        reroutes,
     )
 }
 
@@ -2307,9 +2363,10 @@ fn run_multi_agent_inner(
     board: Option<&str>,
     completed_seed: &BTreeSet<String>,
     hybrid: Option<&HybridSession>,
+    reroutes: &BTreeMap<String, String>,
 ) -> Result<RunOutcome> {
     let ordered = topo_order(graph)?; // validates acyclic
-    validate_node_agent_requirements(&ordered, agents)?;
+    validate_node_agent_requirements(&ordered, agents, reroutes)?;
     let ids: Vec<String> = ordered
         .iter()
         .filter_map(|node| node.get("id").and_then(Value::as_str).map(str::to_owned))
@@ -2444,7 +2501,7 @@ fn run_multi_agent_inner(
                     let for_this_agent = |id: &String| {
                         let node = &node_by_id[id];
                         if node_required_agent(node).is_some() {
-                            node_allows_agent(node, &agent)
+                            node_allows_agent_with_reroutes(node, &agent, reroutes)
                         } else if !has_workers {
                             true
                         } else if is_lead {
@@ -3654,8 +3711,33 @@ mod tests {
         assert!(!node_allows_agent(&node, "claude"));
 
         let roster = vec!["codex".to_owned(), "codex-luna".to_owned()];
-        let error = validate_node_agent_requirements(&[node], &roster).unwrap_err();
+        let error =
+            validate_node_agent_requirements(&[node], &roster, &BTreeMap::new()).unwrap_err();
         assert!(error.to_string().contains("requires worker `cursor`"));
+    }
+
+    #[test]
+    fn explicit_resume_reroute_changes_only_the_named_node_affinity() {
+        let failed = json!({"id":"claude_failed","executor":{"agent":"claude"}});
+        let untouched = json!({"id":"claude_untouched","executor":{"agent":"claude"}});
+        let reroutes = BTreeMap::from([("claude_failed".to_owned(), "codex-luna".to_owned())]);
+
+        assert!(node_allows_agent_with_reroutes(
+            &failed,
+            "codex-luna:2",
+            &reroutes
+        ));
+        assert!(!node_allows_agent_with_reroutes(
+            &failed, "claude:1", &reroutes
+        ));
+        assert!(node_allows_agent_with_reroutes(
+            &untouched, "claude:1", &reroutes
+        ));
+        assert!(!node_allows_agent_with_reroutes(
+            &untouched,
+            "codex-luna:2",
+            &reroutes
+        ));
     }
 
     #[test]

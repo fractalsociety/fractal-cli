@@ -77,6 +77,7 @@ pub(crate) fn run(
             DEFAULT_GRAPH_PORT,
             coordinate,
             false,
+            &[],
         )?;
         return Ok(());
     }

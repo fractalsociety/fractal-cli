@@ -300,6 +300,7 @@ fn run(cli: Cli) -> Result<()> {
             args.port,
             coordinate,
             args.hybrid,
+            &args.reroute_unavailable,
         )
         .map(|_| ()),
         (None, Some(Command::Stop(args))) => run_control::stop(&args),

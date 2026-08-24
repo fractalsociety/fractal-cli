@@ -266,6 +266,7 @@ fn process_event(event: InputEvent, options: EventOptions<'_>) -> Result<()> {
             options.port,
             options.coordinate,
             false,
+            &[],
         )
         .map(|_| ());
     }

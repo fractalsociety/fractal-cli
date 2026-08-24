@@ -103,6 +103,7 @@ pub(crate) fn run_end_to_end(
     request: &str,
     resume_completed: &std::collections::BTreeSet<String>,
     hybrid: bool,
+    resume_reroutes: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<execute::RunOutcome> {
     run_end_to_end_with_efficiency(
         graph_hash,
@@ -114,6 +115,7 @@ pub(crate) fn run_end_to_end(
         request,
         resume_completed,
         hybrid,
+        resume_reroutes,
         None,
     )
 }
@@ -131,6 +133,7 @@ pub(crate) fn run_end_to_end_with_efficiency(
     request: &str,
     resume_completed: &std::collections::BTreeSet<String>,
     hybrid: bool,
+    resume_reroutes: Option<&std::collections::BTreeMap<String, String>>,
     efficiency: Option<&crate::efficiency_config::EfficiencyConfig>,
 ) -> Result<execute::RunOutcome> {
     let mut graph = graph_store::load_graph(graph_hash)?;
@@ -184,7 +187,14 @@ pub(crate) fn run_end_to_end_with_efficiency(
                 ) {
                     eprintln!("  efficiency boundary note: {error:#}");
                 }
-                execute::run_multi_agent_hybrid(&graph, workspace, agents, board, &run_completed)?
+                execute::run_multi_agent_hybrid_with_reroutes(
+                    &graph,
+                    workspace,
+                    agents,
+                    board,
+                    &run_completed,
+                    resume_reroutes.unwrap_or(&std::collections::BTreeMap::new()),
+                )?
             }
             // Mid-run morphogenesis supervisor: drives the graph wave-by-wave and
             // fires proactive governed morphogens between waves (adapting the graph
