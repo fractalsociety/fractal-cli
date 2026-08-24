@@ -522,6 +522,7 @@ pub(crate) fn run_supervised_with_efficiency(
             verified,
             detail,
             failed_node: failed,
+            retryable: true,
             log,
         },
         graph,

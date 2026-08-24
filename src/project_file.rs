@@ -469,6 +469,23 @@ pub(crate) fn release_node(
     })
 }
 
+pub(crate) fn record_integration_failure(
+    workspace: &Path,
+    node: &str,
+    detail: crate::learning_data::IntegrationFailureDetail,
+) -> Result<()> {
+    mutate_execution_document(workspace, |document, _now| {
+        ensure_known_node(document, node)?;
+        let record = document
+            .learning
+            .nodes
+            .get_mut(node)
+            .context("learning node missing")?;
+        record.integration_failure = Some(detail);
+        Ok(())
+    })
+}
+
 #[allow(dead_code)]
 pub(crate) fn reopen_node(workspace: &Path, node: &str) -> Result<()> {
     mutate_execution_document(workspace, |document, now| {
@@ -810,6 +827,7 @@ fn finish_node_in_document(
     if let Some(record) = document.learning.nodes.get_mut(node) {
         record.finished_at = Some(now.to_owned());
         record.outcome = Some(outcome);
+        record.integration_failure = None;
     }
     complete_graph_if_terminal(document);
     Ok(())
@@ -868,6 +886,7 @@ fn release_node_in_document(
             record.finished_at = Some(now.to_owned());
             record.outcome = Some(outcome);
             record.failure_code = Some(failure_code);
+            record.integration_failure = None;
             if outcome == crate::learning_data::NodeOutcome::FailedVerification {
                 record.verification = Some(crate::learning_data::Verification {
                     kind: Some("automated".to_owned()),

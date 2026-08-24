@@ -47,6 +47,8 @@ pub(crate) struct RunOutcome {
     pub detail: String,
     /// The node whose verification failed (drives governed evolution), if any.
     pub failed_node: Option<String>,
+    /// False when repeating the same graph cannot repair the failure.
+    pub retryable: bool,
     /// Per-node execution log for chain receipts + the sanitized export.
     pub log: Vec<NodeRun>,
 }
@@ -611,6 +613,52 @@ fn validate_node_agent_requirements(
 /// One hybrid run owns isolated worker checkouts and a single integration
 /// boundary. Worker models never share a mutable source tree; only Fractal may
 /// serialize their commits into the canonical workspace.
+#[derive(Debug)]
+struct HybridExecutionFailure {
+    detail: crate::learning_data::IntegrationFailureDetail,
+    failure_code: crate::learning_data::FailureCode,
+}
+
+impl std::fmt::Display for HybridExecutionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail.summary)
+    }
+}
+
+impl std::error::Error for HybridExecutionFailure {}
+
+fn bounded_hybrid_summary(value: &str) -> String {
+    let mut summary = String::new();
+    for character in value.chars().filter(|character| !character.is_control()) {
+        if summary.len() + character.len_utf8() > 240 {
+            break;
+        }
+        summary.push(character);
+    }
+    summary
+}
+
+fn hybrid_failure(
+    kind: crate::learning_data::IntegrationFailureKind,
+    failure_code: crate::learning_data::FailureCode,
+    summary: impl AsRef<str>,
+    worker_commit: Option<String>,
+) -> anyhow::Error {
+    HybridExecutionFailure {
+        detail: crate::learning_data::IntegrationFailureDetail {
+            schema: "fractal.integration_failure.v1".to_owned(),
+            kind,
+            summary: bounded_hybrid_summary(summary.as_ref()),
+            worker_commit: worker_commit.filter(|commit| {
+                matches!(commit.len(), 40 | 64)
+                    && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }),
+        },
+        failure_code,
+    }
+    .into()
+}
+
 struct HybridSession {
     workspace: PathBuf,
     git_boundary: Mutex<()>,
@@ -708,10 +756,12 @@ impl HybridSession {
         if node_required_agent(node).is_some() {
             if let Some(source) = declared_artifact_path(node, worktree) {
                 if !source.exists() {
-                    bail!(
-                        "hybrid worker `{agent}` did not produce declared artifact {}",
-                        source.display()
-                    );
+                    return Err(hybrid_failure(
+                        crate::learning_data::IntegrationFailureKind::MissingArtifact,
+                        crate::learning_data::FailureCode::InvalidOutputSchema,
+                        format!("hybrid worker `{agent}` did not produce its declared artifact"),
+                        None,
+                    ));
                 }
             }
         }
@@ -762,9 +812,12 @@ impl HybridSession {
         if commit.is_none()
             && is_build(node.get("capability").and_then(Value::as_str).unwrap_or(""))
         {
-            bail!(
-                "hybrid build node `{id}` exited successfully but made no tracked source changes"
-            );
+            return Err(hybrid_failure(
+                crate::learning_data::IntegrationFailureKind::NoTrackedChanges,
+                crate::learning_data::FailureCode::InvalidOutputSchema,
+                format!("hybrid build node `{id}` made no tracked source changes"),
+                None,
+            ));
         }
 
         let _git = self.git_boundary.lock().expect("hybrid git boundary");
@@ -774,10 +827,12 @@ impl HybridSession {
                 &["status", "--porcelain=v1", "--untracked-files=no"],
             )?;
             if !clean.trim().is_empty() {
-                bail!(
-                    "canonical workspace changed before integrating `{id}`:\n{}",
-                    clean.trim()
-                );
+                return Err(hybrid_failure(
+                    crate::learning_data::IntegrationFailureKind::CanonicalWorkspaceChanged,
+                    crate::learning_data::FailureCode::ToolFailure,
+                    format!("canonical workspace changed before integrating hybrid node `{id}`"),
+                    Some(commit),
+                ));
             }
             let status = Command::new("git")
                 .arg("-C")
@@ -792,10 +847,12 @@ impl HybridSession {
                     .arg(&self.workspace)
                     .args(["cherry-pick", "--abort"])
                     .status();
-                bail!(
-                    "hybrid integration conflict for node `{id}` from `{agent}`; worktree preserved at {}",
-                    worktree.display()
-                );
+                return Err(hybrid_failure(
+                    crate::learning_data::IntegrationFailureKind::IntegrationConflict,
+                    crate::learning_data::FailureCode::ConflictingParallelEdits,
+                    format!("hybrid integration conflict for node `{id}` from `{agent}`"),
+                    Some(commit),
+                ));
             }
         }
         copy_declared_artifact(node, worktree, &self.workspace)?;
@@ -874,65 +931,150 @@ fn hybrid_git_status(workspace: &Path, args: &[&str]) -> Result<bool> {
     Ok(status.success())
 }
 
-fn hybrid_owned_paths(node: &Value, worktree: &Path) -> Result<Vec<String>> {
-    let mut declared = BTreeSet::new();
+fn normalize_hybrid_owned_path(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    let invalid = |reason: &str| {
+        hybrid_failure(
+            crate::learning_data::IntegrationFailureKind::InvalidOwnedPath,
+            crate::learning_data::FailureCode::InvalidOutputSchema,
+            format!("invalid hybrid owned path `{raw}`: {reason}"),
+            None,
+        )
+    };
+    if raw.is_empty() || raw.chars().any(char::is_whitespace) {
+        return Err(invalid(
+            "empty or whitespace-containing paths are not allowed",
+        ));
+    }
+    if raw.contains('\\') {
+        return Err(invalid("backslash path separators are not portable"));
+    }
+    let candidate = Path::new(raw);
+    if candidate.is_absolute() {
+        return Err(invalid(
+            "absolute paths are outside the repository boundary",
+        ));
+    }
+    let mut normalized = Vec::new();
+    for component in candidate.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => {
+                if name == ".git" || name == ".fractal" {
+                    return Err(invalid("reserved control directories cannot be owned"));
+                }
+                normalized.push(name.to_string_lossy().into_owned());
+            }
+            std::path::Component::ParentDir => {
+                return Err(invalid(
+                    "parent traversal is outside the repository boundary",
+                ));
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(invalid("root or platform-prefixed paths are not allowed"));
+            }
+        }
+    }
+    if normalized.is_empty() {
+        return Err(invalid("repository root ownership is too broad"));
+    }
+    Ok(normalized.join("/"))
+}
+
+fn ensure_hybrid_path_within_root(root: &Path, relative: &str) -> Result<()> {
+    let canonical_root = std::fs::canonicalize(root).context("resolve hybrid ownership root")?;
+    let mut existing = root.join(relative);
+    while std::fs::symlink_metadata(&existing).is_err() {
+        if !existing.pop() || existing == root {
+            existing = root.to_path_buf();
+            break;
+        }
+    }
+    let canonical_existing = std::fs::canonicalize(&existing)
+        .with_context(|| format!("resolve declared hybrid owned path `{relative}`"))?;
+    if !canonical_existing.starts_with(&canonical_root) {
+        return Err(hybrid_failure(
+            crate::learning_data::IntegrationFailureKind::InvalidOwnedPath,
+            crate::learning_data::FailureCode::InvalidOutputSchema,
+            format!("invalid hybrid owned path `{relative}`: path resolves outside repository"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn hybrid_declared_owned_paths(node: &Value, root: &Path) -> Result<Vec<String>> {
+    let mut owned = BTreeSet::new();
     if let Some(paths) = node
         .pointer("/efficiency/files_or_systems_affected")
         .and_then(Value::as_array)
     {
-        for path in paths.iter().filter_map(Value::as_str) {
-            declared.insert(path.trim().to_owned());
+        for value in paths {
+            let raw = value.as_str().ok_or_else(|| {
+                hybrid_failure(
+                    crate::learning_data::IntegrationFailureKind::InvalidOwnedPath,
+                    crate::learning_data::FailureCode::InvalidOutputSchema,
+                    "invalid hybrid owned path: declarations must be strings",
+                    None,
+                )
+            })?;
+            let path = normalize_hybrid_owned_path(raw)?;
+            ensure_hybrid_path_within_root(root, &path)?;
+            owned.insert(path);
         }
     }
-    if let Some(path) = node
-        .pointer("/efficiency/expected_artifact")
-        .and_then(Value::as_str)
-    {
-        declared.insert(path.trim().to_owned());
-    }
+    Ok(owned.into_iter().collect())
+}
 
+fn hybrid_owned_paths(node: &Value, worktree: &Path) -> Result<Vec<String>> {
+    let declared = hybrid_declared_owned_paths(node, worktree)?;
     let mut owned = Vec::new();
     for path in declared {
-        if path.is_empty()
-            || matches!(path.as_str(), "." | "./")
-            || path.starts_with(':')
-            || path.chars().any(char::is_whitespace)
-        {
-            continue;
-        }
-        let candidate = Path::new(&path);
-        let first = candidate.components().next();
-        if candidate.is_absolute()
-            || candidate.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::ParentDir
-                        | std::path::Component::RootDir
-                        | std::path::Component::Prefix(_)
-                )
-            })
-            || matches!(first, Some(std::path::Component::Normal(name)) if name == ".git" || name == ".fractal")
-        {
-            continue;
-        }
         let tracked = !hybrid_git_output(worktree, &["ls-files", "--", &path])?
             .trim()
             .is_empty();
-        if worktree.join(candidate).exists() || tracked {
+        if worktree.join(&path).exists() || tracked {
             owned.push(path);
         }
     }
-    owned.sort();
-    owned.dedup();
     Ok(owned)
+}
+
+fn hybrid_paths_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn hybrid_ownership_available(
+    candidate: &str,
+    in_progress: &BTreeSet<String>,
+    ownership: &BTreeMap<String, Vec<String>>,
+) -> bool {
+    let candidate_paths = ownership.get(candidate).map(Vec::as_slice).unwrap_or(&[]);
+    in_progress.iter().all(|active| {
+        let active_paths = ownership.get(active).map(Vec::as_slice).unwrap_or(&[]);
+        !candidate_paths.iter().any(|candidate_path| {
+            active_paths
+                .iter()
+                .any(|active_path| hybrid_paths_overlap(candidate_path, active_path))
+        })
+    })
 }
 
 fn reject_hybrid_scope_escape(worktree: &Path, node: &str) -> Result<()> {
     let unstaged = hybrid_git_output(worktree, &["diff", "--name-only"])?;
     if let Some(path) = unstaged.lines().find(|path| !path.trim().is_empty()) {
-        bail!(
-            "hybrid node `{node}` modified tracked path `{path}` outside its declared file ownership"
-        );
+        return Err(hybrid_failure(
+            crate::learning_data::IntegrationFailureKind::ScopeEscape,
+            crate::learning_data::FailureCode::InvalidOutputSchema,
+            format!("hybrid node `{node}` modified undeclared tracked path `{path}`"),
+            None,
+        ));
     }
     let untracked = hybrid_git_output(worktree, &["ls-files", "--others", "--exclude-standard"])?;
     if let Some(path) = untracked
@@ -940,7 +1082,12 @@ fn reject_hybrid_scope_escape(worktree: &Path, node: &str) -> Result<()> {
         .map(str::trim)
         .find(|path| !path.is_empty() && !is_hybrid_generated_path(path))
     {
-        bail!("hybrid node `{node}` created path `{path}` outside its declared file ownership");
+        return Err(hybrid_failure(
+            crate::learning_data::IntegrationFailureKind::ScopeEscape,
+            crate::learning_data::FailureCode::InvalidOutputSchema,
+            format!("hybrid node `{node}` created undeclared path `{path}`"),
+            None,
+        ));
     }
     Ok(())
 }
@@ -1072,9 +1219,11 @@ fn pool_requeue_failure(
     id: &str,
     pool_mode: bool,
     is_lead: bool,
+    retryable: bool,
 ) -> bool {
-    if !pool_mode || is_lead {
+    if !pool_mode || is_lead || !retryable {
         state.failed = Some(id.to_owned());
+        state.failed_retryable = retryable;
         return true;
     }
     let retries = state.retry_counts.entry(id.to_owned()).or_insert(0);
@@ -1085,6 +1234,7 @@ fn pool_requeue_failure(
         false
     } else {
         state.failed = Some(id.to_owned());
+        state.failed_retryable = true;
         true
     }
 }
@@ -1215,6 +1365,9 @@ struct NodeOutcome {
     /// Prior verified lesson IDs that were injected into this node's worker
     /// prompt.  This is bookkeeping only; lesson confidence is never updated.
     lessons: Vec<String>,
+    failure_code: Option<crate::learning_data::FailureCode>,
+    integration_failure: Option<crate::learning_data::IntegrationFailureDetail>,
+    retryable: bool,
 }
 
 impl NodeOutcome {
@@ -1225,6 +1378,9 @@ impl NodeOutcome {
             timed_out: false,
             note,
             lessons: Vec::new(),
+            failure_code: None,
+            integration_failure: None,
+            retryable: false,
         }
     }
 
@@ -1235,6 +1391,22 @@ impl NodeOutcome {
             timed_out,
             note,
             lessons: Vec::new(),
+            failure_code: None,
+            integration_failure: None,
+            retryable: true,
+        }
+    }
+
+    fn hybrid_failure(failure: &HybridExecutionFailure) -> Self {
+        Self {
+            ok: false,
+            verified: None,
+            timed_out: false,
+            note: Some(failure.detail.summary.clone()),
+            lessons: Vec::new(),
+            failure_code: Some(failure.failure_code),
+            integration_failure: Some(failure.detail.clone()),
+            retryable: false,
         }
     }
 
@@ -1274,7 +1446,15 @@ fn run_worker_node(
         .unwrap_or("");
     let timeout_ms = agent_timeout_ms(node);
     let run = match hybrid {
-        Some(session) => session.run_worker(node, agent, timeout_ms)?,
+        Some(session) => match session.run_worker(node, agent, timeout_ms) {
+            Ok(run) => run,
+            Err(error) => {
+                if let Some(failure) = error.downcast_ref::<HybridExecutionFailure>() {
+                    return Ok(NodeOutcome::hybrid_failure(failure));
+                }
+                return Err(error);
+            }
+        },
         None => run_worker_as_for_node(agent, instruction, workspace, timeout_ms, Some(node))?,
     };
     let timeout_note = run.timed_out.then(|| {
@@ -1597,7 +1777,7 @@ fn report_node_outcome_with_lessons(
         return;
     }
 
-    let (learning_outcome, failure_code) = if outcome.verified == Some(false) {
+    let (learning_outcome, default_failure_code) = if outcome.verified == Some(false) {
         (
             crate::learning_data::NodeOutcome::FailedVerification,
             crate::learning_data::FailureCode::WeakVerifier,
@@ -1613,9 +1793,10 @@ fn report_node_outcome_with_lessons(
             crate::learning_data::FailureCode::ToolFailure,
         )
     };
+    let failure_code = outcome.failure_code.unwrap_or(default_failure_code);
     crate::run_control::node_transition(board, node, "release", agent);
     let evidence = compact_evidence_ref(node, evidence_hex);
-    let result = release_learning_failure(
+    let mut result = release_learning_failure(
         workspace,
         node,
         agent,
@@ -1623,6 +1804,12 @@ fn report_node_outcome_with_lessons(
         failure_code,
         Some((evidence.as_str(), latency_ms)),
     );
+    if result.is_ok() {
+        if let Some(detail) = &outcome.integration_failure {
+            result =
+                crate::project_file::record_integration_failure(workspace, node, detail.clone());
+        }
+    }
     if let Err(error) = result {
         eprintln!("  live graph state note: {error:#}");
     } else {
@@ -2292,6 +2479,7 @@ struct Schedule {
     slot_leases: BTreeMap<String, String>,
     retry_counts: BTreeMap<String, u32>,
     failed: Option<String>,
+    failed_retryable: bool,
     built: bool,
     verified: Option<bool>,
     log: Vec<NodeRun>,
@@ -2379,6 +2567,16 @@ fn run_multi_agent_inner(
                 .map(|id| (id.to_owned(), node.clone()))
         })
         .collect();
+    let hybrid_ownership: BTreeMap<String, Vec<String>> = if hybrid.is_some() {
+        node_by_id
+            .iter()
+            .map(|(id, node)| {
+                hybrid_declared_owned_paths(node, workspace).map(|paths| (id.clone(), paths))
+            })
+            .collect::<Result<_>>()?
+    } else {
+        BTreeMap::new()
+    };
     let mut predecessors: BTreeMap<String, Vec<String>> =
         ids.iter().map(|id| (id.clone(), Vec::new())).collect();
     for edge in graph
@@ -2428,13 +2626,14 @@ fn run_multi_agent_inner(
             let agent = agent.clone();
             let is_lead = agent.as_str() == lead;
             let provider_caps = provider_caps.clone();
-            let (schedule, ids, node_by_id, predecessors, graph, graph_hash) = (
+            let (schedule, ids, node_by_id, predecessors, graph, graph_hash, hybrid_ownership) = (
                 &schedule,
                 &ids,
                 &node_by_id,
                 &predecessors,
                 graph,
                 &graph_hash,
+                &hybrid_ownership,
             );
             scope.spawn(move || {
               let mut mine: u64 = 0;
@@ -2493,6 +2692,11 @@ fn run_multi_agent_inner(
                                 .iter()
                                 .all(|pred| state.completed.contains(pred))
                             && gate_admitted(id)
+                            && hybrid_ownership_available(
+                                id,
+                                &state.in_progress,
+                                hybrid_ownership,
+                            )
                     };
                     let is_root = |id: &String| predecessors[id].is_empty();
                     let is_control = |id: &String| capability_of(id).starts_with("control.");
@@ -2529,6 +2733,7 @@ fn run_multi_agent_inner(
                                 && !gate_admitted(id)
                         }) {
                             state.failed = Some(denied.clone());
+                            state.failed_retryable = false;
                             break;
                         }
                     }
@@ -2564,6 +2769,7 @@ fn run_multi_agent_inner(
                     state.in_progress.remove(&id);
                     state.slot_leases.remove(&agent);
                     state.failed = Some(id.clone());
+                    state.failed_retryable = false;
                     state.log.push(NodeRun {
                         node: id.clone(),
                         agent: agent.clone(),
@@ -2595,6 +2801,8 @@ fn run_multi_agent_inner(
                             timed_out: _,
                             note,
                             lessons,
+                            retryable,
+                            ..
                         } = &outcome;
                         if is_build(capability) && *ok {
                             state.built = true;
@@ -2641,7 +2849,14 @@ fn run_multi_agent_inner(
                                 &preds,
                                 lessons,
                             );
-                            if pool_requeue_failure(&mut state, workspace, &id, pool_mode, is_lead)
+                            if pool_requeue_failure(
+                                &mut state,
+                                workspace,
+                                &id,
+                                pool_mode,
+                                is_lead,
+                                *retryable,
+                            )
                             {
                                 println!("{clr}  [{agent}] ✗ {id}{suffix}");
                             } else {
@@ -2662,7 +2877,14 @@ fn run_multi_agent_inner(
                             latency_ms,
                             &preds,
                         );
-                        if pool_requeue_failure(&mut state, workspace, &id, pool_mode, is_lead) {
+                        if pool_requeue_failure(
+                            &mut state,
+                            workspace,
+                            &id,
+                            pool_mode,
+                            is_lead,
+                            true,
+                        ) {
                             eprintln!("  [{agent}] ✗ {id}: {error:#}");
                         } else {
                             let retries = state.retry_counts.get(&id).copied().unwrap_or(0);
@@ -2703,6 +2925,7 @@ fn run_multi_agent_inner(
         verified: state.verified,
         detail,
         failed_node: state.failed.clone(),
+        retryable: state.failed_retryable,
         log: state.log.clone(),
     })
 }
@@ -3664,6 +3887,22 @@ mod tests {
             .integrate_worker_result(&second, "codex-luna", &second_tree)
             .unwrap_err();
         assert!(error.to_string().contains("integration conflict"));
+        let typed = error
+            .downcast_ref::<HybridExecutionFailure>()
+            .expect("integration conflict is typed");
+        assert_eq!(
+            typed.failure_code,
+            crate::learning_data::FailureCode::ConflictingParallelEdits
+        );
+        assert_eq!(
+            typed.detail.kind,
+            crate::learning_data::IntegrationFailureKind::IntegrationConflict
+        );
+        assert!(typed.detail.worker_commit.is_some());
+        assert!(!typed
+            .detail
+            .summary
+            .contains(second_tree.to_string_lossy().as_ref()));
         assert_eq!(
             fs::read_to_string(root.join("README.md")).unwrap(),
             "cursor version\n"
@@ -3674,6 +3913,38 @@ mod tests {
                 .trim()
                 .is_empty()
         );
+
+        let mut graph = json!({
+            "schema":"fractal.execution_graph.v1",
+            "graph_id":"fg_hybrid_conflict",
+            "goal":"Persist safe hybrid conflict evidence",
+            "nodes":[first, second],
+            "edges":[]
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::project_file::persist(&root, &graph, "Hybrid conflict").unwrap();
+        crate::project_file::checkout_start_node(&root, "second", "codex-luna", "codex-luna")
+            .unwrap();
+        report_node_outcome(
+            None,
+            "second",
+            "codex-luna",
+            &root,
+            &NodeOutcome::hybrid_failure(typed),
+            "sha256:abcdef",
+            1,
+            &[],
+        );
+        let durable = crate::project_file::load(&root).unwrap();
+        let record = &durable.learning.nodes["second"];
+        assert_eq!(
+            record.failure_code,
+            Some(crate::learning_data::FailureCode::ConflictingParallelEdits)
+        );
+        assert_eq!(record.integration_failure.as_ref(), Some(&typed.detail));
+        let bytes = serde_json::to_string(&durable).unwrap();
+        assert!(!bytes.contains(second_tree.to_string_lossy().as_ref()));
+        assert!(!bytes.contains("/Users/"));
         session.remove_worktree(&second_tree).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
@@ -3694,12 +3965,130 @@ mod tests {
         let error = session
             .integrate_worker_result(&node, "cursor", &worktree)
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("outside its declared file ownership"));
+        let typed = error
+            .downcast_ref::<HybridExecutionFailure>()
+            .expect("scope escape is typed");
+        assert_eq!(
+            typed.detail.kind,
+            crate::learning_data::IntegrationFailureKind::ScopeEscape
+        );
         assert!(!root.join("owned.txt").exists());
         session.remove_worktree(&worktree).unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_owned_paths_reject_absolute_parent_and_git_boundaries() {
+        let root = hybrid_test_repository("invalid-owned-paths");
+        let normalized = json!({
+            "id":"normalized",
+            "efficiency":{"files_or_systems_affected":["./src//lib.rs"]}
+        });
+        assert_eq!(
+            hybrid_declared_owned_paths(&normalized, &root).unwrap(),
+            vec!["src/lib.rs"]
+        );
+        for invalid in ["../sibling/file.rs", "/tmp/file.rs", ".git/config"] {
+            let node = json!({
+                "id":"invalid",
+                "efficiency":{"files_or_systems_affected":[invalid]}
+            });
+            let error = hybrid_declared_owned_paths(&node, &root).unwrap_err();
+            let typed = error
+                .downcast_ref::<HybridExecutionFailure>()
+                .expect("invalid ownership is typed");
+            assert_eq!(
+                typed.detail.kind,
+                crate::learning_data::IntegrationFailureKind::InvalidOwnedPath
+            );
+            assert!(typed.detail.summary.contains(invalid));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hybrid_owned_paths_reject_symlink_escape_from_repository() {
+        use std::os::unix::fs::symlink;
+
+        let root = hybrid_test_repository("symlink-owned-path");
+        let outside = root.with_file_name(format!(
+            "{}-outside",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("outside-link")).unwrap();
+        let node = json!({
+            "id":"invalid",
+            "efficiency":{"files_or_systems_affected":["outside-link/new.rs"]}
+        });
+
+        let error = hybrid_declared_owned_paths(&node, &root).unwrap_err();
+        let typed = error
+            .downcast_ref::<HybridExecutionFailure>()
+            .expect("symlink escape is typed");
+        assert_eq!(
+            typed.detail.kind,
+            crate::learning_data::IntegrationFailureKind::InvalidOwnedPath
+        );
+        assert!(typed.detail.summary.contains("outside repository"));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn hybrid_exact_ownership_overlap_is_serialized() {
+        let ownership = BTreeMap::from([
+            ("active".to_owned(), vec!["src/lib.rs".to_owned()]),
+            ("candidate".to_owned(), vec!["src/lib.rs".to_owned()]),
+        ]);
+        assert!(!hybrid_ownership_available(
+            "candidate",
+            &BTreeSet::from(["active".to_owned()]),
+            &ownership
+        ));
+    }
+
+    #[test]
+    fn hybrid_directory_prefix_ownership_overlap_is_serialized() {
+        let ownership = BTreeMap::from([
+            ("active".to_owned(), vec!["src".to_owned()]),
+            ("candidate".to_owned(), vec!["src/bin/main.rs".to_owned()]),
+        ]);
+        assert!(!hybrid_ownership_available(
+            "candidate",
+            &BTreeSet::from(["active".to_owned()]),
+            &ownership
+        ));
+    }
+
+    #[test]
+    fn hybrid_disjoint_ownership_remains_parallel() {
+        let ownership = BTreeMap::from([
+            ("active".to_owned(), vec!["src/lib.rs".to_owned()]),
+            ("candidate".to_owned(), vec!["tests/api.rs".to_owned()]),
+        ]);
+        assert!(hybrid_ownership_available(
+            "candidate",
+            &BTreeSet::from(["active".to_owned()]),
+            &ownership
+        ));
+    }
+
+    #[test]
+    fn deterministic_hybrid_failures_are_not_pool_retried() {
+        let mut schedule = Schedule::default();
+        assert!(pool_requeue_failure(
+            &mut schedule,
+            Path::new("unused"),
+            "scope_failure",
+            true,
+            false,
+            false,
+        ));
+        assert_eq!(schedule.failed.as_deref(), Some("scope_failure"));
+        assert!(!schedule.failed_retryable);
+        assert!(schedule.retry_counts.is_empty());
     }
 
     #[test]
