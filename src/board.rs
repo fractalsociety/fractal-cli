@@ -1966,6 +1966,7 @@ fn project_view(workspace: &Path, token: &str) -> Result<Value> {
 
 fn graph_snapshot(workspace: &Path) -> Result<Value> {
     let project = crate::project_file::load(workspace)?;
+    let intelligence = project_intelligence(&project);
     Ok(json!({
         "schema": GRAPH_SNAPSHOT_SCHEMA,
         "bundle": GRAPH_UI_BUNDLE_ID,
@@ -1975,8 +1976,743 @@ fn graph_snapshot(workspace: &Path) -> Result<Value> {
         "execution": project.execution,
         "learning": project.learning,
         "efficiency": project.efficiency,
-        "intelligence": project.extra.get("intelligence").cloned(),
+        "intelligence": intelligence,
     }))
+}
+
+fn project_intelligence(project: &crate::project_file::FractalProject) -> Value {
+    let mut derived = derived_project_intelligence(project);
+    let Some(supplied) = project
+        .extra
+        .get("intelligence")
+        .and_then(Value::as_object)
+        .filter(|value| {
+            value.get("schema").and_then(Value::as_str) == Some(INTELLIGENCE_SNAPSHOT_SCHEMA)
+        })
+    else {
+        return derived;
+    };
+    let mut merged = supplied.clone();
+    let mut lenses = derived
+        .get_mut("lenses")
+        .and_then(Value::as_object_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    if let Some(authoritative) = supplied.get("lenses").and_then(Value::as_object) {
+        for lens_id in LENS_IDS {
+            if let Some(lens) = authoritative.get(lens_id).filter(|value| value.is_object()) {
+                lenses.insert(lens_id.to_owned(), lens.clone());
+            }
+        }
+    }
+    merged.insert(
+        "schema".to_owned(),
+        Value::String(INTELLIGENCE_SNAPSHOT_SCHEMA.to_owned()),
+    );
+    merged.insert("lenses".to_owned(), Value::Object(lenses));
+    Value::Object(merged)
+}
+
+fn lens_record(
+    id: impl Into<String>,
+    record_type: &str,
+    label: impl Into<String>,
+    summary: impl Into<String>,
+    properties: serde_json::Map<String, Value>,
+) -> Value {
+    json!({
+        "id": id.into(),
+        "type": record_type,
+        "label": label.into(),
+        "summary": summary.into(),
+        "properties": properties,
+    })
+}
+
+fn derived_lens(
+    lens_id: &str,
+    nodes: Vec<Value>,
+    edges: Vec<Value>,
+    source_hashes: &[String],
+    generated_at: &str,
+) -> Value {
+    let available = !nodes.is_empty() || !edges.is_empty();
+    let mut lens = json!({
+        "lens_id": lens_id,
+        "label": lens_label(lens_id),
+        "summary": lens_summary(lens_id),
+        "availability": if available { "available" } else { "unavailable" },
+        "nodes": nodes,
+        "edges": edges,
+        "provenance": {
+            "source_hashes": source_hashes,
+            "generated_at": generated_at,
+            "derivation": "canonical_project_projection",
+        },
+    });
+    if available {
+        let node_count = lens["nodes"].as_array().map_or(0, Vec::len);
+        let edge_count = lens["edges"].as_array().map_or(0, Vec::len);
+        lens.as_object_mut().expect("derived lens object").insert(
+            "counts".to_owned(),
+            json!({"nodes": node_count, "edges": edge_count}),
+        );
+    }
+    lens
+}
+
+fn insert_if_some<T: serde::Serialize>(
+    properties: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<T>,
+) {
+    if let Some(value) = value.and_then(|item| serde_json::to_value(item).ok()) {
+        properties.insert(key.to_owned(), value);
+    }
+}
+
+fn safe_evidence_list(evidence: &[crate::failure_graph::EvidenceRef]) -> Vec<Value> {
+    evidence
+        .iter()
+        .map(safe_evidence)
+        .filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
+        .collect()
+}
+
+fn economic_lens_nodes(
+    project: &crate::project_file::FractalProject,
+    graph_nodes: &[Value],
+) -> Vec<Value> {
+    let mut nodes = Vec::new();
+    for node in graph_nodes {
+        let Some(id) = node.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut properties = serde_json::Map::new();
+        if let Some(value) = node.pointer("/policy_contract/budgets") {
+            properties.insert("declared_policy_budget".to_owned(), value.clone());
+        }
+        if let Some(value) = node.get("budget") {
+            properties.insert("declared_runtime_budget".to_owned(), value.clone());
+        }
+        if let Some(value) = node.pointer("/efficiency/estimated_remaining_tokens") {
+            properties.insert("estimated_remaining_tokens".to_owned(), value.clone());
+        }
+        if properties.is_empty() {
+            continue;
+        }
+        properties.insert(
+            "measurement_state".to_owned(),
+            Value::String("declared_estimate".to_owned()),
+        );
+        properties.insert("task_id".to_owned(), Value::String(id.to_owned()));
+        nodes.push(lens_record(
+            format!("economic:budget:{id}"),
+            "declared_budget",
+            node.get("title").and_then(Value::as_str).unwrap_or(id),
+            "Declared limits and planning estimates; not observed usage.",
+            properties,
+        ));
+    }
+    if let Some(efficiency) = &project.efficiency {
+        let realized_evidence = efficiency
+            .episodes
+            .iter()
+            .any(|episode| episode.realized_tokens_saved.is_some());
+        for episode in &efficiency.episodes {
+            let mut properties = serde_json::Map::new();
+            properties.insert(
+                "measurement_state".to_owned(),
+                Value::String(
+                    if episode.realized_tokens_saved.is_some() {
+                        "observed_and_estimated"
+                    } else {
+                        "estimated"
+                    }
+                    .to_owned(),
+                ),
+            );
+            properties.insert(
+                "estimated_tokens_avoided".to_owned(),
+                json!(episode.estimated_tokens_avoided),
+            );
+            properties.insert(
+                "confidence_adjusted_tokens_avoided".to_owned(),
+                json!(episode.confidence_adjusted_tokens_avoided),
+            );
+            properties.insert("confidence".to_owned(), json!(episode.confidence));
+            properties.insert(
+                "estimation_basis".to_owned(),
+                Value::String(episode.estimation_basis.clone()),
+            );
+            properties.insert("accepted".to_owned(), Value::Bool(episode.accepted));
+            properties.insert(
+                "waste_type".to_owned(),
+                Value::String(episode.waste_type.as_str().to_owned()),
+            );
+            properties.insert(
+                "proposed_action".to_owned(),
+                Value::String(episode.proposed_action.as_str().to_owned()),
+            );
+            insert_if_some(
+                &mut properties,
+                "realized_tokens_saved",
+                episode.realized_tokens_saved,
+            );
+            insert_if_some(
+                &mut properties,
+                "realization_basis",
+                episode.realization_basis.clone(),
+            );
+            nodes.push(lens_record(
+                format!("economic:efficiency:{}", episode.episode_id),
+                "efficiency_episode",
+                format!("Efficiency estimate for {}", episode.detected_node),
+                if episode.realized_tokens_saved.is_some() {
+                    "Estimated and observed values are separately named and evidence-linked."
+                } else {
+                    "Estimate only; no realized savings are claimed."
+                },
+                properties,
+            ));
+        }
+        for (scope, aggregate) in [
+            ("build", &efficiency.build),
+            ("lifetime", &efficiency.lifetime),
+        ] {
+            let mut properties = serde_json::Map::new();
+            properties.insert(
+                "measurement_state".to_owned(),
+                Value::String(
+                    if realized_evidence {
+                        "observed_and_estimated"
+                    } else {
+                        "estimated"
+                    }
+                    .to_owned(),
+                ),
+            );
+            if aggregate.episode_count > 0 {
+                properties.insert("episode_count".to_owned(), json!(aggregate.episode_count));
+            }
+            if aggregate.gross_estimated_tokens_avoided > 0 {
+                properties.insert(
+                    "gross_estimated_tokens_avoided".to_owned(),
+                    json!(aggregate.gross_estimated_tokens_avoided),
+                );
+            }
+            if aggregate.confidence_adjusted_tokens_avoided > 0 {
+                properties.insert(
+                    "confidence_adjusted_tokens_avoided".to_owned(),
+                    json!(aggregate.confidence_adjusted_tokens_avoided),
+                );
+            }
+            if aggregate.estimated_cost_avoided > 0.0 {
+                properties.insert(
+                    "estimated_cost_avoided".to_owned(),
+                    json!(aggregate.estimated_cost_avoided),
+                );
+            }
+            if realized_evidence {
+                properties.insert(
+                    "realized_tokens_saved".to_owned(),
+                    json!(aggregate.realized_tokens_saved),
+                );
+                properties.insert(
+                    "realized_cost_avoided".to_owned(),
+                    json!(aggregate.realized_cost_avoided),
+                );
+            }
+            if properties.len() > 1 {
+                nodes.push(lens_record(
+                    format!("economic:aggregate:{scope}"),
+                    "efficiency_aggregate",
+                    format!("{scope} efficiency"),
+                    if realized_evidence {
+                        "Aggregate with separately named estimated and evidence-backed realized values."
+                    } else {
+                        "Estimate-only aggregate; realized values are intentionally omitted."
+                    },
+                    properties,
+                ));
+            }
+        }
+    }
+    for record in project.learning.nodes.values() {
+        if record.estimated_cost.is_none() && record.actual_cost.is_none() {
+            continue;
+        }
+        let mut properties = serde_json::Map::new();
+        properties.insert("task_id".to_owned(), Value::String(record.node_id.clone()));
+        properties.insert(
+            "measurement_state".to_owned(),
+            Value::String(
+                if record.actual_cost.is_some() {
+                    "observed_and_estimated"
+                } else {
+                    "estimated"
+                }
+                .to_owned(),
+            ),
+        );
+        insert_if_some(&mut properties, "estimated_cost", record.estimated_cost);
+        insert_if_some(&mut properties, "observed_cost", record.actual_cost);
+        nodes.push(lens_record(
+            format!("economic:cost:{}", record.node_id),
+            "task_cost",
+            record.objective.clone(),
+            "Task cost fields retain their declared estimated or observed meaning.",
+            properties,
+        ));
+    }
+    nodes
+}
+
+fn memory_lens(project: &crate::project_file::FractalProject) -> (Vec<Value>, Vec<Value>) {
+    let mut nodes = Vec::new();
+    let mut included = BTreeSet::new();
+    for record in project.learning.nodes.values() {
+        if record.outcome.is_none()
+            && record.notes.is_none()
+            && record.artifacts_produced.is_empty()
+            && record.consumed_by.is_empty()
+            && !record.human_intervention
+        {
+            continue;
+        }
+        included.insert(record.node_id.clone());
+        let mut properties = serde_json::Map::new();
+        properties.insert("task_id".to_owned(), Value::String(record.node_id.clone()));
+        insert_if_some(&mut properties, "outcome", record.outcome);
+        insert_if_some(&mut properties, "notes", record.notes.clone());
+        if !record.artifacts_produced.is_empty() {
+            properties.insert(
+                "artifacts_produced".to_owned(),
+                json!(record.artifacts_produced),
+            );
+        }
+        if !record.consumed_by.is_empty() {
+            properties.insert("consumed_by".to_owned(), json!(record.consumed_by));
+        }
+        properties.insert("attempt_count".to_owned(), json!(record.attempt_count));
+        properties.insert("reopen_count".to_owned(), json!(record.reopen_count));
+        if record.human_intervention {
+            properties.insert("human_intervention".to_owned(), Value::Bool(true));
+        }
+        nodes.push(lens_record(
+            format!("memory:node:{}", record.node_id),
+            "learning_record",
+            record.objective.clone(),
+            match record.outcome {
+                Some(crate::learning_data::NodeOutcome::VerifiedSuccess) => {
+                    "Verified learning outcome recorded by the canonical project."
+                }
+                Some(_) => "Learning outcome recorded without upgrading its verification status.",
+                None => "Learning record with evidence or notes and no claimed outcome.",
+            },
+            properties,
+        ));
+    }
+    for (index, edit) in project.learning.graph_edits.iter().enumerate() {
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "graph_before_hash".to_owned(),
+            Value::String(edit.graph_before_hash.clone()),
+        );
+        properties.insert("actor".to_owned(), Value::String(edit.actor.clone()));
+        properties.insert("trigger".to_owned(), Value::String(edit.trigger.clone()));
+        properties.insert(
+            "timestamp".to_owned(),
+            Value::String(edit.timestamp.clone()),
+        );
+        properties.insert(
+            "action".to_owned(),
+            serde_json::to_value(&edit.action).unwrap_or(Value::Null),
+        );
+        nodes.push(lens_record(
+            format!("memory:graph-edit:{index}"),
+            "graph_edit_learning",
+            format!("Graph edit {}", index + 1),
+            "Canonical graph-edit memory with its original trigger and actor.",
+            properties,
+        ));
+    }
+    let edges = project
+        .learning
+        .nodes
+        .values()
+        .flat_map(|record| {
+            record
+                .depends_on
+                .iter()
+                .filter(|dependency| {
+                    included.contains(&record.node_id) && included.contains(*dependency)
+                })
+                .map(|dependency| {
+                    json!({
+                        "id": format!("memory-edge:{dependency}:{}", record.node_id),
+                        "source": format!("memory:node:{dependency}"),
+                        "target": format!("memory:node:{}", record.node_id),
+                        "type": "depends_on",
+                    })
+                })
+        })
+        .collect();
+    (nodes, edges)
+}
+
+fn trace_lens(project: &crate::project_file::FractalProject) -> (Vec<Value>, Vec<Value>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    if let Some(execution) = &project.execution {
+        for (node_id, assignment) in &execution.assignments {
+            let mut properties = serde_json::Map::new();
+            properties.insert("task_id".to_owned(), Value::String(node_id.clone()));
+            properties.insert("state".to_owned(), Value::String(assignment.state.clone()));
+            properties.insert(
+                "agent_id".to_owned(),
+                Value::String(assignment.agent_id.clone()),
+            );
+            properties.insert(
+                "agent_label".to_owned(),
+                Value::String(assignment.agent_label.clone()),
+            );
+            properties.insert(
+                "checked_out_at".to_owned(),
+                Value::String(assignment.checked_out_at.clone()),
+            );
+            insert_if_some(
+                &mut properties,
+                "completed_at",
+                assignment.completed_at.clone(),
+            );
+            insert_if_some(
+                &mut properties,
+                "released_at",
+                assignment.released_at.clone(),
+            );
+            nodes.push(lens_record(
+                format!("trace:assignment:{node_id}"),
+                "assignment_trace",
+                format!("Assignment for {node_id}"),
+                "Execution assignment state from the canonical project.",
+                properties,
+            ));
+        }
+    }
+    for record in project.learning.nodes.values() {
+        let Some(verification) = &record.verification else {
+            continue;
+        };
+        let mut properties = serde_json::Map::new();
+        properties.insert("task_id".to_owned(), Value::String(record.node_id.clone()));
+        insert_if_some(&mut properties, "type", verification.kind.clone());
+        insert_if_some(&mut properties, "passed", verification.passed);
+        if !verification.evidence_refs.is_empty() {
+            properties.insert(
+                "evidence_refs".to_owned(),
+                json!(verification.evidence_refs),
+            );
+        }
+        nodes.push(lens_record(
+            format!("trace:verification:{}", record.node_id),
+            "verification_evidence",
+            format!("Verification for {}", record.node_id),
+            if verification.evidence_refs.is_empty() {
+                "Verification state is recorded without inventing proof references."
+            } else {
+                "Verification state with canonical opaque evidence references."
+            },
+            properties,
+        ));
+        if project
+            .execution
+            .as_ref()
+            .is_some_and(|execution| execution.assignments.contains_key(&record.node_id))
+        {
+            edges.push(json!({
+                "id": format!("trace-edge:{}", record.node_id),
+                "source": format!("trace:assignment:{}", record.node_id),
+                "target": format!("trace:verification:{}", record.node_id),
+                "type": "verified_by",
+            }));
+        }
+    }
+    (nodes, edges)
+}
+
+fn failure_learning_lens(
+    project: &crate::project_file::FractalProject,
+) -> (Vec<Value>, Vec<Value>, Option<String>) {
+    let graph = crate::project_file::failure_graph(project);
+    let mut nodes = Vec::new();
+    let mut ids = BTreeSet::new();
+    for failure in graph.failures.values() {
+        ids.insert(failure.id.clone());
+        let mut properties = serde_json::Map::new();
+        properties.insert("task_id".to_owned(), Value::String(failure.node_id.clone()));
+        properties.insert(
+            "failure_code".to_owned(),
+            Value::String(failure.failure_code.clone()),
+        );
+        properties.insert("outcome".to_owned(), Value::String(failure.outcome.clone()));
+        properties.insert(
+            "state".to_owned(),
+            serde_json::to_value(failure.state).unwrap_or(Value::Null),
+        );
+        properties.insert("attempt".to_owned(), json!(failure.attempt));
+        let evidence = safe_evidence_list(&failure.evidence);
+        if !evidence.is_empty() {
+            properties.insert("evidence".to_owned(), Value::Array(evidence));
+        }
+        if let Some(resolution) = &failure.resolution {
+            properties.insert(
+                "resolution".to_owned(),
+                json!({
+                    "success": resolution.success,
+                    "summary": resolution.summary,
+                    "evidence": safe_evidence_list(&resolution.evidence),
+                }),
+            );
+        }
+        nodes.push(lens_record(
+            failure.id.clone(),
+            "failure",
+            failure.summary.clone(),
+            "Canonical failure record; resolution and evidence appear only when recorded.",
+            properties,
+        ));
+    }
+    for lesson in graph.lessons.values() {
+        ids.insert(lesson.id.clone());
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "status".to_owned(),
+            serde_json::to_value(lesson.status).unwrap_or(Value::Null),
+        );
+        let evidence = safe_evidence_list(&lesson.evidence);
+        if !evidence.is_empty() {
+            properties.insert("evidence".to_owned(), Value::Array(evidence));
+        }
+        insert_if_some(&mut properties, "capability", lesson.capability.clone());
+        insert_if_some(&mut properties, "component", lesson.component.clone());
+        nodes.push(lens_record(
+            lesson.id.clone(),
+            "lesson",
+            lesson.summary.clone(),
+            "Canonical lesson retaining its recorded adoption status.",
+            properties,
+        ));
+    }
+    for record in project.learning.nodes.values() {
+        let Some(failure_code) = record.failure_code else {
+            continue;
+        };
+        let code = serde_json::to_value(failure_code)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".to_owned());
+        let id = format!("learning-failure:{}:{code}", record.node_id);
+        if ids.contains(&id) {
+            continue;
+        }
+        let mut properties = serde_json::Map::new();
+        properties.insert("task_id".to_owned(), Value::String(record.node_id.clone()));
+        properties.insert("failure_code".to_owned(), Value::String(code));
+        insert_if_some(&mut properties, "outcome", record.outcome);
+        properties.insert("attempt_count".to_owned(), json!(record.attempt_count));
+        ids.insert(id.clone());
+        nodes.push(lens_record(
+            id,
+            "learning_failure",
+            record.objective.clone(),
+            "Learning record reports a failure without claiming a separate lesson or resolution.",
+            properties,
+        ));
+    }
+    let edges = graph
+        .edges
+        .values()
+        .filter(|edge| ids.contains(&edge.from) && ids.contains(&edge.to))
+        .map(|edge| {
+            json!({
+                "id": edge.id,
+                "source": edge.from,
+                "target": edge.to,
+                "type": edge.edge_type.as_str(),
+            })
+        })
+        .collect();
+    (
+        nodes,
+        edges,
+        (!graph.failure_graph_hash.is_empty()).then_some(graph.failure_graph_hash),
+    )
+}
+
+fn agent_harness_lens(
+    project: &crate::project_file::FractalProject,
+    graph_nodes: &[Value],
+) -> (Vec<Value>, Vec<Value>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let assignments = project
+        .execution
+        .as_ref()
+        .map(|execution| &execution.assignments);
+    for node in graph_nodes {
+        let Some(id) = node.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let learned_executor = project
+            .learning
+            .nodes
+            .get(id)
+            .and_then(|record| record.executor.as_ref());
+        let assignment = assignments.and_then(|items| items.get(id));
+        if learned_executor.is_some() || assignment.is_some() {
+            let mut properties = serde_json::Map::new();
+            properties.insert("task_id".to_owned(), Value::String(id.to_owned()));
+            insert_if_some(
+                &mut properties,
+                "agent",
+                learned_executor
+                    .and_then(|executor| executor.agent.clone())
+                    .or_else(|| assignment.map(|value| value.agent_label.clone())),
+            );
+            insert_if_some(
+                &mut properties,
+                "model",
+                learned_executor.and_then(|executor| executor.model.clone()),
+            );
+            insert_if_some(
+                &mut properties,
+                "version",
+                learned_executor.and_then(|executor| executor.version.clone()),
+            );
+            insert_if_some(
+                &mut properties,
+                "state",
+                assignment.map(|value| value.state.clone()),
+            );
+            nodes.push(lens_record(
+                format!("agent:assignment:{id}"),
+                "agent_assignment",
+                format!("Agent for {id}"),
+                "Recorded executor metadata and current assignment state.",
+                properties,
+            ));
+        }
+        let mut properties = serde_json::Map::new();
+        properties.insert("task_id".to_owned(), Value::String(id.to_owned()));
+        if let Some(capability) = node.get("capability") {
+            properties.insert("capability".to_owned(), capability.clone());
+        }
+        if let Some(executor) = node.get("executor") {
+            properties.insert("declared_executor".to_owned(), executor.clone());
+        }
+        if let Some(routes) = node.get("route_candidates") {
+            properties.insert("route_candidates".to_owned(), routes.clone());
+        }
+        if let Some(profile) = node.pointer("/policy_contract/sandbox_profile") {
+            properties.insert("sandbox_profile".to_owned(), profile.clone());
+        }
+        if let Some(provenance) = node.pointer("/policy_contract/provenance") {
+            properties.insert("policy_provenance".to_owned(), provenance.clone());
+        }
+        if properties.len() > 1 {
+            nodes.push(lens_record(
+                format!("harness:binding:{id}"),
+                "harness_binding",
+                node.get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id),
+                "Declared capability, provider route, and sandbox metadata from the execution graph.",
+                properties,
+            ));
+            if learned_executor.is_some() || assignment.is_some() {
+                edges.push(json!({
+                    "id": format!("agent-harness:{id}"),
+                    "source": format!("agent:assignment:{id}"),
+                    "target": format!("harness:binding:{id}"),
+                    "type": "executes_with",
+                }));
+            }
+        }
+    }
+    (nodes, edges)
+}
+
+fn derived_project_intelligence(project: &crate::project_file::FractalProject) -> Value {
+    let graph_nodes = project
+        .graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let graph_edges = project
+        .graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let economic_nodes = economic_lens_nodes(project, &graph_nodes);
+    let (memory_nodes, memory_edges) = memory_lens(project);
+    let (trace_nodes, trace_edges) = trace_lens(project);
+    let (failure_nodes, failure_edges, failure_hash) = failure_learning_lens(project);
+    let (agent_nodes, agent_edges) = agent_harness_lens(project, &graph_nodes);
+    let mut source_hashes = BTreeSet::from([project.graph_hash.clone()]);
+    if let Some(efficiency) = &project.efficiency {
+        if !efficiency.config_hash.is_empty() {
+            source_hashes.insert(efficiency.config_hash.clone());
+        }
+    }
+    if let Some(hash) = failure_hash {
+        source_hashes.insert(hash);
+    }
+    let source_hashes: Vec<String> = source_hashes.into_iter().collect();
+    let mut lenses = serde_json::Map::new();
+    lenses.insert(
+        "overview".to_owned(),
+        derived_lens(
+            "overview",
+            graph_nodes.clone(),
+            graph_edges.clone(),
+            &source_hashes,
+            &project.updated_at,
+        ),
+    );
+    lenses.insert(
+        "execution".to_owned(),
+        derived_lens(
+            "execution",
+            graph_nodes,
+            graph_edges,
+            &source_hashes,
+            &project.updated_at,
+        ),
+    );
+    for (lens_id, nodes, edges) in [
+        ("resource_economic", economic_nodes, Vec::new()),
+        ("memory_knowledge", memory_nodes, memory_edges),
+        ("trace_evidence", trace_nodes, trace_edges),
+        ("failure_learning", failure_nodes, failure_edges),
+        ("agent_model_tool_harness", agent_nodes, agent_edges),
+    ] {
+        lenses.insert(
+            lens_id.to_owned(),
+            derived_lens(lens_id, nodes, edges, &source_hashes, &project.updated_at),
+        );
+    }
+    json!({
+        "schema": INTELLIGENCE_SNAPSHOT_SCHEMA,
+        "source": {
+            "kind": "canonical_project_projection",
+            "schema": project.schema,
+        },
+        "generated_at": project.updated_at,
+        "lenses": lenses,
+    })
 }
 
 fn lens_label(lens_id: &str) -> &'static str {
@@ -2586,6 +3322,113 @@ mod tests {
         project.graph_hash
     }
 
+    fn write_projection_project(workspace: &Path) -> String {
+        fs::create_dir_all(workspace.join(".fractal")).unwrap();
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [{
+                "id": "n1",
+                "title": "Repair compiler",
+                "instruction": "repair the compiler regression",
+                "capability": "code.generate",
+                "executor": {"provider": "cursor-cli"},
+                "route_candidates": ["cursor-cli", "codex"],
+                "budget": {"timeout_ms": 120000},
+                "efficiency": {"estimated_remaining_tokens": 2400},
+                "policy_contract": {
+                    "budgets": {"max_cost_usd": 5, "max_input_tokens": 12000},
+                    "sandbox_profile": "workspace-write",
+                    "provenance": "prd:canonical"
+                }
+            }],
+            "edges": []
+        });
+        let graph_hash = fractal_contracts::canonical_sha256(&graph).expect("hash graph");
+        graph
+            .as_object_mut()
+            .unwrap()
+            .insert("graph_hash".to_owned(), json!(graph_hash));
+        crate::project_file::persist(workspace, &graph, "Projection fixture").unwrap();
+        crate::project_file::mutate_document(workspace, |project| {
+            assert!(!project.extra.contains_key("intelligence"));
+            project.execution = Some(
+                serde_json::from_value(json!({
+                    "schema": "fractal.execution_state.v1",
+                    "phase": "executing",
+                    "assignments": {
+                        "n1": {
+                            "agent_id": "agent-cursor-1",
+                            "agent_label": "cursor-cli",
+                            "state": "completed",
+                            "checked_out_at": "2026-08-24T10:00:00Z",
+                            "completed_at": "2026-08-24T10:02:00Z"
+                        }
+                    },
+                    "updated_at": "2026-08-24T10:02:00Z"
+                }))
+                .expect("typed execution fixture"),
+            );
+            project.learning.nodes.insert(
+                "n1".to_owned(),
+                serde_json::from_value(json!({
+                    "node_id": "n1",
+                    "node_type": "task",
+                    "objective": "Repair compiler",
+                    "depends_on": [],
+                    "finished_at": "2026-08-24T10:02:00Z",
+                    "executor": {
+                        "agent": "cursor-cli",
+                        "model": "cursor-agent",
+                        "version": "2026.08"
+                    },
+                    "attempt_count": 2,
+                    "outcome": "unverified_success",
+                    "failure_code": "tool_failure",
+                    "verification": {
+                        "type": "test_suite",
+                        "passed": true,
+                        "evidence_refs": ["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+                    },
+                    "artifacts_produced": ["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+                    "estimated_cost": 1.75,
+                    "actual_cost": 1.25,
+                    "notes": "Compiler repair completed; promotion is still pending."
+                }))
+                .expect("typed learning fixture"),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let mut failures = crate::failure_graph::FailureGraph::empty();
+        let failure_id = crate::failure_graph::failure_id("n1", "tool_failure");
+        failures.failures.insert(
+            failure_id.clone(),
+            crate::failure_graph::FailureRecord {
+                id: failure_id,
+                node_id: "n1".to_owned(),
+                attempt: 1,
+                failure_code: "tool_failure".to_owned(),
+                outcome: "failed_execution".to_owned(),
+                summary: "Compiler command failed before the retry.".to_owned(),
+                ..Default::default()
+            },
+        );
+        failures.lessons.insert(
+            "lesson:inspect-generated-output".to_owned(),
+            crate::failure_graph::LessonRecord {
+                id: "lesson:inspect-generated-output".to_owned(),
+                summary: "Inspect generated output before retrying the compiler.".to_owned(),
+                capability: Some("code.generate".to_owned()),
+                component: Some("compiler".to_owned()),
+                ..Default::default()
+            },
+        );
+        crate::failure_graph::normalize(&mut failures).unwrap();
+        crate::project_file::replace_failure_graph(workspace, failures).unwrap();
+        graph_hash
+    }
+
     fn sha256_prefixed(bytes: &[u8]) -> String {
         let digest = Sha256::digest(bytes);
         let mut out = String::with_capacity(71);
@@ -3081,7 +3924,88 @@ mod tests {
         let lens = &response["intelligence"]["lenses"]["resource_economic"];
         assert_eq!(lens["availability"], "unavailable");
         assert_eq!(lens["nodes"].as_array().unwrap().len(), 0);
-        assert!(serde_json::to_string(lens).unwrap().find(":0").is_none());
+        assert!(lens.get("counts").is_none());
+        let encoded = serde_json::to_string(lens).unwrap();
+        assert!(!encoded.contains("realized_tokens_saved"));
+        assert!(!encoded.contains("observed_cost"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn intelligence_query_derives_all_lenses_without_precomputed_intelligence() {
+        let _guard = test_lock();
+        let root = temp_root("derived-intelligence");
+        let workspace = root.join("project");
+        write_projection_project(&workspace);
+        let project = crate::project_file::load(&workspace).unwrap();
+        assert!(!project.extra.contains_key("intelligence"));
+
+        let snapshot = graph_snapshot(&workspace).unwrap();
+        let intelligence = &snapshot["intelligence"];
+        assert_eq!(
+            intelligence["source"]["kind"],
+            "canonical_project_projection"
+        );
+        for lens_id in LENS_IDS {
+            assert_eq!(
+                intelligence["lenses"][lens_id]["availability"], "available",
+                "{lens_id} should derive from canonical project fields"
+            );
+        }
+
+        let economics =
+            serde_json::to_string(&intelligence["lenses"]["resource_economic"]).unwrap();
+        assert!(economics.contains("declared_estimate"));
+        assert!(economics.contains("estimated_cost"));
+        assert!(economics.contains("observed_cost"));
+        assert!(!economics.contains("realized_tokens_saved"));
+
+        let memory = serde_json::to_string(&intelligence["lenses"]["memory_knowledge"]).unwrap();
+        assert!(memory.contains("unverified_success"));
+        assert!(memory.contains("without upgrading its verification status"));
+
+        let traces = serde_json::to_string(&intelligence["lenses"]["trace_evidence"]).unwrap();
+        assert!(traces.contains("assignment_trace"));
+        assert!(traces.contains("sha256:aaaaaaaa"));
+
+        let failures = serde_json::to_string(&intelligence["lenses"]["failure_learning"]).unwrap();
+        assert!(failures.contains("\"type\":\"failure\""));
+        assert!(failures.contains("\"type\":\"lesson\""));
+
+        let agents =
+            serde_json::to_string(&intelligence["lenses"]["agent_model_tool_harness"]).unwrap();
+        assert!(agents.contains("cursor-cli"));
+        assert!(agents.contains("cursor-agent"));
+        assert!(agents.contains("harness_binding"));
+
+        for (lens_id, query_text) in [
+            ("overview", "show overview"),
+            ("execution", "show execution"),
+            ("resource_economic", "show economics"),
+            ("memory_knowledge", "show memory"),
+            ("trace_evidence", "show traces"),
+            ("failure_learning", "show failures and lessons"),
+            ("agent_model_tool_harness", "show agents and tools"),
+        ] {
+            let request = parse_query_request(
+                serde_json::to_string(&json!({
+                    "schema": INTELLIGENCE_QUERY_SCHEMA,
+                    "query": query_text,
+                    "modality": "text",
+                    "lens_ids": [lens_id]
+                }))
+                .unwrap()
+                .as_bytes(),
+            )
+            .unwrap();
+            let response = intelligence_query(&workspace, &request).unwrap();
+            let lens = &response["intelligence"]["lenses"][lens_id];
+            assert_eq!(lens["availability"], "available");
+            assert!(
+                lens["counts"]["nodes"].as_u64().unwrap_or(0) > 0,
+                "{lens_id} query should return derived records"
+            );
+        }
         let _ = fs::remove_dir_all(root);
     }
 
