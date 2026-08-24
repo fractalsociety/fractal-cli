@@ -1334,7 +1334,7 @@ fn run_local(
     let workspace = std::env::current_dir()?;
     let agents = execute::detect_agents();
     if agents.is_empty() {
-        anyhow::bail!("no agents (claude/codex/cursor/hermes) on PATH");
+        anyhow::bail!("no agents (claude/codex/cursor/hermes/opencode) on PATH");
     }
     let title = graph
         .get("goal")

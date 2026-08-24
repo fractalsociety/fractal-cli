@@ -179,12 +179,19 @@ is no policy count cap; resource and graph-quality gates still apply.
 
 ### Scale-out provider pool
 
-The in-process executor can opt into a 20–42 slot heterogeneous pool. All four
-providers must be explicit and their binaries must be available on `PATH`:
+The in-process executor can opt into a 20–42 slot heterogeneous pool. The four
+core providers must be explicit and their binaries must be available on `PATH`:
 
 ```sh
 export FRACTAL_AGENT_POOL='codex=6,cursor=6,claude=6,hermes=6'
 fractal run --local --graph-file path/to/graph.json
+```
+
+OpenCode is an optional fifth provider. Its default model is
+`zai-coding-plan/glm-5.3`; set `FRACTAL_OPENCODE_MODEL` to override it:
+
+```sh
+export FRACTAL_AGENT_POOL='codex=5,cursor=5,claude=5,hermes=5,opencode=4'
 ```
 
 The Codex lead planner is separate from those worker slots. Each provider has

@@ -1,13 +1,15 @@
 //! Drive a committed execution graph to a built, verified result by handing
-//! each build node to a real headless worker (claude / codex / cursor) in the
+//! each build node to a real headless worker (Claude, Codex, Cursor, Hermes, or
+//! OpenCode) in the
 //! trusted workspace, then running the graph's verification node against what it
 //! produced. This is what turns a typed request into an actual artifact.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -139,8 +141,9 @@ fn topo_order(graph: &Value) -> Result<Vec<Value>> {
 
 /// A model for `kind`, overridden by `$FRACTAL_<KIND>_MODEL` when set.
 ///
-/// Claude defaults to its rolling `opus` alias so unattended workers do not
-/// fall back to the CLI's account-dependent default model.
+/// Claude defaults to its rolling `opus` alias. OpenCode defaults to the
+/// operator-confirmed Z.AI coding-plan route; both remain environment
+/// overridable without reading or copying provider credentials.
 fn model_for(kind: &str) -> Option<String> {
     let key = format!(
         "FRACTAL_{}_MODEL",
@@ -151,8 +154,15 @@ fn model_for(kind: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
         .or_else(|| match kind {
             "claude" => Some("opus".to_owned()),
+            "opencode" => Some("zai-coding-plan/glm-5.3".to_owned()),
             _ => None,
         })
+}
+
+fn opencode_binary() -> std::ffi::OsString {
+    std::env::var_os("FRACTAL_OPENCODE_BIN")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| std::ffi::OsString::from("opencode"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,7 +176,12 @@ pub(crate) enum AgentRole {
 /// Lead planning is deliberately a separate invocation role.  In particular,
 /// selecting Codex as the lead must not make its implementation-worker command
 /// inherit the planner's high-effort Sol configuration.
-pub(crate) fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> {
+pub(crate) fn worker_command(
+    kind: &str,
+    prompt: &str,
+    role: AgentRole,
+    workspace: &Path,
+) -> Result<Command> {
     let identity = kind;
     let kind = command_kind_for_agent(kind);
     let mut command = match kind {
@@ -224,7 +239,18 @@ pub(crate) fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Resul
             c.arg("-z").arg(prompt);
             c
         }
-        other => bail!("unknown worker: {other} (use claude|codex|codex-luna|cursor|hermes)"),
+        "opencode" => {
+            let mut c = Command::new(opencode_binary());
+            c.arg("run").arg("--format").arg("json");
+            if let Some(model) = model_for("opencode") {
+                c.arg("--model").arg(model);
+            }
+            c.arg("--dir").arg(workspace).arg(prompt);
+            c
+        }
+        other => {
+            bail!("unknown worker: {other} (use claude|codex|codex-luna|cursor|hermes|opencode)")
+        }
     };
     command.env("FRACTAL_WORKER", identity);
     Ok(command)
@@ -240,6 +266,153 @@ pub(crate) struct AgentRun {
     /// IDs are carried to the final lifecycle transition so reuse is recorded
     /// as an additive typed edge, never as a mutable weight.
     pub lesson_ids: Vec<String>,
+}
+
+const OPENCODE_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+const OPENCODE_VERSION_MAX_BYTES: usize = 256;
+const OPENCODE_JSON_MAX_BYTES: usize = 1_048_576;
+
+struct CapturedCommand {
+    success: bool,
+    timed_out: bool,
+    stdout: Vec<u8>,
+    stdout_overflowed: bool,
+}
+
+fn capture_bounded<R: Read + Send + 'static>(
+    mut reader: R,
+    limit: usize,
+    retain: bool,
+) -> std::thread::JoinHandle<std::io::Result<(Vec<u8>, bool)>> {
+    std::thread::spawn(move || {
+        let mut retained = Vec::new();
+        let mut overflowed = false;
+        let mut buffer = [0_u8; 8_192];
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            if retain {
+                let remaining = limit.saturating_sub(retained.len());
+                retained.extend_from_slice(&buffer[..count.min(remaining)]);
+                overflowed |= count > remaining;
+            }
+        }
+        Ok((retained, overflowed))
+    })
+}
+
+fn run_captured_command(
+    mut command: Command,
+    timeout: Duration,
+    label: &str,
+) -> Result<CapturedCommand> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to launch {label} (is opencode on PATH?)"))?;
+    let stdout = child.stdout.take().context("capture OpenCode stdout")?;
+    let stderr = child.stderr.take().context("capture OpenCode stderr")?;
+    let stdout_reader = capture_bounded(stdout, OPENCODE_JSON_MAX_BYTES, true);
+    // Always drain stderr to prevent a pipe deadlock, but never retain or log
+    // it: provider diagnostics can contain credential-shaped configuration.
+    let stderr_reader = capture_bounded(stderr, 0, false);
+    let worker = crate::run_control::WorkerGuard::register(child.id());
+    let deadline = Instant::now() + timeout;
+    let (success, timed_out) = loop {
+        match child.try_wait()? {
+            Some(status) => break (status.success(), false),
+            None if Instant::now() >= deadline => {
+                crate::run_control::terminate_worker(child.id());
+                let _ = child.wait();
+                break (false, true);
+            }
+            None => std::thread::sleep(Duration::from_millis(25)),
+        }
+    };
+    crate::run_control::terminate_worker(child.id());
+    drop(worker);
+    let (stdout, stdout_overflowed) = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("OpenCode stdout reader panicked"))??;
+    stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("OpenCode stderr reader panicked"))??;
+    Ok(CapturedCommand {
+        success,
+        timed_out,
+        stdout,
+        stdout_overflowed,
+    })
+}
+
+fn preflight_opencode(workspace: &Path) -> Result<()> {
+    let mut command = Command::new(opencode_binary());
+    command.arg("--version").current_dir(workspace);
+    let mut result =
+        run_captured_command(command, OPENCODE_PREFLIGHT_TIMEOUT, "OpenCode preflight")?;
+    if result.timed_out {
+        bail!("OpenCode preflight timed out");
+    }
+    if !result.success || result.stdout_overflowed {
+        bail!("OpenCode preflight failed");
+    }
+    result.stdout.truncate(OPENCODE_VERSION_MAX_BYTES + 1);
+    let version = std::str::from_utf8(&result.stdout).context("OpenCode version is not UTF-8")?;
+    if version.trim().is_empty() || version.len() > OPENCODE_VERSION_MAX_BYTES {
+        bail!("OpenCode preflight returned an invalid version");
+    }
+    Ok(())
+}
+
+fn opencode_json_succeeded(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let mut saw_event = false;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        let Some(object) = event.as_object() else {
+            return false;
+        };
+        saw_event = true;
+        let event_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if event_type.is_empty() {
+            return false;
+        }
+        let part_type = object
+            .get("part")
+            .and_then(|part| part.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let finish_reason = object
+            .get("part")
+            .and_then(|part| part.get("reason"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if event_type.contains("error")
+            || part_type.contains("error")
+            || matches!(finish_reason.as_str(), "error" | "failed" | "failure")
+            || object.get("error").is_some_and(|error| !error.is_null())
+        {
+            return false;
+        }
+    }
+    saw_event
 }
 
 #[allow(dead_code)]
@@ -348,9 +521,27 @@ fn run_agent_prompt_with_role(
     role: AgentRole,
     label: &str,
 ) -> Result<AgentRun> {
+    if command_kind_for_agent(kind) == "opencode" {
+        preflight_opencode(workspace)?;
+        let mut command = worker_command(kind, prompt, role, workspace)?;
+        command.current_dir(workspace);
+        let result = run_captured_command(
+            command,
+            Duration::from_millis(timeout_ms),
+            "OpenCode worker",
+        )?;
+        return Ok(AgentRun {
+            ok: result.success
+                && !result.timed_out
+                && !result.stdout_overflowed
+                && opencode_json_succeeded(&result.stdout),
+            timed_out: result.timed_out,
+            lesson_ids: Vec::new(),
+        });
+    }
     // Detach the worker's stdin: headless agents (e.g. `claude -p`) otherwise
     // inherit the CLI's piped stdin and block reading it instead of exiting.
-    let mut command = worker_command(kind, prompt, role)?;
+    let mut command = worker_command(kind, prompt, role, workspace)?;
     command
         .current_dir(workspace)
         .stdin(std::process::Stdio::null());
@@ -435,7 +626,7 @@ fn binary_on_path(binary: &str) -> bool {
 
 /// Every supported agent whose binary is on `PATH` (ignores env config).
 pub(crate) fn available_agents() -> Vec<String> {
-    ["claude", "codex", "cursor", "hermes"]
+    ["claude", "codex", "cursor", "hermes", "opencode"]
         .into_iter()
         .filter(|kind| binary_on_path(agent_binary(kind)))
         .map(str::to_owned)
@@ -443,7 +634,7 @@ pub(crate) fn available_agents() -> Vec<String> {
 }
 
 /// The agents to run, from `$FRACTAL_AGENTS` (comma-separated) or auto-detected
-/// among claude / codex / cursor on `PATH`.
+/// among the supported headless providers on `PATH`.
 ///
 /// Codex has two logical routes in the scheduler: plain `codex` is reserved
 /// for the first (lead planner/orchestrator) slot, while `codex-luna` is the
@@ -467,7 +658,7 @@ pub(crate) fn detect_agents() -> Vec<String> {
             return logical_agent_routes(chosen);
         }
     }
-    let mut detected: Vec<String> = ["codex", "cursor", "claude", "hermes"]
+    let mut detected: Vec<String> = ["codex", "cursor", "claude", "hermes", "opencode"]
         .into_iter()
         .filter(|kind| binary_on_path(agent_binary(kind)))
         .map(str::to_owned)
@@ -506,6 +697,7 @@ fn logical_agent_routes(agents: Vec<String>) -> Vec<String> {
 /// counted separately from the Codex lead planner, which is never part of the
 /// 20–42 worker capacity.
 const POOL_PROVIDERS: [&str; 4] = ["codex", "cursor", "claude", "hermes"];
+const ALL_POOL_PROVIDERS: [&str; 5] = ["codex", "cursor", "claude", "hermes", "opencode"];
 const POOL_MIN_WORKER_SLOTS: usize = 20;
 const POOL_MAX_WORKER_SLOTS: usize = 42;
 /// Matches the bounded repair budget in `orchestrate` (`MAX_REPAIRS`).
@@ -522,6 +714,15 @@ struct PoolSlot {
 
 /// Strip a `:N` pool suffix so command adapters keep seeing logical kinds.
 fn command_kind_for_agent(agent: &str) -> &str {
+    if let Some(identity) = agent.strip_prefix("opencode:") {
+        if !identity.is_empty()
+            && identity
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return "opencode";
+        }
+    }
     match agent.rsplit_once(':') {
         Some((kind, index))
             if !kind.is_empty()
@@ -552,6 +753,7 @@ pub(crate) fn agent_matches_requirement(agent: &str, required: &str) -> bool {
         "codex-luna" => actual == "codex-luna",
         "claude" => actual == "claude",
         "hermes" => actual == "hermes",
+        "opencode" => actual == "opencode",
         other => actual == other,
     }
 }
@@ -1151,7 +1353,7 @@ fn copy_declared_artifact(node: &Value, worktree: &Path, workspace: &Path) -> Re
 fn is_pool_slot_id(agent: &str) -> bool {
     matches!(
         command_kind_for_agent(agent),
-        "codex-luna" | "cursor" | "cursor-agent" | "claude" | "hermes"
+        "codex-luna" | "cursor" | "cursor-agent" | "claude" | "hermes" | "opencode"
     ) && agent.contains(':')
 }
 
@@ -1161,6 +1363,7 @@ fn slot_provider(agent: &str) -> Option<&'static str> {
         "cursor" | "cursor-agent" => Some("cursor"),
         "claude" => Some("claude"),
         "hermes" => Some("hermes"),
+        "opencode" => Some("opencode"),
         _ => None,
     }
 }
@@ -1171,6 +1374,7 @@ fn pool_worker_kind(provider: &str) -> Option<&'static str> {
         "cursor" => Some("cursor"),
         "claude" => Some("claude"),
         "hermes" => Some("hermes"),
+        "opencode" => Some("opencode"),
         _ => None,
     }
 }
@@ -1239,10 +1443,11 @@ fn pool_requeue_failure(
     }
 }
 
-/// Parse `$FRACTAL_AGENT_POOL` (`codex=6,cursor=6,claude=6,hermes=6`).
+/// Parse `$FRACTAL_AGENT_POOL` (`codex=5,cursor=5,claude=5,hermes=5,opencode=4`).
 ///
 /// Rejects duplicates, unknown providers, zero/overflow counts, totals outside
-/// 20–42, and any config that omits one of the four required providers.
+/// 20–42, and any config that omits one of the original four required providers.
+/// OpenCode is additive and optional, so existing pool strings remain valid.
 fn parse_agent_pool(raw: &str) -> Result<BTreeMap<String, usize>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1260,7 +1465,7 @@ fn parse_agent_pool(raw: &str) -> Result<BTreeMap<String, usize>> {
         };
         let provider = key.trim();
         let count_str = value.trim();
-        if !POOL_PROVIDERS.contains(&provider) {
+        if !ALL_POOL_PROVIDERS.contains(&provider) {
             bail!("unknown provider `{provider}` in FRACTAL_AGENT_POOL");
         }
         if !seen.insert(provider.to_owned()) {
@@ -1299,7 +1504,7 @@ fn parse_agent_pool(raw: &str) -> Result<BTreeMap<String, usize>> {
 
 fn expand_pool_slots(counts: &BTreeMap<String, usize>) -> Vec<PoolSlot> {
     let mut slots = Vec::new();
-    for provider in POOL_PROVIDERS {
+    for provider in ALL_POOL_PROVIDERS {
         let n = counts.get(provider).copied().unwrap_or(0);
         let kind = pool_worker_kind(provider).expect("known pool provider");
         for index in 1..=n {
@@ -1316,9 +1521,9 @@ fn expand_pool_slots(counts: &BTreeMap<String, usize>) -> Vec<PoolSlot> {
 
 fn resolve_agent_pool(raw: &str, available: impl Fn(&str) -> bool) -> Result<Vec<PoolSlot>> {
     let counts = parse_agent_pool(raw)?;
-    let missing: Vec<&str> = POOL_PROVIDERS
-        .iter()
-        .copied()
+    let missing: Vec<&str> = counts
+        .keys()
+        .map(String::as_str)
         .filter(|provider| !available(agent_binary(provider)))
         .collect();
     if !missing.is_empty() {
@@ -3726,6 +3931,80 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_opencode(name: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "fractal-fake-opencode-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin = root.join("bin");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let executable = bin.join("opencode");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  if [ "$FRACTAL_FAKE_OPENCODE_VERSION_FAIL" = "1" ]; then exit 7; fi
+  printf 'opencode 1.17.20\n'
+  exit 0
+fi
+printf '%s\n' "$@" > "$FRACTAL_FAKE_OPENCODE_ARGS"
+case "$FRACTAL_FAKE_OPENCODE_MODE" in
+  success)
+    printf '%s\n' '{"type":"step_start","part":{"type":"step-start"}}'
+    printf '%s\n' '{"type":"text","part":{"type":"text","text":"ok"}}'
+    ;;
+  error)
+    printf '%s\n' '{"type":"error","error":{"message":"provider rejected request"}}'
+    ;;
+  timeout)
+    /bin/sleep 5
+    ;;
+  malformed)
+    printf '%s\n' 'not-json'
+    ;;
+  *) exit 8 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).unwrap();
+        (root, workspace)
+    }
+
     fn hybrid_test_repository(name: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
@@ -3757,6 +4036,33 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requires a clean tracked workspace"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_opencode_instances_receive_distinct_scoped_worktrees() {
+        let _lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let root = hybrid_test_repository("opencode-worktrees");
+        let session = HybridSession::initialize(&root).unwrap();
+        let identities = [
+            "opencode:glm-01",
+            "opencode:glm-02",
+            "opencode:glm-03",
+            "opencode:glm-04",
+        ];
+        let mut worktrees = BTreeSet::new();
+        for (index, identity) in identities.into_iter().enumerate() {
+            let node = format!("owned-task-{index}");
+            let worktree = session.create_worktree(&node, identity).unwrap();
+            assert!(worktree.is_dir());
+            assert!(worktree.starts_with(std::env::temp_dir()));
+            assert_ne!(worktree, root);
+            assert!(worktrees.insert(worktree));
+        }
+        assert_eq!(worktrees.len(), 4);
+        for worktree in &worktrees {
+            session.remove_worktree(worktree).unwrap();
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4099,6 +4405,11 @@ mod tests {
         assert!(!node_allows_agent(&node, "codex-luna"));
         assert!(!node_allows_agent(&node, "claude"));
 
+        let opencode = json!({"id":"glm_check","executor":{"agent":"opencode"}});
+        assert!(node_allows_agent(&opencode, "opencode:glm-01"));
+        assert!(node_allows_agent(&opencode, "opencode:glm-04"));
+        assert!(!node_allows_agent(&opencode, "cursor:1"));
+
         let roster = vec!["codex".to_owned(), "codex-luna".to_owned()];
         let error =
             validate_node_agent_requirements(&[node], &roster, &BTreeMap::new()).unwrap_err();
@@ -4151,7 +4462,13 @@ mod tests {
 
     #[test]
     fn codex_lead_planner_is_pinned_to_sol_high_without_changing_workers() {
-        let lead = worker_command("codex", "plan", AgentRole::LeadPlanner).unwrap();
+        let lead = worker_command(
+            "codex",
+            "plan",
+            AgentRole::LeadPlanner,
+            Path::new("/tmp/fractal-worker"),
+        )
+        .unwrap();
         let lead_args: Vec<String> = lead
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -4166,7 +4483,13 @@ mod tests {
             ]
         }));
 
-        let worker = worker_command("codex", "build", AgentRole::Worker).unwrap();
+        let worker = worker_command(
+            "codex",
+            "build",
+            AgentRole::Worker,
+            Path::new("/tmp/fractal-worker"),
+        )
+        .unwrap();
         let worker_args: Vec<String> = worker
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -4182,7 +4505,13 @@ mod tests {
     #[test]
     fn codex_luna_worker_route_uses_the_codex_binary_and_luna_model() {
         assert_eq!(agent_binary("codex-luna"), "codex");
-        let worker = worker_command("codex-luna", "build", AgentRole::Worker).unwrap();
+        let worker = worker_command(
+            "codex-luna",
+            "build",
+            AgentRole::Worker,
+            Path::new("/tmp/fractal-worker"),
+        )
+        .unwrap();
         assert_eq!(worker.get_program().to_string_lossy(), "codex");
         let args: Vec<String> = worker
             .get_args()
@@ -4214,7 +4543,11 @@ mod tests {
 
     #[test]
     fn pool_slot_identity_uses_existing_command_adapters() {
-        let worker = worker_command("codex-luna:3", "build", AgentRole::Worker).unwrap();
+        let _lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let _binary = EnvGuard::set("FRACTAL_OPENCODE_BIN", "opencode");
+        let _model = EnvGuard::set("FRACTAL_OPENCODE_MODEL", "zai-coding-plan/glm-5.3");
+        let workspace = Path::new("/tmp/fractal-worker");
+        let worker = worker_command("codex-luna:3", "build", AgentRole::Worker, workspace).unwrap();
         assert_eq!(worker.get_program().to_string_lossy(), "codex");
         assert_eq!(
             worker.get_envs().find_map(|(key, value)| {
@@ -4223,12 +4556,117 @@ mod tests {
             }),
             Some("codex-luna:3".to_owned())
         );
-        let cursor = worker_command("cursor:2", "build", AgentRole::Worker).unwrap();
+        let cursor = worker_command("cursor:2", "build", AgentRole::Worker, workspace).unwrap();
         assert_eq!(cursor.get_program().to_string_lossy(), "cursor-agent");
-        let claude = worker_command("claude:1", "build", AgentRole::Worker).unwrap();
+        let claude = worker_command("claude:1", "build", AgentRole::Worker, workspace).unwrap();
         assert_eq!(claude.get_program().to_string_lossy(), "claude");
-        let hermes = worker_command("hermes:4", "build", AgentRole::Worker).unwrap();
+        let hermes = worker_command("hermes:4", "build", AgentRole::Worker, workspace).unwrap();
         assert_eq!(hermes.get_program().to_string_lossy(), "hermes");
+        let opencode =
+            worker_command("opencode:glm-01", "build", AgentRole::Worker, workspace).unwrap();
+        assert_eq!(opencode.get_program().to_string_lossy(), "opencode");
+        let args = opencode
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "run",
+                "--format",
+                "json",
+                "--model",
+                "zai-coding-plan/glm-5.3",
+                "--dir",
+                "/tmp/fractal-worker",
+                "build",
+            ]
+        );
+        assert_eq!(
+            opencode.get_envs().find_map(|(key, value)| {
+                (key.to_string_lossy() == "FRACTAL_WORKER")
+                    .then(|| value.unwrap().to_string_lossy().into_owned())
+            }),
+            Some("opencode:glm-01".to_owned())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_fake_executable_json_success_uses_model_dir_and_identity() {
+        let _lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let (root, workspace) = fake_opencode("success");
+        let args_path = root.join("args.txt");
+        let _binary = EnvGuard::set("FRACTAL_OPENCODE_BIN", root.join("bin/opencode"));
+        let _mode = EnvGuard::set("FRACTAL_FAKE_OPENCODE_MODE", "success");
+        let _args = EnvGuard::set("FRACTAL_FAKE_OPENCODE_ARGS", &args_path);
+        let _model = EnvGuard::set("FRACTAL_OPENCODE_MODEL", "zai-coding-plan/glm-5.3");
+        let _credential = EnvGuard::set("ZAI_API_KEY", "must-not-appear-in-arguments");
+
+        let run = run_agent_prompt(
+            "opencode:glm-01",
+            "edit only owned files",
+            &workspace,
+            2_000,
+        )
+        .unwrap();
+
+        assert!(run.ok);
+        assert!(!run.timed_out);
+        let args = fs::read_to_string(&args_path).unwrap();
+        assert!(args.contains("run\n--format\njson\n--model\nzai-coding-plan/glm-5.3"));
+        assert!(args.contains(&format!("--dir\n{}", workspace.display())));
+        assert!(args.ends_with("edit only owned files\n"));
+        assert!(!args.contains("must-not-appear-in-arguments"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_fake_executable_json_error_fails_closed() {
+        let _lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let (root, workspace) = fake_opencode("error");
+        let _binary = EnvGuard::set("FRACTAL_OPENCODE_BIN", root.join("bin/opencode"));
+        let _mode = EnvGuard::set("FRACTAL_FAKE_OPENCODE_MODE", "error");
+        let _args = EnvGuard::set("FRACTAL_FAKE_OPENCODE_ARGS", root.join("args.txt"));
+        let run = run_agent_prompt("opencode:glm-02", "work", &workspace, 2_000).unwrap();
+        assert!(!run.ok);
+        assert!(!run.timed_out);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_fake_executable_timeout_is_killed() {
+        let _lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let (root, workspace) = fake_opencode("timeout");
+        let _binary = EnvGuard::set("FRACTAL_OPENCODE_BIN", root.join("bin/opencode"));
+        let _mode = EnvGuard::set("FRACTAL_FAKE_OPENCODE_MODE", "timeout");
+        let _args = EnvGuard::set("FRACTAL_FAKE_OPENCODE_ARGS", root.join("args.txt"));
+        let started = Instant::now();
+        let run = run_agent_prompt("opencode:glm-03", "work", &workspace, 100).unwrap();
+        assert!(!run.ok);
+        assert!(run.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_fake_executable_version_preflight_fails_without_running_task() {
+        let _lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let (root, workspace) = fake_opencode("preflight");
+        let args_path = root.join("args.txt");
+        let _binary = EnvGuard::set("FRACTAL_OPENCODE_BIN", root.join("bin/opencode"));
+        let _mode = EnvGuard::set("FRACTAL_FAKE_OPENCODE_MODE", "success");
+        let _args = EnvGuard::set("FRACTAL_FAKE_OPENCODE_ARGS", &args_path);
+        let _version = EnvGuard::set("FRACTAL_FAKE_OPENCODE_VERSION_FAIL", "1");
+        let error = run_agent_prompt("opencode:glm-04", "work", &workspace, 2_000)
+            .err()
+            .expect("failed version preflight must stop execution");
+        assert!(format!("{error:#}").contains("OpenCode preflight failed"));
+        assert!(!args_path.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5128,6 +5566,7 @@ mod tests {
 
     const POOL_24: &str = "codex=6,cursor=6,claude=6,hermes=6";
     const POOL_42: &str = "codex=12,cursor=10,claude=10,hermes=10";
+    const POOL_24_WITH_OPENCODE: &str = "codex=5,cursor=5,claude=5,hermes=5,opencode=4";
 
     fn all_binaries_available(_binary: &str) -> bool {
         true
@@ -5504,6 +5943,86 @@ mod tests {
     }
 
     #[test]
+    fn optional_opencode_pool_expands_four_distinct_concurrent_workers() {
+        let slots = resolve_agent_pool(POOL_24_WITH_OPENCODE, all_binaries_available).unwrap();
+        let opencode = slots
+            .iter()
+            .filter(|slot| slot.provider == "opencode")
+            .collect::<Vec<_>>();
+        assert_eq!(opencode.len(), 4);
+        assert_eq!(
+            opencode
+                .iter()
+                .map(|slot| slot.id.as_str())
+                .collect::<Vec<_>>(),
+            ["opencode:1", "opencode:2", "opencode:3", "opencode:4"]
+        );
+        assert!(opencode.iter().all(|slot| slot.kind == "opencode"));
+        assert_eq!(command_kind_for_agent("opencode:glm-01"), "opencode");
+        assert_eq!(command_kind_for_agent("opencode:glm-04"), "opencode");
+
+        let (nodes, runner) = seeded_48_nodes(0x0C0D_E004);
+        let metrics = simulate_heterogeneous_pool(&nodes, &slots, &runner, &BTreeSet::new(), None);
+        assert_safety(&metrics, 48);
+        assert_eq!(
+            metrics
+                .max_leases_by_provider
+                .get("opencode")
+                .copied()
+                .unwrap_or(0),
+            4
+        );
+        assert!(metrics
+            .completions_by_provider
+            .get("opencode")
+            .is_some_and(|count| *count >= 4));
+    }
+
+    #[test]
+    fn opencode_pool_failure_and_rate_limit_behavior_is_deterministic() {
+        let slots = resolve_agent_pool(POOL_24_WITH_OPENCODE, all_binaries_available).unwrap();
+        let (nodes, mut failing) = seeded_48_nodes(0x0C0D_E005);
+        failing
+            .fail_first
+            .extend(["n00".to_owned(), "n07".to_owned()]);
+        let first = simulate_heterogeneous_pool(&nodes, &slots, &failing, &BTreeSet::new(), None);
+        let replay = simulate_heterogeneous_pool(&nodes, &slots, &failing, &BTreeSet::new(), None);
+        assert_safety(&first, 48);
+        assert_safety(&replay, 48);
+        assert_eq!(first.completion_log, replay.completion_log);
+
+        let mut rate_limited = failing.clone();
+        rate_limited.fail_first.clear();
+        rate_limited.stall_providers.insert("opencode".to_owned());
+        let limited_a =
+            simulate_heterogeneous_pool(&nodes, &slots, &rate_limited, &BTreeSet::new(), None);
+        let limited_b =
+            simulate_heterogeneous_pool(&nodes, &slots, &rate_limited, &BTreeSet::new(), None);
+        assert_eq!(limited_a.completion_log, limited_b.completion_log);
+        assert_eq!(limited_a.completed, limited_b.completed);
+        assert_eq!(limited_a.completed.len(), 44);
+        assert_eq!(
+            limited_a
+                .max_leases_by_provider
+                .get("opencode")
+                .copied()
+                .unwrap_or(0),
+            4
+        );
+        assert_eq!(
+            limited_a
+                .completions_by_provider
+                .get("opencode")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(limited_a.duplicate_leases, 0);
+        assert_eq!(limited_a.duplicate_completions, 0);
+        assert_eq!(limited_a.dependency_violations, 0);
+    }
+
+    #[test]
     fn agent_pool_rejects_malformed_configs_and_mixed_availability() {
         let cases = [
             ("", "empty"),
@@ -5530,6 +6049,9 @@ mod tests {
         assert!(mixed.is_err(), "mixed availability must not fall back");
         let none = resolve_agent_pool(POOL_24, |_| false);
         assert!(none.is_err());
+        let optional_missing =
+            resolve_agent_pool(POOL_24_WITH_OPENCODE, |binary| binary != "opencode");
+        assert!(optional_missing.is_err());
     }
 
     #[test]
