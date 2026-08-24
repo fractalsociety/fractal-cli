@@ -18,6 +18,7 @@ function queryMode() {
 
 function setBoardMode(mode) {
   document.body.classList.toggle("master-active", mode === "master");
+  document.body.classList.toggle("canonical-master", mode === "master");
   document.getElementById("master-browser").classList.toggle("hidden", mode !== "master");
   /* Pause is an execution control and must never appear to apply to the
    * read-only estate view. Individual mode lets renderRunControl restore it
@@ -44,9 +45,23 @@ function individualUrl() {
   return `${window.location.pathname}${params.toString() ? `?${params}` : ""}`;
 }
 
+function mountCanonicalGraph() {
+  const host = document.querySelector(".canonical-graph-shell > div");
+  if (!host) return;
+  host.setAttribute("data-fractal-graph-ui", "");
+  if (window.FractalGraphUI && typeof window.FractalGraphUI.mount === "function") {
+    void window.FractalGraphUI.mount({
+      element: host,
+      snapshotUrl: "/api/snapshot",
+      queryUrl: "/api/intelligence/query"
+    });
+  }
+}
+
 function switchToIndividual(push = true) {
   if (push) history.pushState(null, "", individualUrl());
   setBoardMode("individual");
+  mountCanonicalGraph();
   loadGraph();
 }
 

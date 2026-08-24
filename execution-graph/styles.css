@@ -297,3 +297,27 @@ footer { max-width: 1480px; margin: 0 auto; padding: 22px clamp(18px,4vw,72px) 3
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; scroll-behavior: auto !important; }
 }
+/* The individual board is rendered by the generated Fractal Society bundle.
+ * The legacy regions remain mounted for run controls and master-estate mode,
+ * but are not a second visible project-graph implementation. */
+.canonical-graph-shell {
+  width: min(1440px, calc(100% - 42px));
+  margin: 28px auto 54px;
+}
+
+body:not(.canonical-master) main > .hero,
+body:not(.canonical-master) main > .workspace {
+  display: none;
+}
+
+body.canonical-master .canonical-graph-shell,
+body.master-active .canonical-graph-shell {
+  display: none;
+}
+
+@media (max-width: 640px) {
+  .canonical-graph-shell {
+    width: min(100% - 20px, 1440px);
+    margin-top: 16px;
+  }
+}

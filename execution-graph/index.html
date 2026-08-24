@@ -8,8 +8,10 @@
     <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="styles.css">
     <link rel="stylesheet" href="master-graph.css">
+    <link rel="stylesheet" href="fractal-graph-ui.css">
   </head>
   <body>
+    <script>if(new URLSearchParams(location.search).get("mode")==="master")document.body.classList.add("canonical-master");</script>
     <div class="ambient" aria-hidden="true"></div>
     <header class="topbar">
       <a class="brand" href="/" aria-label="Fractal execution graph home">
@@ -37,6 +39,14 @@
 
     <main>
       <section id="master-browser" class="master-browser hidden" aria-label="Master graph browser"></section>
+      <section class="canonical-graph-shell" aria-label="Canonical Fractal project graph">
+        <div
+          data-fractal-graph-ui
+          data-snapshot-url="/api/snapshot"
+          data-query-url="/api/intelligence/query"
+          data-refresh-ms="2000"
+        >Loading canonical graph…</div>
+      </section>
       <section class="hero">
         <div class="eyebrow"><span>WORK /</span> FRACTAL-MAC-RUNTIME-PRD</div>
         <h1>Build intelligence<br><em>you can inspect.</em></h1>
@@ -121,5 +131,7 @@
     </footer>
     <script src="master-graph.js"></script>
     <script src="app.js"></script>
+    <script>if(document.body.classList.contains("canonical-master"))document.querySelector("[data-fractal-graph-ui]").removeAttribute("data-fractal-graph-ui");</script>
+    <script src="fractal-graph-ui.js"></script>
   </body>
 </html>

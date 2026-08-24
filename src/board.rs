@@ -1,5 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,8 +18,97 @@ const BOARD_START_TIMEOUT: Duration = Duration::from_secs(6);
 const BOARD_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const BOARD_PROJECTS_SCHEMA: &str = "fractal.board_projects.v1";
 const FAILURE_GRAPH_VIEW_SCHEMA: &str = "fractal.failure_graph_view.v1";
+const GRAPH_SNAPSHOT_SCHEMA: &str = "fractal.graph_snapshot.v1";
+const INTELLIGENCE_SNAPSHOT_SCHEMA: &str = "fractal.intelligence.snapshot.v1";
+const INTELLIGENCE_QUERY_SCHEMA: &str = "fractal.intelligence.query.v1";
+const INTELLIGENCE_QUERY_RESPONSE_SCHEMA: &str = "fractal.intelligence.query_response.v1";
+const GRAPH_UI_BUNDLE_ID: &str = "fractal-graph-ui.v1";
+const MAX_QUERY_BODY_BYTES: u64 = 16 * 1024;
+const MAX_QUERY_CHARS: usize = 512;
+const MAX_QUERY_LENSES: usize = 7;
+const MAX_QUERY_ROOTS: usize = 32;
+const MAX_QUERY_DEPTH: u32 = 32;
+const MAX_QUERY_NODES: usize = 1_000;
+const MAX_QUERY_EDGES: usize = 2_000;
+const LENS_IDS: [&str; 7] = [
+    "overview",
+    "execution",
+    "resource_economic",
+    "memory_knowledge",
+    "trace_evidence",
+    "failure_learning",
+    "agent_model_tool_harness",
+];
 const READ_ONLY_API_ERROR: &str =
     "the Rust board API is read-only; use `fractal node` for transitions";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntelligenceQueryRequest {
+    schema: String,
+    query: String,
+    modality: QueryModality,
+    #[serde(default)]
+    project_key: Option<String>,
+    #[serde(default)]
+    lens_ids: Vec<String>,
+    #[serde(default)]
+    root_ids: Vec<String>,
+    #[serde(default)]
+    bounds: QueryBounds,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum QueryModality {
+    Text,
+    Voice,
+}
+
+impl QueryModality {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Voice => "voice",
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueryBounds {
+    #[serde(default)]
+    max_depth: Option<u32>,
+    #[serde(default)]
+    max_nodes: Option<usize>,
+    #[serde(default)]
+    max_edges: Option<usize>,
+}
+
+#[derive(Debug)]
+struct QueryApiError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+
+impl QueryApiError {
+    fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode(400),
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn payload_too_large() -> Self {
+        Self {
+            status: StatusCode(413),
+            code: "query_too_large",
+            message: format!("query body exceeds {MAX_QUERY_BODY_BYTES} bytes"),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct BoardPayload {
@@ -1520,7 +1611,7 @@ fn failure_summary_for_workspace(workspace: &Path) -> (Value, Option<String>) {
 }
 
 fn respond(
-    request: tiny_http::Request,
+    mut request: tiny_http::Request,
     workspace: &Path,
     viewer_dir: &Path,
     token: &str,
@@ -1543,6 +1634,58 @@ fn respond(
                 "project": identity.get("project"),
             }),
         );
+    }
+    if matches!(route, "/api/snapshot" | "/api/intelligence/snapshot") {
+        if request.method() != &Method::Get {
+            return send_json(
+                request,
+                StatusCode(405),
+                &json!({"error": "snapshot is read-only", "code": "read_only"}),
+            );
+        }
+        return send_json(request, StatusCode(200), &graph_snapshot(workspace)?);
+    }
+    if matches!(route, "/api/query" | "/api/intelligence/query") {
+        if request.method() != &Method::Post {
+            return send_json(
+                request,
+                StatusCode(405),
+                &json!({"error": "query requires POST", "code": "method_not_allowed"}),
+            );
+        }
+        let content_type_ok = request.headers().iter().any(|header| {
+            header.field.equiv("Content-Type")
+                && header
+                    .value
+                    .as_str()
+                    .to_ascii_lowercase()
+                    .starts_with("application/json")
+        });
+        if !content_type_ok {
+            return send_json(
+                request,
+                StatusCode(415),
+                &json!({"error": "Content-Type must be application/json", "code": "unsupported_media_type"}),
+            );
+        }
+        let query = match read_query_request(&mut request) {
+            Ok(query) => query,
+            Err(error) => {
+                return send_json(
+                    request,
+                    error.status,
+                    &json!({"error": error.message, "code": error.code}),
+                )
+            }
+        };
+        return match intelligence_query(workspace, &query) {
+            Ok(response) => send_json(request, StatusCode(200), &response),
+            Err(error) => send_json(
+                request,
+                error.status,
+                &json!({"error": error.message, "code": error.code}),
+            ),
+        };
     }
     if route == "/api/failure-graph" && request.method() != &Method::Get {
         return send_json(
@@ -1616,6 +1759,9 @@ fn serve_board_asset(request: tiny_http::Request, route: &str, viewer_dir: &Path
         "/styles.css" => "styles.css",
         "/master-graph.js" => "master-graph.js",
         "/master-graph.css" => "master-graph.css",
+        "/fractal-graph-ui.js" => "fractal-graph-ui.js",
+        "/fractal-graph-ui.css" => "fractal-graph-ui.css",
+        "/fractal-graph-ui.manifest.json" => "fractal-graph-ui.manifest.json",
         "/assets/favicon.svg" => "assets/favicon.svg",
         "/assets/fractal-graph-field.png" => "assets/fractal-graph-field.png",
         _ => {
@@ -1635,6 +1781,7 @@ fn serve_board_asset(request: tiny_http::Request, route: &str, viewer_dir: &Path
         Some("html") => "text/html; charset=utf-8",
         Some("js") => "application/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
         _ => "application/octet-stream",
@@ -1653,6 +1800,11 @@ fn embedded_asset(relative: &str) -> &'static [u8] {
         "styles.css" => include_bytes!("../execution-graph/styles.css"),
         "master-graph.js" => include_bytes!("../execution-graph/master-graph.js"),
         "master-graph.css" => include_bytes!("../execution-graph/master-graph.css"),
+        "fractal-graph-ui.js" => include_bytes!("../execution-graph/fractal-graph-ui.js"),
+        "fractal-graph-ui.css" => include_bytes!("../execution-graph/fractal-graph-ui.css"),
+        "fractal-graph-ui.manifest.json" => {
+            include_bytes!("../execution-graph/fractal-graph-ui.manifest.json")
+        }
         "assets/favicon.svg" => include_bytes!("../execution-graph/assets/favicon.svg"),
         "assets/fractal-graph-field.png" => {
             include_bytes!("../execution-graph/assets/fractal-graph-field.png")
@@ -1809,6 +1961,450 @@ fn project_view(workspace: &Path, token: &str) -> Result<Value> {
             "tasks": tasks,
             "edges": edges
         }]
+    }))
+}
+
+fn graph_snapshot(workspace: &Path) -> Result<Value> {
+    let project = crate::project_file::load(workspace)?;
+    Ok(json!({
+        "schema": GRAPH_SNAPSHOT_SCHEMA,
+        "bundle": GRAPH_UI_BUNDLE_ID,
+        "project_key": project.project.slug,
+        "project": project.project,
+        "graph": project.graph,
+        "execution": project.execution,
+        "learning": project.learning,
+        "efficiency": project.efficiency,
+        "intelligence": project.extra.get("intelligence").cloned(),
+    }))
+}
+
+fn lens_label(lens_id: &str) -> &'static str {
+    match lens_id {
+        "overview" => "Overview",
+        "execution" => "Execution",
+        "resource_economic" => "Economics",
+        "memory_knowledge" => "Memory",
+        "trace_evidence" => "Traces & evidence",
+        "failure_learning" => "Failures & lessons",
+        "agent_model_tool_harness" => "Agents & tools",
+        _ => "Unavailable",
+    }
+}
+
+fn lens_summary(lens_id: &str) -> &'static str {
+    match lens_id {
+        "overview" => "The full bounded project picture across every available authority.",
+        "execution" => "Tasks, dependencies, waves, status, and active ownership.",
+        "resource_economic" => {
+            "Estimates, observed usage, bills, receipts, rewards, and finality remain distinct."
+        }
+        "memory_knowledge" => "Verified outcomes and reusable knowledge recorded for future work.",
+        "trace_evidence" => {
+            "Assignments, verification evidence, and causal execution observations."
+        }
+        "failure_learning" => "Failures, repair observations, resolutions, and adopted lessons.",
+        "agent_model_tool_harness" => "Assigned agents, models, tools, and harness boundaries.",
+        _ => "No lens data is available.",
+    }
+}
+
+fn unavailable_lens(lens_id: &str) -> Value {
+    json!({
+        "lens_id": lens_id,
+        "label": lens_label(lens_id),
+        "summary": lens_summary(lens_id),
+        "availability": "unavailable",
+        "nodes": [],
+        "edges": [],
+    })
+}
+
+fn fallback_graph_lens(snapshot: &Value, lens_id: &str) -> Value {
+    let graph = snapshot.get("graph").cloned().unwrap_or_else(|| json!({}));
+    let nodes = graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let edges = graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    json!({
+        "lens_id": lens_id,
+        "label": lens_label(lens_id),
+        "summary": lens_summary(lens_id),
+        "availability": if nodes.is_empty() { "unavailable" } else { "available" },
+        "counts": {"nodes": nodes.len(), "edges": edges.len()},
+        "nodes": nodes,
+        "edges": edges,
+        "provenance": {
+            "source_hashes": graph.get("graph_hash").and_then(Value::as_str).map(|hash| vec![hash]).unwrap_or_default(),
+        },
+    })
+}
+
+fn canonical_intelligence(snapshot: &Value) -> Value {
+    let supplied = snapshot
+        .get("intelligence")
+        .and_then(Value::as_object)
+        .filter(|value| {
+            value.get("schema").and_then(Value::as_str) == Some(INTELLIGENCE_SNAPSHOT_SCHEMA)
+        });
+    let supplied_lenses = supplied
+        .and_then(|value| value.get("lenses"))
+        .and_then(Value::as_object);
+    let mut lenses = serde_json::Map::new();
+    for lens_id in LENS_IDS {
+        let lens = supplied_lenses
+            .and_then(|items| items.get(lens_id))
+            .filter(|value| value.is_object())
+            .cloned()
+            .unwrap_or_else(|| match lens_id {
+                "overview" | "execution" => fallback_graph_lens(snapshot, lens_id),
+                _ => unavailable_lens(lens_id),
+            });
+        lenses.insert(lens_id.to_owned(), lens);
+    }
+    let mut result = supplied.cloned().unwrap_or_default();
+    result.insert(
+        "schema".to_owned(),
+        Value::String(INTELLIGENCE_SNAPSHOT_SCHEMA.to_owned()),
+    );
+    result.insert("lenses".to_owned(), Value::Object(lenses));
+    Value::Object(result)
+}
+
+fn node_id(value: &Value) -> Option<&str> {
+    value
+        .get("id")
+        .or_else(|| value.get("node_id"))
+        .and_then(Value::as_str)
+}
+
+fn edge_endpoints(value: &Value) -> Option<(&str, &str)> {
+    let source = value
+        .get("source")
+        .or_else(|| value.get("from"))
+        .or_else(|| value.get("source_id"))
+        .and_then(Value::as_str)?;
+    let target = value
+        .get("target")
+        .or_else(|| value.get("to"))
+        .or_else(|| value.get("target_id"))
+        .and_then(Value::as_str)?;
+    Some((source, target))
+}
+
+fn query_terms(query: &str) -> Vec<String> {
+    const STOP_WORDS: [&str; 20] = [
+        "show",
+        "find",
+        "me",
+        "the",
+        "a",
+        "an",
+        "and",
+        "graph",
+        "overview",
+        "execution",
+        "economic",
+        "economics",
+        "memory",
+        "traces",
+        "evidence",
+        "failures",
+        "lessons",
+        "agents",
+        "tools",
+        "tasks",
+    ];
+    query
+        .split(|character: char| {
+            !character.is_alphanumeric() && character != '_' && character != '-'
+        })
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(str::to_ascii_lowercase)
+        .filter(|term| !STOP_WORDS.contains(&term.as_str()))
+        .collect()
+}
+
+fn inferred_lens_ids(query: &str) -> Vec<String> {
+    let lower = query.to_ascii_lowercase();
+    let mut lenses = Vec::new();
+    let patterns = [
+        (
+            "failure_learning",
+            ["failure", "lesson", "repair"].as_slice(),
+        ),
+        ("trace_evidence", ["trace", "evidence", "span"].as_slice()),
+        (
+            "memory_knowledge",
+            ["memory", "knowledge", "remember"].as_slice(),
+        ),
+        (
+            "resource_economic",
+            ["economic", "cost", "budget", "bill", "receipt", "reward"].as_slice(),
+        ),
+        (
+            "agent_model_tool_harness",
+            ["agent", "model", "tool", "harness"].as_slice(),
+        ),
+        (
+            "execution",
+            ["execution", "task", "wave", "milestone"].as_slice(),
+        ),
+    ];
+    for (lens_id, terms) in patterns {
+        if terms.iter().any(|term| lower.contains(term)) {
+            lenses.push(lens_id.to_owned());
+        }
+    }
+    if lenses.is_empty() {
+        lenses.push("overview".to_owned());
+    }
+    lenses
+}
+
+fn validate_query(query: &IntelligenceQueryRequest) -> std::result::Result<(), QueryApiError> {
+    if query.schema != INTELLIGENCE_QUERY_SCHEMA {
+        return Err(QueryApiError::bad_request(
+            "invalid_schema",
+            format!("schema must be {INTELLIGENCE_QUERY_SCHEMA}"),
+        ));
+    }
+    let query_length = query.query.chars().count();
+    if query.query.trim().is_empty() || query_length > MAX_QUERY_CHARS {
+        return Err(QueryApiError::bad_request(
+            "invalid_query",
+            format!("query must contain 1..={MAX_QUERY_CHARS} characters"),
+        ));
+    }
+    if query.lens_ids.len() > MAX_QUERY_LENSES {
+        return Err(QueryApiError::bad_request(
+            "too_many_lenses",
+            format!("lens_ids is limited to {MAX_QUERY_LENSES} entries"),
+        ));
+    }
+    if let Some(invalid) = query
+        .lens_ids
+        .iter()
+        .find(|lens| !LENS_IDS.contains(&lens.as_str()))
+    {
+        return Err(QueryApiError::bad_request(
+            "unknown_lens",
+            format!("unknown lens_id {invalid}"),
+        ));
+    }
+    if query.root_ids.len() > MAX_QUERY_ROOTS {
+        return Err(QueryApiError::bad_request(
+            "too_many_roots",
+            format!("root_ids is limited to {MAX_QUERY_ROOTS} entries"),
+        ));
+    }
+    if query.bounds.max_depth.unwrap_or(0) > MAX_QUERY_DEPTH
+        || query.bounds.max_nodes.unwrap_or(100) > MAX_QUERY_NODES
+        || query.bounds.max_edges.unwrap_or(200) > MAX_QUERY_EDGES
+    {
+        return Err(QueryApiError::bad_request(
+            "bounds_exceeded",
+            format!(
+                "bounds may not exceed max_depth={MAX_QUERY_DEPTH}, max_nodes={MAX_QUERY_NODES}, max_edges={MAX_QUERY_EDGES}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn read_query_request(
+    request: &mut tiny_http::Request,
+) -> std::result::Result<IntelligenceQueryRequest, QueryApiError> {
+    let declared_length = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("Content-Length"))
+        .and_then(|header| header.value.as_str().parse::<u64>().ok());
+    if declared_length.is_some_and(|length| length > MAX_QUERY_BODY_BYTES) {
+        return Err(QueryApiError::payload_too_large());
+    }
+    let mut body = Vec::new();
+    request
+        .as_reader()
+        .take(MAX_QUERY_BODY_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| QueryApiError::bad_request("invalid_body", "could not read query body"))?;
+    if body.len() as u64 > MAX_QUERY_BODY_BYTES {
+        return Err(QueryApiError::payload_too_large());
+    }
+    parse_query_request(&body)
+}
+
+fn parse_query_request(
+    body: &[u8],
+) -> std::result::Result<IntelligenceQueryRequest, QueryApiError> {
+    let query = serde_json::from_slice::<IntelligenceQueryRequest>(body).map_err(|error| {
+        QueryApiError::bad_request("invalid_body", format!("invalid query body: {error}"))
+    })?;
+    validate_query(&query)?;
+    Ok(query)
+}
+
+fn bounded_lens(lens: &Value, query: &IntelligenceQueryRequest) -> Value {
+    if lens.get("availability").and_then(Value::as_str) == Some("unavailable") {
+        return lens.clone();
+    }
+    let source_nodes = lens
+        .get("nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let source_edges = lens
+        .get("edges")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let terms = query_terms(&query.query);
+    let matching: BTreeSet<String> = source_nodes
+        .iter()
+        .filter_map(|node| {
+            let id = node_id(node)?;
+            let searchable = serde_json::to_string(node).ok()?.to_ascii_lowercase();
+            (terms.is_empty() || terms.iter().any(|term| searchable.contains(term)))
+                .then(|| id.to_owned())
+        })
+        .collect();
+    let mut selected = if query.root_ids.is_empty() {
+        matching.clone()
+    } else {
+        query.root_ids.iter().cloned().collect()
+    };
+    if !query.root_ids.is_empty() {
+        let mut outgoing: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for edge in &source_edges {
+            if let Some((source, target)) = edge_endpoints(edge) {
+                outgoing
+                    .entry(source.to_owned())
+                    .or_default()
+                    .push(target.to_owned());
+            }
+        }
+        let max_depth = query.bounds.max_depth.unwrap_or(0);
+        let mut queue: VecDeque<(String, u32)> =
+            query.root_ids.iter().cloned().map(|id| (id, 0)).collect();
+        while let Some((id, depth)) = queue.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+            for target in outgoing.get(&id).into_iter().flatten() {
+                if selected.insert(target.clone()) {
+                    queue.push_back((target.clone(), depth + 1));
+                }
+            }
+        }
+        if !terms.is_empty() {
+            selected.retain(|id| matching.contains(id) || query.root_ids.contains(id));
+        }
+    }
+    let node_limit = query.bounds.max_nodes.unwrap_or(100);
+    let edge_limit = query.bounds.max_edges.unwrap_or(200);
+    let nodes: Vec<Value> = source_nodes
+        .iter()
+        .filter(|node| node_id(node).is_some_and(|id| selected.contains(id)))
+        .take(node_limit)
+        .cloned()
+        .collect();
+    let node_ids: BTreeSet<&str> = nodes.iter().filter_map(node_id).collect();
+    let edges: Vec<Value> = source_edges
+        .iter()
+        .filter(|edge| {
+            edge_endpoints(edge).is_some_and(|(source, target)| {
+                node_ids.contains(source) && node_ids.contains(target)
+            })
+        })
+        .take(edge_limit)
+        .cloned()
+        .collect();
+    let mut result = lens.clone();
+    if !result.is_object() {
+        result = unavailable_lens("unknown");
+    }
+    let object = result.as_object_mut().expect("lens object");
+    object.insert("nodes".to_owned(), Value::Array(nodes.clone()));
+    object.insert("edges".to_owned(), Value::Array(edges.clone()));
+    object.insert(
+        "counts".to_owned(),
+        json!({"nodes": nodes.len(), "edges": edges.len()}),
+    );
+    object.insert(
+        "truncated".to_owned(),
+        Value::Bool(source_nodes.len() > nodes.len() || source_edges.len() > edges.len()),
+    );
+    result
+}
+
+fn intelligence_query(
+    workspace: &Path,
+    query: &IntelligenceQueryRequest,
+) -> std::result::Result<Value, QueryApiError> {
+    let snapshot = graph_snapshot(workspace).map_err(|error| QueryApiError {
+        status: StatusCode(409),
+        code: "snapshot_unavailable",
+        message: format!("canonical graph snapshot unavailable: {error:#}"),
+    })?;
+    let project_key = snapshot
+        .get("project_key")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if query
+        .project_key
+        .as_deref()
+        .is_some_and(|requested| requested != project_key)
+    {
+        return Err(QueryApiError {
+            status: StatusCode(404),
+            code: "project_not_found",
+            message: "project_key does not match the board's bound project".to_owned(),
+        });
+    }
+    let intelligence = canonical_intelligence(&snapshot);
+    let lenses = intelligence
+        .get("lenses")
+        .and_then(Value::as_object)
+        .expect("canonical intelligence lenses");
+    let requested = if query.lens_ids.is_empty() {
+        inferred_lens_ids(&query.query)
+    } else {
+        query.lens_ids.clone()
+    };
+    let mut selected = serde_json::Map::new();
+    for lens_id in requested {
+        if let Some(lens) = lenses.get(&lens_id) {
+            selected.insert(lens_id, bounded_lens(lens, query));
+        }
+    }
+    Ok(json!({
+        "schema": INTELLIGENCE_QUERY_RESPONSE_SCHEMA,
+        "project_key": project_key,
+        "query": {
+            "schema": INTELLIGENCE_QUERY_SCHEMA,
+            "query": query.query,
+            "modality": query.modality.as_str(),
+            "lens_ids": selected.keys().cloned().collect::<Vec<_>>(),
+            "root_ids": query.root_ids,
+            "bounds": {
+                "max_depth": query.bounds.max_depth.unwrap_or(0),
+                "max_nodes": query.bounds.max_nodes.unwrap_or(100),
+                "max_edges": query.bounds.max_edges.unwrap_or(200),
+            },
+        },
+        "intelligence": {
+            "schema": INTELLIGENCE_SNAPSHOT_SCHEMA,
+            "source": {"kind": "canonical_project", "path": ".fractal/project.fractal"},
+            "lenses": selected,
+        },
     }))
 }
 
@@ -2104,6 +2700,30 @@ mod tests {
     }
 
     #[test]
+    fn embedded_graph_ui_is_the_provenance_pinned_society_bundle() {
+        let js = embedded_asset("fractal-graph-ui.js");
+        let css = embedded_asset("fractal-graph-ui.css");
+        let manifest: Value =
+            serde_json::from_slice(embedded_asset("fractal-graph-ui.manifest.json")).unwrap();
+        assert!(String::from_utf8_lossy(js).contains(GRAPH_UI_BUNDLE_ID));
+        assert_eq!(manifest["schema"], "fractal.graph_ui_bundle.v1");
+        assert_eq!(manifest["renderer"], GRAPH_UI_BUNDLE_ID);
+        assert_eq!(
+            manifest["source_repository"],
+            "fractalsociety/fractalsociety-website"
+        );
+        assert_ne!(manifest["source_commit"], "pending");
+        assert_eq!(
+            manifest["asset_hashes"]["fractal-graph-ui.js"],
+            sha256_prefixed(js)
+        );
+        assert_eq!(
+            manifest["asset_hashes"]["fractal-graph-ui.css"],
+            sha256_prefixed(css)
+        );
+    }
+
+    #[test]
     fn master_board_launch_url_selects_master_mode() {
         assert_eq!(master_board_url(8093), "http://127.0.0.1:8093/?mode=master");
     }
@@ -2139,8 +2759,11 @@ mod tests {
 
     #[test]
     fn board_identity_payload_is_derived_from_the_canonical_project() {
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let identity = board_identity(workspace).unwrap();
+        let _guard = test_lock();
+        let root = temp_root("identity");
+        let workspace = root.join("project");
+        write_minimal_project(&workspace, "Identity project");
+        let identity = board_identity(&workspace).unwrap();
         let canonical_workspace = workspace.canonicalize().unwrap();
         let canonical_workspace = canonical_workspace.to_string_lossy();
         assert_eq!(
@@ -2156,7 +2779,8 @@ mod tests {
             Some(canonical_workspace.as_ref())
         );
         let graph_hash = identity.get("graph_hash").and_then(Value::as_str).unwrap();
-        assert!(identity_matches_value(&identity, workspace, graph_hash));
+        assert!(identity_matches_value(&identity, &workspace, graph_hash));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2352,9 +2976,122 @@ mod tests {
     }
 
     #[test]
+    fn canonical_graph_snapshot_exposes_the_shared_typed_contract() {
+        let _guard = test_lock();
+        let root = temp_root("canonical-snapshot");
+        let workspace = root.join("solo");
+        write_minimal_project(&workspace, "Solo");
+        let snapshot = graph_snapshot(&workspace).unwrap();
+        assert_eq!(snapshot["schema"], GRAPH_SNAPSHOT_SCHEMA);
+        assert_eq!(snapshot["bundle"], GRAPH_UI_BUNDLE_ID);
+        assert!(snapshot["graph"]["nodes"].is_array());
+        assert!(snapshot.get("execution").is_some());
+        assert!(snapshot.get("learning").is_some());
+        assert!(snapshot.get("efficiency").is_some());
+        assert!(snapshot.get("intelligence").is_some());
+
+        let intelligence = canonical_intelligence(&snapshot);
+        assert_eq!(intelligence["schema"], INTELLIGENCE_SNAPSHOT_SCHEMA);
+        let lenses = intelligence["lenses"].as_object().unwrap();
+        assert_eq!(lenses.len(), LENS_IDS.len());
+        assert_eq!(lenses["overview"]["availability"], "available");
+        assert_eq!(lenses["execution"]["availability"], "available");
+        assert_eq!(lenses["resource_economic"]["availability"], "unavailable");
+        assert!(lenses["resource_economic"].get("counts").is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn typed_intelligence_query_is_bounded_and_fail_closed() {
+        let valid = br#"{
+          "schema":"fractal.intelligence.query.v1",
+          "query":"show execution tasks",
+          "modality":"text",
+          "lens_ids":["execution"],
+          "bounds":{"max_depth":2,"max_nodes":20,"max_edges":40}
+        }"#;
+        let parsed = parse_query_request(valid).unwrap();
+        assert_eq!(parsed.lens_ids, vec!["execution"]);
+
+        let unknown_field = br#"{
+          "schema":"fractal.intelligence.query.v1",
+          "query":"show execution",
+          "modality":"text",
+          "ambient_authority":true
+        }"#;
+        assert_eq!(
+            parse_query_request(unknown_field).unwrap_err().code,
+            "invalid_body"
+        );
+
+        let unknown_lens = br#"{
+          "schema":"fractal.intelligence.query.v1",
+          "query":"show credentials",
+          "modality":"text",
+          "lens_ids":["credential_store"]
+        }"#;
+        assert_eq!(
+            parse_query_request(unknown_lens).unwrap_err().code,
+            "unknown_lens"
+        );
+
+        let excessive = format!(
+            r#"{{"schema":"{INTELLIGENCE_QUERY_SCHEMA}","query":"show tasks","modality":"voice","bounds":{{"max_nodes":{}}}}}"#,
+            MAX_QUERY_NODES + 1
+        );
+        assert_eq!(
+            parse_query_request(excessive.as_bytes()).unwrap_err().code,
+            "bounds_exceeded"
+        );
+    }
+
+    #[test]
+    fn intelligence_query_preserves_unavailable_and_filters_canonical_nodes() {
+        let _guard = test_lock();
+        let root = temp_root("canonical-query");
+        let workspace = root.join("solo");
+        write_minimal_project(&workspace, "Solo");
+
+        let execution = parse_query_request(
+            br#"{
+              "schema":"fractal.intelligence.query.v1",
+              "query":"Task one",
+              "modality":"text",
+              "lens_ids":["execution"],
+              "bounds":{"max_nodes":1,"max_edges":1}
+            }"#,
+        )
+        .unwrap();
+        let response = intelligence_query(&workspace, &execution).unwrap();
+        assert_eq!(response["schema"], INTELLIGENCE_QUERY_RESPONSE_SCHEMA);
+        assert_eq!(
+            response["intelligence"]["lenses"]["execution"]["counts"]["nodes"],
+            1
+        );
+
+        let economics = parse_query_request(
+            br#"{
+              "schema":"fractal.intelligence.query.v1",
+              "query":"show economics",
+              "modality":"voice"
+            }"#,
+        )
+        .unwrap();
+        let response = intelligence_query(&workspace, &economics).unwrap();
+        let lens = &response["intelligence"]["lenses"]["resource_economic"];
+        assert_eq!(lens["availability"], "unavailable");
+        assert_eq!(lens["nodes"].as_array().unwrap().len(), 0);
+        assert!(serde_json::to_string(lens).unwrap().find(":0").is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn asset_allowlist_includes_master_modules_and_rejects_traversal_paths() {
         assert!(!embedded_asset("master-graph.js").is_empty());
         assert!(!embedded_asset("master-graph.css").is_empty());
+        assert!(!embedded_asset("fractal-graph-ui.js").is_empty());
+        assert!(!embedded_asset("fractal-graph-ui.css").is_empty());
+        assert!(!embedded_asset("fractal-graph-ui.manifest.json").is_empty());
         assert!(embedded_asset("../secrets.txt").is_empty());
         assert!(embedded_asset("/etc/passwd").is_empty());
     }
