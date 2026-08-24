@@ -1245,12 +1245,15 @@ fn hybrid_declared_owned_paths(node: &Value, root: &Path) -> Result<Vec<String>>
     Ok(owned.into_iter().collect())
 }
 
-/// Control closeout executes directly in the canonical workspace and writes a
-/// Fractal-owned control artifact; it is not a worker-owned source change and
-/// must not enter hybrid ownership arbitration. All worker nodes still pass
-/// through the reserved-directory rejection above.
+/// Lead planning and closeout execute directly in the canonical workspace and
+/// write Fractal-owned control artifacts; they are not worker-owned source
+/// changes and must not enter hybrid ownership arbitration. All worker nodes
+/// still pass through the reserved-directory rejection above.
 fn hybrid_scheduled_owned_paths(node: &Value, root: &Path) -> Result<Vec<String>> {
-    if node.get("capability").and_then(Value::as_str) == Some("control.closeout") {
+    if matches!(
+        node.get("capability").and_then(Value::as_str),
+        Some("control.plan" | "control.closeout")
+    ) {
         Ok(Vec::new())
     } else {
         hybrid_declared_owned_paths(node, root)
@@ -4416,8 +4419,16 @@ esac
     }
 
     #[test]
-    fn hybrid_ownership_excludes_only_the_builtin_closeout_control_artifact() {
+    fn hybrid_ownership_excludes_only_builtin_control_artifacts() {
         let root = hybrid_test_repository("closeout-control-artifact");
+        let plan = json!({
+            "id":"lead_plan",
+            "capability":"control.plan",
+            "efficiency":{"files_or_systems_affected":[".fractal/lead-prd.json"]}
+        });
+        assert!(hybrid_scheduled_owned_paths(&plan, &root)
+            .unwrap()
+            .is_empty());
         let closeout = json!({
             "id":"lead_closeout",
             "capability":"control.closeout",
