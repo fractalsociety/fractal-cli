@@ -153,7 +153,10 @@ pub(crate) fn plan_and_commit(
 /// Validate and compile an existing `fractal-plan.json` without calling a lead
 /// agent. Validation errors are returned directly; this path never substitutes
 /// the deterministic fallback harness used by interactive planning.
-pub(crate) fn compile_existing_plan(plan_path: &Path) -> Result<ExistingPlanCompilation> {
+pub(crate) fn compile_existing_plan(
+    plan_path: &Path,
+    repo: &Path,
+) -> Result<ExistingPlanCompilation> {
     let raw = std::fs::read_to_string(plan_path)
         .with_context(|| format!("read existing plan {}", plan_path.display()))?;
     let planned = parse_and_validate(&raw)
@@ -162,7 +165,10 @@ pub(crate) fn compile_existing_plan(plan_path: &Path) -> Result<ExistingPlanComp
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| plan_path.display().to_string());
-    let harness = build_harness_genome(&planned.tasks, &source_name);
+    let mut harness = build_harness_genome(&planned.tasks, &source_name);
+    let policy = crate::harness::load_policy(repo)
+        .with_context(|| format!("load harness policy for {}", repo.display()))?;
+    crate::harness_policy::attach_to_harness(&mut harness, &policy);
     let goal = format!(
         "Execute the validated existing project plan `{}` from {source_name}.",
         planned.prd.title
@@ -171,7 +177,7 @@ pub(crate) fn compile_existing_plan(plan_path: &Path) -> Result<ExistingPlanComp
     // the subsequent `--yes` apply name the same content-addressed graph.
     let work = build_work_value_at(&goal, 0)?;
     let target_id = "darwin-arm64";
-    let graph = crate::compile::recompile(&work, &harness, target_id)
+    let graph = crate::compile::recompile_with_policy(&work, &harness, target_id, &policy)
         .context("compile the validated existing task graph")?;
 
     Ok(ExistingPlanCompilation {

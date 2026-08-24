@@ -741,7 +741,7 @@ fn run_graph_compile_plan(args: &crate::cli::GraphCompilePlanArgs) -> Result<()>
     }
     let repo = canonicalize_compile_plan_repo(&args.repo)?;
     let plan_path = resolve_existing_plan_path(&repo, &args.plan)?;
-    let compilation = decompose::compile_existing_plan(&plan_path)?;
+    let compilation = decompose::compile_existing_plan(&plan_path, &repo)?;
     let graph_hash = compilation
         .graph
         .get("graph_hash")
@@ -2646,6 +2646,56 @@ mod tests {
         assert!(project.graph["nodes"]
             .as_array()
             .is_some_and(|nodes| nodes.iter().any(|node| node["id"] == "implement")));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_compile_plan_applies_repository_harness_policy() -> Result<()> {
+        let _env_lock = graph_store::ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph-store test environment lock poisoned"))?;
+        let _home = graph_store::TestHome::new("compile-plan-project-policy")?;
+        let root = temp_root("compile-plan-project-policy");
+        fs::create_dir_all(root.join(".fractal"))?;
+        fs::write(root.join("fractal-plan.json"), sample_existing_plan(false))?;
+        fs::write(
+            root.join(".fractal/harness.yaml"),
+            r#"schema: fractal.harness_policy.v1
+workspace:
+  max_files_changed: 24
+  max_diff_lines: 4000
+limits:
+  max_files_changed: 24
+  max_diff_lines: 4000
+capabilities:
+  code.generate: { enabled: true }
+  project.tests.execute: { enabled: true }
+  control.plan: { enabled: true }
+  control.closeout: { enabled: true }
+"#,
+        )?;
+
+        run_graph_compile_plan(&compile_plan_args(&root, true))?;
+
+        let project = project_file::load(&root)?;
+        let implement = project.graph["nodes"]
+            .as_array()
+            .and_then(|nodes| nodes.iter().find(|node| node["id"] == "implement"))
+            .context("compiled implement node")?;
+        assert_eq!(
+            implement["policy_contract"]["budgets"]["max_files_changed"],
+            24
+        );
+        assert_eq!(
+            implement["policy_contract"]["budgets"]["max_diff_lines"],
+            4000
+        );
+        assert_eq!(
+            project.graph["policy_provenance"]["source"],
+            "project:.fractal/harness.yaml"
+        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())
