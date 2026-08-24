@@ -733,6 +733,12 @@ fn validate_amendment_rejection_reason(reason: &str) -> Result<()> {
 }
 
 fn run_graph_compile_plan(args: &crate::cli::GraphCompilePlanArgs) -> Result<()> {
+    if args.preserve_execution && !args.yes {
+        anyhow::bail!("--preserve-execution requires --yes");
+    }
+    if !args.preserve_execution && !args.reopen.is_empty() {
+        anyhow::bail!("--reopen requires --preserve-execution");
+    }
     let repo = canonicalize_compile_plan_repo(&args.repo)?;
     let plan_path = resolve_existing_plan_path(&repo, &args.plan)?;
     let compilation = decompose::compile_existing_plan(&plan_path)?;
@@ -767,6 +773,14 @@ fn run_graph_compile_plan(args: &crate::cli::GraphCompilePlanArgs) -> Result<()>
         return Ok(());
     }
 
+    let forced_reopen = args.reopen.iter().cloned().collect::<BTreeSet<_>>();
+    let migration = args
+        .preserve_execution
+        .then(|| {
+            project_file::preview_halted_graph_migration(&repo, &compilation.graph, &forced_reopen)
+        })
+        .transpose()?;
+
     let commit = graph_store::commit_graph(&compilation.graph)
         .context("commit graph compiled from existing plan")?;
     graph_store::persist_source(
@@ -777,12 +791,23 @@ fn run_graph_compile_plan(args: &crate::cli::GraphCompilePlanArgs) -> Result<()>
     )
     .context("persist compiler inputs for existing plan graph")?;
     let prd_path = decompose::persist_existing_plan_prd(&repo, &compilation)?;
-    let project_path = project_file::persist(&repo, &compilation.graph, &compilation.title)
-        .context("update canonical project with graph compiled from existing plan")?;
+    let project_path = if let Some(migration) = &migration {
+        project_file::apply_halted_graph_migration(
+            &repo,
+            &compilation.graph,
+            &forced_reopen,
+            migration,
+        )
+        .context("migrate halted canonical project to graph compiled from existing plan")?
+    } else {
+        project_file::persist(&repo, &compilation.graph, &compilation.title)
+            .context("update canonical project with graph compiled from existing plan")?
+    };
     let applied = CompilePlanApplied {
         commit,
         project_path,
         prd_path,
+        migration,
     };
     print_compile_plan_result(
         args,
@@ -800,6 +825,7 @@ struct CompilePlanApplied {
     commit: graph_store::CommitRecord,
     project_path: std::path::PathBuf,
     prd_path: std::path::PathBuf,
+    migration: Option<project_file::GraphMigrationReport>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -846,6 +872,7 @@ fn print_compile_plan_result(
                 "commit": commit,
                 "project_path": applied.map(|value| value.project_path.display().to_string()),
                 "prd_path": applied.map(|value| value.prd_path.display().to_string()),
+                "migration": applied.and_then(|value| value.migration.as_ref()),
                 "readiness_marker": readiness_marker,
             }))?
         );
@@ -875,6 +902,13 @@ fn print_compile_plan_result(
             );
             println!("  Project: {}", applied.project_path.display());
             println!("  Structured PRD: {}", applied.prd_path.display());
+            if let Some(migration) = &applied.migration {
+                println!("  Old graph: {}", migration.old_graph_hash);
+                println!("  New graph: {}", migration.new_graph_hash);
+                println!("  Preserved: {}", migration.preserved.join(", "));
+                println!("  Reopened: {}", migration.reopened.join(", "));
+                println!("  Removed: {}", migration.removed.join(", "));
+            }
         } else {
             println!("Re-run this exact command with --yes to commit the graph.");
         }
@@ -2618,6 +2652,56 @@ mod tests {
     }
 
     #[test]
+    fn graph_compile_plan_migrates_halted_execution_and_forces_reopen() -> Result<()> {
+        let _env_lock = graph_store::ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph-store test environment lock poisoned"))?;
+        let _home = graph_store::TestHome::new("compile-plan-migrate")?;
+        let root = temp_root("compile-plan-migrate");
+        fs::write(root.join("fractal-plan.json"), sample_existing_plan(false))?;
+        run_graph_compile_plan(&compile_plan_args(&root, true))?;
+        project_file::mutate_document(&root, |document| {
+            let execution = document.execution.as_mut().context("execution")?;
+            execution.phase = "halted".to_owned();
+            for node in ["lead_plan", "implement"] {
+                execution.assignments.insert(
+                    node.to_owned(),
+                    project_file::ExecutionAssignment {
+                        agent_id: format!("agent-{node}"),
+                        agent_label: format!("Agent {node}"),
+                        state: "completed".to_owned(),
+                        checked_out_at: "2026-01-01T00:00:00Z".to_owned(),
+                        completed_at: Some("2026-01-01T00:00:01Z".to_owned()),
+                        released_at: None,
+                        extra: BTreeMap::new(),
+                    },
+                );
+            }
+            Ok(())
+        })?;
+
+        let mut args = compile_plan_args(&root, true);
+        args.preserve_execution = true;
+        args.reopen = vec!["implement".to_owned()];
+        run_graph_compile_plan(&args)?;
+
+        let project = project_file::load(&root)?;
+        let execution = project.execution.context("execution")?;
+        assert_eq!(execution.phase, "halted");
+        assert_eq!(execution.assignments["lead_plan"].state, "completed");
+        assert_eq!(execution.assignments["implement"].state, "released");
+        assert!(execution.assignments["implement"].completed_at.is_none());
+        let migration = &project.learning.extra["plan_migrations"]["records"][0];
+        assert_eq!(migration["preserved"], serde_json::json!(["lead_plan"]));
+        assert!(migration["reopened"]
+            .as_array()
+            .is_some_and(|nodes| nodes.iter().any(|node| node == "implement")));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn graph_compile_plan_invalid_input_fails_closed_without_fallback() -> Result<()> {
         let _env_lock = graph_store::ENV_LOCK
             .lock()
@@ -2816,6 +2900,8 @@ mod tests {
             repo: root.to_owned(),
             plan: Path::new("fractal-plan.json").to_owned(),
             yes,
+            preserve_execution: false,
+            reopen: Vec::new(),
             json: false,
         }
     }

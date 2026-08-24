@@ -203,6 +203,357 @@ pub(crate) fn path(workspace: &Path) -> PathBuf {
     workspace.join(".fractal").join("project.fractal")
 }
 
+/// Exact, deterministic effect of replacing a halted project's execution
+/// graph. The preview is also the optimistic-concurrency token used by apply.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct GraphMigrationReport {
+    pub(crate) old_graph_hash: String,
+    pub(crate) new_graph_hash: String,
+    pub(crate) preserved: Vec<String>,
+    pub(crate) reopened: Vec<String>,
+    pub(crate) removed: Vec<String>,
+}
+
+/// Compute a fail-closed migration without writing. Only completed assignments
+/// with an unchanged semantic node projection enter the initial preserve set;
+/// the fixed-point pass then removes nodes whose new dependencies are not also
+/// preserved.
+pub(crate) fn preview_halted_graph_migration(
+    workspace: &Path,
+    graph: &Value,
+    forced_reopen: &BTreeSet<String>,
+) -> Result<GraphMigrationReport> {
+    let current = load(workspace).context("preserve-execution requires an existing project")?;
+    plan_halted_graph_migration(&current, graph, forced_reopen)
+}
+
+/// Atomically replace the canonical project with the migration preview, after
+/// rechecking it under the project lock. Immutable graph-store writes may occur
+/// before this call, but canonical project state is never partially updated.
+pub(crate) fn apply_halted_graph_migration(
+    workspace: &Path,
+    graph: &Value,
+    forced_reopen: &BTreeSet<String>,
+    expected: &GraphMigrationReport,
+) -> Result<PathBuf> {
+    let _guard = project_file_lock();
+    let _file_guard = ProjectWriteGuard::acquire(workspace)?;
+    let mut current = load(workspace)?;
+    let actual = plan_halted_graph_migration(&current, graph, forced_reopen)?;
+    if &actual != expected {
+        bail!(
+            "halted graph migration preview is stale: expected {} -> {}, found {} -> {}",
+            expected.old_graph_hash,
+            expected.new_graph_hash,
+            actual.old_graph_hash,
+            actual.new_graph_hash
+        );
+    }
+
+    let now = monotonic_timestamp(&current, timestamp());
+    let old_learning = current.learning.clone();
+    let old_assignments = current
+        .execution
+        .as_ref()
+        .map(|execution| execution.assignments.clone())
+        .unwrap_or_default();
+    let mut learning = learning_from_graph(graph, &now);
+    learning.graph_edits = old_learning.graph_edits.clone();
+    learning.extra = old_learning.extra.clone();
+
+    for node in &actual.preserved {
+        if let (Some(previous), Some(fresh)) =
+            (old_learning.nodes.get(node), learning.nodes.get_mut(node))
+        {
+            let dependencies = fresh.depends_on.clone();
+            *fresh = previous.clone();
+            fresh.depends_on = dependencies;
+        }
+    }
+    for node in &actual.reopened {
+        if let (Some(previous), Some(fresh)) =
+            (old_learning.nodes.get(node), learning.nodes.get_mut(node))
+        {
+            fresh.attempt_count = previous.attempt_count;
+            fresh.reopen_count = previous.reopen_count.saturating_add(1);
+        }
+    }
+    append_bounded_migration_history(&mut learning, &old_learning, &actual, &now)?;
+    learning.outcome = None;
+
+    let mut assignments = BTreeMap::new();
+    for node in &actual.preserved {
+        if let Some(assignment) = old_assignments.get(node) {
+            assignments.insert(node.clone(), assignment.clone());
+        }
+    }
+    for node in &actual.reopened {
+        if let Some(previous) = old_assignments.get(node) {
+            let mut released = previous.clone();
+            released.state = "released".to_owned();
+            released.completed_at = None;
+            released.released_at = Some(now.clone());
+            assignments.insert(node.clone(), released);
+        }
+    }
+
+    let execution_extra = current
+        .execution
+        .as_ref()
+        .map(|execution| execution.extra.clone())
+        .unwrap_or_default();
+    current.graph_hash = actual.new_graph_hash.clone();
+    current.graph = graph.clone();
+    current.execution = Some(ExecutionState {
+        schema: "fractal.execution_state.v1".to_owned(),
+        phase: "halted".to_owned(),
+        assignments,
+        progress: None,
+        updated_at: now.clone(),
+        extra: execution_extra,
+    });
+    current.learning = learning;
+    current.updated_at = now;
+    write_document(workspace, &current)?;
+    Ok(path(workspace))
+}
+
+fn plan_halted_graph_migration(
+    current: &FractalProject,
+    graph: &Value,
+    forced_reopen: &BTreeSet<String>,
+) -> Result<GraphMigrationReport> {
+    let phase = current
+        .execution
+        .as_ref()
+        .map(|execution| execution.phase.as_str())
+        .unwrap_or("<missing>");
+    if phase != "halted" {
+        bail!("preserve-execution requires a halted project; current phase is `{phase}`");
+    }
+    validate_migration_history(&current.learning.extra)?;
+    crate::graph_store::verify_graph_document(graph)
+        .context("refuse to migrate to an execution graph with an invalid hash")?;
+    reject_secret_fields(graph)?;
+    let new_graph_hash = graph
+        .get("graph_hash")
+        .and_then(Value::as_str)
+        .context("replacement execution graph is missing graph_hash")?
+        .to_owned();
+    let old_nodes = graph_nodes_by_id(&current.graph)?;
+    let new_nodes = graph_nodes_by_id(graph)?;
+    for node in forced_reopen {
+        if node.trim().is_empty() || !new_nodes.contains_key(node) {
+            bail!("--reopen references unknown replacement graph node `{node}`");
+        }
+    }
+
+    let completed = current
+        .execution
+        .as_ref()
+        .map(|execution| {
+            execution
+                .assignments
+                .iter()
+                .filter_map(|(node, assignment)| {
+                    (assignment.state == "completed").then_some(node.clone())
+                })
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut preserved = BTreeSet::new();
+    for (id, new_node) in &new_nodes {
+        let Some(old_node) = old_nodes.get(id) else {
+            continue;
+        };
+        if completed.contains(id)
+            && !forced_reopen.contains(id)
+            && semantic_node_projection(old_node) == semantic_node_projection(new_node)
+        {
+            preserved.insert(id.clone());
+        }
+    }
+
+    let dependencies = graph_dependencies(graph, new_nodes.keys().cloned().collect())?;
+    loop {
+        let invalid = preserved
+            .iter()
+            .filter(|node| {
+                dependencies
+                    .get(*node)
+                    .is_some_and(|values| values.iter().any(|dep| !preserved.contains(dep)))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if invalid.is_empty() {
+            break;
+        }
+        for node in invalid {
+            preserved.remove(&node);
+        }
+    }
+
+    let new_ids = new_nodes.keys().cloned().collect::<BTreeSet<_>>();
+    let old_ids = old_nodes.keys().cloned().collect::<BTreeSet<_>>();
+    Ok(GraphMigrationReport {
+        old_graph_hash: current.graph_hash.clone(),
+        new_graph_hash,
+        preserved: preserved.iter().cloned().collect(),
+        reopened: new_ids.difference(&preserved).cloned().collect(),
+        removed: old_ids.difference(&new_ids).cloned().collect(),
+    })
+}
+
+fn graph_nodes_by_id(graph: &Value) -> Result<BTreeMap<String, Value>> {
+    let nodes = graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .context("execution graph nodes must be an array")?;
+    let mut indexed = BTreeMap::new();
+    for node in nodes {
+        let id = node
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .context("execution graph node is missing id")?;
+        if indexed.insert(id.to_owned(), node.clone()).is_some() {
+            bail!("execution graph contains duplicate node `{id}`");
+        }
+    }
+    Ok(indexed)
+}
+
+fn graph_dependencies(
+    graph: &Value,
+    node_ids: BTreeSet<String>,
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut dependencies = node_ids
+        .iter()
+        .map(|id| (id.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    for edge in graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .context("execution graph edges must be an array")?
+    {
+        let from = edge
+            .get("from")
+            .and_then(Value::as_str)
+            .context("execution graph edge is missing from")?;
+        let to = edge
+            .get("to")
+            .and_then(Value::as_str)
+            .context("execution graph edge is missing to")?;
+        if !node_ids.contains(from) || !node_ids.contains(to) {
+            bail!("execution graph edge `{from}` -> `{to}` references an unknown node");
+        }
+        dependencies
+            .get_mut(to)
+            .expect("known dependency target")
+            .insert(from.to_owned());
+    }
+    Ok(dependencies)
+}
+
+fn semantic_node_projection(node: &Value) -> Value {
+    let mut projected = node.clone();
+    if let Some(object) = projected.as_object_mut() {
+        for field in [
+            "execution",
+            "depends_on",
+            "preconditions",
+            "created_at",
+            "ready_at",
+            "started_at",
+            "finished_at",
+            "attempt_count",
+            "artifacts_produced",
+            "consumed_by",
+            "human_intervention",
+            "outcome",
+            "failure_code",
+            "verification",
+            "actual_cost",
+            "notes",
+            "reopen_count",
+        ] {
+            object.remove(field);
+        }
+        if let Some(efficiency) = object.get_mut("efficiency").and_then(Value::as_object_mut) {
+            efficiency.remove("dependencies");
+        }
+    }
+    projected
+}
+
+fn append_bounded_migration_history(
+    learning: &mut crate::learning_data::LearningData,
+    old_learning: &crate::learning_data::LearningData,
+    report: &GraphMigrationReport,
+    now: &str,
+) -> Result<()> {
+    const MAX_MIGRATIONS: usize = 16;
+    const MAX_RETIRED_NODES: usize = 128;
+    let retired_nodes = report
+        .removed
+        .iter()
+        .take(MAX_RETIRED_NODES)
+        .map(|id| {
+            let record = old_learning.nodes.get(id);
+            serde_json::json!({
+                "node_id": id,
+                "outcome": record.and_then(|record| record.outcome),
+                "failure_code": record.and_then(|record| record.failure_code),
+                "attempt_count": record.map_or(0, |record| record.attempt_count),
+                "finished_at": record.and_then(|record| record.finished_at.as_deref()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let entry = serde_json::json!({
+        "old_graph_hash": report.old_graph_hash,
+        "new_graph_hash": report.new_graph_hash,
+        "migrated_at": now,
+        "preserved": report.preserved,
+        "reopened": report.reopened,
+        "removed": report.removed,
+        "retired_nodes": retired_nodes,
+    });
+    let history = learning
+        .extra
+        .entry("plan_migrations".to_owned())
+        .or_insert_with(|| {
+            serde_json::json!({
+                "schema": "fractal.plan_migrations.v1",
+                "records": []
+            })
+        });
+    if history.get("schema").and_then(Value::as_str) != Some("fractal.plan_migrations.v1") {
+        bail!("existing plan_migrations history has an unsupported schema");
+    }
+    let records = history
+        .get_mut("records")
+        .and_then(Value::as_array_mut)
+        .context("existing plan_migrations history records must be an array")?;
+    records.push(entry);
+    if records.len() > MAX_MIGRATIONS {
+        records.drain(0..records.len() - MAX_MIGRATIONS);
+    }
+    Ok(())
+}
+
+fn validate_migration_history(extra: &BTreeMap<String, Value>) -> Result<()> {
+    let Some(history) = extra.get("plan_migrations") else {
+        return Ok(());
+    };
+    if history.get("schema").and_then(Value::as_str) != Some("fractal.plan_migrations.v1") {
+        bail!("existing plan_migrations history has an unsupported schema");
+    }
+    if !history.get("records").is_some_and(Value::is_array) {
+        bail!("existing plan_migrations history records must be an array");
+    }
+    Ok(())
+}
+
 /// Pin the user-confirmed name for a managed voice project. Every later
 /// planning/execution persist reads this record, so lead request text cannot
 /// replace the dashboard title or hosted URL slug.
@@ -3931,6 +4282,203 @@ mod tests {
         assert!(load(&workspace)?.failure_graph.is_none());
         assert_eq!(before_read, fs::read(path(&workspace))?);
         assert_ne!(before, before_read);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    fn migration_graph(revision: &str, nodes: &[(&str, &str)], edges: &[(&str, &str)]) -> Value {
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": revision,
+            "nodes": nodes.iter().map(|(id, instruction)| json!({
+                "id": id,
+                "title": id,
+                "capability": "code.generate",
+                "instruction": instruction,
+                "execution": {"wave": 7, "task_number": "7.1"},
+                "depends_on": edges.iter()
+                    .filter(|(_, to)| to == id)
+                    .map(|(from, _)| Value::String((*from).to_owned()))
+                    .collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "edges": edges.iter().map(|(from, to)| json!({
+                "from": from,
+                "to": to,
+                "condition": "success"
+            })).collect::<Vec<_>>(),
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        graph
+    }
+
+    fn seed_halted_migration_project(
+        workspace: &Path,
+        graph: &Value,
+        completed: &[&str],
+    ) -> Result<()> {
+        fs::create_dir_all(workspace)?;
+        persist(workspace, graph, "Migration fixture")?;
+        mutate_document(workspace, |document| {
+            let now = "2026-01-01T00:00:00Z".to_owned();
+            let execution = document.execution.as_mut().expect("execution");
+            execution.phase = "halted".to_owned();
+            for node in completed {
+                execution.assignments.insert(
+                    (*node).to_owned(),
+                    ExecutionAssignment {
+                        agent_id: format!("agent-{node}"),
+                        agent_label: format!("Agent {node}"),
+                        state: "completed".to_owned(),
+                        checked_out_at: now.clone(),
+                        completed_at: Some(now.clone()),
+                        released_at: None,
+                        extra: BTreeMap::new(),
+                    },
+                );
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn halted_graph_migration_requires_existing_project() {
+        let workspace = temp_workspace();
+        let graph = migration_graph("new", &[("a", "same")], &[]);
+        let error = preview_halted_graph_migration(&workspace, &graph, &BTreeSet::new())
+            .expect_err("missing project must fail closed");
+        assert!(format!("{error:#}").contains("requires an existing project"));
+        assert!(!path(&workspace).exists());
+    }
+
+    #[test]
+    fn halted_graph_migration_refuses_active_project_without_write() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph("old", &[("a", "same")], &[]);
+        fs::create_dir_all(&workspace)?;
+        persist(&workspace, &old, "Active")?;
+        let before = fs::read(path(&workspace))?;
+        let new = migration_graph("new", &[("a", "same")], &[]);
+        let error = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())
+            .expect_err("executing project must be refused");
+        assert!(format!("{error:#}").contains("requires a halted project"));
+        assert_eq!(fs::read(path(&workspace))?, before);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_preserves_unchanged_completed_assignment() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph("old", &[("a", "same")], &[]);
+        seed_halted_migration_project(&workspace, &old, &["a"])?;
+        let new = migration_graph("new", &[("a", "same")], &[]);
+        let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
+        assert_eq!(preview.preserved, ["a"]);
+        assert!(preview.reopened.is_empty());
+        apply_halted_graph_migration(&workspace, &new, &BTreeSet::new(), &preview)?;
+        assert_eq!(
+            load(&workspace)?.execution.unwrap().assignments["a"].state,
+            "completed"
+        );
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_reopens_semantically_changed_node() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph("old", &[("a", "old instruction")], &[]);
+        seed_halted_migration_project(&workspace, &old, &["a"])?;
+        let new = migration_graph("new", &[("a", "corrected instruction")], &[]);
+        let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
+        assert!(preview.preserved.is_empty());
+        assert_eq!(preview.reopened, ["a"]);
+        apply_halted_graph_migration(&workspace, &new, &BTreeSet::new(), &preview)?;
+        let assignment = load(&workspace)?
+            .execution
+            .unwrap()
+            .assignments
+            .remove("a")
+            .unwrap();
+        assert_eq!(assignment.state, "released");
+        assert!(assignment.completed_at.is_none());
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_enforces_preserved_dependency_closure() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph("old", &[("a", "old"), ("b", "same")], &[("a", "b")]);
+        seed_halted_migration_project(&workspace, &old, &["a", "b"])?;
+        let new = migration_graph("new", &[("a", "changed"), ("b", "same")], &[("a", "b")]);
+        let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
+        assert!(preview.preserved.is_empty());
+        assert_eq!(preview.reopened, ["a", "b"]);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_honors_forced_reopen() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph("old", &[("companion_export_contract_tests", "same")], &[]);
+        seed_halted_migration_project(&workspace, &old, &["companion_export_contract_tests"])?;
+        let new = migration_graph("new", &[("companion_export_contract_tests", "same")], &[]);
+        let forced = BTreeSet::from(["companion_export_contract_tests".to_owned()]);
+        let preview = preview_halted_graph_migration(&workspace, &new, &forced)?;
+        assert!(preview.preserved.is_empty());
+        assert_eq!(preview.reopened, ["companion_export_contract_tests"]);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_removes_active_node_and_keeps_bounded_history() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph(
+            "old",
+            &[("keep", "same"), ("dynamic_verifier", "verify")],
+            &[],
+        );
+        seed_halted_migration_project(&workspace, &old, &["keep", "dynamic_verifier"])?;
+        let new = migration_graph("new", &[("keep", "same")], &[]);
+        let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
+        assert_eq!(preview.removed, ["dynamic_verifier"]);
+        apply_halted_graph_migration(&workspace, &new, &BTreeSet::new(), &preview)?;
+        let migrated = load(&workspace)?;
+        assert!(!migrated
+            .execution
+            .unwrap()
+            .assignments
+            .contains_key("dynamic_verifier"));
+        assert_eq!(
+            migrated.learning.extra["plan_migrations"]["records"][0]["retired_nodes"][0]["node_id"],
+            "dynamic_verifier"
+        );
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_invalid_replacement_is_atomic() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph("old", &[("a", "same")], &[]);
+        seed_halted_migration_project(&workspace, &old, &["a"])?;
+        let before = fs::read(path(&workspace))?;
+        let replacement = migration_graph("new", &[("a", "same")], &[]);
+        let mut stale = preview_halted_graph_migration(&workspace, &replacement, &BTreeSet::new())?;
+        stale.preserved.clear();
+        assert!(
+            apply_halted_graph_migration(&workspace, &replacement, &BTreeSet::new(), &stale)
+                .is_err()
+        );
+        assert_eq!(fs::read(path(&workspace))?, before);
+
+        let mut invalid = migration_graph("new", &[("a", "same")], &[]);
+        invalid["nodes"][0]["instruction"] = Value::String("tampered".to_owned());
+        assert!(preview_halted_graph_migration(&workspace, &invalid, &BTreeSet::new()).is_err());
+        assert_eq!(fs::read(path(&workspace))?, before);
         fs::remove_dir_all(workspace)?;
         Ok(())
     }

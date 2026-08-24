@@ -1086,6 +1086,19 @@ pub(crate) struct GraphCompilePlanArgs {
     #[arg(long)]
     pub(crate) yes: bool,
 
+    /// Replace an existing halted graph while preserving only semantically
+    /// unchanged, dependency-closed completed work.
+    #[arg(long, requires = "yes")]
+    pub(crate) preserve_execution: bool,
+
+    /// Force a node to reopen even when its semantic task identity is unchanged.
+    #[arg(
+        long = "reopen",
+        value_name = "NODE_ID",
+        requires = "preserve_execution"
+    )]
+    pub(crate) reopen: Vec<String>,
+
     /// Print a stable JSON report instead of human-readable diagnostics.
     #[arg(long)]
     pub(crate) json: bool,
@@ -1593,6 +1606,11 @@ mod tests {
             "--plan",
             "fractal-plan.json",
             "--yes",
+            "--preserve-execution",
+            "--reopen",
+            "companion_export_contract_tests",
+            "--reopen",
+            "integration_verify",
             "--json",
         ])
         .unwrap();
@@ -1605,6 +1623,11 @@ mod tests {
         assert_eq!(args.repo, PathBuf::from("/tmp/project"));
         assert_eq!(args.plan, PathBuf::from("fractal-plan.json"));
         assert!(args.yes);
+        assert!(args.preserve_execution);
+        assert_eq!(
+            args.reopen,
+            ["companion_export_contract_tests", "integration_verify"]
+        );
         assert!(args.json);
 
         let board = Cli::try_parse_from([
