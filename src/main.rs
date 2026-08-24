@@ -1107,18 +1107,22 @@ fn run_local(
     std::thread::sleep(std::time::Duration::from_millis(1500));
 
     println!("{}", efficiency_config::banner(efficiency));
+    let execution_label = if args.hybrid {
+        "hybrid isolated-worktree team"
+    } else {
+        "agent team"
+    };
     println!(
-        "Running graph with agent team: {} in {}",
+        "Running graph with {execution_label}: {} in {}",
         agents.join(", "),
         workspace.display()
     );
-    let outcome = execute::run_multi_agent(
-        &graph,
-        &workspace,
-        &agents,
-        Some(&board_url),
-        &std::collections::BTreeSet::new(),
-    )?;
+    let completed = std::collections::BTreeSet::new();
+    let outcome = if args.hybrid {
+        execute::run_multi_agent_hybrid(&graph, &workspace, &agents, Some(&board_url), &completed)?
+    } else {
+        execute::run_multi_agent(&graph, &workspace, &agents, Some(&board_url), &completed)?
+    };
     println!("⇒ {}", outcome.detail);
     if let Some(failed) = outcome.failed_node {
         anyhow::bail!("local graph failed at node `{failed}`");

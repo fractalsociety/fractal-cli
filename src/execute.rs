@@ -579,6 +579,392 @@ fn validate_node_agent_requirements(nodes: &[Value], agents: &[String]) -> Resul
     Ok(())
 }
 
+/// One hybrid run owns isolated worker checkouts and a single integration
+/// boundary. Worker models never share a mutable source tree; only Fractal may
+/// serialize their commits into the canonical workspace.
+struct HybridSession {
+    workspace: PathBuf,
+    git_boundary: Mutex<()>,
+    next_worktree: std::sync::atomic::AtomicU64,
+}
+
+impl HybridSession {
+    fn initialize(workspace: &Path) -> Result<Self> {
+        let root = hybrid_git_output(workspace, &["rev-parse", "--show-toplevel"])
+            .context("hybrid mode requires a Git repository")?;
+        let root = std::fs::canonicalize(root.trim()).context("resolve Git repository root")?;
+        let requested = std::fs::canonicalize(workspace).context("resolve hybrid workspace")?;
+        if root != requested {
+            bail!(
+                "hybrid mode must run from the Git repository root: {}",
+                root.display()
+            );
+        }
+        hybrid_git_output(workspace, &["rev-parse", "--verify", "HEAD"])
+            .context("hybrid mode requires an existing HEAD commit")?;
+        let tracked = hybrid_git_output(
+            workspace,
+            &["status", "--porcelain=v1", "--untracked-files=no"],
+        )?;
+        if !tracked.trim().is_empty() {
+            bail!(
+                "hybrid mode requires a clean tracked workspace before parallel integration:\n{}",
+                tracked.trim()
+            );
+        }
+        Ok(Self {
+            workspace: requested,
+            git_boundary: Mutex::new(()),
+            next_worktree: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    fn run_worker(&self, node: &Value, agent: &str, timeout_ms: u64) -> Result<AgentRun> {
+        let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
+        let instruction = node
+            .get("instruction")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let worktree = self.create_worktree(id, agent)?;
+        copy_hybrid_context(&self.workspace, &worktree)?;
+        let run = run_worker_as_for_node(agent, instruction, &worktree, timeout_ms, Some(node))?;
+        if !run.ok {
+            eprintln!(
+                "  [{agent}] hybrid worktree preserved after worker failure: {}",
+                worktree.display()
+            );
+            return Ok(run);
+        }
+
+        self.integrate_worker_result(node, agent, &worktree)?;
+        self.remove_worktree(&worktree)?;
+        Ok(run)
+    }
+
+    fn create_worktree(&self, node: &str, agent: &str) -> Result<PathBuf> {
+        let serial = self
+            .next_worktree
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let leaf = format!(
+            "fractal-hybrid-{}-{}-{}-{}",
+            std::process::id(),
+            hybrid_path_component(node),
+            hybrid_path_component(agent),
+            serial
+        );
+        let path = std::env::temp_dir().join(leaf);
+        if path.exists() {
+            bail!(
+                "refuse to reuse existing hybrid worktree {}",
+                path.display()
+            );
+        }
+        let _git = self.git_boundary.lock().expect("hybrid git boundary");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&self.workspace)
+            .args(["worktree", "add", "--detach", "--quiet"])
+            .arg(&path)
+            .arg("HEAD")
+            .status()
+            .context("create isolated hybrid worktree")?;
+        if !status.success() {
+            bail!("git worktree add failed with {status}");
+        }
+        Ok(path)
+    }
+
+    fn integrate_worker_result(&self, node: &Value, agent: &str, worktree: &Path) -> Result<()> {
+        let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
+        if node_required_agent(node).is_some() {
+            if let Some(source) = declared_artifact_path(node, worktree) {
+                if !source.exists() {
+                    bail!(
+                        "hybrid worker `{agent}` did not produce declared artifact {}",
+                        source.display()
+                    );
+                }
+            }
+        }
+
+        // Worker-controlled staging is never integration authority. Reset the
+        // task index, then stage only the PRD-declared ownership below.
+        if !hybrid_git_status(worktree, &["reset", "--quiet", "HEAD", "--"])? {
+            bail!("git reset failed while normalizing hybrid node `{id}`");
+        }
+        let owned = hybrid_owned_paths(node, worktree)?;
+        if !owned.is_empty() {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(worktree)
+                .args(["add", "-A", "--"])
+                .args(&owned)
+                .status()
+                .context("stage declared hybrid ownership")?;
+            if !status.success() {
+                bail!("git add failed while staging hybrid node `{id}`");
+            }
+        }
+        reject_hybrid_scope_escape(worktree, id)?;
+        let staged = !hybrid_git_status(worktree, &["diff", "--cached", "--quiet"])?;
+        let commit = if staged {
+            let message = format!("fractal({id}): integrate {agent} worker result");
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(worktree)
+                .args(["-c", "user.name=Fractal"])
+                .args(["-c", "user.email=fractal@local"])
+                .args(["commit", "--quiet", "-m"])
+                .arg(&message)
+                .status()
+                .context("commit hybrid worker result")?;
+            if !status.success() {
+                bail!("hybrid worker commit failed with {status}");
+            }
+            Some(
+                hybrid_git_output(worktree, &["rev-parse", "HEAD"])?
+                    .trim()
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+
+        if commit.is_none()
+            && is_build(node.get("capability").and_then(Value::as_str).unwrap_or(""))
+        {
+            bail!(
+                "hybrid build node `{id}` exited successfully but made no tracked source changes"
+            );
+        }
+
+        let _git = self.git_boundary.lock().expect("hybrid git boundary");
+        if let Some(commit) = commit {
+            let clean = hybrid_git_output(
+                &self.workspace,
+                &["status", "--porcelain=v1", "--untracked-files=no"],
+            )?;
+            if !clean.trim().is_empty() {
+                bail!(
+                    "canonical workspace changed before integrating `{id}`:\n{}",
+                    clean.trim()
+                );
+            }
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&self.workspace)
+                .args(["cherry-pick", "--quiet"])
+                .arg(&commit)
+                .status()
+                .context("integrate hybrid worker commit")?;
+            if !status.success() {
+                let _ = Command::new("git")
+                    .arg("-C")
+                    .arg(&self.workspace)
+                    .args(["cherry-pick", "--abort"])
+                    .status();
+                bail!(
+                    "hybrid integration conflict for node `{id}` from `{agent}`; worktree preserved at {}",
+                    worktree.display()
+                );
+            }
+        }
+        copy_declared_artifact(node, worktree, &self.workspace)?;
+        Ok(())
+    }
+
+    fn remove_worktree(&self, worktree: &Path) -> Result<()> {
+        let _git = self.git_boundary.lock().expect("hybrid git boundary");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&self.workspace)
+            .args(["worktree", "remove", "--force"])
+            .arg(worktree)
+            .status()
+            .context("remove completed hybrid worktree")?;
+        if !status.success() {
+            bail!("git worktree remove failed with {status}");
+        }
+        Ok(())
+    }
+}
+
+fn hybrid_path_component(value: &str) -> String {
+    let component: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .take(48)
+        .collect();
+    if component.is_empty() {
+        "node".to_owned()
+    } else {
+        component
+    }
+}
+
+fn hybrid_git_output(workspace: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(args)
+        .output()
+        .with_context(|| format!("run git {}", args.first().copied().unwrap_or("command")))?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed with {}: {}",
+            args.first().copied().unwrap_or("command"),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout).context("git output was not UTF-8")
+}
+
+/// Return the status success bit for Git commands whose nonzero result is data
+/// (for example `git diff --quiet`) rather than a launch failure.
+fn hybrid_git_status(workspace: &Path, args: &[&str]) -> Result<bool> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(args)
+        .status()
+        .with_context(|| format!("run git {}", args.first().copied().unwrap_or("command")))?;
+    Ok(status.success())
+}
+
+fn hybrid_owned_paths(node: &Value, worktree: &Path) -> Result<Vec<String>> {
+    let mut declared = BTreeSet::new();
+    if let Some(paths) = node
+        .pointer("/efficiency/files_or_systems_affected")
+        .and_then(Value::as_array)
+    {
+        for path in paths.iter().filter_map(Value::as_str) {
+            declared.insert(path.trim().to_owned());
+        }
+    }
+    if let Some(path) = node
+        .pointer("/efficiency/expected_artifact")
+        .and_then(Value::as_str)
+    {
+        declared.insert(path.trim().to_owned());
+    }
+
+    let mut owned = Vec::new();
+    for path in declared {
+        if path.is_empty()
+            || matches!(path.as_str(), "." | "./")
+            || path.starts_with(':')
+            || path.chars().any(char::is_whitespace)
+        {
+            continue;
+        }
+        let candidate = Path::new(&path);
+        let first = candidate.components().next();
+        if candidate.is_absolute()
+            || candidate.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+            || matches!(first, Some(std::path::Component::Normal(name)) if name == ".git" || name == ".fractal")
+        {
+            continue;
+        }
+        let tracked = !hybrid_git_output(worktree, &["ls-files", "--", &path])?
+            .trim()
+            .is_empty();
+        if worktree.join(candidate).exists() || tracked {
+            owned.push(path);
+        }
+    }
+    owned.sort();
+    owned.dedup();
+    Ok(owned)
+}
+
+fn reject_hybrid_scope_escape(worktree: &Path, node: &str) -> Result<()> {
+    let unstaged = hybrid_git_output(worktree, &["diff", "--name-only"])?;
+    if let Some(path) = unstaged.lines().find(|path| !path.trim().is_empty()) {
+        bail!(
+            "hybrid node `{node}` modified tracked path `{path}` outside its declared file ownership"
+        );
+    }
+    let untracked = hybrid_git_output(worktree, &["ls-files", "--others", "--exclude-standard"])?;
+    if let Some(path) = untracked
+        .lines()
+        .map(str::trim)
+        .find(|path| !path.is_empty() && !is_hybrid_generated_path(path))
+    {
+        bail!("hybrid node `{node}` created path `{path}` outside its declared file ownership");
+    }
+    Ok(())
+}
+
+fn is_hybrid_generated_path(path: &str) -> bool {
+    path == "Cargo.lock"
+        || path == ".coverage"
+        || path.ends_with(".pyc")
+        || [
+            ".fractal/",
+            "target/",
+            "node_modules/",
+            ".build/",
+            "build/",
+            "dist/",
+            "__pycache__/",
+            ".pytest_cache/",
+            ".venv/",
+            "venv/",
+            "coverage/",
+        ]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
+fn copy_hybrid_context(workspace: &Path, worktree: &Path) -> Result<()> {
+    let target = worktree.join(".fractal");
+    for name in ["project.fractal", "lead-prd.json"] {
+        let source = workspace.join(".fractal").join(name);
+        if source.is_file() {
+            std::fs::create_dir_all(&target)?;
+            std::fs::copy(&source, target.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_declared_artifact(node: &Value, worktree: &Path, workspace: &Path) -> Result<()> {
+    let Some(source) = declared_artifact_path(node, worktree) else {
+        return Ok(());
+    };
+    let Some(target) = declared_artifact_path(node, workspace) else {
+        return Ok(());
+    };
+    if source == target || !source.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(&source, &target).with_context(|| {
+        format!(
+            "copy hybrid artifact {} to {}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    Ok(())
+}
+
 fn is_pool_slot_id(agent: &str) -> bool {
     matches!(
         command_kind_for_agent(agent),
@@ -840,13 +1226,21 @@ fn declared_artifact_path(node: &Value, workspace: &Path) -> Option<PathBuf> {
     }
 }
 
-fn run_worker_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> {
+fn run_worker_node(
+    node: &Value,
+    agent: &str,
+    workspace: &Path,
+    hybrid: Option<&HybridSession>,
+) -> Result<NodeOutcome> {
     let instruction = node
         .get("instruction")
         .and_then(Value::as_str)
         .unwrap_or("");
     let timeout_ms = agent_timeout_ms(node);
-    let run = run_worker_as_for_node(agent, instruction, workspace, timeout_ms, Some(node))?;
+    let run = match hybrid {
+        Some(session) => session.run_worker(node, agent, timeout_ms)?,
+        None => run_worker_as_for_node(agent, instruction, workspace, timeout_ms, Some(node))?,
+    };
     let timeout_note = run.timed_out.then(|| {
         format!(
             "agent hung — killed after {}s; failing the task so it is repaired",
@@ -881,6 +1275,15 @@ fn run_worker_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOu
 /// Cursor CLI), then the trusted host independently evaluates the workspace.
 /// Unpinned verification nodes remain host-only acceptance gates.
 fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> {
+    run_node_with_hybrid(node, agent, workspace, None)
+}
+
+fn run_node_with_hybrid(
+    node: &Value,
+    agent: &str,
+    workspace: &Path,
+    hybrid: Option<&HybridSession>,
+) -> Result<NodeOutcome> {
     let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
     let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
     // Defense in depth: callers must atomically checkout first, but this
@@ -898,9 +1301,9 @@ fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> 
     if capability == "control.closeout" {
         run_lead_closeout(node, agent, workspace)
     } else if is_build(capability) {
-        run_worker_node(node, agent, workspace)
+        run_worker_node(node, agent, workspace, hybrid)
     } else if is_verify(capability) && node_required_agent(node).is_some() {
-        let worker = run_worker_node(node, agent, workspace)?;
+        let worker = run_worker_node(node, agent, workspace, hybrid)?;
         if !worker.ok {
             return Ok(worker);
         }
@@ -1869,6 +2272,35 @@ pub(crate) fn run_multi_agent(
     board: Option<&str>,
     completed_seed: &BTreeSet<String>,
 ) -> Result<RunOutcome> {
+    run_multi_agent_inner(graph, workspace, agents, board, completed_seed, None)
+}
+
+pub(crate) fn run_multi_agent_hybrid(
+    graph: &Value,
+    workspace: &Path,
+    agents: &[String],
+    board: Option<&str>,
+    completed_seed: &BTreeSet<String>,
+) -> Result<RunOutcome> {
+    let hybrid = HybridSession::initialize(workspace)?;
+    run_multi_agent_inner(
+        graph,
+        workspace,
+        agents,
+        board,
+        completed_seed,
+        Some(&hybrid),
+    )
+}
+
+fn run_multi_agent_inner(
+    graph: &Value,
+    workspace: &Path,
+    agents: &[String],
+    board: Option<&str>,
+    completed_seed: &BTreeSet<String>,
+    hybrid: Option<&HybridSession>,
+) -> Result<RunOutcome> {
     let ordered = topo_order(graph)?; // validates acyclic
     validate_node_agent_requirements(&ordered, agents)?;
     let ids: Vec<String> = ordered
@@ -2081,7 +2513,7 @@ pub(crate) fn run_multi_agent(
                     break;
                 }
                 let started = std::time::Instant::now();
-                let result = run_node(node, &agent, workspace);
+                let result = run_node_with_hybrid(node, &agent, workspace, hybrid);
                 let latency_ms = started.elapsed().as_millis() as u64;
 
                 let evidence_hex = workspace_digest(workspace);
@@ -3006,6 +3438,167 @@ mod tests {
     use std::fs;
     use std::sync::{Arc, Barrier};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn hybrid_test_repository(name: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "fractal-hybrid-test-{name}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for args in [
+            &["init", "--quiet"][..],
+            &["config", "user.name", "Fractal Test"][..],
+            &["config", "user.email", "fractal-test@local"][..],
+        ] {
+            assert!(hybrid_git_status(&root, args).unwrap());
+        }
+        fs::write(root.join("README.md"), "hybrid base\n").unwrap();
+        assert!(hybrid_git_status(&root, &["add", "README.md"]).unwrap());
+        assert!(hybrid_git_status(&root, &["commit", "--quiet", "-m", "base"]).unwrap());
+        root
+    }
+
+    #[test]
+    fn hybrid_worktrees_integrate_parallel_nonoverlapping_results() {
+        let root = hybrid_test_repository("parallel");
+        let session = HybridSession::initialize(&root).unwrap();
+        let alpha = json!({
+            "id":"alpha",
+            "capability":"code.generate",
+            "efficiency":{"files_or_systems_affected":["alpha.txt"],"expected_artifact":"alpha.txt"}
+        });
+        let beta = json!({
+            "id":"beta",
+            "capability":"code.generate",
+            "efficiency":{"files_or_systems_affected":["beta.txt"],"expected_artifact":"beta.txt"}
+        });
+        let alpha_tree = session.create_worktree("alpha", "cursor").unwrap();
+        let beta_tree = session.create_worktree("beta", "codex-luna").unwrap();
+        fs::write(alpha_tree.join("alpha.txt"), "from cursor\n").unwrap();
+        fs::create_dir_all(alpha_tree.join("target/debug")).unwrap();
+        fs::write(alpha_tree.join("target/debug/build-output"), "generated\n").unwrap();
+        fs::write(alpha_tree.join("Cargo.lock"), "generated\n").unwrap();
+        fs::write(beta_tree.join("beta.txt"), "from codex\n").unwrap();
+
+        session
+            .integrate_worker_result(&alpha, "cursor", &alpha_tree)
+            .unwrap();
+        session.remove_worktree(&alpha_tree).unwrap();
+        session
+            .integrate_worker_result(&beta, "codex-luna", &beta_tree)
+            .unwrap();
+        session.remove_worktree(&beta_tree).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("alpha.txt")).unwrap(),
+            "from cursor\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("beta.txt")).unwrap(),
+            "from codex\n"
+        );
+        assert!(!root.join("target").exists());
+        assert!(!root.join("Cargo.lock").exists());
+        let log = hybrid_git_output(&root, &["log", "--format=%s", "-3"]).unwrap();
+        assert!(log.contains("fractal(alpha): integrate cursor worker result"));
+        assert!(log.contains("fractal(beta): integrate codex-luna worker result"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_verifier_copies_proof_without_source_commit() {
+        let root = hybrid_test_repository("artifact");
+        let session = HybridSession::initialize(&root).unwrap();
+        let node = json!({
+            "id":"cursor_verify",
+            "capability":"project.tests.execute",
+            "executor":{"agent":"cursor"},
+            "efficiency":{"expected_artifact":".fractal/cursor-proof.json"}
+        });
+        let worktree = session.create_worktree("cursor_verify", "cursor").unwrap();
+        fs::create_dir_all(worktree.join(".fractal")).unwrap();
+        fs::write(
+            worktree.join(".fractal/cursor-proof.json"),
+            "{\"passed\":true}\n",
+        )
+        .unwrap();
+        session
+            .integrate_worker_result(&node, "cursor", &worktree)
+            .unwrap();
+        session.remove_worktree(&worktree).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(".fractal/cursor-proof.json")).unwrap(),
+            "{\"passed\":true}\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_integration_conflict_aborts_without_corrupting_canonical_tree() {
+        let root = hybrid_test_repository("conflict");
+        let session = HybridSession::initialize(&root).unwrap();
+        let first = json!({
+            "id":"first",
+            "capability":"code.generate",
+            "efficiency":{"files_or_systems_affected":["README.md"],"expected_artifact":"README.md"}
+        });
+        let second = json!({
+            "id":"second",
+            "capability":"code.generate",
+            "efficiency":{"files_or_systems_affected":["README.md"],"expected_artifact":"README.md"}
+        });
+        let first_tree = session.create_worktree("first", "cursor").unwrap();
+        let second_tree = session.create_worktree("second", "codex-luna").unwrap();
+        fs::write(first_tree.join("README.md"), "cursor version\n").unwrap();
+        fs::write(second_tree.join("README.md"), "codex version\n").unwrap();
+
+        session
+            .integrate_worker_result(&first, "cursor", &first_tree)
+            .unwrap();
+        session.remove_worktree(&first_tree).unwrap();
+        let error = session
+            .integrate_worker_result(&second, "codex-luna", &second_tree)
+            .unwrap_err();
+        assert!(error.to_string().contains("integration conflict"));
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "cursor version\n"
+        );
+        assert!(
+            hybrid_git_output(&root, &["status", "--porcelain=v1", "--untracked-files=no"])
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+        session.remove_worktree(&second_tree).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_rejects_source_changes_outside_declared_ownership() {
+        let root = hybrid_test_repository("scope");
+        let session = HybridSession::initialize(&root).unwrap();
+        let node = json!({
+            "id":"owned",
+            "capability":"code.generate",
+            "efficiency":{"files_or_systems_affected":["owned.txt"],"expected_artifact":"owned.txt"}
+        });
+        let worktree = session.create_worktree("owned", "cursor").unwrap();
+        fs::write(worktree.join("owned.txt"), "owned\n").unwrap();
+        fs::write(worktree.join("escape.txt"), "not owned\n").unwrap();
+        assert!(hybrid_git_status(&worktree, &["add", "escape.txt"]).unwrap());
+        let error = session
+            .integrate_worker_result(&node, "cursor", &worktree)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("outside its declared file ownership"));
+        assert!(!root.join("owned.txt").exists());
+        session.remove_worktree(&worktree).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn executor_affinity_matches_pool_slots_and_rejects_fallback_workers() {

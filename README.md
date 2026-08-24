@@ -15,6 +15,7 @@ Claude, and Hermes.
 - [Why Fractal](#why-fractal)
 - [Quick start](#quick-start)
 - [Multi-agent execution](#multi-agent-execution)
+- [Hybrid isolated-worktree execution](#hybrid-isolated-worktree-execution)
 - [Worker, coordinator, and architect roles](#worker-coordinator-and-architect-roles)
 - [Scale-out provider pool](#scale-out-provider-pool)
 - [Graph inspection and testing](#graph-inspection-and-testing)
@@ -79,10 +80,12 @@ starts workers, verifies completed nodes, and preserves state for resume.
 
 ## Multi-agent execution
 
-Fractal supports two complementary ways to add capacity:
+Fractal supports three complementary ways to add capacity:
 
 1. Human-opened agent terminals join an existing project with one command.
 2. The architect launches bounded six-agent specialist teams automatically.
+3. Hybrid mode launches the local provider roster in isolated Git worktrees
+   and integrates dependency-ready results through Fractal.
 
 For manual terminals, start or verify the coordinator in the project root:
 
@@ -120,6 +123,25 @@ fractal status --running
 # Pause one project without destroying completed graph state.
 fractal pause --project PROJECT_NAME
 ```
+
+### Hybrid isolated-worktree execution
+
+Use hybrid mode when a graph exposes parallel-safe tasks with concrete file
+ownership. Cursor, Codex, Claude, and Hermes workers receive separate detached
+worktrees; Fractal commits only each node's declared
+`files_or_systems_affected` and `expected_artifact`, cherry-picks successful
+results one at a time, and runs trusted verification against the integrated
+branch.
+
+```sh
+export FRACTAL_AGENTS='codex,cursor'
+fractal --offline run --local --hybrid --graph-file path/to/graph.json
+```
+
+Hybrid mode requires an existing commit and a clean tracked workspace. Build
+nodes that make no declared source change fail. Undeclared source changes and
+integration conflicts also fail closed; generated build directories remain in
+the disposable task worktree and are not committed.
 
 ### Worker, coordinator, and architect roles
 

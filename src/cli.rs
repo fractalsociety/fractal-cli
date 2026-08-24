@@ -1085,6 +1085,11 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     pub(crate) local: bool,
 
+    /// Run worker nodes in isolated Git worktrees, then let Fractal integrate
+    /// their commits serially before trusted verification.
+    #[arg(long, requires = "local")]
+    pub(crate) hybrid: bool,
+
     /// Coordinate SQLite store (defaults to `$FRACTAL_HOME/coordinate.sqlite3`).
     #[arg(long, value_name = "PATH")]
     pub(crate) db: Option<PathBuf>,
@@ -2333,6 +2338,24 @@ mod tests {
             panic!("expected run command");
         };
         assert_eq!(args.efficiency.efficiency_mode, EfficiencyModeArg::Suggest);
+
+        let hybrid = Cli::try_parse_from([
+            "fractal",
+            "run",
+            "--local",
+            "--hybrid",
+            "--graph-file",
+            "graph.json",
+        ])
+        .unwrap();
+        let Some(Command::Run(args)) = hybrid.command else {
+            panic!("expected hybrid run command");
+        };
+        assert!(args.local && args.hybrid);
+        assert!(
+            Cli::try_parse_from(["fractal", "run", "--hybrid", "--graph-file", "graph.json"])
+                .is_err()
+        );
     }
 
     #[test]
