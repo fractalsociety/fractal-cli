@@ -277,9 +277,11 @@ fn team_reserves_nodes(team: &TeamRecord) -> bool {
 }
 
 pub(crate) fn enabled(workspace: &Path) -> bool {
-    load_state(&state_path(workspace))
-        .ok()
-        .is_some_and(|state| !state.stop_requested)
+    let path = state_path(workspace);
+    path.is_file()
+        && load_state(&path)
+            .ok()
+            .is_some_and(|state| !state.stop_requested)
 }
 
 pub(crate) fn checkout_authorized(workspace: &Path, agent_id: &str, node_id: &str) -> bool {
@@ -2669,6 +2671,15 @@ mod tests {
         assert!(!checkout_authorized_in(&state, &worker, "n1"));
         state.teams[0].status = "completed".to_owned();
         assert!(!checkout_authorized_in(&state, &worker, "n0"));
+    }
+
+    #[test]
+    fn architect_mode_is_disabled_without_persisted_state() {
+        let workspace = std::env::temp_dir().join(format!(
+            "fractal-architect-disabled-without-state-{}",
+            std::process::id()
+        ));
+        assert!(!enabled(&workspace));
     }
 
     #[test]
