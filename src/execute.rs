@@ -782,6 +782,7 @@ fn validate_node_agent_requirements(
     nodes: &[Value],
     agents: &[String],
     reroutes: &BTreeMap<String, String>,
+    completed: &BTreeSet<String>,
 ) -> Result<()> {
     let node_ids: BTreeSet<&str> = nodes
         .iter()
@@ -792,6 +793,9 @@ fn validate_node_agent_requirements(
     }
     for node in nodes {
         let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
+        if completed.contains(id) {
+            continue;
+        }
         let required = reroutes
             .get(id)
             .map(String::as_str)
@@ -2802,7 +2806,7 @@ fn run_multi_agent_inner(
     reroutes: &BTreeMap<String, String>,
 ) -> Result<RunOutcome> {
     let ordered = topo_order(graph)?; // validates acyclic
-    validate_node_agent_requirements(&ordered, agents, reroutes)?;
+    validate_node_agent_requirements(&ordered, agents, reroutes, completed_seed)?;
     let ids: Vec<String> = ordered
         .iter()
         .filter_map(|node| node.get("id").and_then(Value::as_str).map(str::to_owned))
@@ -4571,9 +4575,18 @@ esac
         assert!(!node_allows_agent(&opencode, "cursor:1"));
 
         let roster = vec!["codex".to_owned(), "codex-luna".to_owned()];
-        let error =
-            validate_node_agent_requirements(&[node], &roster, &BTreeMap::new()).unwrap_err();
+        let error = validate_node_agent_requirements(
+            &[node.clone()],
+            &roster,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("requires worker `cursor`"));
+
+        let completed = BTreeSet::from(["cursor_check".to_owned()]);
+        validate_node_agent_requirements(&[node], &roster, &BTreeMap::new(), &completed)
+            .expect("completed historical assignments do not require a live provider");
     }
 
     #[test]
