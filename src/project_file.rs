@@ -368,7 +368,7 @@ fn plan_halted_graph_migration(
         };
         if completed.contains(id)
             && !forced_reopen.contains(id)
-            && semantic_node_projection(old_node) == semantic_node_projection(new_node)
+            && semantic_node_migration_compatible(old_node, new_node)
         {
             preserved.insert(id.clone());
         }
@@ -484,6 +484,63 @@ fn semantic_node_projection(node: &Value) -> Value {
         }
     }
     projected
+}
+
+/// Completed work performed under a stricter budget remains valid when the
+/// replacement graph changes only policy provenance and raises those numeric
+/// ceilings. Every non-budget authorization field must remain byte-for-byte
+/// identical; a tighter budget or any authority change reopens the node.
+fn semantic_node_migration_compatible(old_node: &Value, new_node: &Value) -> bool {
+    let mut old = semantic_node_projection(old_node);
+    let mut new = semantic_node_projection(new_node);
+    let old_policy = detach_node_policy(&mut old);
+    let new_policy = detach_node_policy(&mut new);
+    old == new && policy_contract_is_equal_or_relaxed(old_policy.as_ref(), new_policy.as_ref())
+}
+
+fn detach_node_policy(node: &mut Value) -> Option<Value> {
+    let object = node.as_object_mut()?;
+    object.remove("policy_hash");
+    object.remove("policy_provenance");
+    object.remove("policy_contract")
+}
+
+fn policy_contract_is_equal_or_relaxed(old: Option<&Value>, new: Option<&Value>) -> bool {
+    if old == new {
+        return true;
+    }
+    let (Some(mut old), Some(mut new)) = (old.cloned(), new.cloned()) else {
+        return false;
+    };
+    let (Some(old_object), Some(new_object)) = (old.as_object_mut(), new.as_object_mut()) else {
+        return false;
+    };
+    for field in ["policy_hash", "provenance"] {
+        old_object.remove(field);
+        new_object.remove(field);
+    }
+    let (Some(old_budgets), Some(new_budgets)) =
+        (old_object.remove("budgets"), new_object.remove("budgets"))
+    else {
+        return false;
+    };
+    if old != new {
+        return false;
+    }
+    let (Some(old_budgets), Some(new_budgets)) = (old_budgets.as_object(), new_budgets.as_object())
+    else {
+        return false;
+    };
+    old_budgets.len() == new_budgets.len()
+        && old_budgets.iter().all(|(name, old_value)| {
+            let Some(old_value) = old_value.as_u64() else {
+                return false;
+            };
+            new_budgets
+                .get(name)
+                .and_then(Value::as_u64)
+                .is_some_and(|new_value| new_value >= old_value)
+        })
 }
 
 fn append_bounded_migration_history(
@@ -4311,6 +4368,43 @@ mod tests {
         graph
     }
 
+    fn migration_graph_with_policy(
+        revision: &str,
+        max_files_changed: u64,
+        max_diff_lines: u64,
+    ) -> Value {
+        let mut graph = migration_graph(revision, &[("a", "same")], &[]);
+        let node = &mut graph["nodes"][0];
+        node["policy_hash"] = Value::String(format!("sha256:{revision:0<64}"));
+        node["policy_provenance"] = Value::String(format!("policy:{revision}"));
+        node["policy_contract"] = json!({
+            "schema": "fractal.node_policy_contract.v1",
+            "policy_hash": format!("sha256:{revision:0<64}"),
+            "provenance": format!("policy:{revision}"),
+            "decision": "allow",
+            "allowed_writes": [],
+            "allowed_commands": [],
+            "external_side_effects": false,
+            "network": {"default": "deny", "allowed_destinations": []},
+            "sandbox_profile": "local-work-v1",
+            "budgets": {
+                "max_steps": 40,
+                "max_minutes": 60,
+                "max_attempts": 1,
+                "max_files_changed": max_files_changed,
+                "max_diff_lines": max_diff_lines,
+                "max_input_tokens": 250000,
+                "max_output_tokens": 50000,
+                "max_cost_usd": 20
+            },
+            "verifier_ids": ["independent"],
+            "evidence_requirements": ["commands", "exit_codes"]
+        });
+        graph.as_object_mut().unwrap().remove("graph_hash");
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        graph
+    }
+
     fn seed_halted_migration_project(
         workspace: &Path,
         graph: &Value,
@@ -4380,6 +4474,32 @@ mod tests {
             load(&workspace)?.execution.unwrap().assignments["a"].state,
             "completed"
         );
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_preserves_completed_work_under_budget_relaxation() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph_with_policy("old", 6, 500);
+        seed_halted_migration_project(&workspace, &old, &["a"])?;
+        let new = migration_graph_with_policy("new", 24, 4000);
+        let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
+        assert_eq!(preview.preserved, ["a"]);
+        assert!(preview.reopened.is_empty());
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_reopens_completed_work_under_budget_tightening() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph_with_policy("old", 24, 4000);
+        seed_halted_migration_project(&workspace, &old, &["a"])?;
+        let new = migration_graph_with_policy("new", 6, 500);
+        let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
+        assert!(preview.preserved.is_empty());
+        assert_eq!(preview.reopened, ["a"]);
         fs::remove_dir_all(workspace)?;
         Ok(())
     }
