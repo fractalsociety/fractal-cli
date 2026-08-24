@@ -125,10 +125,15 @@ fn run(cli: Cli) -> Result<()> {
         request,
         command,
     } = cli;
+    // Offline is a process-wide safety contract, not an interactive-mode hint.
+    // Set it before dispatch so local graph runs and every other command also
+    // suppress authentication, cloud sync, and GitHub synchronization.
+    if offline {
+        std::env::set_var("FRACTAL_OFFLINE", "1");
+    }
     match (request, command) {
         (None, None) => {
             if offline {
-                std::env::set_var("FRACTAL_OFFLINE", "1");
                 println!("Offline mode: Fractal Society login and cloud sync are disabled.\n");
             } else {
                 auth::ensure_login()?;
@@ -1086,6 +1091,12 @@ fn run_local(
     if agents.is_empty() {
         anyhow::bail!("no agents (claude/codex/cursor/hermes) on PATH");
     }
+    let title = graph
+        .get("goal")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Local Fractal graph");
+    project_file::persist(&workspace, &graph, title)
+        .context("initialize the canonical local project before execution")?;
 
     let port = crate::cli::DEFAULT_GRAPH_PORT;
     let board_url = format!("http://127.0.0.1:{port}");
@@ -1109,6 +1120,12 @@ fn run_local(
         &std::collections::BTreeSet::new(),
     )?;
     println!("⇒ {}", outcome.detail);
+    if let Some(failed) = outcome.failed_node {
+        anyhow::bail!("local graph failed at node `{failed}`");
+    }
+    if outcome.verified == Some(false) {
+        anyhow::bail!("local graph verification failed");
+    }
     Ok(())
 }
 

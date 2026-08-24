@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -362,6 +362,11 @@ fn run_agent_prompt_with_role(
     loop {
         match child.try_wait()? {
             Some(status) => {
+                // Some headless CLIs (notably Cursor) leave a worker-server
+                // child in the invocation's process group after the CLI exits.
+                // The task is complete, so close that exact group before
+                // releasing its guard; otherwise every node leaks ~200 MiB.
+                crate::run_control::terminate_worker(child.id());
                 drop(worker);
                 return Ok(AgentRun {
                     ok: status.success(),
@@ -525,6 +530,53 @@ fn command_kind_for_agent(agent: &str) -> &str {
         }
         _ => agent,
     }
+}
+
+/// A graph may hard-pin a node to one worker implementation. Presentation is
+/// not scheduling authority: this value is enforced at the claim boundary and
+/// again by the wave runner instead of being treated as advisory prose.
+fn node_required_agent(node: &Value) -> Option<&str> {
+    node.pointer("/executor/agent")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|agent| !agent.is_empty())
+}
+
+fn agent_matches_requirement(agent: &str, required: &str) -> bool {
+    let actual = command_kind_for_agent(agent);
+    match required {
+        "cursor" | "cursor-agent" => matches!(actual, "cursor" | "cursor-agent"),
+        "codex" => matches!(actual, "codex" | "codex-luna"),
+        "codex-luna" => actual == "codex-luna",
+        "claude" => actual == "claude",
+        "hermes" => actual == "hermes",
+        other => actual == other,
+    }
+}
+
+fn node_allows_agent(node: &Value, agent: &str) -> bool {
+    node_required_agent(node)
+        .map(|required| agent_matches_requirement(agent, required))
+        .unwrap_or(true)
+}
+
+fn validate_node_agent_requirements(nodes: &[Value], agents: &[String]) -> Result<()> {
+    for node in nodes {
+        let Some(required) = node_required_agent(node) else {
+            continue;
+        };
+        if !agents
+            .iter()
+            .any(|agent| agent_matches_requirement(agent, required))
+        {
+            let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
+            bail!(
+                "node `{id}` requires worker `{required}`, but the active roster is [{}]",
+                agents.join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 
 fn is_pool_slot_id(agent: &str) -> bool {
@@ -770,9 +822,64 @@ impl NodeOutcome {
     }
 }
 
-/// Execute one node with a given agent: build nodes run the worker; verify nodes
-/// run the tests and are judged by the genuine `fractal-verify` evidence floor;
-/// passive nodes (analyze/control) are no-ops.
+fn declared_artifact_path(node: &Value, workspace: &Path) -> Option<PathBuf> {
+    let raw = node
+        .pointer("/efficiency/expected_artifact")
+        .and_then(Value::as_str)?
+        .trim();
+    if raw.is_empty() || raw.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else if raw.contains('/') || raw.starts_with('.') {
+        Some(workspace.join(path))
+    } else {
+        None
+    }
+}
+
+fn run_worker_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> {
+    let instruction = node
+        .get("instruction")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let timeout_ms = agent_timeout_ms(node);
+    let run = run_worker_as_for_node(agent, instruction, workspace, timeout_ms, Some(node))?;
+    let timeout_note = run.timed_out.then(|| {
+        format!(
+            "agent hung — killed after {}s; failing the task so it is repaired",
+            timeout_ms / 1000
+        )
+    });
+    if !run.ok {
+        return Ok(
+            NodeOutcome::failure(None, run.timed_out, timeout_note).with_lessons(run.lesson_ids)
+        );
+    }
+    if let Some(path) =
+        node_required_agent(node).and_then(|_| declared_artifact_path(node, workspace))
+    {
+        if !path.exists() {
+            return Ok(NodeOutcome::failure(
+                None,
+                false,
+                Some(format!(
+                    "worker exited successfully but did not produce declared artifact {}",
+                    path.display()
+                )),
+            )
+            .with_lessons(run.lesson_ids));
+        }
+    }
+    Ok(NodeOutcome::success(None, timeout_note).with_lessons(run.lesson_ids))
+}
+
+/// Execute one node with a given agent. Build nodes run the worker. An explicitly
+/// pinned verification node first runs that worker (so `cursor` really means the
+/// Cursor CLI), then the trusted host independently evaluates the workspace.
+/// Unpinned verification nodes remain host-only acceptance gates.
 fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> {
     let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
     let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
@@ -788,25 +895,33 @@ fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> 
         crate::external_gates::enforce_checkout(workspace, &document, id, agent)
             .with_context(|| format!("external gate denied execution of node {}", id))?;
     }
-    let instruction = node
-        .get("instruction")
-        .and_then(Value::as_str)
-        .unwrap_or("");
     if capability == "control.closeout" {
         run_lead_closeout(node, agent, workspace)
     } else if is_build(capability) {
-        let timeout_ms = agent_timeout_ms(node);
-        let run = run_worker_as_for_node(agent, instruction, workspace, timeout_ms, Some(node))?;
-        let note = run.timed_out.then(|| {
-            format!(
-                "agent hung — killed after {}s; failing the task so it is repaired",
-                timeout_ms / 1000
+        run_worker_node(node, agent, workspace)
+    } else if is_verify(capability) && node_required_agent(node).is_some() {
+        let worker = run_worker_node(node, agent, workspace)?;
+        if !worker.ok {
+            return Ok(worker);
+        }
+        match crate::verify::evaluate_workspace(workspace, id, agent)? {
+            Some(verdict) if verdict.complete => Ok(NodeOutcome::success(
+                Some(true),
+                Some(format!("worker task complete; {}", verdict.detail)),
             )
-        });
-        if run.ok {
-            Ok(NodeOutcome::success(None, note).with_lessons(run.lesson_ids))
-        } else {
-            Ok(NodeOutcome::failure(None, run.timed_out, note).with_lessons(run.lesson_ids))
+            .with_lessons(worker.lessons)),
+            Some(verdict) => Ok(
+                NodeOutcome::failure(Some(false), false, Some(verdict.detail))
+                    .with_lessons(worker.lessons),
+            ),
+            None => Ok(NodeOutcome::failure(
+                None,
+                false,
+                Some(
+                    "worker task completed, but no native verification suite was found".to_owned(),
+                ),
+            )
+            .with_lessons(worker.lessons)),
         }
     } else if is_verify(capability) {
         // Genuine governance: judge the suite with the real deny-by-default floor.
@@ -1755,6 +1870,7 @@ pub(crate) fn run_multi_agent(
     completed_seed: &BTreeSet<String>,
 ) -> Result<RunOutcome> {
     let ordered = topo_order(graph)?; // validates acyclic
+    validate_node_agent_requirements(&ordered, agents)?;
     let ids: Vec<String> = ordered
         .iter()
         .filter_map(|node| node.get("id").and_then(Value::as_str).map(str::to_owned))
@@ -1887,7 +2003,10 @@ pub(crate) fn run_multi_agent(
                     // Role split: the lead plans (root) + closes out (control);
                     // workers do the middle coding/verify tasks in parallel.
                     let for_this_agent = |id: &String| {
-                        if !has_workers {
+                        let node = &node_by_id[id];
+                        if node_required_agent(node).is_some() {
+                            node_allows_agent(node, &agent)
+                        } else if !has_workers {
                             true
                         } else if is_lead {
                             is_root(id) || is_control(id)
@@ -2848,7 +2967,16 @@ pub(crate) fn run_wave_with_runtime(
             let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
             let is_root = preds.get(id).map(|p| p.is_empty()).unwrap_or(true);
             let is_control = capability.starts_with("control.");
-            let agent: String = if let Some(reassigned) =
+            let agent: String = if let Some(required) = node_required_agent(node) {
+                // Hard affinity wins over learned/runtime reassignment. If the
+                // roster is malformed, invoke the declared route rather than
+                // silently substituting a different worker.
+                agents
+                    .iter()
+                    .find(|agent| agent_matches_requirement(agent, required))
+                    .cloned()
+                    .unwrap_or_else(|| required.to_owned())
+            } else if let Some(reassigned) =
                 runtime.and_then(|rt| rt.reassignments.get(id)).cloned()
             {
                 reassigned
@@ -2878,6 +3006,39 @@ mod tests {
     use std::fs;
     use std::sync::{Arc, Barrier};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn executor_affinity_matches_pool_slots_and_rejects_fallback_workers() {
+        let node = json!({"id":"cursor_check","executor":{"agent":"cursor"}});
+        assert!(node_allows_agent(&node, "cursor"));
+        assert!(node_allows_agent(&node, "cursor:7"));
+        assert!(!node_allows_agent(&node, "codex-luna"));
+        assert!(!node_allows_agent(&node, "claude"));
+
+        let roster = vec!["codex".to_owned(), "codex-luna".to_owned()];
+        let error = validate_node_agent_requirements(&[node], &roster).unwrap_err();
+        assert!(error.to_string().contains("requires worker `cursor`"));
+    }
+
+    #[test]
+    fn declared_artifact_is_a_worker_completion_postcondition() {
+        let root =
+            std::env::temp_dir().join(format!("fractal-declared-artifact-{}", std::process::id()));
+        let node = json!({
+            "efficiency": {"expected_artifact": ".fractal/cursor-result.json"}
+        });
+        assert_eq!(
+            declared_artifact_path(&node, &root),
+            Some(root.join(".fractal/cursor-result.json"))
+        );
+        assert_eq!(
+            declared_artifact_path(
+                &json!({"efficiency":{"expected_artifact":"passing native tests"}}),
+                &root
+            ),
+            None
+        );
+    }
 
     #[test]
     fn codex_lead_planner_is_pinned_to_sol_high_without_changing_workers() {

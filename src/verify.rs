@@ -255,6 +255,19 @@ fn python_test_command(workspace: &Path, has_tests_dir: bool) -> Command {
     c
 }
 
+/// Prefer a repository's native Rust test driver when it provides one. seL4
+/// and other freestanding workspaces commonly cannot be tested with a raw
+/// workspace-wide `cargo test`; their xtask knows which host suites are valid.
+fn cargo_test_command(workspace: &Path) -> Command {
+    let mut command = Command::new("cargo");
+    if workspace.join("xtask").join("Cargo.toml").is_file() {
+        command.args(["xtask", "test"]);
+    } else {
+        command.arg("test");
+    }
+    command
+}
+
 /// Detect and run the workspace's tests, capturing a content hash of the runner
 /// output as report evidence. Returns `None` when there is nothing to run (the
 /// node is unverifiable, but that is not a failure).
@@ -285,9 +298,7 @@ fn run_suite(workspace: &Path) -> Result<Option<SuiteRun>> {
         };
         command
     } else if has("Cargo.toml") {
-        let mut c = Command::new("cargo");
-        c.arg("test");
-        c
+        cargo_test_command(workspace)
     } else if python_tests {
         python_test_command(workspace, has_tests_dir)
     } else if has("package.json") && has(".fractal-profile") {
@@ -426,6 +437,26 @@ mod tests {
             .iter()
             .any(|arg| arg.starts_with("platform=iOS Simulator,name=")));
         assert_eq!(args.last().map(String::as_str), Some("test"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rust_workspace_prefers_native_xtask_test_driver() {
+        let root =
+            std::env::temp_dir().join(format!("fractal-cargo-command-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("xtask")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(
+            root.join("xtask").join("Cargo.toml"),
+            "[package]\nname='xtask'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let command = cargo_test_command(&root);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["xtask", "test"]);
         std::fs::remove_dir_all(root).ok();
     }
 

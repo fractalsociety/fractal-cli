@@ -97,6 +97,8 @@ struct Task {
     id: String,
     title: String,
     capability: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
     instruction: String,
     depends_on: Vec<String>,
     execution: TaskExecution,
@@ -369,6 +371,7 @@ fn planning_prompt(source_text: &str, source_name: &str) -> String {
              \"id\": \"short_snake_case_id\",\n\
              \"title\": \"one line\",\n\
              \"capability\": \"code.generate|code.edit|project.tests.execute|content.analyze\",\n\
+             \"agent\": \"optional exact worker route: cursor|codex-luna|claude|hermes\",\n\
              \"instruction\": \"a self-contained directive an agent can execute in this workspace with no other context\",\n\
              \"depends_on\": [\"ids of tasks that must finish first\"],\n\
              \"execution\": {{\n\
@@ -391,6 +394,7 @@ fn planning_prompt(source_text: &str, source_name: &str) -> String {
          Rules: {min}-{max} tasks; ids unique; `depends_on` must reference earlier task ids only and form a DAG (no cycles); \
          every task MUST include the `efficiency` block: `dependencies` repeats its `depends_on`, `similarity_to_other_active_nodes` scores overlap with other task ids in 0..=1 (empty object when none overlap), `confidence_still_useful` is in 0..=1, and file references contain no whitespace or credentials; \
          every task MUST label its dependency-ready execution wave and whether it runs `parallel` (two or more tasks become ready in that same wave) or `sequential` (it is the only task in its wave); \
+         when the source explicitly requires a named worker CLI, the task that must use it MUST set `agent` to that exact route (for example `cursor`); never leave named-worker routing only in prose; \
          roots are wave 1, every other task is wave 1 + the maximum wave of its dependencies, and all parallel tasks in wave N use `parallel_group`: `wave-N`; \
          every `instruction` must be concrete and standalone (name the files to create/edit and what they must contain/do); \
          architecture must name at least one component; include at least one observable acceptance criterion; \
@@ -454,6 +458,7 @@ fn parse_and_validate(raw: &str) -> Result<PlannedProject> {
             bail!("task `{id}` has no instruction");
         }
         let capability = normalize_capability(item.get("capability").and_then(Value::as_str));
+        let agent = parse_agent_requirement(item, &id)?;
         let title = item
             .get("title")
             .and_then(Value::as_str)
@@ -476,6 +481,7 @@ fn parse_and_validate(raw: &str) -> Result<PlannedProject> {
             id,
             title,
             capability,
+            agent,
             instruction,
             depends_on,
             execution: TaskExecution {
@@ -536,6 +542,29 @@ fn parse_and_validate(raw: &str) -> Result<PlannedProject> {
         bail!("lead plan must contain a gating tests task");
     }
     Ok(PlannedProject { prd, tasks })
+}
+
+fn parse_agent_requirement(item: &Value, id: &str) -> Result<Option<String>> {
+    let Some(raw) = item.get("agent") else {
+        return Ok(None);
+    };
+    let raw = raw
+        .as_str()
+        .with_context(|| format!("task `{id}` agent must be a string"))?
+        .trim();
+    if raw.is_empty() {
+        bail!("task `{id}` agent must not be empty");
+    }
+    let normalized = match raw {
+        "cursor" | "cursor-agent" => "cursor",
+        "codex" | "codex-luna" => "codex-luna",
+        "claude" => "claude",
+        "hermes" => "hermes",
+        other => {
+            bail!("task `{id}` agent `{other}` is unsupported; use cursor|codex-luna|claude|hermes")
+        }
+    };
+    Ok(Some(normalized.to_owned()))
 }
 
 fn parse_execution_declaration(item: &Value, id: &str) -> Result<Option<TaskExecution>> {
@@ -755,7 +784,7 @@ fn build_harness_genome(tasks: &[Task], prd_name: &str) -> Value {
         // compiler's dependency-consistency gate always holds.
         let mut efficiency = task.efficiency.clone();
         efficiency.dependencies = dependencies.clone();
-        nodes.push(json!({
+        let mut node = json!({
             "id": task.id,
             "title": task.title,
             "capability": task.capability,
@@ -765,7 +794,11 @@ fn build_harness_genome(tasks: &[Task], prd_name: &str) -> Value {
             "instruction": task.instruction,
             "budget": {"timeout_ms": budget},
             "efficiency": node_efficiency_to_graph_value(&efficiency),
-        }));
+        });
+        if let Some(agent) = &task.agent {
+            node["executor"] = json!({"agent": agent});
+        }
+        nodes.push(node);
         for dep in &dependencies {
             edges.push(json!({"from": dep, "to": task.id, "condition": "success"}));
         }
@@ -929,6 +962,32 @@ mod tests {
             .iter()
             .any(|e| e["from"] == "tests" && e["to"] == "lead_closeout");
         assert!(closer_edge);
+    }
+
+    #[test]
+    fn named_worker_is_normalized_and_compiled_as_hard_executor_affinity() {
+        let raw = valid_plan(
+            r#"[
+          {"id":"implementation","capability":"code.generate","agent":"cursor-agent","instruction":"write the implementation","depends_on":[]},
+          {"id":"tests","capability":"project.tests.execute","instruction":"run native tests","depends_on":["implementation"]}
+        ]"#,
+        );
+        let planned = parse_and_validate(&raw).expect("named worker plan");
+        assert_eq!(planned.tasks[0].agent.as_deref(), Some("cursor"));
+        let genome = build_harness_genome(&planned.tasks, "X.md");
+        let implementation = genome["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["id"] == "implementation")
+            .unwrap();
+        assert_eq!(implementation["executor"]["agent"], "cursor");
+
+        let invalid = raw.replace("cursor-agent", "unknown-worker");
+        assert!(parse_and_validate(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported"));
     }
 
     #[test]
