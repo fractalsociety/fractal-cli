@@ -493,9 +493,40 @@ fn semantic_node_projection(node: &Value) -> Value {
 fn semantic_node_migration_compatible(old_node: &Value, new_node: &Value) -> bool {
     let mut old = semantic_node_projection(old_node);
     let mut new = semantic_node_projection(new_node);
+    let old_budget = old
+        .as_object_mut()
+        .and_then(|object| object.remove("budget"));
+    let new_budget = new
+        .as_object_mut()
+        .and_then(|object| object.remove("budget"));
     let old_policy = detach_node_policy(&mut old);
     let new_policy = detach_node_policy(&mut new);
-    old == new && policy_contract_is_equal_or_relaxed(old_policy.as_ref(), new_policy.as_ref())
+    old == new
+        && node_budget_is_equal_or_relaxed(old_budget.as_ref(), new_budget.as_ref())
+        && policy_contract_is_equal_or_relaxed(old_policy.as_ref(), new_policy.as_ref())
+}
+
+fn node_budget_is_equal_or_relaxed(old: Option<&Value>, new: Option<&Value>) -> bool {
+    if old == new {
+        return true;
+    }
+    let (Some(mut old), Some(mut new)) = (old.cloned(), new.cloned()) else {
+        return false;
+    };
+    let (Some(old_object), Some(new_object)) = (old.as_object_mut(), new.as_object_mut()) else {
+        return false;
+    };
+    let (Some(old_timeout), Some(new_timeout)) = (
+        old_object.remove("timeout_ms"),
+        new_object.remove("timeout_ms"),
+    ) else {
+        return false;
+    };
+    old == new
+        && old_timeout
+            .as_u64()
+            .zip(new_timeout.as_u64())
+            .is_some_and(|(old_timeout, new_timeout)| new_timeout >= old_timeout)
 }
 
 fn detach_node_policy(node: &mut Value) -> Option<Value> {
@@ -4405,6 +4436,14 @@ mod tests {
         graph
     }
 
+    fn migration_graph_with_timeout(revision: &str, timeout_ms: u64) -> Value {
+        let mut graph = migration_graph(revision, &[("a", "same")], &[]);
+        graph["nodes"][0]["budget"] = json!({"timeout_ms": timeout_ms});
+        graph.as_object_mut().unwrap().remove("graph_hash");
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        graph
+    }
+
     fn seed_halted_migration_project(
         workspace: &Path,
         graph: &Value,
@@ -4497,6 +4536,32 @@ mod tests {
         let old = migration_graph_with_policy("old", 24, 4000);
         seed_halted_migration_project(&workspace, &old, &["a"])?;
         let new = migration_graph_with_policy("new", 6, 500);
+        let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
+        assert!(preview.preserved.is_empty());
+        assert_eq!(preview.reopened, ["a"]);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_preserves_completed_work_under_timeout_relaxation() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph_with_timeout("old", 180_000);
+        seed_halted_migration_project(&workspace, &old, &["a"])?;
+        let new = migration_graph_with_timeout("new", 3_600_000);
+        let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
+        assert_eq!(preview.preserved, ["a"]);
+        assert!(preview.reopened.is_empty());
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_reopens_completed_work_under_timeout_tightening() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph_with_timeout("old", 3_600_000);
+        seed_halted_migration_project(&workspace, &old, &["a"])?;
+        let new = migration_graph_with_timeout("new", 180_000);
         let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
         assert!(preview.preserved.is_empty());
         assert_eq!(preview.reopened, ["a"]);

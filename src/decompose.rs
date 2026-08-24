@@ -850,9 +850,9 @@ fn build_harness_genome(tasks: &[Task], prd_name: &str) -> Value {
         };
         let preconditions: Vec<String> = dependencies.iter().map(|dep| ready(dep)).collect();
         let budget = if task.capability.ends_with("tests.execute") {
-            120_000
+            1_800_000
         } else {
-            180_000
+            3_600_000
         };
         // Expose the planning metadata with the node's ACTUAL graph
         // dependencies (roots hang off the durable lead_plan node), so the
@@ -900,7 +900,7 @@ fn build_harness_genome(tasks: &[Task], prd_name: &str) -> Value {
         "preconditions": closer_preconditions,
         "produced_state": ["outcome_verified"],
         "instruction": "Review the finished implementation against .fractal/lead-prd.json. Inspect the changes and verification evidence, run any final checks needed, then write .fractal/closeout.json with schema fractal.closeout.v1, status approved, a non-empty summary, an acceptance array containing every PRD acceptance id with passed=true and concrete evidence, and a risks array. Do not approve if any criterion is unsupported.",
-        "budget": {"timeout_ms": 180_000},
+        "budget": {"timeout_ms": 1_800_000},
         "efficiency": baseline_efficiency_value(
             8_000,
             sinks.iter().map(|task| task.id.clone()).collect(),
@@ -1287,6 +1287,17 @@ mod tests {
                 .unwrap_or_else(|error| panic!("node {id}: {error}"));
             validate_node_metadata(&decoded).unwrap_or_else(|error| panic!("node {id}: {error}"));
         }
+        let nodes = genome["nodes"].as_array().expect("genome nodes");
+        let timeout = |id: &str| {
+            nodes
+                .iter()
+                .find(|node| node["id"] == id)
+                .and_then(|node| node["budget"]["timeout_ms"].as_u64())
+                .unwrap_or_else(|| panic!("missing timeout for {id}"))
+        };
+        assert_eq!(timeout("core"), 3_600_000);
+        assert_eq!(timeout("tests"), 1_800_000);
+        assert_eq!(timeout("lead_closeout"), 1_800_000);
     }
 
     #[test]
