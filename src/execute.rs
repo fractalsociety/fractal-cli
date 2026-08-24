@@ -4576,7 +4576,7 @@ esac
 
         let roster = vec!["codex".to_owned(), "codex-luna".to_owned()];
         let error = validate_node_agent_requirements(
-            &[node.clone()],
+            std::slice::from_ref(&node),
             &roster,
             &BTreeMap::new(),
             &BTreeSet::new(),
