@@ -180,7 +180,8 @@ is no policy count cap; resource and graph-quality gates still apply.
 ### Scale-out provider pool
 
 The in-process executor can opt into a 20–42 slot heterogeneous pool. The four
-core providers must be explicit and their binaries must be available on `PATH`:
+core provider keys must be explicit; providers with nonzero counts must have
+their binaries available on `PATH`:
 
 ```sh
 export FRACTAL_AGENT_POOL='codex=6,cursor=6,claude=6,hermes=6'
@@ -194,10 +195,18 @@ OpenCode is an optional fifth provider. Its default model is
 export FRACTAL_AGENT_POOL='codex=5,cursor=5,claude=5,hermes=5,opencode=4'
 ```
 
+An exhausted provider can be explicitly disabled and replaced without losing
+pool capacity:
+
+```sh
+export FRACTAL_AGENT_POOL='codex=5,cursor=5,claude=0,hermes=5,opencode=9'
+```
+
 The Codex lead planner is separate from those worker slots. Each provider has
 independent capacity, so a slow or failed provider does not stop healthy slots
-from consuming the ready queue. Invalid counts, missing providers, unavailable
-binaries, and totals outside the verified envelope fail closed. See
+from consuming the ready queue. Invalid counts, missing provider keys,
+unavailable nonzero providers, and totals outside the verified envelope fail
+closed. See
 [`docs/heterogeneous-agent-pool.md`](docs/heterogeneous-agent-pool.md) for the
 contract, benchmark, and rollback details.
 

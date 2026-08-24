@@ -4,7 +4,7 @@ Opt-in worker capacity for the in-process graph executor. When unset, scheduling
 
 ## Configuration
 
-Set `$FRACTAL_AGENT_POOL` to an explicit `provider=count` list. The original four providers are required; OpenCode is optional:
+Set `$FRACTAL_AGENT_POOL` to an explicit `provider=count` list. The original four provider keys are required; OpenCode is optional. Set a temporarily unavailable provider to zero and replace its capacity with another provider:
 
 ```text
 FRACTAL_AGENT_POOL=codex=6,cursor=6,claude=6,hermes=6
@@ -12,6 +12,10 @@ FRACTAL_AGENT_POOL=codex=6,cursor=6,claude=6,hermes=6
 
 ```text
 FRACTAL_AGENT_POOL=codex=5,cursor=5,claude=5,hermes=5,opencode=4
+```
+
+```text
+FRACTAL_AGENT_POOL=codex=5,cursor=5,claude=0,hermes=5,opencode=9
 ```
 
 Rules:
@@ -22,11 +26,11 @@ Rules:
 * Codex implementation workers use the existing `codex-luna` command adapter (`gpt-5.6-luna`). The lead keeps the Sol High planner route.
 * Cursor, Claude, and Hermes workers use the existing `cursor-agent` / `claude` / `hermes` adapters.
 * OpenCode workers run `opencode run --format json --model <model> --dir <worktree>`. The default model is `zai-coding-plan/glm-5.3`; `$FRACTAL_OPENCODE_MODEL` overrides it.
-* Duplicates, unknown providers, zero counts, overflow counts, totals outside 20–42, missing core providers, and unavailable configured binaries are hard errors. The executor never silently falls back to one provider.
+* Duplicates, unknown providers, overflow counts, totals outside 20–42, missing core provider keys, and unavailable providers with nonzero counts are hard errors. A zero count is an explicit disable, never a silent fallback.
 
 ## Readiness
 
-Before enabling the pool, every physical binary must be on `PATH`:
+Before enabling the pool, every provider with a nonzero count must have its physical binary on `PATH`:
 
 | Provider | Binary        | Worker kind  |
 |----------|---------------|--------------|

@@ -1489,9 +1489,10 @@ fn pool_requeue_failure(
 
 /// Parse `$FRACTAL_AGENT_POOL` (`codex=5,cursor=5,claude=5,hermes=5,opencode=4`).
 ///
-/// Rejects duplicates, unknown providers, zero/overflow counts, totals outside
-/// 20–42, and any config that omits one of the original four required providers.
-/// OpenCode is additive and optional, so existing pool strings remain valid.
+/// Rejects duplicates, unknown providers, overflow counts, totals outside
+/// 20–42, and any config that omits one of the original four provider keys.
+/// A zero count explicitly disables a temporarily unavailable provider without
+/// weakening the total-capacity bound; OpenCode can replace that capacity.
 fn parse_agent_pool(raw: &str) -> Result<BTreeMap<String, usize>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1524,9 +1525,6 @@ fn parse_agent_pool(raw: &str) -> Result<BTreeMap<String, usize>> {
         let count: u64 = count_str.parse().map_err(|_| {
             anyhow::anyhow!("overflow count for `{provider}` in FRACTAL_AGENT_POOL")
         })?;
-        if count == 0 {
-            bail!("zero count for `{provider}` in FRACTAL_AGENT_POOL");
-        }
         if count > POOL_MAX_WORKER_SLOTS as u64 {
             bail!("overflow count for `{provider}` in FRACTAL_AGENT_POOL");
         }
@@ -1566,8 +1564,9 @@ fn expand_pool_slots(counts: &BTreeMap<String, usize>) -> Vec<PoolSlot> {
 fn resolve_agent_pool(raw: &str, available: impl Fn(&str) -> bool) -> Result<Vec<PoolSlot>> {
     let counts = parse_agent_pool(raw)?;
     let missing: Vec<&str> = counts
-        .keys()
-        .map(String::as_str)
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(provider, _)| provider.as_str())
         .filter(|provider| !available(agent_binary(provider)))
         .collect();
     if !missing.is_empty() {
@@ -6189,7 +6188,6 @@ esac
             ("", "empty"),
             ("codex=6,cursor=6,claude=6,hermes=6,codex=6", "duplicate"),
             ("codex=6,cursor=6,claude=6,gpt=6", "unknown"),
-            ("codex=0,cursor=8,claude=8,hermes=8", "zero"),
             ("codex=100,cursor=1,claude=1,hermes=1", "overflow"),
             (
                 "codex=18446744073709551616,cursor=1,claude=1,hermes=1",
@@ -6213,6 +6211,37 @@ esac
         let optional_missing =
             resolve_agent_pool(POOL_24_WITH_OPENCODE, |binary| binary != "opencode");
         assert!(optional_missing.is_err());
+    }
+
+    #[test]
+    fn agent_pool_zero_count_disables_unavailable_provider() {
+        let raw = "codex=5,cursor=5,claude=0,hermes=5,opencode=9";
+        let slots = resolve_agent_pool(raw, |binary| binary != "claude").unwrap();
+        assert_eq!(slots.len(), 24);
+        assert_eq!(
+            slots
+                .iter()
+                .filter(|slot| slot.provider == "claude")
+                .count(),
+            0
+        );
+        assert_eq!(
+            slots
+                .iter()
+                .filter(|slot| slot.provider == "opencode")
+                .count(),
+            9
+        );
+        let roster =
+            detect_pool_roster_with_lead(raw, |binary| binary != "claude", Some("codex")).unwrap();
+        assert!(!roster.iter().any(|agent| agent.starts_with("claude:")));
+        assert_eq!(
+            roster
+                .iter()
+                .filter(|agent| agent.starts_with("opencode:"))
+                .count(),
+            9
+        );
     }
 
     #[test]
