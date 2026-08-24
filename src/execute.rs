@@ -1245,6 +1245,18 @@ fn hybrid_declared_owned_paths(node: &Value, root: &Path) -> Result<Vec<String>>
     Ok(owned.into_iter().collect())
 }
 
+/// Control closeout executes directly in the canonical workspace and writes a
+/// Fractal-owned control artifact; it is not a worker-owned source change and
+/// must not enter hybrid ownership arbitration. All worker nodes still pass
+/// through the reserved-directory rejection above.
+fn hybrid_scheduled_owned_paths(node: &Value, root: &Path) -> Result<Vec<String>> {
+    if node.get("capability").and_then(Value::as_str) == Some("control.closeout") {
+        Ok(Vec::new())
+    } else {
+        hybrid_declared_owned_paths(node, root)
+    }
+}
+
 fn hybrid_owned_paths(node: &Value, worktree: &Path) -> Result<Vec<String>> {
     let declared = hybrid_declared_owned_paths(node, worktree)?;
     let mut owned = Vec::new();
@@ -2793,7 +2805,7 @@ fn run_multi_agent_inner(
         node_by_id
             .iter()
             .map(|(id, node)| {
-                hybrid_declared_owned_paths(node, workspace).map(|paths| (id.clone(), paths))
+                hybrid_scheduled_owned_paths(node, workspace).map(|paths| (id.clone(), paths))
             })
             .collect::<Result<_>>()?
     } else {
@@ -4400,6 +4412,34 @@ esac
             );
             assert!(typed.detail.summary.contains(invalid));
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_ownership_excludes_only_the_builtin_closeout_control_artifact() {
+        let root = hybrid_test_repository("closeout-control-artifact");
+        let closeout = json!({
+            "id":"lead_closeout",
+            "capability":"control.closeout",
+            "efficiency":{"files_or_systems_affected":[".fractal/closeout.json"]}
+        });
+        assert!(hybrid_scheduled_owned_paths(&closeout, &root)
+            .unwrap()
+            .is_empty());
+
+        let worker = json!({
+            "id":"worker",
+            "capability":"code.generate",
+            "efficiency":{"files_or_systems_affected":[".fractal/closeout.json"]}
+        });
+        let error = hybrid_scheduled_owned_paths(&worker, &root).unwrap_err();
+        let typed = error
+            .downcast_ref::<HybridExecutionFailure>()
+            .expect("worker control-directory ownership remains typed");
+        assert_eq!(
+            typed.detail.kind,
+            crate::learning_data::IntegrationFailureKind::InvalidOwnedPath
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
