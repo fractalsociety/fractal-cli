@@ -238,7 +238,9 @@ fn task_group_for(classification: &Result<intent::TaskClassification>, request: 
 fn setup_agents() -> Result<Vec<String>> {
     let available = execute::available_agents();
     if available.is_empty() {
-        println!("No build agents (claude/codex/cursor/hermes) found on PATH — preview only.\n");
+        println!(
+            "No build agents (claude/codex/cursor/hermes/opencode) found on PATH — preview only.\n"
+        );
         return Ok(Vec::new());
     }
 
@@ -337,6 +339,7 @@ fn pick_model(agent: &str) -> Result<Option<String>> {
             "nvidia/nemotron-3-super-120b-a12b:free",
             "nvidia/nemotron-3-ultra-550b-a55b:free",
         ],
+        "opencode" => &["zai-coding-plan/glm-5.3"],
         _ => &[],
     };
     if !menu.is_empty() {
@@ -458,7 +461,7 @@ pub(crate) fn execute_ingested(
     }
     let agents = execute::detect_agents();
     if agents.is_empty() {
-        anyhow::bail!("no build agents (claude/codex/cursor/hermes) found on PATH");
+        anyhow::bail!("no build agents (claude/codex/cursor/hermes/opencode) found on PATH");
     }
     let backend = Backend::resolve(coordinate_flag);
 
@@ -619,6 +622,7 @@ fn reroute_provider(value: &str, allow_lead: bool) -> Option<&'static str> {
         "claude" => Some("claude"),
         "cursor" | "cursor-agent" => Some("cursor"),
         "hermes" => Some("hermes"),
+        "opencode" => Some("opencode"),
         "codex-luna" => Some("codex-luna"),
         "codex" if allow_lead => Some("codex"),
         _ => None,
@@ -779,7 +783,7 @@ pub(crate) fn resume_project(
     }
     let agents = execute::detect_agents();
     if agents.is_empty() {
-        anyhow::bail!("no build agents (claude/codex/cursor/hermes) found on PATH");
+        anyhow::bail!("no build agents (claude/codex/cursor/hermes/opencode) found on PATH");
     }
     let mut completed: BTreeSet<String> = cp.completed.iter().cloned().collect();
     completed.extend(crate::project_file::completed_nodes(&workspace));

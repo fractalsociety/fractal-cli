@@ -434,7 +434,7 @@ fn planning_prompt(source_text: &str, source_name: &str) -> String {
              \"id\": \"short_snake_case_id\",\n\
              \"title\": \"one line\",\n\
              \"capability\": \"code.generate|code.edit|project.tests.execute|content.analyze\",\n\
-             \"agent\": \"optional exact worker route: cursor|codex-luna|claude|hermes\",\n\
+             \"agent\": \"optional exact worker route: cursor|codex-luna|claude|hermes|opencode\",\n\
              \"instruction\": \"a self-contained directive an agent can execute in this workspace with no other context\",\n\
              \"depends_on\": [\"ids of tasks that must finish first\"],\n\
              \"execution\": {{\n\
@@ -623,8 +623,9 @@ fn parse_agent_requirement(item: &Value, id: &str) -> Result<Option<String>> {
         "codex" | "codex-luna" => "codex-luna",
         "claude" => "claude",
         "hermes" => "hermes",
+        "opencode" => "opencode",
         other => {
-            bail!("task `{id}` agent `{other}` is unsupported; use cursor|codex-luna|claude|hermes")
+            bail!("task `{id}` agent `{other}` is unsupported; use cursor|codex-luna|claude|hermes|opencode")
         }
     };
     Ok(Some(normalized.to_owned()))
@@ -1050,6 +1051,10 @@ mod tests {
             .find(|node| node["id"] == "implementation")
             .unwrap();
         assert_eq!(implementation["executor"]["agent"], "cursor");
+
+        let opencode = raw.replace("cursor-agent", "opencode");
+        let opencode_plan = parse_and_validate(&opencode).expect("OpenCode worker plan");
+        assert_eq!(opencode_plan.tasks[0].agent.as_deref(), Some("opencode"));
 
         let invalid = raw.replace("cursor-agent", "unknown-worker");
         assert!(parse_and_validate(&invalid)

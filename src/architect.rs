@@ -816,6 +816,7 @@ fn tracked_agent_process_record_alive(record: &str) -> bool {
         || (command.contains("cursor-agent") && command.contains(" -p"))
         || (command.contains("hermes") && command.contains("--yolo"))
         || (command.contains("claude") && command.contains(" -p"))
+        || (command.contains("opencode run") && command.contains("--format json"))
 }
 
 #[allow(dead_code)]
@@ -1709,7 +1710,7 @@ fn enabled_clients<'a>(
 }
 
 fn mixed_worker_roster_from(available: &[String], count: usize) -> Vec<String> {
-    let preferred = ["codex", "cursor", "hermes", "claude"];
+    let preferred = ["codex", "cursor", "hermes", "claude", "opencode"];
     let clients: Vec<&str> = preferred
         .into_iter()
         .filter(|client| available.iter().any(|candidate| candidate == client))
@@ -1725,8 +1726,12 @@ fn mixed_worker_roster_from(available: &[String], count: usize) -> Vec<String> {
 }
 
 fn spawn_agent(workspace: &Path, client: &str, prompt: &str) -> Result<u32> {
-    let mut command =
-        crate::execute::worker_command(client, prompt, crate::execute::AgentRole::Worker)?;
+    let mut command = crate::execute::worker_command(
+        client,
+        prompt,
+        crate::execute::AgentRole::Worker,
+        workspace,
+    )?;
     let child = command
         .current_dir(workspace)
         .stdin(Stdio::null())
@@ -2783,6 +2788,9 @@ mod tests {
         ));
         assert!(tracked_agent_process_record_alive(
             "S+   node /Users/me/.local/bin/claude -p task"
+        ));
+        assert!(tracked_agent_process_record_alive(
+            "S+   /opt/homebrew/bin/opencode run --format json --model zai-coding-plan/glm-5.3 task"
         ));
     }
 
