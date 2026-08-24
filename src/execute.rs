@@ -881,10 +881,7 @@ impl HybridSession {
         }
         hybrid_git_output(workspace, &["rev-parse", "--verify", "HEAD"])
             .context("hybrid mode requires an existing HEAD commit")?;
-        let tracked = hybrid_git_output(
-            workspace,
-            &["status", "--porcelain=v1", "--untracked-files=no"],
-        )?;
+        let tracked = hybrid_source_status(workspace)?;
         if !tracked.trim().is_empty() {
             bail!(
                 "hybrid mode requires a clean tracked workspace before parallel integration:\n{}",
@@ -1024,10 +1021,7 @@ impl HybridSession {
 
         let _git = self.git_boundary.lock().expect("hybrid git boundary");
         if let Some(commit) = commit {
-            let clean = hybrid_git_output(
-                &self.workspace,
-                &["status", "--porcelain=v1", "--untracked-files=no"],
-            )?;
+            let clean = hybrid_source_status(&self.workspace)?;
             if !clean.trim().is_empty() {
                 return Err(hybrid_failure(
                     crate::learning_data::IntegrationFailureKind::CanonicalWorkspaceChanged,
@@ -1075,6 +1069,29 @@ impl HybridSession {
         }
         Ok(())
     }
+}
+
+/// Return tracked source changes while excluding Fractal's own mutable runtime
+/// records. A resumed project updates these records before the hybrid session
+/// is created and after every node transition; treating them as source edits
+/// makes a clean resume reject the state change it just wrote. Worker commits
+/// cannot stage these paths because integration remains limited to each node's
+/// declared ownership.
+fn hybrid_source_status(workspace: &Path) -> Result<String> {
+    hybrid_git_output(
+        workspace,
+        &[
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=no",
+            "--",
+            ".",
+            ":(exclude).fractal/project.fractal",
+            ":(exclude).fractal/run-state.json",
+            ":(exclude).fractal/sync-state.json",
+            ":(exclude).fractal/pending-amendments.claim",
+        ],
+    )
 }
 
 /// Validate the hybrid integration boundary before a resume starts any durable
@@ -4036,6 +4053,80 @@ esac
         assert!(error
             .to_string()
             .contains("requires a clean tracked workspace"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_resume_allows_its_tracked_mutable_project_state() {
+        let root = hybrid_test_repository("mutable-project-state");
+        fs::create_dir_all(root.join(".fractal")).unwrap();
+        fs::write(
+            root.join(".fractal/project.fractal"),
+            "{\"phase\":\"halted\"}\n",
+        )
+        .unwrap();
+        assert!(hybrid_git_status(&root, &["add", ".fractal/project.fractal"]).unwrap());
+        assert!(
+            hybrid_git_status(&root, &["commit", "--quiet", "-m", "track project state"]).unwrap()
+        );
+        fs::write(
+            root.join(".fractal/project.fractal"),
+            "{\"phase\":\"running\"}\n",
+        )
+        .unwrap();
+
+        validate_hybrid_workspace(&root).unwrap();
+
+        fs::write(root.join("README.md"), "uncommitted source edit\n").unwrap();
+        let error = validate_hybrid_workspace(&root).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires a clean tracked workspace"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_integrates_worker_commit_while_project_state_is_dirty() {
+        let root = hybrid_test_repository("mutable-state-integration");
+        fs::create_dir_all(root.join(".fractal")).unwrap();
+        fs::write(
+            root.join(".fractal/project.fractal"),
+            "{\"phase\":\"halted\"}\n",
+        )
+        .unwrap();
+        assert!(hybrid_git_status(&root, &["add", ".fractal/project.fractal"]).unwrap());
+        assert!(
+            hybrid_git_status(&root, &["commit", "--quiet", "-m", "track project state"]).unwrap()
+        );
+        let session = HybridSession::initialize(&root).unwrap();
+        let node = json!({
+            "id":"runtime-safe",
+            "capability":"code.generate",
+            "efficiency":{"files_or_systems_affected":["runtime-safe.txt"],"expected_artifact":"runtime-safe.txt"}
+        });
+        let worktree = session
+            .create_worktree("runtime-safe", "opencode:1")
+            .unwrap();
+        fs::write(worktree.join("runtime-safe.txt"), "worker result\n").unwrap();
+        fs::write(
+            root.join(".fractal/project.fractal"),
+            "{\"phase\":\"running\"}\n",
+        )
+        .unwrap();
+
+        session
+            .integrate_worker_result(&node, "opencode:1", &worktree)
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("runtime-safe.txt")).unwrap(),
+            "worker result\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(".fractal/project.fractal")).unwrap(),
+            "{\"phase\":\"running\"}\n"
+        );
+        session.remove_worktree(&worktree).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
