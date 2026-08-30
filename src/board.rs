@@ -3546,9 +3546,15 @@ mod tests {
     fn embedded_graph_ui_is_the_provenance_pinned_society_bundle() {
         let js = embedded_asset("fractal-graph-ui.js");
         let css = embedded_asset("fractal-graph-ui.css");
+        let js_text = String::from_utf8_lossy(js);
+        let css_text = String::from_utf8_lossy(css);
         let manifest: Value =
             serde_json::from_slice(embedded_asset("fractal-graph-ui.manifest.json")).unwrap();
-        assert!(String::from_utf8_lossy(js).contains(GRAPH_UI_BUNDLE_ID));
+        assert!(js_text.contains(GRAPH_UI_BUNDLE_ID));
+        assert!(js_text.contains("Query graph"));
+        assert!(js_text.contains("execution-flow--rootless"));
+        assert!(css_text.contains(".fractal-graph-query[hidden]"));
+        assert!(css_text.contains(".execution-canvas.has-tasks"));
         assert_eq!(manifest["schema"], "fractal.graph_ui_bundle.v1");
         assert_eq!(manifest["renderer"], GRAPH_UI_BUNDLE_ID);
         assert_eq!(

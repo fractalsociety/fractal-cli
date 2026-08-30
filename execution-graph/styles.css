@@ -301,8 +301,8 @@ footer { max-width: 1480px; margin: 0 auto; padding: 22px clamp(18px,4vw,72px) 3
  * The legacy regions remain mounted for run controls and master-estate mode,
  * but are not a second visible project-graph implementation. */
 .canonical-graph-shell {
-  width: min(1440px, calc(100% - 42px));
-  margin: 28px auto 54px;
+  width: min(1720px, calc(100% - 18px));
+  margin: 18px auto 42px;
 }
 
 body:not(.canonical-master) main > .hero,

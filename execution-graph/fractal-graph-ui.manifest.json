@@ -2,7 +2,7 @@
   "schema": "fractal.graph_ui_bundle.v1",
   "renderer": "fractal-graph-ui.v1",
   "source_repository": "fractalsociety/fractalsociety-website",
-  "source_commit": "3986e9e93ecd26f9356fc739b560b6aabad0fef9",
+  "source_commit": "f790ca9ce01fa3d36e257d8d25d1511aa96ece03",
   "source_package": "packages/fractal-graph-ui",
   "build_command": "pnpm --filter @fractalsociety/graph-ui build:browser",
   "build": {
@@ -11,9 +11,9 @@
     "target": "es2020",
     "format": "iife"
   },
-  "source_tree_hash": "sha256:4574888a5b7169dc9db245d5762c536af11ad24bc07626b7156d1d0e6a190278",
+  "source_tree_hash": "sha256:c19e06eb0a3caf6f261af30d17047ba7ef41524a1456011251d1f8a4378e95be",
   "asset_hashes": {
-    "fractal-graph-ui.js": "sha256:422ee746ca1ae569b97d7d12e48d8cca0c7c40c66d015bb9d73cdd42ea24941a",
-    "fractal-graph-ui.css": "sha256:0dddabd06c14a74c78cb775f637a4d3363eca47ac51b9ffea261047fa04b2242"
+    "fractal-graph-ui.js": "sha256:6ffefd58a8412b776e50f7e4fdf4a40cfd4ab4152ac4fe80f53bceb022d38280",
+    "fractal-graph-ui.css": "sha256:ea5b3fcb1c9ad26ea312acc9248188c067bc6d6901a116ed8d86ba685f5af946"
   }
 }
