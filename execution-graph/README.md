@@ -1,9 +1,9 @@
-# Canonical Fractal Execution Graph
+# Fractal Execution Snapshot Viewer
 
-This is the current and only supported Fractal graph frontend. It is the
-`fractal-graph-ui.v1` shared renderer backed by the Rust
-`fractal.graph_snapshot.v1` API. Do not add a parallel renderer or restore the
-retired standalone Three.js implementation.
+This is the supported read-only viewer for Rust-managed execution snapshots. It
+is the `fractal-graph-ui.v1` shared renderer backed by the Rust
+`fractal.graph_snapshot.v1` API. It is not the current interactive Manual
+assignment design.
 
 This directory contains the static frontend served by the Rust CLI:
 

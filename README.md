@@ -10,30 +10,45 @@ The project includes a Rust CLI, a local and hosted graph experience, a native
 macOS voice front end, graph lineage receipts, and adapters for Codex, Cursor,
 Claude, and Hermes.
 
-## Canonical graph
+## Current graph interfaces
 
-Fractal has one graph implementation. The Rust controller owns
-`.fractal/project.fractal` and publishes `fractal.graph_snapshot.v1` at
-`/api/snapshot`; local and hosted boards both render that snapshot with the
-shared `fractal-graph-ui.v1` bundle. The exact Society source commit and asset
-hashes are recorded in
-`execution-graph/fractal-graph-ui.manifest.json`.
+Fractal has one execution-state authority and two deliberately different
+views. The Rust controller owns `.fractal/project.fractal` and publishes
+`fractal.graph_snapshot.v1` at `/api/snapshot`. The shared
+`fractal-graph-ui.v1` bundle renders that read-only snapshot locally and on
+Fractal Society.
 
-Open a graph in manual, read-only mode with:
+Inspect a compiled execution snapshot with:
 
 ```sh
 fractal graph board GRAPH_HASH
 ```
 
-This does not start the coordinator, launch agents, or claim nodes. The old
-standalone Three.js board and Python-owned graph state are retired and must not
-be used for new work. See `execution-graph/README.md` for the compatibility
-boundary and bundle update procedure.
+This does not start the coordinator, launch agents, or claim nodes.
+
+The current interactive Manual design is FractalMaster's Intelligence Graph.
+It is the UI with Codex Luna High + Fast, Claude, Cursor, GLM/ZCode,
+terminal/automatic launch, copy prompt, retry-safe checkout, release, notes,
+and completion. Run it from the target project with:
+
+```sh
+PYTHONPATH=/Users/jamesstar/fractalmaster \
+  python3 -m intelligence_graph.web_server \
+  --port 8091 \
+  --project .fractal/project.fractal \
+  --manual-prd /absolute/path/to/task-graph.md
+```
+
+Open `http://127.0.0.1:8091/?lens=manual`. This Manual design is the current
+interaction reference for local and hosted web experiences. The old standalone
+Three.js board and Python `execution-graph/server.py` task-state board are
+retired and must not be used for new work. See `execution-graph/README.md` for
+the exact compatibility boundary.
 
 ## Contents
 
 - [Why Fractal](#why-fractal)
-- [Canonical graph](#canonical-graph)
+- [Current graph interfaces](#current-graph-interfaces)
 - [Quick start](#quick-start)
 - [Multi-agent execution](#multi-agent-execution)
 - [Hybrid isolated-worktree execution](#hybrid-isolated-worktree-execution)
