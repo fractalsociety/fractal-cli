@@ -29,7 +29,7 @@ This does not start the coordinator, launch agents, or claim nodes.
 The current interactive Manual design is FractalMaster's Intelligence Graph.
 It is the UI with Codex Luna High + Fast, Claude, Cursor, GLM/ZCode,
 terminal/automatic launch, copy prompt, retry-safe checkout, release, notes,
-and completion. Run it from the target project with:
+completion, and persistent server-side Cursor wave autopilot. Run it from the target project with:
 
 ```sh
 PYTHONPATH=/Users/jamesstar/fractalmaster \
@@ -44,6 +44,11 @@ interaction reference for local and hosted web experiences. The old standalone
 Three.js board and Python `execution-graph/server.py` task-state board are
 retired and must not be used for new work. See `execution-graph/README.md` for
 the exact compatibility boundary.
+
+Add `--cursor-autopilot` or use the Manual-mode autopilot button to run every
+remaining dependency wave with Cursor. The scheduler lives in the server,
+waits for the whole active wave, persists across browser closure/restart, and
+starts the next wave without another LLM turn.
 
 ## Contents
 

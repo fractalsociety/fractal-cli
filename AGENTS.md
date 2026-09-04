@@ -31,7 +31,7 @@ fractal graph board GRAPH_HASH
 
 This is not FractalMaster Manual mode. When a user asks for the manual board
 with Codex Fast, Claude, Cursor, GLM/ZCode, prompt copying, retry-safe checkout,
-release, and completion controls, use `/Users/jamesstar/fractalmaster` and run
+release, completion controls, and server-side Cursor wave autopilot, use `/Users/jamesstar/fractalmaster` and run
 `python3 -m intelligence_graph.web_server --manual-prd ...`. Do not serve this
 snapshot viewer in its place.
 
