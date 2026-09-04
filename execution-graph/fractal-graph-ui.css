@@ -1,0 +1,77 @@
+:root {
+  --fractal-graph-bg:#0a0e0d;
+  --fractal-graph-panel:#101514;
+  --fractal-graph-line:rgba(198,224,210,.14);
+  --fractal-graph-blue:#89aacc;
+  --fractal-graph-text:#eff7f2;
+  --fractal-graph-muted:#718079;
+}
+.fractal-graph-renderer { color:var(--fractal-graph-text); font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+.fractal-graph-renderer * { box-sizing:border-box; }
+.fractal-graph-query { display:grid; grid-template-columns:auto minmax(0,1fr); gap:6px 14px; align-items:center; padding:12px; border:1px solid var(--fractal-graph-line); border-bottom:0; border-radius:13px 13px 0 0; background:#090d0c; }
+.fractal-graph-query[hidden] { display:none; }
+.fractal-graph-query > label { color:#91a49a; font:850 8px ui-monospace,monospace; letter-spacing:.06em; text-transform:uppercase; }
+.fractal-graph-query > div { display:flex; gap:7px; }.fractal-graph-query > div input { flex:1 1 auto; }
+.fractal-graph-query input { min-width:0; height:34px; padding:0 11px; border:1px solid rgba(198,224,210,.14); border-radius:8px; outline:0; background:#0d1210; color:#dce8e1; font:10px Inter,ui-sans-serif,sans-serif; }
+.fractal-graph-query input:focus { border-color:rgba(137,170,204,.48); box-shadow:0 0 0 3px rgba(78,133,191,.07); }
+.fractal-graph-query button { min-height:34px; padding:0 12px; border:1px solid rgba(137,170,204,.45); border-radius:8px; background:rgba(137,170,204,.11); color:#b9d2e8; font-size:9px; font-weight:850; cursor:pointer; }
+.fractal-graph-query button.secondary { border-color:rgba(198,224,210,.14); background:rgba(255,255,255,.025); color:#7f8d85; }
+.fractal-graph-query button:disabled { cursor:default; opacity:.5; }
+.fractal-graph-query > p { grid-column:2; min-height:11px; margin:0; color:#617069; font-size:8px; }
+.fractal-graph-query > p.ready { color:#89aacc; }.fractal-graph-query > p.error { color:#e9c67a; }
+.fractal-lens-tabs { display:flex; gap:7px; overflow-x:auto; padding:10px 12px; border:1px solid var(--fractal-graph-line); border-bottom:0; border-radius:13px 13px 0 0; background:#090d0c; scrollbar-width:thin; }
+.fractal-graph-query:not([hidden]) + .fractal-lens-tabs { border-radius:0; }
+.fractal-lens-tabs button { display:flex; align-items:center; flex:0 0 auto; gap:7px; min-height:32px; padding:0 10px; border:1px solid transparent; border-radius:8px; background:transparent; color:#718079; font:800 8px Inter,ui-sans-serif,sans-serif; letter-spacing:.035em; cursor:pointer; }
+.fractal-lens-tabs .fractal-graph-query-toggle { margin-left:auto; border-color:rgba(137,170,204,.28); background:rgba(137,170,204,.07); color:#a9c4dd; }
+.fractal-lens-tabs .fractal-graph-query-toggle:hover { border-color:rgba(137,170,204,.48); background:rgba(137,170,204,.12); color:#d8e8f5; }
+.fractal-lens-tabs button i { width:5px; height:5px; border-radius:50%; background:#46524c; }
+.fractal-lens-tabs button[data-availability="available"] i { background:var(--fractal-graph-blue); box-shadow:0 0 7px rgba(137,170,204,.45); }
+.fractal-lens-tabs button[data-availability="partial"] i { background:#e9c67a; }
+.fractal-lens-tabs button[aria-selected="true"] { border-color:rgba(137,170,204,.35); background:rgba(137,170,204,.1); color:#bed2e5; }
+.fractal-lens-content > .execution-preview { border-radius:0 0 13px 13px; }
+.fractal-lens-panel { min-height:390px; padding:26px; border:1px solid var(--fractal-graph-line); border-radius:0 0 13px 13px; background:radial-gradient(circle at 16% 15%,rgba(137,170,204,.1),transparent 30%),radial-gradient(circle at 78% 78%,rgba(167,139,250,.1),transparent 34%),#0a0e0d; }
+.fractal-lens-panel > header { display:flex; align-items:flex-start; justify-content:space-between; gap:24px; padding-bottom:18px; border-bottom:1px solid var(--fractal-graph-line); }
+.fractal-lens-panel > header div { display:grid; gap:6px; }
+.fractal-lens-panel > header span { color:var(--fractal-graph-blue); font:800 8px ui-monospace,monospace; letter-spacing:.08em; }
+.fractal-lens-panel h3 { margin:0; color:#e6f0ea; font-size:19px; }
+.fractal-lens-panel header p { max-width:680px; margin:0; color:#7f8d85; font-size:10px; line-height:1.55; }
+.fractal-lens-availability { flex:0 0 auto; padding:5px 8px; border:1px solid var(--fractal-graph-line); border-radius:999px; color:#708078; font:850 7px ui-monospace,monospace; letter-spacing:.06em; text-transform:uppercase; }
+.fractal-lens-availability.available { border-color:rgba(137,170,204,.34); background:rgba(137,170,204,.08); color:#a9c4dd; }
+.fractal-lens-availability.partial { border-color:rgba(233,198,122,.35); background:rgba(233,198,122,.07); color:#e9c67a; }
+.fractal-lens-provenance { display:flex; flex-wrap:wrap; gap:6px; margin-top:13px; }
+.fractal-lens-provenance code { max-width:100%; overflow:hidden; padding:5px 7px; border:1px solid rgba(198,224,210,.09); border-radius:6px; background:rgba(255,255,255,.025); color:#68776f; font-size:7px; text-overflow:ellipsis; white-space:nowrap; }
+.fractal-lens-records { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px; margin-top:18px; }
+.fractal-lens-records article { display:grid; align-content:start; min-height:125px; padding:14px; border:1px solid rgba(198,224,210,.15); border-radius:11px; background:linear-gradient(150deg,rgba(23,34,29,.96),rgba(8,13,11,.98)); box-shadow:0 16px 36px rgba(0,0,0,.26); }
+.fractal-lens-records article > span { color:var(--fractal-graph-blue); font:800 7px ui-monospace,monospace; letter-spacing:.07em; text-transform:uppercase; }
+.fractal-lens-records article > strong { margin-top:13px; color:#dce7e1; font-size:11px; line-height:1.35; }
+.fractal-lens-records article > p { margin:8px 0 0; color:#718079; font-size:9px; line-height:1.5; }
+.fractal-lens-empty { display:grid; place-items:center; min-height:220px; margin-top:18px; padding:24px; border:1px dashed rgba(198,224,210,.15); border-radius:10px; color:#75827b; font-size:10px; text-align:center; }
+.fractal-lens-panel > footer { display:flex; gap:14px; margin-top:16px; color:#647169; font:800 8px ui-monospace,monospace; }
+.fractal-graph-renderer > .fractal-lens-content > .execution-canvas { border:1px solid var(--fractal-graph-line); border-radius:0 0 13px 13px; }
+.execution-canvas { position:relative; min-height:390px; overflow:hidden; padding:34px 25px 25px; background:radial-gradient(circle at 16% 15%,rgba(137,170,204,.1),transparent 30%),radial-gradient(circle at 78% 78%,rgba(167,139,250,.1),transparent 34%),radial-gradient(rgba(166,202,184,.14) .7px,transparent .7px); background-size:auto,auto,18px 18px; }
+.execution-canvas.has-tasks { min-height:clamp(480px,68vh,760px); padding-top:14px; }
+.execution-root { position:relative; z-index:2; display:grid; gap:7px; width:min(430px,88%); margin:0 auto; padding:15px 18px; border:1px solid rgba(137,170,204,.34); border-radius:12px; background:linear-gradient(145deg,rgba(137,170,204,.1),rgba(9,17,13,.92)); box-shadow:0 18px 50px rgba(0,0,0,.32); text-align:center; }
+.execution-root span { color:var(--fractal-graph-blue); font-size:9px; text-transform:uppercase; }
+.execution-root strong { font-size:12px; }
+.execution-flow { position:relative; z-index:2; display:flex; align-items:stretch; gap:42px; overflow-x:auto; margin:34px -10px 0; padding:24px 12px 28px; scroll-snap-type:x proximity; }
+.execution-flow--rootless { margin-top:0; padding-top:4px; }
+.execution-wave { position:relative; flex:0 0 min(280px,76vw); padding:11px; border:1px solid rgba(178,218,197,.12); border-radius:15px; background:linear-gradient(150deg,rgba(255,255,255,.045),rgba(5,10,8,.66)); scroll-snap-align:start; }
+.execution-wave.parallel { flex-basis:min(590px,86vw); border-color:rgba(137,170,204,.2); }
+.execution-wave > header { display:flex; justify-content:space-between; min-height:24px; margin-bottom:8px; color:#69776f; font:800 8px ui-monospace,monospace; letter-spacing:.08em; text-transform:uppercase; }
+.execution-tasks { display:grid; grid-template-columns:1fr; gap:8px; }
+.execution-wave.parallel .execution-tasks { grid-template-columns:repeat(2,minmax(0,1fr)); }
+.execution-node { display:grid; min-height:140px; overflow:hidden; padding:13px; border:1px solid rgba(198,224,210,.16); border-radius:12px; background:radial-gradient(circle at 18% 0,rgba(255,255,255,.09),transparent 34%),linear-gradient(150deg,rgba(23,34,29,.96),rgba(8,13,11,.98)); box-shadow:0 18px 42px rgba(0,0,0,.36); }
+.execution-node.active { border-color:rgba(137,170,204,.48); }
+.execution-node.done { opacity:.82; }
+.execution-node-top { display:flex; justify-content:space-between; gap:6px; }
+.execution-task-id { color:#56625c; font:9px ui-monospace,monospace; }
+.execution-status { padding:3px 5px; border-radius:999px; background:rgba(255,255,255,.04); color:#718079; font-size:8px; font-weight:800; text-transform:uppercase; }
+.execution-node > strong { margin-top:15px; font-size:11px; line-height:1.35; }
+.execution-mode { margin-top:7px; color:#68766e; font:700 8px ui-monospace,monospace; text-transform:uppercase; }
+.execution-mode.parallel { color:var(--fractal-graph-blue); }
+.execution-node-detail { color:#7f8d85; font-size:9px; line-height:1.55; }
+.execution-agent { align-self:end; margin-top:12px; color:#74817a; font-size:9px; }
+.execution-wave-arrow { position:absolute; top:50%; right:-33px; display:grid; place-items:center; width:22px; height:22px; border:1px solid rgba(137,170,204,.22); border-radius:50%; background:#0a0f0d; color:rgba(137,170,204,.72); transform:translateY(-50%); }
+.execution-empty { display:grid; place-items:center; min-height:160px; min-width:320px; color:#75827b; font-size:10px; }
+@media (max-width:640px) { .fractal-graph-query { grid-template-columns:1fr; }.fractal-graph-query > p { grid-column:1; }.fractal-lens-tabs { border-radius:10px 10px 0 0; }.fractal-graph-query:not([hidden]) + .fractal-lens-tabs { border-radius:0; }.fractal-lens-tabs .fractal-graph-query-toggle { position:sticky; right:0; }.fractal-lens-panel { padding:18px; }.fractal-lens-records { grid-template-columns:1fr; }.execution-canvas.has-tasks { min-height:520px; }.execution-wave.parallel .execution-tasks { grid-template-columns:1fr; } }
+@media (prefers-reduced-motion:reduce) { .fractal-graph-renderer * { scroll-behavior:auto!important; animation:none!important; transition:none!important; } }

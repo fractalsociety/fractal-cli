@@ -16,6 +16,26 @@ The portable project state is:
 .fractal/project.fractal
 ```
 
+## Canonical graph version
+
+The only current local graph is the Rust-backed graph snapshot rendered by
+`fractal-graph-ui.v1`. Its authoritative read API is `/api/snapshot` with
+schema `fractal.graph_snapshot.v1`, and its checked-in browser assets are
+pinned by `execution-graph/fractal-graph-ui.manifest.json`.
+
+For manual mode, launch the read-only board without starting a coordinator or
+checking out work:
+
+```sh
+fractal graph board GRAPH_HASH
+```
+
+Do not restore or use the retired standalone Three.js graph
+(`three-graph.js`), its `graph-state*.json` state, or the Python task-control
+runtime. Compatibility import code exists only to migrate old projects once.
+New graph behavior belongs in the Rust snapshot/controller and the shared
+Fractal Society graph-ui package, never in a second local renderer.
+
 Treat that file and the other controller files under `.fractal/` as
 Fractal-owned state. Do not manually edit graph nodes, edges, assignments,
 timestamps, hashes, checkpoints, sync state, or closeout state.

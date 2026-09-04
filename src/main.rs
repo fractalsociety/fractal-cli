@@ -2,7 +2,6 @@ mod amendments;
 mod architect;
 mod auth;
 mod board;
-mod bridge;
 mod chain;
 mod checkpoint;
 mod cli;
@@ -17,10 +16,9 @@ mod efficiency_accounting;
 mod efficiency_config;
 mod efficiency_detector;
 mod efficiency_policy;
-mod evidence_manifest;
 mod evolve;
 mod execute;
-mod failure_cli;
+mod external_gates;
 mod failure_graph;
 mod graph_store;
 mod handoff;
@@ -39,7 +37,7 @@ mod mobile;
 mod node;
 mod orchestrate;
 mod pipeline;
-mod policy_executor;
+mod prd_graph;
 mod project_audit;
 mod project_file;
 mod project_sync;
@@ -61,7 +59,7 @@ mod work_builder;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -69,7 +67,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sha2::{Digest, Sha256};
 
-use crate::cli::{BridgeCommand, Cli, Command, GraphCommand, HarnessCommand};
+use crate::cli::{AmendmentCommand, Cli, Command, GateCommand, GraphCommand, HarnessCommand};
 use crate::work_builder::IntentClassification;
 
 fn main() -> ExitCode {
@@ -101,12 +99,22 @@ fn uses_stable_json_diagnostics(cli: &Cli) -> bool {
         Some(Command::Graph(crate::cli::GraphArgs {
             command: GraphCommand::Audit(_)
                 | GraphCommand::Compose(_)
-                | GraphCommand::Failure(_)
-                | GraphCommand::Reconcile(_),
+                | GraphCommand::Reconcile(_)
+                | GraphCommand::PlanPrd(crate::cli::GraphPlanPrdArgs { json: true, .. })
+                | GraphCommand::CompilePlan(crate::cli::GraphCompilePlanArgs { json: true, .. }),
         })) | Some(Command::Harness(crate::cli::HarnessArgs {
             command: HarnessCommand::Validate(crate::cli::HarnessPolicyArgs { json: true, .. })
                 | HarnessCommand::Show(crate::cli::HarnessPolicyArgs { json: true, .. }),
         })) | Some(Command::Join(crate::cli::JoinArgs { json: true, .. }))
+            | Some(Command::Gate(crate::cli::GateArgs {
+                command: GateCommand::Record(crate::cli::GateRecordArgs { json: true, .. })
+                    | GateCommand::Show(crate::cli::GateShowArgs { json: true, .. })
+                    | GateCommand::Revoke(crate::cli::GateRevokeArgs { json: true, .. }),
+            }))
+            | Some(Command::Amendment(crate::cli::AmendmentArgs {
+                command: AmendmentCommand::List(crate::cli::AmendmentListArgs { json: true, .. })
+                    | AmendmentCommand::Reject(crate::cli::AmendmentRejectArgs { json: true, .. }),
+            }))
     )
 }
 
@@ -118,10 +126,15 @@ fn run(cli: Cli) -> Result<()> {
         request,
         command,
     } = cli;
+    // Offline is a process-wide safety contract, not an interactive-mode hint.
+    // Set it before dispatch so local graph runs and every other command also
+    // suppress authentication, cloud sync, and GitHub synchronization.
+    if offline {
+        std::env::set_var("FRACTAL_OFFLINE", "1");
+    }
     match (request, command) {
         (None, None) => {
             if offline {
-                std::env::set_var("FRACTAL_OFFLINE", "1");
                 println!("Offline mode: Fractal Society login and cloud sync are disabled.\n");
             } else {
                 auth::ensure_login()?;
@@ -172,7 +185,8 @@ fn run(cli: Cli) -> Result<()> {
             ),
             GraphCommand::Status(args) => board::status(&args.url, args.json),
             GraphCommand::Show(args) => graph_store::show(&args.graph_hash, args.json),
-            GraphCommand::Failure(args) => failure_cli::run(&args),
+            GraphCommand::PlanPrd(args) => run_graph_plan_prd(&args),
+            GraphCommand::CompilePlan(args) => run_graph_compile_plan(&args),
             GraphCommand::Audit(args) => run_graph_audit(&args),
             GraphCommand::Compose(args) => run_graph_compose(&args),
             GraphCommand::Reconcile(args) => reconcile::run(&reconcile::ReconcileOptions {
@@ -196,6 +210,8 @@ fn run(cli: Cli) -> Result<()> {
             HarnessCommand::Validate(args) => harness_policy::validate(&args.repo, args.json),
             HarnessCommand::Show(args) => harness_policy::show(&args.repo, args.json),
         },
+        (None, Some(Command::Gate(args))) => run_gate(&args),
+        (None, Some(Command::Amendment(args))) => run_amendment(&args),
         (None, Some(Command::Run(args))) if args.local => {
             let efficiency = efficiency_config::resolve(&args.efficiency)?;
             run_local(&args, &efficiency)
@@ -278,10 +294,15 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        (None, Some(Command::Resume(args))) => {
-            interactive::resume_project(args.number, fractalwork.as_deref(), args.port, coordinate)
-                .map(|_| ())
-        }
+        (None, Some(Command::Resume(args))) => interactive::resume_project(
+            args.number,
+            fractalwork.as_deref(),
+            args.port,
+            coordinate,
+            args.hybrid,
+            &args.reroute_unavailable,
+        )
+        .map(|_| ()),
         (None, Some(Command::Stop(args))) => run_control::stop(&args),
         (None, Some(Command::Status(args))) => run_control::status(&args),
         (None, Some(Command::Login(args))) => auth::run_login(&args),
@@ -295,20 +316,931 @@ fn run(cli: Cli) -> Result<()> {
         (None, Some(Command::ShareX(args))) => social::share_x(&args),
         (None, Some(Command::ConnectX(args))) => social::connect_x(&args),
         (None, Some(Command::Visibility(args))) => visibility::run(&args),
-        (None, Some(Command::Bridge(args))) => match args.command {
-            BridgeCommand::Serve { port } => {
-                bridge::serve(port, fractalwork.as_deref(), coordinate)
-            }
-            BridgeCommand::Install { port } => bridge::install(port),
-            BridgeCommand::Token => bridge::print_token(),
-            BridgeCommand::Status { port } => bridge::status(port),
-        },
+        (None, Some(Command::Bridge(_args))) => {
+            println!("{}", crate::cli::BRIDGE_MIGRATION_MESSAGE);
+            Ok(())
+        }
         (None, Some(Command::Version)) => {
             println!("fractal {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+const AMENDMENT_CLI_SCHEMA: &str = "fractal.amendment.cli.v1";
+const AMENDMENT_REJECTION_PREVIEW_READY: &str = "AMENDMENT_REJECTION_PREVIEW_READY";
+const AMENDMENT_REJECTION_APPLIED: &str = "AMENDMENT_REJECTION_APPLIED";
+
+const PRD_GRAPH_PLAN_SCHEMA: &str = "fractal.prd_graph_plan.v1";
+const PRD_GRAPH_REPLACEMENT_PREVIEW_READY: &str = "PRD_GRAPH_REPLACEMENT_PREVIEW_READY";
+const PRD_GRAPH_REPLACEMENT_APPLIED: &str = "PRD_GRAPH_REPLACEMENT_APPLIED";
+const COMPILE_PLAN_SCHEMA: &str = "fractal.compile_plan.v1";
+const COMPILE_PLAN_PREVIEW_READY: &str = "COMPILE_PLAN_PREVIEW_READY";
+const COMPILE_PLAN_APPLIED: &str = "COMPILE_PLAN_APPLIED";
+const EXTERNAL_GATE_CLI_SCHEMA: &str = "fractal.external_gate.cli.v1";
+const EXTERNAL_GATE_RECORD_PREVIEW_READY: &str = "EXTERNAL_GATE_RECORD_PREVIEW_READY";
+const EXTERNAL_GATE_RECORD_APPLIED: &str = "EXTERNAL_GATE_RECORD_APPLIED";
+const EXTERNAL_GATE_REVOKE_PREVIEW_READY: &str = "EXTERNAL_GATE_REVOKE_PREVIEW_READY";
+const EXTERNAL_GATE_REVOKE_APPLIED: &str = "EXTERNAL_GATE_REVOKE_APPLIED";
+
+fn gate_preview_guidance(operation: &str, token: &str) -> String {
+    let mut guidance = format!(
+        "Preview token: {token}\nRe-run this exact command with --yes --expected-content-hash {token} to append the exact {operation}."
+    );
+    if operation == "revocation" {
+        guidance.push_str(
+            " The token binds the exact approval, project snapshot, and ledger; revocation remains possible if the old approval evidence drifts or is deleted.",
+        );
+    }
+    guidance
+}
+
+fn run_gate(args: &crate::cli::GateArgs) -> Result<()> {
+    match &args.command {
+        GateCommand::Record(args) => run_gate_record(args),
+        GateCommand::Show(args) => run_gate_show(args),
+        GateCommand::Revoke(args) => run_gate_revoke(args),
+    }
+}
+
+fn gate_record_input(args: &crate::cli::GateRecordArgs) -> external_gates::RecordApprovalInput {
+    external_gates::RecordApprovalInput {
+        node_id: args.node.clone(),
+        gate: args.gate.clone(),
+        evidence_path: args.evidence.clone(),
+        reviewer_id: args.reviewer_id.clone(),
+        reviewer_label: if args.reviewer_label.trim().is_empty() {
+            args.reviewer_id.clone()
+        } else {
+            args.reviewer_label.clone()
+        },
+        role: args.role.clone(),
+        attestation: args.attestation.clone(),
+    }
+}
+
+fn gate_revoke_input(args: &crate::cli::GateRevokeArgs) -> external_gates::RevokeApprovalInput {
+    external_gates::RevokeApprovalInput {
+        approval_hash: args.approval_hash.clone(),
+        reviewer_id: args.reviewer_id.clone(),
+        reviewer_label: if args.reviewer_label.trim().is_empty() {
+            args.reviewer_id.clone()
+        } else {
+            args.reviewer_label.clone()
+        },
+        role: args.role.clone(),
+        attestation: args.attestation.clone(),
+    }
+}
+
+fn run_gate_record(args: &crate::cli::GateRecordArgs) -> Result<()> {
+    let input = gate_record_input(args);
+    if !args.yes {
+        let record = external_gates::preview_approval(&args.repo, &input)?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": EXTERNAL_GATE_CLI_SCHEMA,
+                    "operation": "record",
+                    "status": "preview",
+                    "mutation": "none",
+                    "ready": true,
+                    "readiness_marker": EXTERNAL_GATE_RECORD_PREVIEW_READY,
+                    "record": record,
+                }))?
+            );
+        } else {
+            println!("External gate approval preview (no mutation performed)");
+            println!("  Node: {}", record.node_id);
+            println!("  Gate: {}", record.gate);
+            println!("  Graph hash: {}", record.graph_hash);
+            println!(
+                "  Evidence: {} ({} bytes)",
+                record.evidence_path, record.evidence_length
+            );
+            println!("  Evidence hash: {}", record.evidence_hash);
+            println!(
+                "  Reviewer: {} ({})",
+                record.reviewer_label, record.reviewer_id
+            );
+            println!("  Role: {}", record.role);
+            println!("  Authority: {} / {}", record.authority, record.assurance);
+            println!(
+                "{}",
+                gate_preview_guidance("approval", &record.content_hash)
+            );
+            println!("{EXTERNAL_GATE_RECORD_PREVIEW_READY}");
+        }
+        return Ok(());
+    }
+    let expected = args
+        .expected_content_hash
+        .as_deref()
+        .context("--yes requires --expected-content-hash from the preview")?;
+    let record = external_gates::record_approval_with_expected(&args.repo, input, expected)?;
+    if record.content_hash != expected {
+        anyhow::bail!("applied external gate record does not match preview token");
+    }
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": EXTERNAL_GATE_CLI_SCHEMA,
+                "operation": "record",
+                "status": "recorded",
+                "mutation": "applied",
+                "ready": true,
+                "readiness_marker": EXTERNAL_GATE_RECORD_APPLIED,
+                "record": record,
+            }))?
+        );
+    } else {
+        println!("Recorded external gate approval");
+        println!("  Node: {}  Gate: {}", record.node_id, record.gate);
+        println!("  Content hash: {}", record.content_hash);
+        println!("  Graph hash: {}", record.graph_hash);
+        println!("{EXTERNAL_GATE_RECORD_APPLIED}");
+    }
+    Ok(())
+}
+
+fn run_gate_show(args: &crate::cli::GateShowArgs) -> Result<()> {
+    let workspace = args
+        .repo
+        .canonicalize()
+        .context("resolve gate repository")?;
+    let document = project_file::load(&workspace)?;
+    let ledger = document
+        .external_gate_ledger
+        .clone()
+        .unwrap_or_else(external_gates::ExternalGateLedger::empty);
+    external_gates::validate_ledger(&ledger)?;
+    let records = ledger
+        .records
+        .iter()
+        .filter(|record| {
+            args.node
+                .as_deref()
+                .is_none_or(|node| node == record.node_id)
+        })
+        .filter(|record| args.gate.as_deref().is_none_or(|gate| gate == record.gate))
+        .cloned()
+        .collect::<Vec<_>>();
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": EXTERNAL_GATE_CLI_SCHEMA,
+                "operation": "show",
+                "status": "ok",
+                "repo": workspace.display().to_string(),
+                "graph_hash": document.graph_hash,
+                "ledger_present": document.external_gate_ledger.is_some(),
+                "records": records,
+            }))?
+        );
+    } else if records.is_empty() {
+        println!(
+            "No external gate ledger records in {} (ledger {} ).",
+            workspace.display(),
+            if document.external_gate_ledger.is_some() {
+                "present"
+            } else {
+                "missing; gated checkout remains denied"
+            }
+        );
+    } else {
+        println!("External gate ledger in {}:", workspace.display());
+        for record in records {
+            println!(
+                "  {} {} · {} · {} · {}",
+                record.kind, record.content_hash, record.node_id, record.gate, record.reviewer_id
+            );
+            println!(
+                "    graph={} evidence={} ({}, {} bytes)",
+                record.graph_hash,
+                record.evidence_path,
+                record.evidence_hash,
+                record.evidence_length
+            );
+            if let Some(target) = record.revokes {
+                println!("    revokes={target}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_gate_revoke(args: &crate::cli::GateRevokeArgs) -> Result<()> {
+    let input = gate_revoke_input(args);
+    if !args.yes {
+        let record = external_gates::preview_revoke(&args.repo, &input)?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": EXTERNAL_GATE_CLI_SCHEMA,
+                    "operation": "revoke",
+                    "status": "preview",
+                    "mutation": "none",
+                    "ready": true,
+                    "readiness_marker": EXTERNAL_GATE_REVOKE_PREVIEW_READY,
+                    "record": record,
+                }))?
+            );
+        } else {
+            println!("External gate revocation preview (no mutation performed)");
+            println!("  Target approval: {}", args.approval_hash);
+            println!("  Node: {}  Gate: {}", record.node_id, record.gate);
+            println!(
+                "  Revoker: {} ({})",
+                record.reviewer_label, record.reviewer_id
+            );
+            println!(
+                "{}",
+                gate_preview_guidance("revocation", &record.content_hash)
+            );
+            println!("{EXTERNAL_GATE_REVOKE_PREVIEW_READY}");
+        }
+        return Ok(());
+    }
+    let expected = args
+        .expected_content_hash
+        .as_deref()
+        .context("--yes requires --expected-content-hash from the preview")?;
+    let record = external_gates::revoke_approval_with_expected(&args.repo, input, expected)?;
+    if record.content_hash != expected {
+        anyhow::bail!("applied external gate revocation does not match preview token");
+    }
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": EXTERNAL_GATE_CLI_SCHEMA,
+                "operation": "revoke",
+                "status": "revoked",
+                "mutation": "applied",
+                "ready": true,
+                "readiness_marker": EXTERNAL_GATE_REVOKE_APPLIED,
+                "record": record,
+            }))?
+        );
+    } else {
+        println!("Revoked external gate approval");
+        println!("  Revocation hash: {}", record.content_hash);
+        println!("  Revokes: {}", record.revokes.unwrap_or_default());
+        println!("{EXTERNAL_GATE_REVOKE_APPLIED}");
+    }
+    Ok(())
+}
+
+fn run_amendment(args: &crate::cli::AmendmentArgs) -> Result<()> {
+    match &args.command {
+        AmendmentCommand::List(args) => run_amendment_list(args),
+        AmendmentCommand::Reject(args) => run_amendment_reject(args),
+    }
+}
+
+fn run_amendment_list(args: &crate::cli::AmendmentListArgs) -> Result<()> {
+    let records = amendments::list_pending(&args.repo)
+        .with_context(|| format!("list pending amendments in {}", args.repo.display()))?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": AMENDMENT_CLI_SCHEMA,
+                "operation": "list",
+                "status": "ok",
+                "repo": args.repo.display().to_string(),
+                "count": records.len(),
+                "amendments": records,
+            }))?
+        );
+        return Ok(());
+    }
+
+    if records.is_empty() {
+        println!("No pending amendments in {}.", args.repo.display());
+        return Ok(());
+    }
+    println!(
+        "Pending amendments in {} ({}):",
+        args.repo.display(),
+        records.len()
+    );
+    for record in records {
+        println!(
+            "  {} · {} · task {}",
+            record.amendment.command_id, record.amendment.action, record.amendment.task_ref
+        );
+        println!("    Content hash: {}", record.content_hash);
+        println!("    Queue: {} ({})", record.queue, record.queue_file);
+        println!("    Instruction: {}", record.amendment.instruction);
+    }
+    Ok(())
+}
+
+fn run_amendment_reject(args: &crate::cli::AmendmentRejectArgs) -> Result<()> {
+    let reason = args.reason.trim();
+    validate_amendment_rejection_reason(reason)?;
+    let records = amendments::list_pending(&args.repo)
+        .with_context(|| format!("inspect pending amendments in {}", args.repo.display()))?;
+    let target = records
+        .iter()
+        .find(|record| record.amendment.command_id == args.command_id)
+        .with_context(|| {
+            format!(
+                "pending amendment command_id `{}` was not found in {}",
+                args.command_id,
+                args.repo.display()
+            )
+        })?;
+
+    if !args.yes {
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": AMENDMENT_CLI_SCHEMA,
+                    "operation": "reject",
+                    "status": "preview",
+                    "mutation": "none",
+                    "repo": args.repo.display().to_string(),
+                    "ready": true,
+                    "readiness_marker": AMENDMENT_REJECTION_PREVIEW_READY,
+                    "target": target,
+                    "reason": reason,
+                }))?
+            );
+        } else {
+            println!("Amendment rejection preview (no mutation performed)");
+            println!("  Target command ID: {}", target.amendment.command_id);
+            println!("  Content hash: {}", target.content_hash);
+            println!("  Queue: {} ({})", target.queue, target.queue_file);
+            println!("  Reason: {reason}");
+            println!("{AMENDMENT_REJECTION_PREVIEW_READY}");
+            println!("Re-run this exact command with --yes to reject only this pending amendment.");
+        }
+        return Ok(());
+    }
+
+    let rejection = amendments::reject_pending_amendment(&args.repo, &args.command_id, reason)
+        .with_context(|| {
+            format!(
+                "reject pending amendment `{}` in {}",
+                args.command_id,
+                args.repo.display()
+            )
+        })?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": AMENDMENT_CLI_SCHEMA,
+                "operation": "reject",
+                "status": "rejected",
+                "mutation": "applied",
+                "repo": args.repo.display().to_string(),
+                "ready": true,
+                "readiness_marker": AMENDMENT_REJECTION_APPLIED,
+                "rejection": rejection,
+            }))?
+        );
+    } else {
+        println!("Rejected pending amendment");
+        println!("  Target command ID: {}", rejection.command_id);
+        println!("  Content hash: {}", rejection.content_hash);
+        println!("  Queue: {} ({})", rejection.queue, rejection.queue_file);
+        println!("  Reason: {}", rejection.reason);
+        println!("{AMENDMENT_REJECTION_APPLIED}");
+    }
+    Ok(())
+}
+
+fn validate_amendment_rejection_reason(reason: &str) -> Result<()> {
+    if reason.is_empty() {
+        anyhow::bail!("rejection reason must not be empty");
+    }
+    if reason.len() > 1_024 {
+        anyhow::bail!("rejection reason exceeds 1024 bytes");
+    }
+    if reason.chars().any(char::is_control) {
+        anyhow::bail!("rejection reason contains control characters");
+    }
+    Ok(())
+}
+
+fn run_graph_compile_plan(args: &crate::cli::GraphCompilePlanArgs) -> Result<()> {
+    if args.preserve_execution && !args.yes {
+        anyhow::bail!("--preserve-execution requires --yes");
+    }
+    if !args.preserve_execution && !args.reopen.is_empty() {
+        anyhow::bail!("--reopen requires --preserve-execution");
+    }
+    let repo = canonicalize_compile_plan_repo(&args.repo)?;
+    let plan_path = resolve_existing_plan_path(&repo, &args.plan)?;
+    let compilation = decompose::compile_existing_plan(&plan_path, &repo)?;
+    let graph_hash = compilation
+        .graph
+        .get("graph_hash")
+        .and_then(serde_json::Value::as_str)
+        .context("compiled existing plan graph is missing graph_hash")?
+        .to_owned();
+    let node_count = compilation
+        .graph
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let edge_count = compilation
+        .graph
+        .get("edges")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+
+    if !args.yes {
+        print_compile_plan_result(
+            args,
+            &repo,
+            &plan_path,
+            &compilation,
+            &graph_hash,
+            node_count,
+            edge_count,
+            None,
+        )?;
+        return Ok(());
+    }
+
+    let forced_reopen = args.reopen.iter().cloned().collect::<BTreeSet<_>>();
+    let migration = args
+        .preserve_execution
+        .then(|| {
+            project_file::preview_halted_graph_migration(&repo, &compilation.graph, &forced_reopen)
+        })
+        .transpose()?;
+
+    let commit = graph_store::commit_graph(&compilation.graph)
+        .context("commit graph compiled from existing plan")?;
+    graph_store::persist_source(
+        &commit.graph_hash,
+        &compilation.harness,
+        &compilation.work,
+        compilation.target_id,
+    )
+    .context("persist compiler inputs for existing plan graph")?;
+    let prd_path = decompose::persist_existing_plan_prd(&repo, &compilation)?;
+    let project_path = if let Some(migration) = &migration {
+        project_file::apply_halted_graph_migration(
+            &repo,
+            &compilation.graph,
+            &forced_reopen,
+            migration,
+        )
+        .context("migrate halted canonical project to graph compiled from existing plan")?
+    } else {
+        project_file::persist(&repo, &compilation.graph, &compilation.title)
+            .context("update canonical project with graph compiled from existing plan")?
+    };
+    let applied = CompilePlanApplied {
+        commit,
+        project_path,
+        prd_path,
+        migration,
+    };
+    print_compile_plan_result(
+        args,
+        &repo,
+        &plan_path,
+        &compilation,
+        &graph_hash,
+        node_count,
+        edge_count,
+        Some(&applied),
+    )
+}
+
+struct CompilePlanApplied {
+    commit: graph_store::CommitRecord,
+    project_path: std::path::PathBuf,
+    prd_path: std::path::PathBuf,
+    migration: Option<project_file::GraphMigrationReport>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_compile_plan_result(
+    args: &crate::cli::GraphCompilePlanArgs,
+    repo: &Path,
+    plan_path: &Path,
+    compilation: &decompose::ExistingPlanCompilation,
+    graph_hash: &str,
+    node_count: usize,
+    edge_count: usize,
+    applied: Option<&CompilePlanApplied>,
+) -> Result<()> {
+    let (status, mutation, readiness_marker) = if applied.is_some() {
+        ("applied", "applied", COMPILE_PLAN_APPLIED)
+    } else {
+        ("preview", "none", COMPILE_PLAN_PREVIEW_READY)
+    };
+    if args.json {
+        let commit = applied.map(|applied| {
+            serde_json::json!({
+                "graph_hash": applied.commit.graph_hash,
+                "path": applied.commit.path,
+                "bytes": applied.commit.bytes,
+            })
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": COMPILE_PLAN_SCHEMA,
+                "operation": "compile-plan",
+                "status": status,
+                "mutation": mutation,
+                "repo": repo.display().to_string(),
+                "plan": plan_path.display().to_string(),
+                "title": compilation.title,
+                "graph_hash": graph_hash,
+                "summary": {
+                    "planned_tasks": compilation.task_count,
+                    "acceptance_criteria": compilation.acceptance_criteria_count,
+                    "node_count": node_count,
+                    "edge_count": edge_count,
+                },
+                "commit": commit,
+                "project_path": applied.map(|value| value.project_path.display().to_string()),
+                "prd_path": applied.map(|value| value.prd_path.display().to_string()),
+                "migration": applied.and_then(|value| value.migration.as_ref()),
+                "readiness_marker": readiness_marker,
+            }))?
+        );
+    } else {
+        println!(
+            "Existing plan compilation {}{}",
+            status,
+            if applied.is_none() {
+                " (no mutation performed)"
+            } else {
+                ""
+            }
+        );
+        println!("  Repo: {}", repo.display());
+        println!("  Plan: {}", plan_path.display());
+        println!("  Title: {}", compilation.title);
+        println!("  Compiled graph: {graph_hash}");
+        println!(
+            "  Summary: tasks={} acceptance={} nodes={} edges={}",
+            compilation.task_count, compilation.acceptance_criteria_count, node_count, edge_count
+        );
+        if let Some(applied) = applied {
+            println!(
+                "  Commit: {} ({} bytes)",
+                applied.commit.path.display(),
+                applied.commit.bytes
+            );
+            println!("  Project: {}", applied.project_path.display());
+            println!("  Structured PRD: {}", applied.prd_path.display());
+            if let Some(migration) = &applied.migration {
+                println!("  Old graph: {}", migration.old_graph_hash);
+                println!("  New graph: {}", migration.new_graph_hash);
+                println!("  Preserved: {}", migration.preserved.join(", "));
+                println!("  Reopened: {}", migration.reopened.join(", "));
+                println!("  Removed: {}", migration.removed.join(", "));
+            }
+        } else {
+            println!("Re-run this exact command with --yes to commit the graph.");
+        }
+        println!("{readiness_marker}");
+    }
+    Ok(())
+}
+
+fn canonicalize_compile_plan_repo(repo: &Path) -> Result<std::path::PathBuf> {
+    let canonical = fs::canonicalize(repo)
+        .with_context(|| format!("canonicalize project repository {}", repo.display()))?;
+    if !canonical.is_dir() {
+        anyhow::bail!("project repository {} is not a directory", repo.display());
+    }
+    Ok(canonical)
+}
+
+fn resolve_existing_plan_path(repo: &Path, plan: &Path) -> Result<std::path::PathBuf> {
+    if plan.as_os_str().is_empty() {
+        anyhow::bail!("existing plan path must not be empty");
+    }
+    let candidate = if plan.is_absolute() {
+        plan.to_owned()
+    } else {
+        let mut relative = std::path::PathBuf::new();
+        for component in plan.components() {
+            match component {
+                Component::Normal(segment) => relative.push(segment),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    anyhow::bail!("relative existing plan path must not contain `..`");
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    anyhow::bail!("invalid relative existing plan path {}", plan.display());
+                }
+            }
+        }
+        if relative.as_os_str().is_empty() {
+            anyhow::bail!("existing plan path must name a file");
+        }
+        repo.join(relative)
+    };
+    let canonical = fs::canonicalize(&candidate)
+        .with_context(|| format!("canonicalize existing plan {}", candidate.display()))?;
+    let metadata = fs::metadata(&canonical)
+        .with_context(|| format!("inspect existing plan {}", canonical.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "existing plan {} is not a regular file",
+            canonical.display()
+        );
+    }
+    if !plan.is_absolute() && !canonical.starts_with(repo) {
+        anyhow::bail!("relative existing plan path must remain inside --repo");
+    }
+    Ok(canonical)
+}
+
+fn run_graph_plan_prd(args: &crate::cli::GraphPlanPrdArgs) -> Result<()> {
+    let repo = canonicalize_prd_repo(&args.repo)?;
+    let prd_relative = validate_prd_relative_path(&args.prd)?;
+    let prd_path = resolve_prd_path(&repo, &prd_relative)?;
+    let expected_parent_hash = args.expected_parent_hash.trim();
+    validate_prd_parent_hash(expected_parent_hash)?;
+
+    // The first load/check is deliberately before reading or compiling the PRD.
+    // A stale caller therefore cannot accidentally compile against an obsolete
+    // project graph, even when the PRD itself is unchanged.
+    let project = project_file::load(&repo)
+        .with_context(|| format!("load canonical project graph in {}", repo.display()))?;
+    ensure_prd_parent_hash(&project, expected_parent_hash)?;
+
+    let markdown = fs::read_to_string(&prd_path)
+        .with_context(|| format!("read PRD {}", prd_relative.display()))?;
+    let preview = prd_graph::compile_prd(
+        &markdown,
+        &prd_relative.to_string_lossy(),
+        &args.from,
+        &args.through,
+        Some(expected_parent_hash),
+    )
+    .with_context(|| format!("compile PRD {}", prd_relative.display()))?;
+    let graph_hash = preview
+        .graph
+        .get("graph_hash")
+        .and_then(serde_json::Value::as_str)
+        .context("compiled PRD graph is missing graph_hash")?;
+    let summary = preview
+        .graph
+        .get("summary")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    if !args.yes {
+        print_prd_graph_plan_preview(
+            args,
+            &repo,
+            &prd_relative,
+            expected_parent_hash,
+            graph_hash,
+            &summary,
+        )?;
+        return Ok(());
+    }
+
+    // Re-check after compilation before touching the content-addressed store.
+    // This is also useful for callers that hold the project lock only briefly.
+    let current = project_file::load(&repo)
+        .with_context(|| format!("recheck canonical project graph in {}", repo.display()))?;
+    ensure_prd_parent_hash(&current, expected_parent_hash)?;
+    let commit = graph_store::commit_graph(&preview.graph)
+        .context("commit compiled PRD graph to the content-addressed store")?;
+
+    // Commit may involve filesystem I/O. The final parent check and project
+    // replacement must therefore share one canonical project-file lock.
+    let project_path =
+        project_file::persist_evolved_if_parent(&repo, &preview.graph, expected_parent_hash)
+            .context("persist evolved PRD graph through the canonical project boundary")?;
+
+    print_prd_graph_plan_applied(
+        args,
+        &repo,
+        &prd_relative,
+        expected_parent_hash,
+        graph_hash,
+        &summary,
+        &commit,
+        &project_path,
+    )
+}
+
+fn canonicalize_prd_repo(repo: &Path) -> Result<std::path::PathBuf> {
+    let canonical = fs::canonicalize(repo)
+        .with_context(|| format!("canonicalize project repository {}", repo.display()))?;
+    if !canonical.is_dir() {
+        anyhow::bail!("project repository {} is not a directory", repo.display());
+    }
+    Ok(canonical)
+}
+
+fn validate_prd_relative_path(path: &Path) -> Result<std::path::PathBuf> {
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("PRD path must not be empty");
+    }
+    if path.is_absolute() {
+        anyhow::bail!("PRD path must be relative to --repo");
+    }
+
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) => normalized.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                anyhow::bail!("PRD path must not contain traversal component `..`");
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("PRD path must be relative to --repo");
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        anyhow::bail!("PRD path must name a file relative to --repo");
+    }
+    Ok(normalized)
+}
+
+fn resolve_prd_path(repo: &Path, relative: &Path) -> Result<std::path::PathBuf> {
+    let mut candidate = repo.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(segment) = component else {
+            continue;
+        };
+        candidate.push(segment);
+        let metadata = fs::symlink_metadata(&candidate)
+            .with_context(|| format!("inspect PRD path component {}", candidate.display()))?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "PRD path must not traverse a symlink: {}",
+                relative.display()
+            );
+        }
+    }
+
+    let metadata = fs::metadata(&candidate)
+        .with_context(|| format!("inspect PRD file {}", relative.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("PRD path {} is not a regular file", relative.display());
+    }
+    let canonical = fs::canonicalize(&candidate)
+        .with_context(|| format!("canonicalize PRD {}", relative.display()))?;
+    if !canonical.starts_with(repo) {
+        anyhow::bail!("PRD path must remain inside --repo: {}", relative.display());
+    }
+    Ok(canonical)
+}
+
+fn validate_prd_parent_hash(hash: &str) -> Result<()> {
+    let Some(digest) = hash.strip_prefix("sha256:") else {
+        anyhow::bail!("expected parent hash must start with `sha256:`");
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        anyhow::bail!("expected parent hash must contain 64 lowercase hexadecimal characters");
+    }
+    Ok(())
+}
+
+fn ensure_prd_parent_hash(
+    project: &project_file::FractalProject,
+    expected_parent_hash: &str,
+) -> Result<()> {
+    if project.graph_hash != expected_parent_hash {
+        anyhow::bail!(
+            "current project graph hash mismatch: expected {expected_parent_hash}, found {}",
+            project.graph_hash
+        );
+    }
+    Ok(())
+}
+
+fn print_prd_graph_plan_preview(
+    args: &crate::cli::GraphPlanPrdArgs,
+    repo: &Path,
+    prd_relative: &Path,
+    expected_parent_hash: &str,
+    graph_hash: &str,
+    summary: &serde_json::Value,
+) -> Result<()> {
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": PRD_GRAPH_PLAN_SCHEMA,
+                "operation": "plan-prd",
+                "status": "preview",
+                "mutation": "none",
+                "repo": repo.display().to_string(),
+                "prd": prd_relative.to_string_lossy(),
+                "from": args.from,
+                "through": args.through,
+                "expected_parent_hash": expected_parent_hash,
+                "graph_hash": graph_hash,
+                "summary": summary,
+                "readiness_marker": PRD_GRAPH_REPLACEMENT_PREVIEW_READY,
+            }))?
+        );
+    } else {
+        println!("PRD graph replacement preview (no mutation performed)");
+        println!("  Repo: {}", repo.display());
+        println!("  PRD: {}", prd_relative.display());
+        println!("  Range: {} through {}", args.from, args.through);
+        println!("  Expected parent graph: {expected_parent_hash}");
+        println!("  Compiled graph: {graph_hash}");
+        print_prd_graph_summary(summary);
+        println!("{PRD_GRAPH_REPLACEMENT_PREVIEW_READY}");
+        println!("Re-run this exact command with --yes to commit the child graph.");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_prd_graph_plan_applied(
+    args: &crate::cli::GraphPlanPrdArgs,
+    repo: &Path,
+    prd_relative: &Path,
+    expected_parent_hash: &str,
+    graph_hash: &str,
+    summary: &serde_json::Value,
+    commit: &graph_store::CommitRecord,
+    project_path: &Path,
+) -> Result<()> {
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": PRD_GRAPH_PLAN_SCHEMA,
+                "operation": "plan-prd",
+                "status": "applied",
+                "mutation": "applied",
+                "repo": repo.display().to_string(),
+                "prd": prd_relative.to_string_lossy(),
+                "from": args.from,
+                "through": args.through,
+                "expected_parent_hash": expected_parent_hash,
+                "graph_hash": graph_hash,
+                "summary": summary,
+                "commit": {
+                    "graph_hash": commit.graph_hash,
+                    "path": commit.path,
+                    "bytes": commit.bytes,
+                },
+                "readiness_marker": PRD_GRAPH_REPLACEMENT_APPLIED,
+            }))?
+        );
+    } else {
+        println!("PRD graph replacement applied");
+        println!("  Repo: {}", repo.display());
+        println!("  PRD: {}", prd_relative.display());
+        println!("  Range: {} through {}", args.from, args.through);
+        println!("  Parent graph: {expected_parent_hash}");
+        println!("  Child graph: {graph_hash}");
+        print_prd_graph_summary(summary);
+        println!(
+            "  Commit: {} ({} bytes)",
+            commit.path.display(),
+            commit.bytes
+        );
+        println!("  Project: {}", project_path.display());
+        println!("{PRD_GRAPH_REPLACEMENT_APPLIED}");
+    }
+    Ok(())
+}
+
+fn print_prd_graph_summary(summary: &serde_json::Value) {
+    let count = |field: &str| {
+        summary
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    println!(
+        "  Summary: tasks={} nodes={} edges={} waves={} initial-ready={}",
+        count("selected_tasks"),
+        count("node_count"),
+        count("edge_count"),
+        count("wave_count"),
+        count("initial_ready_nodes")
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -402,8 +1334,14 @@ fn run_local(
     let workspace = std::env::current_dir()?;
     let agents = execute::detect_agents();
     if agents.is_empty() {
-        anyhow::bail!("no agents (claude/codex/cursor/hermes) on PATH");
+        anyhow::bail!("no agents (claude/codex/cursor/hermes/opencode) on PATH");
     }
+    let title = graph
+        .get("goal")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Local Fractal graph");
+    project_file::persist(&workspace, &graph, title)
+        .context("initialize the canonical local project before execution")?;
 
     let port = crate::cli::DEFAULT_GRAPH_PORT;
     let board_url = format!("http://127.0.0.1:{port}");
@@ -414,19 +1352,29 @@ fn run_local(
     std::thread::sleep(std::time::Duration::from_millis(1500));
 
     println!("{}", efficiency_config::banner(efficiency));
+    let execution_label = if args.hybrid {
+        "hybrid isolated-worktree team"
+    } else {
+        "agent team"
+    };
     println!(
-        "Running graph with agent team: {} in {}",
+        "Running graph with {execution_label}: {} in {}",
         agents.join(", "),
         workspace.display()
     );
-    let outcome = execute::run_multi_agent(
-        &graph,
-        &workspace,
-        &agents,
-        Some(&board_url),
-        &std::collections::BTreeSet::new(),
-    )?;
+    let completed = std::collections::BTreeSet::new();
+    let outcome = if args.hybrid {
+        execute::run_multi_agent_hybrid(&graph, &workspace, &agents, Some(&board_url), &completed)?
+    } else {
+        execute::run_multi_agent(&graph, &workspace, &agents, Some(&board_url), &completed)?
+    };
     println!("⇒ {}", outcome.detail);
+    if let Some(failed) = outcome.failed_node {
+        anyhow::bail!("local graph failed at node `{failed}`");
+    }
+    if outcome.verified == Some(false) {
+        anyhow::bail!("local graph verification failed");
+    }
     Ok(())
 }
 
@@ -1387,6 +2335,7 @@ fn catalog_from_audit_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn dispatches_version() {
@@ -1396,8 +2345,71 @@ mod tests {
 
     #[test]
     fn dispatches_efficiency_status_with_defaults() {
-        let cli = Cli::try_parse_from(["fractal", "efficiency"]).unwrap();
-        assert!(run(cli).is_ok());
+        let workspace = std::env::temp_dir().join(format!(
+            "fractal_efficiency_dispatch_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let state_dir = workspace.join(".fractal");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/self-healing-failed-project/.fractal/project.fractal"
+            ),
+            state_dir.join("project.fractal"),
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from([
+            "fractal",
+            "efficiency",
+            "--repo",
+            workspace.to_str().unwrap(),
+        ])
+        .unwrap();
+        let result = run(cli);
+        let _ = std::fs::remove_dir_all(&workspace);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn gate_preview_guidance_prints_token_and_exact_rerun_flags() {
+        let token = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let approval = gate_preview_guidance("approval", token);
+        assert!(approval.contains(&format!("Preview token: {token}")));
+        assert!(approval.contains(&format!("--yes --expected-content-hash {token}")));
+        assert!(approval.contains("exact approval"));
+
+        let revocation = gate_preview_guidance("revocation", token);
+        assert!(revocation.contains(&format!("Preview token: {token}")));
+        assert!(revocation.contains(&format!("--yes --expected-content-hash {token}")));
+        assert!(revocation.contains("exact approval, project snapshot, and ledger"));
+        assert!(revocation.contains("old approval evidence drifts or is deleted"));
+    }
+
+    #[test]
+    fn gate_apply_requires_preview_token() {
+        let cli = Cli::try_parse_from([
+            "fractal",
+            "gate",
+            "record",
+            "--node",
+            "secure",
+            "--gate",
+            "security_review",
+            "--evidence",
+            "review.txt",
+            "--reviewer-id",
+            "reviewer",
+            "--role",
+            "security_reviewer",
+            "--attestation",
+            "approve:graph:secure:security_review",
+            "--yes",
+        ])
+        .unwrap();
+        let error = run(cli).expect_err("--yes without a preview token must fail");
+        assert!(format!("{error:#}").contains("--yes requires --expected-content-hash"));
     }
 
     #[test]
@@ -1588,6 +2600,361 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn prd_plan_path_validation_rejects_absolute_and_traversal_paths() {
+        assert!(validate_prd_relative_path(Path::new("/tmp/plan.md")).is_err());
+        assert!(validate_prd_relative_path(Path::new("docs/../plan.md")).is_err());
+        assert!(validate_prd_relative_path(Path::new("./docs/plan.md")).is_ok());
+    }
+
+    #[test]
+    fn compile_plan_resolves_repo_relative_and_absolute_paths() -> Result<()> {
+        let root = temp_root("compile-plan-paths");
+        let plan = root.join("fractal-plan.json");
+        fs::write(&plan, sample_existing_plan(false))?;
+        let canonical_root = fs::canonicalize(&root)?;
+        let canonical_plan = fs::canonicalize(&plan)?;
+
+        assert_eq!(
+            resolve_existing_plan_path(&canonical_root, Path::new("fractal-plan.json"))?,
+            canonical_plan
+        );
+        assert_eq!(
+            resolve_existing_plan_path(&canonical_root, &plan)?,
+            canonical_plan
+        );
+        assert!(resolve_existing_plan_path(&canonical_root, Path::new("../plan.json")).is_err());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_compile_plan_preview_is_read_only() -> Result<()> {
+        let _env_lock = graph_store::ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph-store test environment lock poisoned"))?;
+        let home = graph_store::TestHome::new("compile-plan-preview")?;
+        let root = temp_root("compile-plan-preview");
+        fs::write(root.join("fractal-plan.json"), sample_existing_plan(false))?;
+
+        run_graph_compile_plan(&compile_plan_args(&root, false))?;
+
+        assert!(!project_file::path(&root).exists());
+        assert!(!root.join(".fractal/lead-prd.json").exists());
+        assert!(!home.path.join("graphs").exists());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_compile_plan_apply_commits_source_prd_and_project() -> Result<()> {
+        let _env_lock = graph_store::ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph-store test environment lock poisoned"))?;
+        let _home = graph_store::TestHome::new("compile-plan-apply")?;
+        let root = temp_root("compile-plan-apply");
+        fs::write(root.join("fractal-plan.json"), sample_existing_plan(false))?;
+
+        run_graph_compile_plan(&compile_plan_args(&root, true))?;
+
+        let project = project_file::load(&root)?;
+        assert_eq!(project.project.title, "Existing plan project");
+        assert_eq!(graph_store::load_graph(&project.graph_hash)?, project.graph);
+        assert!(graph_store::source_path(&project.graph_hash).is_file());
+        let prd: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join(".fractal/lead-prd.json"))?)?;
+        assert_eq!(prd["title"], "Existing plan project");
+        assert!(project.graph["nodes"]
+            .as_array()
+            .is_some_and(|nodes| nodes.iter().any(|node| node["id"] == "implement")));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_compile_plan_applies_repository_harness_policy() -> Result<()> {
+        let _env_lock = graph_store::ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph-store test environment lock poisoned"))?;
+        let _home = graph_store::TestHome::new("compile-plan-project-policy")?;
+        let root = temp_root("compile-plan-project-policy");
+        fs::create_dir_all(root.join(".fractal"))?;
+        fs::write(root.join("fractal-plan.json"), sample_existing_plan(false))?;
+        fs::write(
+            root.join(".fractal/harness.yaml"),
+            r#"schema: fractal.harness_policy.v1
+workspace:
+  max_files_changed: 24
+  max_diff_lines: 4000
+limits:
+  max_files_changed: 24
+  max_diff_lines: 4000
+capabilities:
+  code.generate: { enabled: true }
+  project.tests.execute: { enabled: true }
+  control.plan: { enabled: true }
+  control.closeout: { enabled: true }
+"#,
+        )?;
+
+        run_graph_compile_plan(&compile_plan_args(&root, true))?;
+
+        let project = project_file::load(&root)?;
+        let implement = project.graph["nodes"]
+            .as_array()
+            .and_then(|nodes| nodes.iter().find(|node| node["id"] == "implement"))
+            .context("compiled implement node")?;
+        assert_eq!(
+            implement["policy_contract"]["budgets"]["max_files_changed"],
+            24
+        );
+        assert_eq!(
+            implement["policy_contract"]["budgets"]["max_diff_lines"],
+            4000
+        );
+        assert_eq!(
+            project.graph["policy_provenance"]["source"],
+            "project:.fractal/harness.yaml"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_compile_plan_migrates_halted_execution_and_forces_reopen() -> Result<()> {
+        let _env_lock = graph_store::ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph-store test environment lock poisoned"))?;
+        let _home = graph_store::TestHome::new("compile-plan-migrate")?;
+        let root = temp_root("compile-plan-migrate");
+        fs::write(root.join("fractal-plan.json"), sample_existing_plan(false))?;
+        run_graph_compile_plan(&compile_plan_args(&root, true))?;
+        project_file::mutate_document(&root, |document| {
+            let execution = document.execution.as_mut().context("execution")?;
+            execution.phase = "halted".to_owned();
+            for node in ["lead_plan", "implement"] {
+                execution.assignments.insert(
+                    node.to_owned(),
+                    project_file::ExecutionAssignment {
+                        agent_id: format!("agent-{node}"),
+                        agent_label: format!("Agent {node}"),
+                        state: "completed".to_owned(),
+                        checked_out_at: "2026-01-01T00:00:00Z".to_owned(),
+                        completed_at: Some("2026-01-01T00:00:01Z".to_owned()),
+                        released_at: None,
+                        extra: BTreeMap::new(),
+                    },
+                );
+            }
+            Ok(())
+        })?;
+
+        let mut args = compile_plan_args(&root, true);
+        args.preserve_execution = true;
+        args.reopen = vec!["implement".to_owned()];
+        run_graph_compile_plan(&args)?;
+
+        let project = project_file::load(&root)?;
+        let execution = project.execution.context("execution")?;
+        assert_eq!(execution.phase, "halted");
+        assert_eq!(execution.assignments["lead_plan"].state, "completed");
+        assert_eq!(execution.assignments["implement"].state, "released");
+        assert!(execution.assignments["implement"].completed_at.is_none());
+        let migration = &project.learning.extra["plan_migrations"]["records"][0];
+        assert_eq!(migration["preserved"], serde_json::json!(["lead_plan"]));
+        assert!(migration["reopened"]
+            .as_array()
+            .is_some_and(|nodes| nodes.iter().any(|node| node == "implement")));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_compile_plan_invalid_input_fails_closed_without_fallback() -> Result<()> {
+        let _env_lock = graph_store::ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph-store test environment lock poisoned"))?;
+        let home = graph_store::TestHome::new("compile-plan-invalid")?;
+        let root = temp_root("compile-plan-invalid");
+        fs::write(root.join("fractal-plan.json"), sample_existing_plan(true))?;
+
+        let error = run_graph_compile_plan(&compile_plan_args(&root, true))
+            .expect_err("cyclic existing plan must fail");
+
+        assert!(format!("{error:#}").contains("dependency cycle"));
+        assert!(!project_file::path(&root).exists());
+        assert!(!root.join(".fractal/lead-prd.json").exists());
+        assert!(!home.path.join("graphs").exists());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn prd_plan_parent_hash_validation_requires_canonical_sha256() {
+        assert!(validate_prd_parent_hash("sha256:").is_err());
+        assert!(validate_prd_parent_hash(&format!("sha256:{}", "a".repeat(64))).is_ok());
+        assert!(validate_prd_parent_hash(&format!("sha256:{}", "A".repeat(64))).is_err());
+        assert!(validate_prd_parent_hash(&"0".repeat(64)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prd_plan_path_resolution_rejects_symlink_components() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("prd-symlink");
+        fs::write(root.join("outside.md"), "outside").unwrap();
+        symlink(root.join("outside.md"), root.join("plan.md")).unwrap();
+        assert!(resolve_prd_path(&root, Path::new("plan.md")).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn graph_plan_prd_preview_is_read_only() -> Result<()> {
+        let _env_lock = graph_store::ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph-store test environment lock poisoned"))?;
+        let _home = graph_store::TestHome::new("prd-plan-preview")?;
+        let root = temp_root("prd-plan-preview");
+        let (parent, parent_hash) = seed_prd_plan_project(&root)?;
+        fs::create_dir_all(root.join("docs"))?;
+        fs::write(root.join("docs/plan.md"), sample_prd_markdown())?;
+        let before = fs::read(project_file::path(&root))?;
+
+        let args = prd_plan_args(&root, &parent_hash, false);
+        run_graph_plan_prd(&args)?;
+
+        assert_eq!(fs::read(project_file::path(&root))?, before);
+        assert_eq!(project_file::load(&root)?.graph_hash, parent_hash);
+        let expected_child = prd_graph::compile_prd(
+            &sample_prd_markdown(),
+            "docs/plan.md",
+            "INT-002",
+            "INT-003",
+            Some(&parent_hash),
+        )?
+        .graph_hash;
+        assert!(graph_store::load_graph(&expected_child).is_err());
+        assert_eq!(graph_store::load_graph(&parent_hash)?, parent);
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_plan_prd_apply_preserves_parent_and_persists_child() -> Result<()> {
+        let _env_lock = graph_store::ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph-store test environment lock poisoned"))?;
+        let _home = graph_store::TestHome::new("prd-plan-apply")?;
+        let root = temp_root("prd-plan-apply");
+        let (parent, parent_hash) = seed_prd_plan_project(&root)?;
+        fs::create_dir_all(root.join("docs"))?;
+        fs::write(root.join("docs/plan.md"), sample_prd_markdown())?;
+        let expected_child = prd_graph::compile_prd(
+            &sample_prd_markdown(),
+            "docs/plan.md",
+            "INT-002",
+            "INT-003",
+            Some(&parent_hash),
+        )?;
+        let child_hash = expected_child.graph_hash.clone();
+
+        let args = prd_plan_args(&root, &parent_hash, true);
+        run_graph_plan_prd(&args)?;
+
+        assert_eq!(project_file::load(&root)?.graph_hash, child_hash);
+        assert_eq!(graph_store::load_graph(&parent_hash)?, parent);
+        assert_eq!(graph_store::load_graph(&child_hash)?, expected_child.graph);
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_plan_prd_rejects_parent_hash_drift_before_compile() -> Result<()> {
+        let _env_lock = graph_store::ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph-store test environment lock poisoned"))?;
+        let _home = graph_store::TestHome::new("prd-plan-parent-drift")?;
+        let root = temp_root("prd-plan-parent-drift");
+        let (_parent, parent_hash) = seed_prd_plan_project(&root)?;
+        fs::create_dir_all(root.join("docs"))?;
+        fs::write(root.join("docs/plan.md"), sample_prd_markdown())?;
+        let before = fs::read(project_file::path(&root))?;
+        let wrong_hash = format!("sha256:{}", "f".repeat(64));
+        let args = prd_plan_args(&root, &wrong_hash, true);
+        let error = run_graph_plan_prd(&args).expect_err("parent hash drift must fail");
+        assert!(format!("{error:#}").contains("current project graph hash mismatch"));
+        assert_eq!(fs::read(project_file::path(&root))?, before);
+        assert_eq!(project_file::load(&root)?.graph_hash, parent_hash);
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    fn sample_prd_markdown() -> String {
+        concat!(
+            "1. [x] **INT-001 [SEQ] — Foundation**\n",
+            "   - **Owner:** Lead\n",
+            "   - **Depends on:** none\n",
+            "   - Establish the foundation.\n",
+            "   - **Acceptance:** Foundation is complete.\n",
+            "2. [ ] **INT-002 [PAR-A] — Adapter**\n",
+            "   - **Owner:** Worker\n",
+            "   - **Depends on:** INT-001\n",
+            "   - Build the adapter.\n",
+            "   - **Acceptance:** Adapter is complete.\n",
+            "3. [ ] **INT-003 [SEQ] — Compose**\n",
+            "   - **Owner:** Lead\n",
+            "   - **Depends on:** INT-002\n",
+            "   - Compose the adapter.\n",
+            "   - **Acceptance:** Composition is complete.\n",
+        )
+        .to_owned()
+    }
+
+    fn seed_prd_plan_project(root: &Path) -> Result<(serde_json::Value, String)> {
+        let mut parent = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "prd-plan-parent",
+            "nodes": [{
+                "id": "parent-node",
+                "capability": "code.generate",
+                "instruction": "Parent fixture"
+            }],
+            "edges": []
+        });
+        let parent_hash = fractal_contracts::canonical_sha256(&parent)
+            .map_err(|error| anyhow::anyhow!("hash PRD parent fixture: {error}"))?;
+        parent["graph_hash"] = json!(parent_hash);
+        graph_store::commit_graph(&parent)?;
+        project_file::persist(root, &parent, "PRD plan test")?;
+        Ok((parent, parent_hash))
+    }
+
+    fn prd_plan_args(
+        root: &Path,
+        expected_parent_hash: &str,
+        yes: bool,
+    ) -> crate::cli::GraphPlanPrdArgs {
+        crate::cli::GraphPlanPrdArgs {
+            repo: root.to_owned(),
+            prd: Path::new("docs/plan.md").to_owned(),
+            from: "INT-002".to_owned(),
+            through: "INT-003".to_owned(),
+            expected_parent_hash: expected_parent_hash.to_owned(),
+            yes,
+            json: false,
+        }
+    }
+
     fn temp_root(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
             "fractal-cli-main-{name}-{}-{}",
@@ -1599,6 +2966,61 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn compile_plan_args(root: &Path, yes: bool) -> crate::cli::GraphCompilePlanArgs {
+        crate::cli::GraphCompilePlanArgs {
+            repo: root.to_owned(),
+            plan: Path::new("fractal-plan.json").to_owned(),
+            yes,
+            preserve_execution: false,
+            reopen: Vec::new(),
+            json: false,
+        }
+    }
+
+    fn sample_existing_plan(cyclic: bool) -> String {
+        let implement_dependencies = if cyclic {
+            serde_json::json!(["verify"])
+        } else {
+            serde_json::json!([])
+        };
+        serde_json::json!({
+            "prd": {
+                "schema": "fractal.prd.v1",
+                "title": "Existing plan project",
+                "summary": "Compile an already approved plan.",
+                "architecture": {
+                    "approach": "Use the existing repository architecture.",
+                    "rationale": "The plan was reviewed before compilation.",
+                    "components": [{
+                        "name": "compiler",
+                        "responsibility": "Compile the validated plan",
+                        "technology": "Rust"
+                    }]
+                },
+                "acceptance_criteria": [{
+                    "id": "AC-1",
+                    "criterion": "The existing plan becomes the project graph.",
+                    "verification": "Load the committed canonical project."
+                }],
+                "non_goals": []
+            },
+            "tasks": [{
+                "id": "implement",
+                "title": "Implement",
+                "capability": "code.generate",
+                "instruction": "Implement the approved change.",
+                "depends_on": implement_dependencies
+            }, {
+                "id": "verify",
+                "title": "Verify",
+                "capability": "project.tests.execute",
+                "instruction": "Run the repository test suite.",
+                "depends_on": ["implement"]
+            }]
+        })
+        .to_string()
     }
 
     fn write_empty_inventory(root: &Path) -> std::path::PathBuf {

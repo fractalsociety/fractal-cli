@@ -10,11 +10,33 @@ The project includes a Rust CLI, a local and hosted graph experience, a native
 macOS voice front end, graph lineage receipts, and adapters for Codex, Cursor,
 Claude, and Hermes.
 
+## Canonical graph
+
+Fractal has one graph implementation. The Rust controller owns
+`.fractal/project.fractal` and publishes `fractal.graph_snapshot.v1` at
+`/api/snapshot`; local and hosted boards both render that snapshot with the
+shared `fractal-graph-ui.v1` bundle. The exact Society source commit and asset
+hashes are recorded in
+`execution-graph/fractal-graph-ui.manifest.json`.
+
+Open a graph in manual, read-only mode with:
+
+```sh
+fractal graph board GRAPH_HASH
+```
+
+This does not start the coordinator, launch agents, or claim nodes. The old
+standalone Three.js board and Python-owned graph state are retired and must not
+be used for new work. See `execution-graph/README.md` for the compatibility
+boundary and bundle update procedure.
+
 ## Contents
 
 - [Why Fractal](#why-fractal)
+- [Canonical graph](#canonical-graph)
 - [Quick start](#quick-start)
 - [Multi-agent execution](#multi-agent-execution)
+- [Hybrid isolated-worktree execution](#hybrid-isolated-worktree-execution)
 - [Worker, coordinator, and architect roles](#worker-coordinator-and-architect-roles)
 - [Scale-out provider pool](#scale-out-provider-pool)
 - [Graph inspection and testing](#graph-inspection-and-testing)
@@ -80,10 +102,12 @@ starts workers, verifies completed nodes, and preserves state for resume.
 
 ## Multi-agent execution
 
-Fractal supports two complementary ways to add capacity:
+Fractal supports three complementary ways to add capacity:
 
 1. Human-opened agent terminals join an existing project with one command.
 2. The architect launches bounded six-agent specialist teams automatically.
+3. Hybrid mode launches the local provider roster in isolated Git worktrees
+   and integrates dependency-ready results through Fractal.
 
 For manual terminals, start or verify the coordinator in the project root:
 
@@ -122,6 +146,25 @@ fractal status --running
 fractal pause --project PROJECT_NAME
 ```
 
+### Hybrid isolated-worktree execution
+
+Use hybrid mode when a graph exposes parallel-safe tasks with concrete file
+ownership. Cursor, Codex, Claude, and Hermes workers receive separate detached
+worktrees; Fractal commits only each node's declared
+`files_or_systems_affected` and `expected_artifact`, cherry-picks successful
+results one at a time, and runs trusted verification against the integrated
+branch.
+
+```sh
+export FRACTAL_AGENTS='codex,cursor'
+fractal --offline run --local --hybrid --graph-file path/to/graph.json
+```
+
+Hybrid mode requires an existing commit and a clean tracked workspace. Build
+nodes that make no declared source change fail. Undeclared source changes and
+integration conflicts also fail closed; generated build directories remain in
+the disposable task worktree and are not committed.
+
 ### Worker, coordinator, and architect roles
 
 The worker is deliberately narrow: it receives one structured assignment,
@@ -148,16 +191,9 @@ fractal architect --repo . --once --json
 Launch continuously until stopped or constrained by policy:
 
 ```sh
-fractal architect --repo . --launch --planning-lanes 4
+fractal architect --repo . --launch
 fractal architect --repo . --stop
 ```
-
-The master architect keeps multiple coherent team objectives queued. Specialist
-sub-planners decompose up to `--planning-lanes` objectives concurrently into
-five artifact-disjoint tasks each; graph commits remain serialized and
-hash-chained. The default is four lanes (configurable for the coordinator with
-`FRACTAL_PLANNING_LANES`), and each batch records measured parallel wall time,
-serial-equivalent time, and speedup in `.fractal/planning-metrics.json`.
 
 Use `--max-teams`, `--max-load-per-core`, `--min-free-memory-gib`, and
 `--min-improvement-bps` to tune the envelope. A zero `--max-teams` means there
@@ -165,18 +201,34 @@ is no policy count cap; resource and graph-quality gates still apply.
 
 ### Scale-out provider pool
 
-The in-process executor can opt into a 20–42 slot heterogeneous pool. All four
-providers must be explicit and their binaries must be available on `PATH`:
+The in-process executor can opt into a 20–42 slot heterogeneous pool. The four
+core provider keys must be explicit; providers with nonzero counts must have
+their binaries available on `PATH`:
 
 ```sh
 export FRACTAL_AGENT_POOL='codex=6,cursor=6,claude=6,hermes=6'
 fractal run --local --graph-file path/to/graph.json
 ```
 
+OpenCode is an optional fifth provider. Its default model is
+`zai-coding-plan/glm-5.3`; set `FRACTAL_OPENCODE_MODEL` to override it:
+
+```sh
+export FRACTAL_AGENT_POOL='codex=5,cursor=5,claude=5,hermes=5,opencode=4'
+```
+
+An exhausted provider can be explicitly disabled and replaced without losing
+pool capacity:
+
+```sh
+export FRACTAL_AGENT_POOL='codex=5,cursor=5,claude=0,hermes=5,opencode=9'
+```
+
 The Codex lead planner is separate from those worker slots. Each provider has
 independent capacity, so a slow or failed provider does not stop healthy slots
-from consuming the ready queue. Invalid counts, missing providers, unavailable
-binaries, and totals outside the verified envelope fail closed. See
+from consuming the ready queue. Invalid counts, missing provider keys,
+unavailable nonzero providers, and totals outside the verified envelope fail
+closed. See
 [`docs/heterogeneous-agent-pool.md`](docs/heterogeneous-agent-pool.md) for the
 contract, benchmark, and rollback details.
 
@@ -449,7 +501,7 @@ never interpolated into a command line.
 ### ChatGPT Desktop and other external apps
 
 Sandboxed desktop apps can start the same managed build without using Fractal's
-interactive trust flow or the deprecated local bridge:
+interactive trust flow or any local bridge:
 
 ```sh
 fractal handoff --name 'Hello World' <<'FRACTAL_REQUEST'
@@ -466,4 +518,4 @@ is never placed in a URL or shell argument.
 
 ## License
 
-Fractal CLI is available under the [MIT License](LICENSE).
+Fractal CLI is licensed under the [MIT License](LICENSE).

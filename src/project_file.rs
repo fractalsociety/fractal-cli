@@ -34,6 +34,11 @@ pub(crate) struct FractalProject {
     /// `graph_hash`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) failure_graph: Option<crate::failure_graph::FailureGraph>,
+    /// Additive external-review approval/revocation audit. This field is
+    /// deliberately outside the immutable execution graph and never changes
+    /// graph_hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) external_gate_ledger: Option<crate::external_gates::ExternalGateLedger>,
     pub(crate) updated_at: String,
     #[serde(default, flatten)]
     pub(crate) extra: BTreeMap<String, Value>,
@@ -198,6 +203,445 @@ pub(crate) fn path(workspace: &Path) -> PathBuf {
     workspace.join(".fractal").join("project.fractal")
 }
 
+/// Exact, deterministic effect of replacing a halted project's execution
+/// graph. The preview is also the optimistic-concurrency token used by apply.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct GraphMigrationReport {
+    pub(crate) old_graph_hash: String,
+    pub(crate) new_graph_hash: String,
+    pub(crate) preserved: Vec<String>,
+    pub(crate) reopened: Vec<String>,
+    pub(crate) removed: Vec<String>,
+}
+
+/// Compute a fail-closed migration without writing. Only completed assignments
+/// with an unchanged semantic node projection enter the initial preserve set;
+/// the fixed-point pass then removes nodes whose new dependencies are not also
+/// preserved.
+pub(crate) fn preview_halted_graph_migration(
+    workspace: &Path,
+    graph: &Value,
+    forced_reopen: &BTreeSet<String>,
+) -> Result<GraphMigrationReport> {
+    let current = load(workspace).context("preserve-execution requires an existing project")?;
+    plan_halted_graph_migration(&current, graph, forced_reopen)
+}
+
+/// Atomically replace the canonical project with the migration preview, after
+/// rechecking it under the project lock. Immutable graph-store writes may occur
+/// before this call, but canonical project state is never partially updated.
+pub(crate) fn apply_halted_graph_migration(
+    workspace: &Path,
+    graph: &Value,
+    forced_reopen: &BTreeSet<String>,
+    expected: &GraphMigrationReport,
+) -> Result<PathBuf> {
+    let _guard = project_file_lock();
+    let _file_guard = ProjectWriteGuard::acquire(workspace)?;
+    let mut current = load(workspace)?;
+    let actual = plan_halted_graph_migration(&current, graph, forced_reopen)?;
+    if &actual != expected {
+        bail!(
+            "halted graph migration preview is stale: expected {} -> {}, found {} -> {}",
+            expected.old_graph_hash,
+            expected.new_graph_hash,
+            actual.old_graph_hash,
+            actual.new_graph_hash
+        );
+    }
+
+    let now = monotonic_timestamp(&current, timestamp());
+    let old_learning = current.learning.clone();
+    let old_assignments = current
+        .execution
+        .as_ref()
+        .map(|execution| execution.assignments.clone())
+        .unwrap_or_default();
+    let mut learning = learning_from_graph(graph, &now);
+    learning.graph_edits = old_learning.graph_edits.clone();
+    learning.extra = old_learning.extra.clone();
+
+    for node in &actual.preserved {
+        if let (Some(previous), Some(fresh)) =
+            (old_learning.nodes.get(node), learning.nodes.get_mut(node))
+        {
+            let dependencies = fresh.depends_on.clone();
+            *fresh = previous.clone();
+            fresh.depends_on = dependencies;
+        }
+    }
+    for node in &actual.reopened {
+        if let (Some(previous), Some(fresh)) =
+            (old_learning.nodes.get(node), learning.nodes.get_mut(node))
+        {
+            fresh.attempt_count = previous.attempt_count;
+            fresh.reopen_count = previous.reopen_count.saturating_add(1);
+        }
+    }
+    append_bounded_migration_history(&mut learning, &old_learning, &actual, &now)?;
+    learning.outcome = None;
+
+    let mut assignments = BTreeMap::new();
+    for node in &actual.preserved {
+        if let Some(assignment) = old_assignments.get(node) {
+            assignments.insert(node.clone(), assignment.clone());
+        }
+    }
+    for node in &actual.reopened {
+        if let Some(previous) = old_assignments.get(node) {
+            let mut released = previous.clone();
+            released.state = "released".to_owned();
+            released.completed_at = None;
+            released.released_at = Some(now.clone());
+            assignments.insert(node.clone(), released);
+        }
+    }
+
+    let execution_extra = current
+        .execution
+        .as_ref()
+        .map(|execution| execution.extra.clone())
+        .unwrap_or_default();
+    current.graph_hash = actual.new_graph_hash.clone();
+    current.graph = graph.clone();
+    current.execution = Some(ExecutionState {
+        schema: "fractal.execution_state.v1".to_owned(),
+        phase: "halted".to_owned(),
+        assignments,
+        progress: None,
+        updated_at: now.clone(),
+        extra: execution_extra,
+    });
+    current.learning = learning;
+    current.updated_at = now;
+    write_document(workspace, &current)?;
+    Ok(path(workspace))
+}
+
+fn plan_halted_graph_migration(
+    current: &FractalProject,
+    graph: &Value,
+    forced_reopen: &BTreeSet<String>,
+) -> Result<GraphMigrationReport> {
+    let phase = current
+        .execution
+        .as_ref()
+        .map(|execution| execution.phase.as_str())
+        .unwrap_or("<missing>");
+    if phase != "halted" {
+        bail!("preserve-execution requires a halted project; current phase is `{phase}`");
+    }
+    validate_migration_history(&current.learning.extra)?;
+    crate::graph_store::verify_graph_document(graph)
+        .context("refuse to migrate to an execution graph with an invalid hash")?;
+    reject_secret_fields(graph)?;
+    let new_graph_hash = graph
+        .get("graph_hash")
+        .and_then(Value::as_str)
+        .context("replacement execution graph is missing graph_hash")?
+        .to_owned();
+    let old_nodes = graph_nodes_by_id(&current.graph)?;
+    let new_nodes = graph_nodes_by_id(graph)?;
+    for node in forced_reopen {
+        if node.trim().is_empty() || !new_nodes.contains_key(node) {
+            bail!("--reopen references unknown replacement graph node `{node}`");
+        }
+    }
+
+    let completed = current
+        .execution
+        .as_ref()
+        .map(|execution| {
+            execution
+                .assignments
+                .iter()
+                .filter_map(|(node, assignment)| {
+                    (assignment.state == "completed").then_some(node.clone())
+                })
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut preserved = BTreeSet::new();
+    for (id, new_node) in &new_nodes {
+        let Some(old_node) = old_nodes.get(id) else {
+            continue;
+        };
+        if completed.contains(id)
+            && !forced_reopen.contains(id)
+            && semantic_node_migration_compatible(old_node, new_node)
+        {
+            preserved.insert(id.clone());
+        }
+    }
+
+    let dependencies = graph_dependencies(graph, new_nodes.keys().cloned().collect())?;
+    loop {
+        let invalid = preserved
+            .iter()
+            .filter(|node| {
+                dependencies
+                    .get(*node)
+                    .is_some_and(|values| values.iter().any(|dep| !preserved.contains(dep)))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if invalid.is_empty() {
+            break;
+        }
+        for node in invalid {
+            preserved.remove(&node);
+        }
+    }
+
+    let new_ids = new_nodes.keys().cloned().collect::<BTreeSet<_>>();
+    let old_ids = old_nodes.keys().cloned().collect::<BTreeSet<_>>();
+    Ok(GraphMigrationReport {
+        old_graph_hash: current.graph_hash.clone(),
+        new_graph_hash,
+        preserved: preserved.iter().cloned().collect(),
+        reopened: new_ids.difference(&preserved).cloned().collect(),
+        removed: old_ids.difference(&new_ids).cloned().collect(),
+    })
+}
+
+fn graph_nodes_by_id(graph: &Value) -> Result<BTreeMap<String, Value>> {
+    let nodes = graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .context("execution graph nodes must be an array")?;
+    let mut indexed = BTreeMap::new();
+    for node in nodes {
+        let id = node
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .context("execution graph node is missing id")?;
+        if indexed.insert(id.to_owned(), node.clone()).is_some() {
+            bail!("execution graph contains duplicate node `{id}`");
+        }
+    }
+    Ok(indexed)
+}
+
+fn graph_dependencies(
+    graph: &Value,
+    node_ids: BTreeSet<String>,
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut dependencies = node_ids
+        .iter()
+        .map(|id| (id.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    for edge in graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .context("execution graph edges must be an array")?
+    {
+        let from = edge
+            .get("from")
+            .and_then(Value::as_str)
+            .context("execution graph edge is missing from")?;
+        let to = edge
+            .get("to")
+            .and_then(Value::as_str)
+            .context("execution graph edge is missing to")?;
+        if !node_ids.contains(from) || !node_ids.contains(to) {
+            bail!("execution graph edge `{from}` -> `{to}` references an unknown node");
+        }
+        dependencies
+            .get_mut(to)
+            .expect("known dependency target")
+            .insert(from.to_owned());
+    }
+    Ok(dependencies)
+}
+
+fn semantic_node_projection(node: &Value) -> Value {
+    let mut projected = node.clone();
+    if let Some(object) = projected.as_object_mut() {
+        for field in [
+            "execution",
+            "depends_on",
+            "preconditions",
+            "created_at",
+            "ready_at",
+            "started_at",
+            "finished_at",
+            "attempt_count",
+            "artifacts_produced",
+            "consumed_by",
+            "human_intervention",
+            "outcome",
+            "failure_code",
+            "verification",
+            "actual_cost",
+            "notes",
+            "reopen_count",
+        ] {
+            object.remove(field);
+        }
+        if let Some(efficiency) = object.get_mut("efficiency").and_then(Value::as_object_mut) {
+            efficiency.remove("dependencies");
+        }
+    }
+    projected
+}
+
+/// Completed work performed under a stricter budget remains valid when the
+/// replacement graph changes only policy provenance and raises those numeric
+/// ceilings. Every non-budget authorization field must remain byte-for-byte
+/// identical; a tighter budget or any authority change reopens the node.
+fn semantic_node_migration_compatible(old_node: &Value, new_node: &Value) -> bool {
+    let mut old = semantic_node_projection(old_node);
+    let mut new = semantic_node_projection(new_node);
+    let old_budget = old
+        .as_object_mut()
+        .and_then(|object| object.remove("budget"));
+    let new_budget = new
+        .as_object_mut()
+        .and_then(|object| object.remove("budget"));
+    let old_policy = detach_node_policy(&mut old);
+    let new_policy = detach_node_policy(&mut new);
+    old == new
+        && node_budget_is_equal_or_relaxed(old_budget.as_ref(), new_budget.as_ref())
+        && policy_contract_is_equal_or_relaxed(old_policy.as_ref(), new_policy.as_ref())
+}
+
+fn node_budget_is_equal_or_relaxed(old: Option<&Value>, new: Option<&Value>) -> bool {
+    if old == new {
+        return true;
+    }
+    let (Some(mut old), Some(mut new)) = (old.cloned(), new.cloned()) else {
+        return false;
+    };
+    let (Some(old_object), Some(new_object)) = (old.as_object_mut(), new.as_object_mut()) else {
+        return false;
+    };
+    let (Some(old_timeout), Some(new_timeout)) = (
+        old_object.remove("timeout_ms"),
+        new_object.remove("timeout_ms"),
+    ) else {
+        return false;
+    };
+    old == new
+        && old_timeout
+            .as_u64()
+            .zip(new_timeout.as_u64())
+            .is_some_and(|(old_timeout, new_timeout)| new_timeout >= old_timeout)
+}
+
+fn detach_node_policy(node: &mut Value) -> Option<Value> {
+    let object = node.as_object_mut()?;
+    object.remove("policy_hash");
+    object.remove("policy_provenance");
+    object.remove("policy_contract")
+}
+
+fn policy_contract_is_equal_or_relaxed(old: Option<&Value>, new: Option<&Value>) -> bool {
+    if old == new {
+        return true;
+    }
+    let (Some(mut old), Some(mut new)) = (old.cloned(), new.cloned()) else {
+        return false;
+    };
+    let (Some(old_object), Some(new_object)) = (old.as_object_mut(), new.as_object_mut()) else {
+        return false;
+    };
+    for field in ["policy_hash", "provenance"] {
+        old_object.remove(field);
+        new_object.remove(field);
+    }
+    let (Some(old_budgets), Some(new_budgets)) =
+        (old_object.remove("budgets"), new_object.remove("budgets"))
+    else {
+        return false;
+    };
+    if old != new {
+        return false;
+    }
+    let (Some(old_budgets), Some(new_budgets)) = (old_budgets.as_object(), new_budgets.as_object())
+    else {
+        return false;
+    };
+    old_budgets.len() == new_budgets.len()
+        && old_budgets.iter().all(|(name, old_value)| {
+            let Some(old_value) = old_value.as_u64() else {
+                return false;
+            };
+            new_budgets
+                .get(name)
+                .and_then(Value::as_u64)
+                .is_some_and(|new_value| new_value >= old_value)
+        })
+}
+
+fn append_bounded_migration_history(
+    learning: &mut crate::learning_data::LearningData,
+    old_learning: &crate::learning_data::LearningData,
+    report: &GraphMigrationReport,
+    now: &str,
+) -> Result<()> {
+    const MAX_MIGRATIONS: usize = 16;
+    const MAX_RETIRED_NODES: usize = 128;
+    let retired_nodes = report
+        .removed
+        .iter()
+        .take(MAX_RETIRED_NODES)
+        .map(|id| {
+            let record = old_learning.nodes.get(id);
+            serde_json::json!({
+                "node_id": id,
+                "outcome": record.and_then(|record| record.outcome),
+                "failure_code": record.and_then(|record| record.failure_code),
+                "attempt_count": record.map_or(0, |record| record.attempt_count),
+                "finished_at": record.and_then(|record| record.finished_at.as_deref()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let entry = serde_json::json!({
+        "old_graph_hash": report.old_graph_hash,
+        "new_graph_hash": report.new_graph_hash,
+        "migrated_at": now,
+        "preserved": report.preserved,
+        "reopened": report.reopened,
+        "removed": report.removed,
+        "retired_nodes": retired_nodes,
+    });
+    let history = learning
+        .extra
+        .entry("plan_migrations".to_owned())
+        .or_insert_with(|| {
+            serde_json::json!({
+                "schema": "fractal.plan_migrations.v1",
+                "records": []
+            })
+        });
+    if history.get("schema").and_then(Value::as_str) != Some("fractal.plan_migrations.v1") {
+        bail!("existing plan_migrations history has an unsupported schema");
+    }
+    let records = history
+        .get_mut("records")
+        .and_then(Value::as_array_mut)
+        .context("existing plan_migrations history records must be an array")?;
+    records.push(entry);
+    if records.len() > MAX_MIGRATIONS {
+        records.drain(0..records.len() - MAX_MIGRATIONS);
+    }
+    Ok(())
+}
+
+fn validate_migration_history(extra: &BTreeMap<String, Value>) -> Result<()> {
+    let Some(history) = extra.get("plan_migrations") else {
+        return Ok(());
+    };
+    if history.get("schema").and_then(Value::as_str) != Some("fractal.plan_migrations.v1") {
+        bail!("existing plan_migrations history has an unsupported schema");
+    }
+    if !history.get("records").is_some_and(Value::is_array) {
+        bail!("existing plan_migrations history records must be an array");
+    }
+    Ok(())
+}
+
 /// Pin the user-confirmed name for a managed voice project. Every later
 /// planning/execution persist reads this record, so lead request text cannot
 /// replace the dashboard title or hosted URL slug.
@@ -219,6 +663,43 @@ pub(crate) fn configure_managed_identity(workspace: &Path, name: &str, prompt: &
 pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<PathBuf> {
     let _guard = project_file_lock();
     let _file_guard = ProjectWriteGuard::acquire(workspace)?;
+    persist_locked(workspace, graph, title, None)
+}
+
+/// Persist an evolved graph only when the project still points at the expected
+/// parent. The parent check and document write happen under the same in-process
+/// and canonical project-file locks, so a newer writer cannot slip between the
+/// check and the replacement.
+pub(crate) fn persist_evolved_if_parent(
+    workspace: &Path,
+    graph: &Value,
+    expected_parent_hash: &str,
+) -> Result<PathBuf> {
+    let _guard = project_file_lock();
+    let _file_guard = ProjectWriteGuard::acquire(workspace)?;
+    let expected_parent_hash = expected_parent_hash.trim();
+    let current = load(workspace)?;
+    if current.graph_hash != expected_parent_hash {
+        bail!(
+            "current project graph hash mismatch: expected {expected_parent_hash}, found {}",
+            current.graph_hash
+        );
+    }
+    let graph_parent = graph.get("parent_graph").and_then(Value::as_str);
+    if graph_parent != Some(expected_parent_hash) {
+        let found = graph_parent.unwrap_or("<missing>");
+        bail!("evolved graph parent hash mismatch: expected {expected_parent_hash}, found {found}");
+    }
+    let title = current.project.title.clone();
+    persist_locked(workspace, graph, &title, Some(current))
+}
+
+fn persist_locked(
+    workspace: &Path,
+    graph: &Value,
+    title: &str,
+    current: Option<FractalProject>,
+) -> Result<PathBuf> {
     let graph_hash = graph
         .get("graph_hash")
         .and_then(Value::as_str)
@@ -243,7 +724,7 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
         .and_then(|identity| identity.prompt.clone())
         .unwrap_or_else(|| title.clone());
     let now = timestamp();
-    let current = load(workspace).ok();
+    let current = current.or_else(|| load(workspace).ok());
     let execution = current
         .as_ref()
         .filter(|current| current.graph_hash == graph_hash)
@@ -268,9 +749,12 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
                 extra: BTreeMap::new(),
             })
         });
+    let same_graph = current
+        .as_ref()
+        .is_some_and(|document| document.graph_hash == graph_hash);
     let mut learning = current
         .as_ref()
-        .map(|document| merge_learning(&document.learning, graph, &now))
+        .map(|document| merge_learning(&document.learning, graph, &now, same_graph))
         .unwrap_or_else(|| learning_from_graph(graph, &now));
     if let Some(criteria) = load_acceptance_criteria(workspace) {
         learning.extra.insert(
@@ -288,7 +772,7 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
                 &config.config_hash(),
             ))
         });
-    let document = FractalProject {
+    let mut document = FractalProject {
         schema: "fractal.project.v1".to_owned(),
         project: ProjectIdentity {
             slug,
@@ -311,12 +795,20 @@ pub(crate) fn persist(workspace: &Path, graph: &Value, title: &str) -> Result<Pa
         failure_graph: current
             .as_ref()
             .and_then(|document| document.failure_graph.clone()),
+        external_gate_ledger: current
+            .as_ref()
+            .and_then(|document| document.external_gate_ledger.clone()),
         updated_at: now,
         extra: current
             .as_ref()
             .map(|document| document.extra.clone())
             .unwrap_or_default(),
     };
+    // A verifier may have completed before a coordinator persisted the next
+    // lifecycle snapshot. Reconcile those durable records before deciding
+    // whether this graph is terminal so old verifier completions participate
+    // in the next aggregate without replaying the node.
+    refresh_terminal_outcome(&mut document);
     let destination = path(workspace);
     let directory = destination.parent().expect("project file has parent");
     fs::create_dir_all(directory).with_context(|| format!("create {}", directory.display()))?;
@@ -385,7 +877,7 @@ pub(crate) fn checkout_start_node(
     agent_label: &str,
 ) -> Result<()> {
     mutate_execution_document(workspace, |document, now| {
-        checkout_start_node_in_document(document, node, agent_id, agent_label, now)
+        checkout_start_node_in_document(workspace, document, node, agent_id, agent_label, now)
     })
 }
 
@@ -413,6 +905,23 @@ pub(crate) fn release_node(
 ) -> Result<()> {
     mutate_execution_document(workspace, |document, now| {
         release_node_in_document(document, node, agent_id, failure, now)
+    })
+}
+
+pub(crate) fn record_integration_failure(
+    workspace: &Path,
+    node: &str,
+    detail: crate::learning_data::IntegrationFailureDetail,
+) -> Result<()> {
+    mutate_execution_document(workspace, |document, _now| {
+        ensure_known_node(document, node)?;
+        let record = document
+            .learning
+            .nodes
+            .get_mut(node)
+            .context("learning node missing")?;
+        record.integration_failure = Some(detail);
+        Ok(())
     })
 }
 
@@ -641,6 +1150,7 @@ fn execution_state<'a>(document: &'a mut FractalProject, now: &str) -> &'a mut E
 
 #[allow(dead_code)]
 fn checkout_start_node_in_document(
+    workspace: &Path,
     document: &mut FractalProject,
     node: &str,
     agent_id: &str,
@@ -648,6 +1158,7 @@ fn checkout_start_node_in_document(
     now: &str,
 ) -> Result<()> {
     ensure_known_node(document, node)?;
+    crate::external_gates::enforce_checkout(workspace, document, node, agent_id)?;
     let blocked = dependency_blockers(document, node);
     if !blocked.is_empty() {
         bail!(
@@ -755,6 +1266,7 @@ fn finish_node_in_document(
     if let Some(record) = document.learning.nodes.get_mut(node) {
         record.finished_at = Some(now.to_owned());
         record.outcome = Some(outcome);
+        record.integration_failure = None;
     }
     complete_graph_if_terminal(document);
     Ok(())
@@ -813,6 +1325,7 @@ fn release_node_in_document(
             record.finished_at = Some(now.to_owned());
             record.outcome = Some(outcome);
             record.failure_code = Some(failure_code);
+            record.integration_failure = None;
             if outcome == crate::learning_data::NodeOutcome::FailedVerification {
                 record.verification = Some(crate::learning_data::Verification {
                     kind: Some("automated".to_owned()),
@@ -874,11 +1387,253 @@ fn complete_graph_if_terminal(document: &mut FractalProject) {
     refresh_terminal_outcome(document);
 }
 
+/// Reconcile successful verification records to their one intended
+/// implementation target. The relation is deliberately conservative: an
+/// explicit `verifies`/target field wins, otherwise graph incoming topology
+/// must identify exactly one implementation predecessor. Ambiguous, missing,
+/// malformed, or non-implementation targets are ignored (fail closed).
+fn reconcile_successful_verifications(document: &mut FractalProject) {
+    let verifier_ids = document
+        .learning
+        .nodes
+        .iter()
+        .filter(|(id, record)| {
+            is_verification_graph_node(document, id)
+                && record.outcome == Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+                && record.verification.as_ref().and_then(|v| v.passed) == Some(true)
+        })
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+
+    for verifier_id in verifier_ids {
+        let Some(target_id) = verification_target(document, &verifier_id) else {
+            continue;
+        };
+        if !is_implementation_graph_node(document, &target_id) {
+            continue;
+        }
+        let Some(verifier) = document.learning.nodes.get(&verifier_id) else {
+            continue;
+        };
+        let Some(verifier_check) = verifier.verification.as_ref() else {
+            continue;
+        };
+        let evidence_refs = verifier_check.evidence_refs.clone();
+        let verifier_finished_at = verifier.finished_at.clone();
+        let fallback_finished_at = document.updated_at.clone();
+        let Some(target) = document.learning.nodes.get_mut(&target_id) else {
+            continue;
+        };
+
+        // A successful automated verifier adds verification evidence, but it
+        // must not erase a stronger explicit human decision or a superseded
+        // lifecycle state already recorded for the implementation target.
+        let upgrade_outcome = !matches!(
+            target.outcome,
+            Some(crate::learning_data::NodeOutcome::HumanCompleted)
+                | Some(crate::learning_data::NodeOutcome::Superseded)
+        );
+        if upgrade_outcome {
+            target.outcome = Some(crate::learning_data::NodeOutcome::VerifiedSuccess);
+            target.failure_code = None;
+        }
+        if target.finished_at.is_none() {
+            target.finished_at = verifier_finished_at
+                .or(Some(fallback_finished_at))
+                .or_else(|| Some(timestamp()));
+        }
+        let mut verification = target.verification.take().unwrap_or_default();
+        verification.kind = Some("automated".to_owned());
+        verification.passed = Some(true);
+        verification.evidence_refs = evidence_refs;
+        target.verification = Some(verification);
+    }
+}
+
+/// Resolve a verifier's target from an explicit relation or a uniquely
+/// identifying incoming graph dependency. The boolean distinguishes an
+/// explicitly declared but malformed/ambiguous relation from an absent one so
+/// malformed declarations cannot silently fall back to guessed topology.
+fn verification_target(document: &FractalProject, verifier_id: &str) -> Option<String> {
+    let verifier = graph_node(document, verifier_id)?;
+    let (explicit, target) = explicit_verification_target(verifier);
+    if explicit {
+        return target.filter(|target| is_implementation_graph_node(document, target));
+    }
+
+    let mut dependencies = BTreeSet::new();
+    let mut saw_graph_edge = false;
+    if let Some(edges) = document.graph.get("edges").and_then(Value::as_array) {
+        for edge in edges {
+            if edge.get("to").and_then(Value::as_str) != Some(verifier_id) {
+                continue;
+            }
+            saw_graph_edge = true;
+            if edge.get("condition").and_then(Value::as_str) == Some("failure") {
+                continue;
+            }
+            if let Some(from) = edge.get("from").and_then(Value::as_str) {
+                dependencies.insert(from.to_owned());
+            }
+        }
+    }
+    if let Some(values) = verifier.get("depends_on").and_then(Value::as_array) {
+        dependencies.extend(values.iter().filter_map(Value::as_str).map(str::to_owned));
+    }
+    if dependencies.is_empty() && !saw_graph_edge {
+        dependencies.extend(
+            document
+                .learning
+                .nodes
+                .get(verifier_id)
+                .into_iter()
+                .flat_map(|record| record.depends_on.iter().cloned()),
+        );
+    }
+    // A dangling dependency makes the relation untrustworthy even if another
+    // dependency happens to look like an implementation.
+    if dependencies
+        .iter()
+        .any(|dependency| graph_node(document, dependency).is_none())
+    {
+        return None;
+    }
+    let implementations = dependencies
+        .iter()
+        .filter(|dependency| is_implementation_graph_node(document, dependency))
+        .cloned()
+        .collect::<Vec<_>>();
+    (implementations.len() == 1).then(|| implementations[0].clone())
+}
+
+fn graph_node<'a>(document: &'a FractalProject, id: &str) -> Option<&'a Value> {
+    document
+        .graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|node| node.get("id").and_then(Value::as_str) == Some(id))
+}
+
+fn is_verification_graph_node(document: &FractalProject, id: &str) -> bool {
+    let record_type = document
+        .learning
+        .nodes
+        .get(id)
+        .map(|record| record.node_type.as_str());
+    if record_type == Some("verification") {
+        return true;
+    }
+    let Some(node) = graph_node(document, id) else {
+        return false;
+    };
+    node.get("node_type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "verification")
+        || node
+            .get("capability")
+            .and_then(Value::as_str)
+            .is_some_and(|capability| {
+                capability.starts_with("project.tests")
+                    || capability.starts_with("python.tests")
+                    || capability.contains("verify")
+                    || capability.contains("test")
+            })
+}
+
+fn is_implementation_graph_node(document: &FractalProject, id: &str) -> bool {
+    let record_type = document
+        .learning
+        .nodes
+        .get(id)
+        .map(|record| record.node_type.as_str());
+    if record_type == Some("control") || record_type == Some("verification") {
+        return false;
+    }
+    let Some(node) = graph_node(document, id) else {
+        return false;
+    };
+    if node.get("node_type").and_then(Value::as_str) == Some("control")
+        || node.get("node_type").and_then(Value::as_str) == Some("verification")
+    {
+        return false;
+    }
+    !is_verification_graph_node(document, id)
+}
+
+fn explicit_verification_target(node: &Value) -> (bool, Option<String>) {
+    const KEYS: [&str; 8] = [
+        "verifies",
+        "verifies_node_ids",
+        "verifies_node_id",
+        "verifies_node",
+        "verification_target",
+        "target_implementation",
+        "target_node",
+        "target",
+    ];
+    let mut saw_declaration = false;
+    let mut malformed_declaration = false;
+    let mut candidates = BTreeSet::new();
+    let mut inspect = |container: &Value| {
+        let Some(object) = container.as_object() else {
+            return;
+        };
+        for key in KEYS {
+            let Some(value) = object.get(key) else {
+                continue;
+            };
+            saw_declaration = true;
+            let Some(values) = relation_values(value) else {
+                malformed_declaration = true;
+                continue;
+            };
+            candidates.extend(values);
+        }
+    };
+    inspect(node);
+    for key in ["verification", "efficiency", "execution"] {
+        if let Some(value) = node.get(key) {
+            inspect(value);
+        }
+    }
+    if !saw_declaration || malformed_declaration || candidates.len() != 1 {
+        (saw_declaration, None)
+    } else {
+        (true, candidates.into_iter().next())
+    }
+}
+
+fn relation_values(value: &Value) -> Option<Vec<String>> {
+    if let Some(id) = value.as_str() {
+        return (!id.trim().is_empty()).then(|| vec![id.to_owned()]);
+    }
+    if let Some(values) = value.as_array() {
+        let mut ids = Vec::with_capacity(values.len());
+        for value in values {
+            ids.push(value.as_str()?.to_owned());
+        }
+        return Some(ids);
+    }
+    value.as_object().and_then(|object| {
+        ["node_id", "target_node", "id"]
+            .into_iter()
+            .find_map(|key| object.get(key).and_then(Value::as_str))
+            .map(|id| vec![id.to_owned()])
+    })
+}
+
 /// Recompute the graph-level outcome whenever a terminal state is observed.
 /// Replacing the prior value is intentional: event eventual effects and late
 /// lifecycle facts may arrive after the first terminal write, and aggregation
 /// reads only source records so it cannot double-count a refresh.
 fn refresh_terminal_outcome(document: &mut FractalProject) {
+    // Reconcile every durable successful verifier, not just the verifier that
+    // triggered this write. This makes the lifecycle seam self-healing for
+    // records written by an older binary before verifier→implementation
+    // propagation existed.
+    reconcile_successful_verifications(document);
     let Some(execution) = document.execution.as_ref() else {
         return;
     };
@@ -1054,6 +1809,13 @@ pub(crate) fn transition(
         bail!("execution transition references unknown graph node `{node}`");
     }
     let now = timestamp();
+    let is_verifier_node = is_verification_graph_node(&document, node);
+    if action == "checkout" {
+        // This is the final TOCTOU authority. Scheduler/frontier filters are
+        // advisory; verify the gate ledger while the canonical project lock is
+        // held immediately before ownership is written.
+        crate::external_gates::enforce_checkout(workspace, &document, node, agent_id)?;
+    }
     let execution = document.execution.get_or_insert_with(|| ExecutionState {
         schema: "fractal.execution_state.v1".to_owned(),
         phase: "executing".to_owned(),
@@ -1172,18 +1934,22 @@ pub(crate) fn transition(
                 },
             );
             if let Some(record) = document.learning.nodes.get_mut(node) {
-                let is_verifier = record.node_type == "verification";
+                let existing_evidence = record
+                    .verification
+                    .as_ref()
+                    .map(|verification| verification.evidence_refs.clone())
+                    .unwrap_or_default();
                 record.finished_at = Some(now.clone());
-                record.outcome = Some(if is_verifier {
+                record.outcome = Some(if is_verifier_node {
                     crate::learning_data::NodeOutcome::VerifiedSuccess
                 } else {
                     crate::learning_data::NodeOutcome::UnverifiedSuccess
                 });
-                if is_verifier {
+                if is_verifier_node {
                     record.verification = Some(crate::learning_data::Verification {
                         kind: Some("automated".to_owned()),
                         passed: Some(true),
-                        evidence_refs: Vec::new(),
+                        evidence_refs: existing_evidence,
                         ..crate::learning_data::Verification::default()
                     });
                 }
@@ -1568,6 +2334,14 @@ fn validate(document: &FractalProject) -> Result<()> {
         crate::failure_graph::validate_unknown_fields(failure_graph)
             .context("failure graph unknown fields contain forbidden credentials")?;
     }
+    if let Some(ledger) = &document.external_gate_ledger {
+        crate::external_gates::validate_ledger(ledger)
+            .context("invalid fractal.external_gate_ledger.v1 document")?;
+        let encoded =
+            serde_json::to_value(ledger).context("encode fractal.external_gate_ledger.v1")?;
+        reject_secret_fields(&encoded)
+            .context("external gate ledger contains forbidden credential-shaped fields")?;
+    }
     if let Some(catalog) = document.extra.get("catalog") {
         let schema = catalog.get("schema").and_then(Value::as_str).unwrap_or("");
         if schema == project_catalog::CATALOG_SCHEMA {
@@ -1632,6 +2406,7 @@ fn merge_learning(
     current: &crate::learning_data::LearningData,
     graph: &Value,
     now: &str,
+    same_graph: bool,
 ) -> crate::learning_data::LearningData {
     let mut merged = learning_from_graph(graph, now);
     for (id, record) in &mut merged.nodes {
@@ -1642,7 +2417,11 @@ fn merge_learning(
         }
     }
     merged.graph_edits = current.graph_edits.clone();
-    merged.outcome = current.outcome.clone();
+    // Graph outcomes summarize one immutable graph. Carrying a terminal
+    // parent's result into an evolved child makes a nonterminal graph appear
+    // complete. A same-graph rewrite may retain it; a changed graph starts
+    // without an outcome and is recomputed only after terminal assignments.
+    merged.outcome = same_graph.then(|| current.outcome.clone()).flatten();
     merged.extra = current.extra.clone();
     merged
 }
@@ -2402,7 +3181,7 @@ mod tests {
 
         let parent_hash = parent["graph_hash"].as_str().unwrap().to_owned();
         let mut child = parent.clone();
-        child["parent_graph"] = Value::String(parent_hash);
+        child["parent_graph"] = Value::String(parent_hash.clone());
         child["nodes"].as_array_mut().unwrap().push(json!({
             "id": "verify.build.harness",
             "capability": "project.tests.execute",
@@ -2418,7 +3197,7 @@ mod tests {
                 .map_err(|error| anyhow::anyhow!("hash fixture: {error}"))?,
         );
 
-        persist_evolved(&workspace, &child)?;
+        persist_evolved_if_parent(&workspace, &child, &parent_hash)?;
         let document = load(&workspace)?;
         crate::graph_store::verify_graph_document(&document.graph)?;
         assert_eq!(document.graph_hash, child["graph_hash"]);
@@ -2426,6 +3205,57 @@ mod tests {
         assert_eq!(execution.phase, "executing");
         assert_eq!(execution.assignments["build"].state, "completed");
         assert!(!execution.assignments.contains_key("verify.build.harness"));
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn evolved_parent_guard_rejects_stale_writer_without_overwrite() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut parent = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_parent_guard",
+            "nodes": [{"id": "build", "capability": "code.generate", "instruction": "Build"}],
+            "edges": []
+        });
+        parent["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&parent)?);
+        persist(&workspace, &parent, "Build")?;
+        let parent_hash = parent["graph_hash"].as_str().unwrap().to_owned();
+
+        let mut first_child = parent.clone();
+        first_child["parent_graph"] = Value::String(parent_hash.clone());
+        first_child["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id": "verify-first", "capability": "project.tests.execute", "instruction": "Verify first"}));
+        first_child.as_object_mut().unwrap().remove("graph_hash");
+        first_child["graph_hash"] =
+            Value::String(fractal_contracts::canonical_sha256(&first_child)?);
+
+        // A newer writer wins before this stale writer reaches the guarded
+        // boundary. The stale child must not replace that newer graph.
+        let workspace_for_writer = workspace.clone();
+        let first_child_for_writer = first_child.clone();
+        let parent_hash_for_writer = parent_hash.clone();
+        let writer = std::thread::spawn(move || {
+            persist_evolved_if_parent(
+                &workspace_for_writer,
+                &first_child_for_writer,
+                &parent_hash_for_writer,
+            )
+        });
+        writer.join().expect("newer writer thread must not panic")?;
+        let before = fs::read(path(&workspace))?;
+
+        let error = persist_evolved_if_parent(&workspace, &first_child, &parent_hash)
+            .expect_err("stale parent must be rejected atomically");
+        assert!(error
+            .to_string()
+            .contains("current project graph hash mismatch"));
+        assert_eq!(fs::read(path(&workspace))?, before);
+        assert_eq!(load(&workspace)?.graph_hash, first_child["graph_hash"]);
+
         fs::remove_dir_all(workspace)?;
         Ok(())
     }
@@ -2835,6 +3665,394 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn evolved_nonterminal_child_discards_parent_graph_outcome() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut parent = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_terminal_parent",
+            "nodes": [
+                {"id": "build", "capability": "code.generate", "instruction": "Build"},
+                {"id": "verify.build", "capability": "project.tests.execute", "instruction": "Verify", "verifies": ["build"]}
+            ],
+            "edges": [{"from": "build", "to": "verify.build", "condition": "success"}]
+        });
+        parent["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&parent)?);
+        persist(&workspace, &parent, "Terminal parent")?;
+        transition(&workspace, "build", "checkout", "worker", "Worker")?;
+        transition(&workspace, "build", "complete", "worker", "Worker")?;
+        transition(&workspace, "verify.build", "checkout", "worker", "Worker")?;
+        transition(&workspace, "verify.build", "complete", "worker", "Worker")?;
+        let parent_document = load(&workspace)?;
+        assert_eq!(
+            parent_document
+                .learning
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.final_verified_success),
+            Some(true)
+        );
+
+        let mut child = parent.clone();
+        child["parent_graph"] = parent["graph_hash"].clone();
+        child["nodes"]
+            .as_array_mut()
+            .expect("parent nodes")
+            .push(json!({
+                "id": "repair",
+                "capability": "code.generate",
+                "instruction": "Repair"
+            }));
+        child["edges"]
+            .as_array_mut()
+            .expect("parent edges")
+            .push(json!({"from": "verify.build", "to": "repair", "condition": "success"}));
+        child
+            .as_object_mut()
+            .expect("child object")
+            .remove("graph_hash");
+        child["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&child)?);
+        persist_evolved(&workspace, &child)?;
+
+        let evolved = load(&workspace)?;
+        assert!(
+            evolved.learning.outcome.is_none(),
+            "an evolved graph with an unassigned repair node must not retain the parent's terminal outcome"
+        );
+        assert_eq!(
+            evolved.learning.nodes["verify.build"].outcome,
+            Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+        );
+        assert!(evolved.learning.nodes["repair"].outcome.is_none());
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn successful_verification_propagates_to_one_explicit_target() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_pair",
+            "nodes": [
+                {"id": "build", "capability": "code.generate", "instruction": "Build"},
+                {"id": "verify.build", "capability": "project.tests.execute", "instruction": "Verify", "verifies": ["build"]}
+            ],
+            "edges": [{"from": "build", "to": "verify.build", "condition": "success"}]
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph)?);
+        persist(&workspace, &graph, "Pair")?;
+        transition(&workspace, "build", "checkout", "worker", "Worker")?;
+        transition(&workspace, "build", "complete", "worker", "Worker")?;
+        transition(&workspace, "verify.build", "checkout", "worker", "Worker")?;
+        transition(&workspace, "verify.build", "complete", "worker", "Worker")?;
+
+        let document = load(&workspace)?;
+        let build = &document.learning.nodes["build"];
+        assert_eq!(
+            build.outcome,
+            Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+        );
+        assert_eq!(
+            build
+                .verification
+                .as_ref()
+                .and_then(|verification| verification.passed),
+            Some(true)
+        );
+        assert_eq!(
+            build
+                .verification
+                .as_ref()
+                .and_then(|verification| verification.kind.as_deref()),
+            Some("automated")
+        );
+        assert_eq!(
+            document.learning.nodes["verify.build"].outcome,
+            Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+        );
+        assert_eq!(
+            document
+                .learning
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.final_verified_success),
+            Some(true)
+        );
+        assert_eq!(
+            document
+                .learning
+                .outcome
+                .as_ref()
+                .map(|outcome| outcome.verification_coverage_denominator),
+            Some(2)
+        );
+        assert_eq!(
+            document
+                .learning
+                .outcome
+                .as_ref()
+                .unwrap()
+                .verification_coverage,
+            1.0
+        );
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn successful_verification_preserves_human_and_superseded_target_outcomes() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_preserve_target_outcome",
+            "nodes": [
+                {"id": "build", "capability": "code.generate", "instruction": "Build"},
+                {"id": "verify.build", "capability": "project.tests.execute", "instruction": "Verify", "verifies": ["build"]}
+            ],
+            "edges": [{"from": "build", "to": "verify.build", "condition": "success"}]
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph)?);
+        persist(&workspace, &graph, "Preserve target")?;
+        transition(&workspace, "build", "checkout", "worker", "Worker")?;
+        record_human_intervention(&workspace, "build", Some("human acceptance"))?;
+        finish_node(
+            &workspace,
+            "build",
+            "worker",
+            crate::learning_data::NodeOutcome::HumanCompleted,
+        )?;
+        transition(&workspace, "verify.build", "checkout", "worker", "Worker")?;
+        transition(&workspace, "verify.build", "complete", "worker", "Worker")?;
+        let document = load(&workspace)?;
+        assert_eq!(
+            document.learning.nodes["build"].outcome,
+            Some(crate::learning_data::NodeOutcome::HumanCompleted)
+        );
+        assert_eq!(
+            document.learning.nodes["build"]
+                .verification
+                .as_ref()
+                .and_then(|verification| verification.passed),
+            Some(true)
+        );
+        fs::remove_dir_all(&workspace)?;
+
+        // Repeat the verifier flow with a target explicitly marked
+        // superseded. Successful verification should attach evidence while
+        // preserving that lifecycle outcome too.
+        let superseded_workspace = temp_workspace();
+        fs::create_dir_all(&superseded_workspace)?;
+        persist(&superseded_workspace, &graph, "Preserve superseded target")?;
+        transition(
+            &superseded_workspace,
+            "build",
+            "checkout",
+            "worker",
+            "Worker",
+        )?;
+        finish_node(
+            &superseded_workspace,
+            "build",
+            "worker",
+            crate::learning_data::NodeOutcome::Superseded,
+        )?;
+        transition(
+            &superseded_workspace,
+            "verify.build",
+            "checkout",
+            "worker",
+            "Worker",
+        )?;
+        transition(
+            &superseded_workspace,
+            "verify.build",
+            "complete",
+            "worker",
+            "Worker",
+        )?;
+        let superseded_document = load(&superseded_workspace)?;
+        assert_eq!(
+            superseded_document.learning.nodes["build"].outcome,
+            Some(crate::learning_data::NodeOutcome::Superseded)
+        );
+        assert_eq!(
+            superseded_document.learning.nodes["build"]
+                .verification
+                .as_ref()
+                .and_then(|verification| verification.passed),
+            Some(true)
+        );
+        fs::remove_dir_all(superseded_workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn verification_target_resolution_fails_closed_when_missing_or_ambiguous() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_pair_fail_closed",
+            "nodes": [
+                {"id": "build-a", "capability": "code.generate", "instruction": "Build A"},
+                {"id": "build-b", "capability": "code.generate", "instruction": "Build B"},
+                {"id": "build-c", "capability": "code.generate", "instruction": "Build C"},
+                {"id": "verify-ambiguous", "capability": "project.tests.execute", "instruction": "Verify A or B"},
+                {"id": "verify-missing", "capability": "project.tests.execute", "instruction": "Verify without target"}
+            ],
+            "edges": [
+                {"from": "build-a", "to": "verify-ambiguous", "condition": "success"},
+                {"from": "build-b", "to": "verify-ambiguous", "condition": "success"}
+            ]
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph)?);
+        persist(&workspace, &graph, "Fail closed")?;
+        for node in ["build-a", "build-b"] {
+            transition(&workspace, node, "checkout", "worker", "Worker")?;
+            transition(&workspace, node, "complete", "worker", "Worker")?;
+        }
+        transition(
+            &workspace,
+            "verify-ambiguous",
+            "checkout",
+            "worker",
+            "Worker",
+        )?;
+        transition(
+            &workspace,
+            "verify-ambiguous",
+            "complete",
+            "worker",
+            "Worker",
+        )?;
+        transition(&workspace, "verify-missing", "checkout", "worker", "Worker")?;
+        transition(&workspace, "verify-missing", "complete", "worker", "Worker")?;
+
+        let document = load(&workspace)?;
+        for node in ["build-a", "build-b", "build-c"] {
+            assert_ne!(
+                document.learning.nodes[node].outcome,
+                Some(crate::learning_data::NodeOutcome::VerifiedSuccess),
+                "{node} must not be guessed as an ambiguous/missing verifier target"
+            );
+        }
+        assert_eq!(
+            document.learning.nodes["verify-ambiguous"].outcome,
+            Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+        );
+        assert_eq!(
+            document.learning.nodes["verify-missing"].outcome,
+            Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+        );
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn historical_successful_verifier_is_reconciled_on_next_refresh() -> Result<()> {
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_historical_pair",
+            "nodes": [
+                {"id": "build", "capability": "code.generate", "instruction": "Build"},
+                {"id": "verify.build", "capability": "project.tests.execute", "instruction": "Verify"}
+            ],
+            "edges": [{"from": "build", "to": "verify.build", "condition": "success"}]
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph)?);
+        persist(&workspace, &graph, "Historical")?;
+        transition(&workspace, "build", "checkout", "worker", "Worker")?;
+        transition(&workspace, "build", "complete", "worker", "Worker")?;
+        transition(&workspace, "verify.build", "checkout", "worker", "Worker")?;
+        transition(&workspace, "verify.build", "complete", "worker", "Worker")?;
+
+        // Emulate a project written by the old binary: the verifier is
+        // terminal, but its implementation target is still unverified.
+        let mut raw: Value = serde_json::from_slice(&fs::read(path(&workspace))?)?;
+        raw["learning"]["nodes"]["build"]["outcome"] = json!("unverified_success");
+        raw["learning"]["nodes"]["build"]
+            .as_object_mut()
+            .expect("build record")
+            .remove("verification");
+        fs::write(path(&workspace), serde_json::to_vec_pretty(&raw)?)?;
+        assert_eq!(
+            load(&workspace)?.learning.nodes["build"].outcome,
+            Some(crate::learning_data::NodeOutcome::UnverifiedSuccess)
+        );
+
+        set_execution_phase(&workspace, "completed")?;
+        let reconciled = load(&workspace)?;
+        assert_eq!(
+            reconciled.learning.nodes["build"].outcome,
+            Some(crate::learning_data::NodeOutcome::VerifiedSuccess)
+        );
+        assert_eq!(
+            reconciled.learning.nodes["build"]
+                .verification
+                .as_ref()
+                .and_then(|verification| verification.passed),
+            Some(true)
+        );
+        assert_eq!(
+            reconciled
+                .learning
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.final_verified_success),
+            Some(true)
+        );
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fully_paired_graph_aggregates_every_implementation_and_verifier() -> Result<()> {
+        const PAIRS: usize = 54;
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace)?;
+        let mut nodes = Vec::with_capacity(PAIRS * 2);
+        let mut edges = Vec::with_capacity(PAIRS);
+        for index in 0..PAIRS {
+            let implementation = format!("implementation-{index}");
+            let verifier = format!("verification-{index}");
+            nodes.push(json!({"id": implementation, "capability": "code.generate", "instruction": "Implement"}));
+            nodes.push(json!({"id": verifier, "capability": "project.tests.execute", "instruction": "Verify"}));
+            edges.push(json!({"from": implementation, "to": verifier, "condition": "success"}));
+        }
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_fifty_four_pairs",
+            "nodes": nodes,
+            "edges": edges
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph)?);
+        persist(&workspace, &graph, "54 pairs")?;
+        for index in 0..PAIRS {
+            let implementation = format!("implementation-{index}");
+            let verifier = format!("verification-{index}");
+            transition(&workspace, &implementation, "checkout", "worker", "Worker")?;
+            transition(&workspace, &implementation, "complete", "worker", "Worker")?;
+            transition(&workspace, &verifier, "checkout", "worker", "Worker")?;
+            transition(&workspace, &verifier, "complete", "worker", "Worker")?;
+        }
+        let document = load(&workspace)?;
+        let outcome = document.learning.outcome.expect("terminal aggregate");
+        assert_eq!(
+            outcome.verification_coverage_denominator,
+            (PAIRS * 2) as u32
+        );
+        assert_eq!(outcome.verification_coverage, 1.0);
+        assert_eq!(outcome.final_verified_success, Some(true));
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
     fn sample_catalog_for(workspace_label: &str) -> project_catalog::CatalogV1 {
         use project_catalog::*;
         let canonical = format!("/tmp/{workspace_label}");
@@ -3152,6 +4370,300 @@ mod tests {
         assert!(load(&workspace)?.failure_graph.is_none());
         assert_eq!(before_read, fs::read(path(&workspace))?);
         assert_ne!(before, before_read);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    fn migration_graph(revision: &str, nodes: &[(&str, &str)], edges: &[(&str, &str)]) -> Value {
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": revision,
+            "nodes": nodes.iter().map(|(id, instruction)| json!({
+                "id": id,
+                "title": id,
+                "capability": "code.generate",
+                "instruction": instruction,
+                "execution": {"wave": 7, "task_number": "7.1"},
+                "depends_on": edges.iter()
+                    .filter(|(_, to)| to == id)
+                    .map(|(from, _)| Value::String((*from).to_owned()))
+                    .collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "edges": edges.iter().map(|(from, to)| json!({
+                "from": from,
+                "to": to,
+                "condition": "success"
+            })).collect::<Vec<_>>(),
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        graph
+    }
+
+    fn migration_graph_with_policy(
+        revision: &str,
+        max_files_changed: u64,
+        max_diff_lines: u64,
+    ) -> Value {
+        let mut graph = migration_graph(revision, &[("a", "same")], &[]);
+        let node = &mut graph["nodes"][0];
+        node["policy_hash"] = Value::String(format!("sha256:{revision:0<64}"));
+        node["policy_provenance"] = Value::String(format!("policy:{revision}"));
+        node["policy_contract"] = json!({
+            "schema": "fractal.node_policy_contract.v1",
+            "policy_hash": format!("sha256:{revision:0<64}"),
+            "provenance": format!("policy:{revision}"),
+            "decision": "allow",
+            "allowed_writes": [],
+            "allowed_commands": [],
+            "external_side_effects": false,
+            "network": {"default": "deny", "allowed_destinations": []},
+            "sandbox_profile": "local-work-v1",
+            "budgets": {
+                "max_steps": 40,
+                "max_minutes": 60,
+                "max_attempts": 1,
+                "max_files_changed": max_files_changed,
+                "max_diff_lines": max_diff_lines,
+                "max_input_tokens": 250000,
+                "max_output_tokens": 50000,
+                "max_cost_usd": 20
+            },
+            "verifier_ids": ["independent"],
+            "evidence_requirements": ["commands", "exit_codes"]
+        });
+        graph.as_object_mut().unwrap().remove("graph_hash");
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        graph
+    }
+
+    fn migration_graph_with_timeout(revision: &str, timeout_ms: u64) -> Value {
+        let mut graph = migration_graph(revision, &[("a", "same")], &[]);
+        graph["nodes"][0]["budget"] = json!({"timeout_ms": timeout_ms});
+        graph.as_object_mut().unwrap().remove("graph_hash");
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        graph
+    }
+
+    fn seed_halted_migration_project(
+        workspace: &Path,
+        graph: &Value,
+        completed: &[&str],
+    ) -> Result<()> {
+        fs::create_dir_all(workspace)?;
+        persist(workspace, graph, "Migration fixture")?;
+        mutate_document(workspace, |document| {
+            let now = "2026-01-01T00:00:00Z".to_owned();
+            let execution = document.execution.as_mut().expect("execution");
+            execution.phase = "halted".to_owned();
+            for node in completed {
+                execution.assignments.insert(
+                    (*node).to_owned(),
+                    ExecutionAssignment {
+                        agent_id: format!("agent-{node}"),
+                        agent_label: format!("Agent {node}"),
+                        state: "completed".to_owned(),
+                        checked_out_at: now.clone(),
+                        completed_at: Some(now.clone()),
+                        released_at: None,
+                        extra: BTreeMap::new(),
+                    },
+                );
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn halted_graph_migration_requires_existing_project() {
+        let workspace = temp_workspace();
+        let graph = migration_graph("new", &[("a", "same")], &[]);
+        let error = preview_halted_graph_migration(&workspace, &graph, &BTreeSet::new())
+            .expect_err("missing project must fail closed");
+        assert!(format!("{error:#}").contains("requires an existing project"));
+        assert!(!path(&workspace).exists());
+    }
+
+    #[test]
+    fn halted_graph_migration_refuses_active_project_without_write() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph("old", &[("a", "same")], &[]);
+        fs::create_dir_all(&workspace)?;
+        persist(&workspace, &old, "Active")?;
+        let before = fs::read(path(&workspace))?;
+        let new = migration_graph("new", &[("a", "same")], &[]);
+        let error = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())
+            .expect_err("executing project must be refused");
+        assert!(format!("{error:#}").contains("requires a halted project"));
+        assert_eq!(fs::read(path(&workspace))?, before);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_preserves_unchanged_completed_assignment() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph("old", &[("a", "same")], &[]);
+        seed_halted_migration_project(&workspace, &old, &["a"])?;
+        let new = migration_graph("new", &[("a", "same")], &[]);
+        let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
+        assert_eq!(preview.preserved, ["a"]);
+        assert!(preview.reopened.is_empty());
+        apply_halted_graph_migration(&workspace, &new, &BTreeSet::new(), &preview)?;
+        assert_eq!(
+            load(&workspace)?.execution.unwrap().assignments["a"].state,
+            "completed"
+        );
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_preserves_completed_work_under_budget_relaxation() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph_with_policy("old", 6, 500);
+        seed_halted_migration_project(&workspace, &old, &["a"])?;
+        let new = migration_graph_with_policy("new", 24, 4000);
+        let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
+        assert_eq!(preview.preserved, ["a"]);
+        assert!(preview.reopened.is_empty());
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_reopens_completed_work_under_budget_tightening() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph_with_policy("old", 24, 4000);
+        seed_halted_migration_project(&workspace, &old, &["a"])?;
+        let new = migration_graph_with_policy("new", 6, 500);
+        let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
+        assert!(preview.preserved.is_empty());
+        assert_eq!(preview.reopened, ["a"]);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_preserves_completed_work_under_timeout_relaxation() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph_with_timeout("old", 180_000);
+        seed_halted_migration_project(&workspace, &old, &["a"])?;
+        let new = migration_graph_with_timeout("new", 3_600_000);
+        let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
+        assert_eq!(preview.preserved, ["a"]);
+        assert!(preview.reopened.is_empty());
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_reopens_completed_work_under_timeout_tightening() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph_with_timeout("old", 3_600_000);
+        seed_halted_migration_project(&workspace, &old, &["a"])?;
+        let new = migration_graph_with_timeout("new", 180_000);
+        let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
+        assert!(preview.preserved.is_empty());
+        assert_eq!(preview.reopened, ["a"]);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_reopens_semantically_changed_node() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph("old", &[("a", "old instruction")], &[]);
+        seed_halted_migration_project(&workspace, &old, &["a"])?;
+        let new = migration_graph("new", &[("a", "corrected instruction")], &[]);
+        let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
+        assert!(preview.preserved.is_empty());
+        assert_eq!(preview.reopened, ["a"]);
+        apply_halted_graph_migration(&workspace, &new, &BTreeSet::new(), &preview)?;
+        let assignment = load(&workspace)?
+            .execution
+            .unwrap()
+            .assignments
+            .remove("a")
+            .unwrap();
+        assert_eq!(assignment.state, "released");
+        assert!(assignment.completed_at.is_none());
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_enforces_preserved_dependency_closure() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph("old", &[("a", "old"), ("b", "same")], &[("a", "b")]);
+        seed_halted_migration_project(&workspace, &old, &["a", "b"])?;
+        let new = migration_graph("new", &[("a", "changed"), ("b", "same")], &[("a", "b")]);
+        let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
+        assert!(preview.preserved.is_empty());
+        assert_eq!(preview.reopened, ["a", "b"]);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_honors_forced_reopen() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph("old", &[("companion_export_contract_tests", "same")], &[]);
+        seed_halted_migration_project(&workspace, &old, &["companion_export_contract_tests"])?;
+        let new = migration_graph("new", &[("companion_export_contract_tests", "same")], &[]);
+        let forced = BTreeSet::from(["companion_export_contract_tests".to_owned()]);
+        let preview = preview_halted_graph_migration(&workspace, &new, &forced)?;
+        assert!(preview.preserved.is_empty());
+        assert_eq!(preview.reopened, ["companion_export_contract_tests"]);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_removes_active_node_and_keeps_bounded_history() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph(
+            "old",
+            &[("keep", "same"), ("dynamic_verifier", "verify")],
+            &[],
+        );
+        seed_halted_migration_project(&workspace, &old, &["keep", "dynamic_verifier"])?;
+        let new = migration_graph("new", &[("keep", "same")], &[]);
+        let preview = preview_halted_graph_migration(&workspace, &new, &BTreeSet::new())?;
+        assert_eq!(preview.removed, ["dynamic_verifier"]);
+        apply_halted_graph_migration(&workspace, &new, &BTreeSet::new(), &preview)?;
+        let migrated = load(&workspace)?;
+        assert!(!migrated
+            .execution
+            .unwrap()
+            .assignments
+            .contains_key("dynamic_verifier"));
+        assert_eq!(
+            migrated.learning.extra["plan_migrations"]["records"][0]["retired_nodes"][0]["node_id"],
+            "dynamic_verifier"
+        );
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn halted_graph_migration_invalid_replacement_is_atomic() -> Result<()> {
+        let workspace = temp_workspace();
+        let old = migration_graph("old", &[("a", "same")], &[]);
+        seed_halted_migration_project(&workspace, &old, &["a"])?;
+        let before = fs::read(path(&workspace))?;
+        let replacement = migration_graph("new", &[("a", "same")], &[]);
+        let mut stale = preview_halted_graph_migration(&workspace, &replacement, &BTreeSet::new())?;
+        stale.preserved.clear();
+        assert!(
+            apply_halted_graph_migration(&workspace, &replacement, &BTreeSet::new(), &stale)
+                .is_err()
+        );
+        assert_eq!(fs::read(path(&workspace))?, before);
+
+        let mut invalid = migration_graph("new", &[("a", "same")], &[]);
+        invalid["nodes"][0]["instruction"] = Value::String("tampered".to_owned());
+        assert!(preview_halted_graph_migration(&workspace, &invalid, &BTreeSet::new()).is_err());
+        assert_eq!(fs::read(path(&workspace))?, before);
         fs::remove_dir_all(workspace)?;
         Ok(())
     }

@@ -97,12 +97,28 @@ struct Task {
     id: String,
     title: String,
     capability: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
     instruction: String,
     depends_on: Vec<String>,
     execution: TaskExecution,
     efficiency: NodeEfficiencyMetadata,
     #[serde(skip)]
     declared_execution: Option<TaskExecution>,
+}
+
+/// Validated, compiled inputs produced from an existing lead plan. Keeping the
+/// PRD and compiler inputs together lets the CLI preview without writing and
+/// apply the exact same artifact later without invoking a planner.
+pub(crate) struct ExistingPlanCompilation {
+    pub(crate) graph: Value,
+    pub(crate) harness: Value,
+    pub(crate) work: Value,
+    pub(crate) target_id: &'static str,
+    pub(crate) title: String,
+    pub(crate) task_count: usize,
+    pub(crate) acceptance_criteria_count: usize,
+    prd: StructuredPrd,
 }
 
 /// Expand any ordinary request into a structured PRD and committed task graph.
@@ -132,6 +148,57 @@ pub(crate) fn plan_and_commit(
         None => (request.to_owned(), "user request".to_owned()),
     };
     decompose_and_commit(&source_text, &source_name, request, workspace, &agents[0])
+}
+
+/// Validate and compile an existing `fractal-plan.json` without calling a lead
+/// agent. Validation errors are returned directly; this path never substitutes
+/// the deterministic fallback harness used by interactive planning.
+pub(crate) fn compile_existing_plan(
+    plan_path: &Path,
+    repo: &Path,
+) -> Result<ExistingPlanCompilation> {
+    let raw = std::fs::read_to_string(plan_path)
+        .with_context(|| format!("read existing plan {}", plan_path.display()))?;
+    let planned = parse_and_validate(&raw)
+        .with_context(|| format!("validate existing plan {}", plan_path.display()))?;
+    let source_name = plan_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| plan_path.display().to_string());
+    let mut harness = build_harness_genome(&planned.tasks, &source_name);
+    let policy = crate::harness::load_policy(repo)
+        .with_context(|| format!("load harness policy for {}", repo.display()))?;
+    crate::harness_policy::attach_to_harness(&mut harness, &policy);
+    let goal = format!(
+        "Execute the validated existing project plan `{}` from {source_name}.",
+        planned.prd.title
+    );
+    // Existing-plan compilation is intentionally deterministic so a preview and
+    // the subsequent `--yes` apply name the same content-addressed graph.
+    let work = build_work_value_at(&goal, 0)?;
+    let target_id = "darwin-arm64";
+    let graph = crate::compile::recompile_with_policy(&work, &harness, target_id, &policy)
+        .context("compile the validated existing task graph")?;
+
+    Ok(ExistingPlanCompilation {
+        graph,
+        harness,
+        work,
+        target_id,
+        title: planned.prd.title.clone(),
+        task_count: planned.tasks.len(),
+        acceptance_criteria_count: planned.prd.acceptance_criteria.len(),
+        prd: planned.prd,
+    })
+}
+
+/// Persist the validated product contract only after the caller has opted into
+/// applying the compiled graph.
+pub(crate) fn persist_existing_plan_prd(
+    workspace: &Path,
+    compilation: &ExistingPlanCompilation,
+) -> Result<PathBuf> {
+    write_structured_prd(workspace, &compilation.prd)
 }
 
 /// Commit a minimal graph before the lead starts its potentially multi-minute
@@ -278,6 +345,10 @@ fn build_work_value(goal: &str) -> Result<Value> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
+    build_work_value_at(goal, created_at_ms)
+}
+
+fn build_work_value_at(goal: &str, created_at_ms: u64) -> Result<Value> {
     let (work, _source) = build_work_from_nl(&NlWorkRequest {
         request: goal.to_owned(),
         requester: "local:cli".to_owned(),
@@ -369,6 +440,7 @@ fn planning_prompt(source_text: &str, source_name: &str) -> String {
              \"id\": \"short_snake_case_id\",\n\
              \"title\": \"one line\",\n\
              \"capability\": \"code.generate|code.edit|project.tests.execute|content.analyze\",\n\
+             \"agent\": \"optional exact worker route: cursor|codex-luna|claude|hermes|opencode\",\n\
              \"instruction\": \"a self-contained directive an agent can execute in this workspace with no other context\",\n\
              \"depends_on\": [\"ids of tasks that must finish first\"],\n\
              \"execution\": {{\n\
@@ -391,6 +463,7 @@ fn planning_prompt(source_text: &str, source_name: &str) -> String {
          Rules: {min}-{max} tasks; ids unique; `depends_on` must reference earlier task ids only and form a DAG (no cycles); \
          every task MUST include the `efficiency` block: `dependencies` repeats its `depends_on`, `similarity_to_other_active_nodes` scores overlap with other task ids in 0..=1 (empty object when none overlap), `confidence_still_useful` is in 0..=1, and file references contain no whitespace or credentials; \
          every task MUST label its dependency-ready execution wave and whether it runs `parallel` (two or more tasks become ready in that same wave) or `sequential` (it is the only task in its wave); \
+         when the source explicitly requires a named worker CLI, the task that must use it MUST set `agent` to that exact route (for example `cursor`); never leave named-worker routing only in prose; \
          roots are wave 1, every other task is wave 1 + the maximum wave of its dependencies, and all parallel tasks in wave N use `parallel_group`: `wave-N`; \
          every `instruction` must be concrete and standalone (name the files to create/edit and what they must contain/do); \
          architecture must name at least one component; include at least one observable acceptance criterion; \
@@ -454,6 +527,7 @@ fn parse_and_validate(raw: &str) -> Result<PlannedProject> {
             bail!("task `{id}` has no instruction");
         }
         let capability = normalize_capability(item.get("capability").and_then(Value::as_str));
+        let agent = parse_agent_requirement(item, &id)?;
         let title = item
             .get("title")
             .and_then(Value::as_str)
@@ -476,6 +550,7 @@ fn parse_and_validate(raw: &str) -> Result<PlannedProject> {
             id,
             title,
             capability,
+            agent,
             instruction,
             depends_on,
             execution: TaskExecution {
@@ -536,6 +611,30 @@ fn parse_and_validate(raw: &str) -> Result<PlannedProject> {
         bail!("lead plan must contain a gating tests task");
     }
     Ok(PlannedProject { prd, tasks })
+}
+
+fn parse_agent_requirement(item: &Value, id: &str) -> Result<Option<String>> {
+    let Some(raw) = item.get("agent") else {
+        return Ok(None);
+    };
+    let raw = raw
+        .as_str()
+        .with_context(|| format!("task `{id}` agent must be a string"))?
+        .trim();
+    if raw.is_empty() {
+        bail!("task `{id}` agent must not be empty");
+    }
+    let normalized = match raw {
+        "cursor" | "cursor-agent" => "cursor",
+        "codex" | "codex-luna" => "codex-luna",
+        "claude" => "claude",
+        "hermes" => "hermes",
+        "opencode" => "opencode",
+        other => {
+            bail!("task `{id}` agent `{other}` is unsupported; use cursor|codex-luna|claude|hermes|opencode")
+        }
+    };
+    Ok(Some(normalized.to_owned()))
 }
 
 fn parse_execution_declaration(item: &Value, id: &str) -> Result<Option<TaskExecution>> {
@@ -703,6 +802,12 @@ fn structured_prd_path(workspace: &Path) -> PathBuf {
 }
 
 fn persist_structured_prd(workspace: &Path, prd: &StructuredPrd) -> Result<()> {
+    let path = write_structured_prd(workspace, prd)?;
+    println!("  ◇ Structured PRD: {}", path.display());
+    Ok(())
+}
+
+fn write_structured_prd(workspace: &Path, prd: &StructuredPrd) -> Result<PathBuf> {
     let path = structured_prd_path(workspace);
     let directory = path.parent().expect("structured PRD has parent");
     std::fs::create_dir_all(directory)?;
@@ -710,8 +815,7 @@ fn persist_structured_prd(workspace: &Path, prd: &StructuredPrd) -> Result<()> {
     std::fs::write(&temporary, serde_json::to_vec_pretty(prd)?)
         .with_context(|| format!("write {}", temporary.display()))?;
     std::fs::rename(&temporary, &path).with_context(|| format!("replace {}", path.display()))?;
-    println!("  ◇ Structured PRD: {}", path.display());
-    Ok(())
+    Ok(path)
 }
 
 /// Assemble a `fractal.compiled_harness.v1` genome from the task DAG. Each task is
@@ -746,16 +850,16 @@ fn build_harness_genome(tasks: &[Task], prd_name: &str) -> Value {
         };
         let preconditions: Vec<String> = dependencies.iter().map(|dep| ready(dep)).collect();
         let budget = if task.capability.ends_with("tests.execute") {
-            120_000
+            1_800_000
         } else {
-            180_000
+            3_600_000
         };
         // Expose the planning metadata with the node's ACTUAL graph
         // dependencies (roots hang off the durable lead_plan node), so the
         // compiler's dependency-consistency gate always holds.
         let mut efficiency = task.efficiency.clone();
         efficiency.dependencies = dependencies.clone();
-        nodes.push(json!({
+        let mut node = json!({
             "id": task.id,
             "title": task.title,
             "capability": task.capability,
@@ -765,7 +869,11 @@ fn build_harness_genome(tasks: &[Task], prd_name: &str) -> Value {
             "instruction": task.instruction,
             "budget": {"timeout_ms": budget},
             "efficiency": node_efficiency_to_graph_value(&efficiency),
-        }));
+        });
+        if let Some(agent) = &task.agent {
+            node["executor"] = json!({"agent": agent});
+        }
+        nodes.push(node);
         for dep in &dependencies {
             edges.push(json!({"from": dep, "to": task.id, "condition": "success"}));
         }
@@ -792,7 +900,7 @@ fn build_harness_genome(tasks: &[Task], prd_name: &str) -> Value {
         "preconditions": closer_preconditions,
         "produced_state": ["outcome_verified"],
         "instruction": "Review the finished implementation against .fractal/lead-prd.json. Inspect the changes and verification evidence, run any final checks needed, then write .fractal/closeout.json with schema fractal.closeout.v1, status approved, a non-empty summary, an acceptance array containing every PRD acceptance id with passed=true and concrete evidence, and a risks array. Do not approve if any criterion is unsupported.",
-        "budget": {"timeout_ms": 180_000},
+        "budget": {"timeout_ms": 1_800_000},
         "efficiency": baseline_efficiency_value(
             8_000,
             sinks.iter().map(|task| task.id.clone()).collect(),
@@ -929,6 +1037,36 @@ mod tests {
             .iter()
             .any(|e| e["from"] == "tests" && e["to"] == "lead_closeout");
         assert!(closer_edge);
+    }
+
+    #[test]
+    fn named_worker_is_normalized_and_compiled_as_hard_executor_affinity() {
+        let raw = valid_plan(
+            r#"[
+          {"id":"implementation","capability":"code.generate","agent":"cursor-agent","instruction":"write the implementation","depends_on":[]},
+          {"id":"tests","capability":"project.tests.execute","instruction":"run native tests","depends_on":["implementation"]}
+        ]"#,
+        );
+        let planned = parse_and_validate(&raw).expect("named worker plan");
+        assert_eq!(planned.tasks[0].agent.as_deref(), Some("cursor"));
+        let genome = build_harness_genome(&planned.tasks, "X.md");
+        let implementation = genome["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["id"] == "implementation")
+            .unwrap();
+        assert_eq!(implementation["executor"]["agent"], "cursor");
+
+        let opencode = raw.replace("cursor-agent", "opencode");
+        let opencode_plan = parse_and_validate(&opencode).expect("OpenCode worker plan");
+        assert_eq!(opencode_plan.tasks[0].agent.as_deref(), Some("opencode"));
+
+        let invalid = raw.replace("cursor-agent", "unknown-worker");
+        assert!(parse_and_validate(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported"));
     }
 
     #[test]
@@ -1149,6 +1287,17 @@ mod tests {
                 .unwrap_or_else(|error| panic!("node {id}: {error}"));
             validate_node_metadata(&decoded).unwrap_or_else(|error| panic!("node {id}: {error}"));
         }
+        let nodes = genome["nodes"].as_array().expect("genome nodes");
+        let timeout = |id: &str| {
+            nodes
+                .iter()
+                .find(|node| node["id"] == id)
+                .and_then(|node| node["budget"]["timeout_ms"].as_u64())
+                .unwrap_or_else(|| panic!("missing timeout for {id}"))
+        };
+        assert_eq!(timeout("core"), 3_600_000);
+        assert_eq!(timeout("tests"), 1_800_000);
+        assert_eq!(timeout("lead_closeout"), 1_800_000);
     }
 
     #[test]

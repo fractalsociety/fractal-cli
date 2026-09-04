@@ -33,6 +33,26 @@ pub(crate) enum FailureCode {
     PrematureCompletion,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IntegrationFailureKind {
+    InvalidOwnedPath,
+    ScopeEscape,
+    MissingArtifact,
+    NoTrackedChanges,
+    CanonicalWorkspaceChanged,
+    IntegrationConflict,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct IntegrationFailureDetail {
+    pub(crate) schema: String,
+    pub(crate) kind: IntegrationFailureKind,
+    pub(crate) summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_commit: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Executor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,6 +100,8 @@ pub(crate) struct NodeRecord {
     pub(crate) outcome: Option<NodeOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) failure_code: Option<FailureCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) integration_failure: Option<IntegrationFailureDetail>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) verification: Option<Verification>,
     #[serde(default)]
@@ -295,6 +317,24 @@ pub(crate) fn validate(data: &LearningData) -> Result<(), String> {
         }
         if node.notes.as_ref().is_some_and(|note| note.len() > 1_000) {
             return Err(format!("learning node `{id}` notes exceed 1000 bytes"));
+        }
+        if let Some(detail) = &node.integration_failure {
+            if detail.schema != "fractal.integration_failure.v1"
+                || detail.summary.is_empty()
+                || detail.summary.len() > 240
+                || detail.summary.contains('\n')
+                || detail.summary.contains('\r')
+            {
+                return Err(format!(
+                    "learning node `{id}` has invalid integration failure detail"
+                ));
+            }
+            if detail.worker_commit.as_ref().is_some_and(|commit| {
+                !matches!(commit.len(), 40 | 64)
+                    || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+                return Err(format!("learning node `{id}` has invalid worker commit"));
+            }
         }
         if node
             .estimated_cost

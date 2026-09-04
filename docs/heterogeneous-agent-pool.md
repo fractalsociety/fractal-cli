@@ -4,24 +4,33 @@ Opt-in worker capacity for the in-process graph executor. When unset, scheduling
 
 ## Configuration
 
-Set `$FRACTAL_AGENT_POOL` to an explicit `provider=count` list. All four providers are required:
+Set `$FRACTAL_AGENT_POOL` to an explicit `provider=count` list. The original four provider keys are required; OpenCode is optional. Set a temporarily unavailable provider to zero and replace its capacity with another provider:
 
 ```text
 FRACTAL_AGENT_POOL=codex=6,cursor=6,claude=6,hermes=6
 ```
 
+```text
+FRACTAL_AGENT_POOL=codex=5,cursor=5,claude=5,hermes=5,opencode=4
+```
+
+```text
+FRACTAL_AGENT_POOL=codex=5,cursor=5,claude=0,hermes=5,opencode=9
+```
+
 Rules:
 
 * Total worker slots must be **20–42**. The example above is 24.
-* Counts expand into stable identities such as `codex-luna:1`…`codex-luna:6`, `cursor:1`…`cursor:6`, `claude:1`…`claude:6`, `hermes:1`…`hermes:6`.
+* Counts expand into stable identities such as `codex-luna:1`…`codex-luna:6`, `cursor:1`…`cursor:6`, `claude:1`…`claude:6`, `hermes:1`…`hermes:6`, and, when configured, `opencode:1`…`opencode:N`.
 * The Codex **lead** planner is a separate roster entry (`codex` by default, or `$FRACTAL_LEAD_AGENT`). It is **not** counted as worker capacity and does not consume a pool slot.
 * Codex implementation workers use the existing `codex-luna` command adapter (`gpt-5.6-luna`). The lead keeps the Sol High planner route.
 * Cursor, Claude, and Hermes workers use the existing `cursor-agent` / `claude` / `hermes` adapters.
-* Duplicates, unknown providers, zero counts, overflow counts, totals outside 20–42, missing providers, and unavailable binaries are hard errors. The executor never silently falls back to one provider.
+* OpenCode workers run `opencode run --format json --model <model> --dir <worktree>`. The default model is `zai-coding-plan/glm-5.3`; `$FRACTAL_OPENCODE_MODEL` overrides it.
+* Duplicates, unknown providers, overflow counts, totals outside 20–42, missing core provider keys, and unavailable providers with nonzero counts are hard errors. A zero count is an explicit disable, never a silent fallback.
 
 ## Readiness
 
-Before enabling the pool, every physical binary must be on `PATH`:
+Before enabling the pool, every provider with a nonzero count must have its physical binary on `PATH`:
 
 | Provider | Binary        | Worker kind  |
 |----------|---------------|--------------|
@@ -29,8 +38,9 @@ Before enabling the pool, every physical binary must be on `PATH`:
 | cursor   | `cursor-agent`| `cursor`     |
 | claude   | `claude`      | `claude`     |
 | hermes   | `hermes`      | `hermes`     |
+| opencode (optional) | `opencode` | `opencode` |
 
-A mixed PATH (any of the four missing) rejects the whole configuration.
+A mixed PATH (any configured provider missing) rejects the whole configuration.
 
 ## Scheduling
 

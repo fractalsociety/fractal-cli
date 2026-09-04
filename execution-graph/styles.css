@@ -104,59 +104,6 @@ h1 em { color: #a8beb4; font-weight: 400; }
 .back-button:hover { color: var(--green); }
 .graph-stage { position: relative; height: 644px; overflow: auto; background: radial-gradient(circle at 50% 50%, rgba(27,70,54,.11), transparent 49%), linear-gradient(rgba(255,255,255,.018) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.018) 1px, transparent 1px); background-size: auto, 48px 48px, 48px 48px; }
 #graph { min-width: 100%; min-height: 100%; display: block; }
-.graph-3d-mount { position: absolute; inset: 0; overflow: hidden; background: radial-gradient(circle at 50% 45%, rgba(22,73,70,.22), transparent 57%), linear-gradient(145deg, rgba(4,10,20,.98), rgba(3,13,12,.96)); }
-.graph-3d-mount canvas { width: 100%; height: 100%; display: block; cursor: grab; }
-.graph-3d-mount canvas:active { cursor: grabbing; }
-.graph-3d-label-layer { position: absolute; z-index: 1; inset: 0; overflow: hidden; pointer-events: none; }
-.graph-3d-label {
-  position: absolute;
-  max-width: min(240px, 30vw);
-  padding: 5px 8px 5px 9px;
-  transform: translate(-50%, -135%);
-  color: #c7e7da;
-  border: 1px solid rgba(var(--green-rgb), .24);
-  border-left: 2px solid rgba(var(--green-rgb), .78);
-  border-radius: 5px;
-  background: rgba(3, 12, 16, .79);
-  box-shadow: 0 7px 22px rgba(0, 0, 0, .34), 0 0 18px rgba(var(--green-rgb), .08);
-  backdrop-filter: blur(7px);
-  font: 700 8px/1.25 "SFMono-Regular", Consolas, monospace;
-  letter-spacing: .035em;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  overflow: hidden;
-  opacity: .78;
-  transition: opacity .16s ease, border-color .16s ease, color .16s ease, box-shadow .16s ease;
-}
-.graph-3d-label:after { content: ""; position: absolute; left: 50%; top: 100%; width: 1px; height: 9px; background: linear-gradient(rgba(var(--green-rgb), .55), transparent); }
-.graph-3d-label.selected {
-  color: #f1fff8;
-  border-color: rgba(var(--green-rgb), .78);
-  box-shadow: 0 8px 26px rgba(0, 0, 0, .42), 0 0 24px rgba(var(--green-rgb), .22);
-  opacity: 1;
-}
-.graph-3d-label-layer.reduced-motion .graph-3d-label { transition: none; }
-.graph-3d-controls { position: absolute; z-index: 2; right: 18px; top: 16px; display: flex; gap: 7px; }
-.graph-3d-controls button { min-height: 28px; padding: 0 9px; color: #9db7ac; border: 1px solid rgba(var(--green-rgb), .24); border-radius: 4px; background: rgba(4,12,17,.78); font: 700 8px "SFMono-Regular", Consolas, monospace; letter-spacing: .08em; cursor: pointer; }
-.graph-3d-controls button:hover, .graph-3d-controls button:focus-visible { color: var(--green); border-color: rgba(var(--green-rgb), .68); outline: 2px solid rgba(var(--green-rgb), .32); outline-offset: 2px; }
-.live-work-hud { position: absolute; z-index: 2; left: 18px; top: 16px; width: min(330px, calc(100% - 36px)); padding: 13px 14px 12px; border: 1px solid rgba(var(--green-rgb), .22); border-left: 2px solid rgba(var(--green-rgb), .8); border-radius: 6px; background: rgba(4, 13, 17, .84); box-shadow: 0 14px 34px rgba(0,0,0,.32); backdrop-filter: blur(8px); transition: border-color .2s ease, opacity .2s ease; pointer-events: none; }
-.live-work-hud.calm { border-color: rgba(var(--green-rgb), .14); opacity: .72; }
-.live-work-hud-head { display: flex; justify-content: space-between; color: #8fa79c; font: 700 8px/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .14em; }
-.live-work-hud-head b { color: var(--green); font: inherit; }
-.live-work-agent { margin: 9px 0 10px; color: #c5ead8; font: 700 10px/1.35 "SFMono-Regular", Consolas, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.live-work-row { display: grid; grid-template-columns: 68px minmax(0, 1fr); gap: 8px; padding-top: 8px; border-top: 1px solid rgba(179,214,199,.1); }
-.live-work-row + .live-work-row { margin-top: 7px; }
-.live-work-row small { color: #5f796e; font: 700 7px/1.4 "SFMono-Regular", Consolas, monospace; letter-spacing: .1em; }
-.live-work-row span { color: #9db5aa; font: 500 10px/1.4 "Avenir Next", sans-serif; overflow-wrap: anywhere; }
-.graph-3d-label.active { border-color: rgba(var(--amber-rgb), .68); color: #ffe6b1; }
-.graph-3d-label.blocked { border-left-color: rgba(132,147,171,.8); color: #9da8b8; opacity: .64; }
-.graph-accessible-list { position: absolute; z-index: 3; inset: 60px 18px 18px auto; width: min(330px, calc(100% - 36px)); max-height: calc(100% - 78px); overflow: auto; padding: 9px; border: 1px solid var(--line); border-radius: 7px; background: rgba(4,12,17,.94); box-shadow: 0 18px 50px rgba(0,0,0,.45); }
-.graph-node-option { width: 100%; display: block; padding: 9px 10px; color: #9aada4; border: 1px solid transparent; border-left: 2px solid #617086; background: rgba(255,255,255,.025); font: 600 10px/1.3 "SFMono-Regular", Consolas, monospace; text-align: left; cursor: pointer; }
-.graph-node-option + .graph-node-option { margin-top: 4px; }
-.graph-node-option:hover, .graph-node-option:focus-visible { color: #edf8f1; border-color: rgba(var(--green-rgb), .42); outline: none; }
-.graph-node-option.complete { border-left-color: var(--green); }.graph-node-option.active { border-left-color: var(--amber); }.graph-node-option.incomplete { border-left-color: #8493ab; }
-.graph-node-option.released { border-left-color: var(--red); color: #dca4a8; }
-.graph-3d-mount.hidden + .graph-3d-controls { display: none; }
 .graph-hint { position: sticky; left: 24px; bottom: 18px; display: inline-block; color: #52635c; font: 500 8px/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .1em; text-transform: uppercase; pointer-events: none; }
 
 .edge { fill: none; stroke: rgba(132,160,148,.27); stroke-width: 1.3; vector-effect: non-scaling-stroke; }
@@ -172,7 +119,6 @@ h1 em { color: #a8beb4; font-weight: 400; }
 .node .rail { opacity: .95; }
 .node.complete .rail { fill: var(--green); }.node.active .rail { fill: var(--amber); }.node.incomplete .rail { fill: var(--red); }
 .node .id-label { fill: #aebdb7; font: 600 10px "SFMono-Regular", Consolas, monospace; letter-spacing: .12em; }
-.node .task-number-label { fill: #bde9d1; font: 700 8px "SFMono-Regular", Consolas, monospace; letter-spacing: .07em; }
 .node .title-label { fill: #e7f0ec; font: 500 13px "Avenir Next", sans-serif; }
 .node .meta-label { fill: #697b73; font: 500 8px "SFMono-Regular", Consolas, monospace; letter-spacing: .08em; }
 .agent-badge rect { fill: rgba(7,16,14,.96); stroke: rgba(var(--amber-rgb), .72); stroke-width: 1; }
@@ -202,9 +148,7 @@ h1 em { color: #a8beb4; font-weight: 400; }
 .status-pill.complete { color: var(--green); background: rgba(var(--green-rgb), .06); }.status-pill.active { color: var(--amber); background: rgba(var(--amber-rgb), .06); }.status-pill.incomplete { color: var(--red); background: rgba(var(--red-rgb), .06); }
 .node-kind { margin: 38px 0 8px; color: #6e8078; }
 .inspector h3 { margin: 0; font: 400 27px/1.15 Iowan Old Style, Georgia, serif; }
-.node-task-number { margin: 9px 0 0; color: #b7d9c9; font: 700 10px/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .1em; }
 .node-id { color: var(--green); font: 600 10px/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .14em; margin: 15px 0 34px; }
-.node-overview { margin: -20px 0 20px; color: #a4b8ae; font-size: 11px; line-height: 1.55; }
 .node-progress span { display: flex; justify-content: space-between; color: #73847d; font: 600 8px/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .1em; }
 .node-progress span small { color: #9fb0a9; font: inherit; }
 .node-progress > div { height: 2px; margin-top: 11px; background: #16221e; overflow: hidden; }
@@ -214,10 +158,6 @@ h1 em { color: #a8beb4; font-weight: 400; }
 .inspector dt { color: #5d6e66; font: 600 8px/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .12em; }
 .inspector .assignment-state-label { margin-top: 15px; }
 .inspector dd { margin: 8px 0 0; color: #a0afa9; font-size: 11px; line-height: 1.5; }
-.inspector dd strong { display: block; color: #d9eee4; font-weight: 600; }
-.inspector dd span { display: block; margin-top: 6px; color: #8ea49a; }
-.inspector dd.evidence-failed { color: var(--red); }
-.inspector dd.evidence-passed { color: var(--green); }
 .inspect-button { width: 100%; margin-top: 25px; padding: 14px 16px; display: flex; justify-content: space-between; color: #07100d; border: 0; background: var(--green); font: 700 9px/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .06em; cursor: pointer; }
 .inspect-button:hover { filter: brightness(1.08); box-shadow: 0 0 25px rgba(var(--green-rgb), .2); }
 .failure-history { grid-column: 1 / -1; border-top: 1px solid var(--line); background: rgba(6, 15, 13, .78); }
@@ -260,12 +200,6 @@ h1 em { color: #a8beb4; font-weight: 400; }
 .failure-empty-copy { color: #65786e; font-size: 10px; }
 footer { max-width: 1480px; margin: 0 auto; padding: 22px clamp(18px,4vw,72px) 30px; display: flex; justify-content: space-between; color: #435149; font: 500 8px/1.5 "SFMono-Regular", Consolas, monospace; letter-spacing: .09em; text-transform: uppercase; }
 .hidden { display: none !important; }
-.sr-only { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
-
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .001ms !important; }
-  .live-work-hud { transition: none; }
-}
 
 /* The modular master browser owns its chrome and stage. Keep the established
  * execution board intact while its alternate view is active. */
@@ -332,7 +266,6 @@ footer { max-width: 1480px; margin: 0 auto; padding: 22px clamp(18px,4vw,72px) 3
   .graph-shell { border-right: 0; }
   .inspector { border-top: 1px solid var(--line); min-height: 330px; }
   .graph-stage { height: 560px; }
-  .graph-3d-controls { right: 12px; top: 12px; }
   .legend { display: none; }
   .failure-history-columns { grid-template-columns: 1fr; }
   .failure-history-list { max-height: 300px; }
@@ -345,9 +278,6 @@ footer { max-width: 1480px; margin: 0 auto; padding: 22px clamp(18px,4vw,72px) 3
   .live-state { display: none; }
   .efficiency-counter { margin-left: 0; order: 4; flex: 0 0 auto; }
   .efficiency-counter summary { max-width: 155px; overflow: hidden; text-overflow: ellipsis; }
-  .graph-3d-controls { left: 12px; right: auto; }
-  .live-work-hud { left: 12px; top: 58px; width: min(270px, calc(100% - 24px)); }
-  .graph-accessible-list { inset: 54px 12px 12px; width: auto; }
   /* Keep pause reachable on narrow individual boards; wrapping the compact
    * control is safer than deleting the only run-control affordance. */
   .pause-build { display: inline-flex; align-items: center; order: 5; margin-left: 0; min-height: 32px; padding: 0 9px; }
@@ -366,4 +296,28 @@ footer { max-width: 1480px; margin: 0 auto; padding: 22px clamp(18px,4vw,72px) 3
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; scroll-behavior: auto !important; }
+}
+/* The individual board is rendered by the generated Fractal Society bundle.
+ * The legacy regions remain mounted for run controls and master-estate mode,
+ * but are not a second visible project-graph implementation. */
+.canonical-graph-shell {
+  width: min(1720px, calc(100% - 18px));
+  margin: 18px auto 42px;
+}
+
+body:not(.canonical-master) main > .hero,
+body:not(.canonical-master) main > .workspace {
+  display: none;
+}
+
+body.canonical-master .canonical-graph-shell,
+body.master-active .canonical-graph-shell {
+  display: none;
+}
+
+@media (max-width: 640px) {
+  .canonical-graph-shell {
+    width: min(100% - 20px, 1440px);
+    margin-top: 16px;
+  }
 }

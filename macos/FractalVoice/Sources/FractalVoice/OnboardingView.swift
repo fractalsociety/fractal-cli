@@ -9,8 +9,6 @@ struct OnboardingView: View {
     @AppStorage(VoiceInputMode.defaultsKey) private var voiceInputModeRaw = ""
     @AppStorage("selectedLeadAgent") private var selectedLeadAgent = "codex"
     @State private var page: Int
-    @State private var bridgeToken = ""
-    @State private var showKeychainExplanation = false
     @State private var projectsDirectoryPath = AppRuntime.projectsURL.path
     @State private var projectsDirectoryMessage = ""
 
@@ -24,9 +22,9 @@ struct OnboardingView: View {
         _page = State(initialValue: initialPage)
     }
 
-    private var pageCount: Int { AppRuntime.isAppStoreEdition ? 9 : 8 }
-    private var readinessPageIndex: Int { AppRuntime.isAppStoreEdition ? 6 : 5 }
-    private var accountPageIndex: Int { AppRuntime.isAppStoreEdition ? 2 : 1 }
+    private let pageCount = 8
+    private let readinessPageIndex = 5
+    private let accountPageIndex = 1
     private var selectedPlannerReady: Bool {
         readiness.snapshot.agents.first(where: { $0.id == selectedLeadAgent })?.authenticated == true
     }
@@ -39,9 +37,6 @@ struct OnboardingView: View {
     private var pageBlocksAdvancement: Bool {
         (page == 0 && selectedVoiceMode == nil)
             || (page == readinessPageIndex && (!readiness.isReady || !selectedPlannerReady))
-            || (AppRuntime.isAppStoreEdition
-                && page == 1
-                && !readiness.snapshot.fractalCLIInstalled)
     }
 
     var body: some View {
@@ -113,117 +108,16 @@ struct OnboardingView: View {
 
     @ViewBuilder
     private var currentPage: some View {
-        if AppRuntime.isAppStoreEdition {
-            switch page {
-            case 0: voiceChoicePage
-            case 1: bridgePage
-            case 2: accountPage
-            case 3: agentPage
-            case 4: githubPage
-            case 5: projectsDirectoryPage
-            case 6: readinessPage
-            case 7: shortcutPage
-            default: buildPage
-            }
-        } else {
-            switch page {
-            case 0: voiceChoicePage
-            case 1: accountPage
-            case 2: agentPage
-            case 3: githubPage
-            case 4: projectsDirectoryPage
-            case 5: readinessPage
-            case 6: shortcutPage
-            default: buildPage
-            }
+        switch page {
+        case 0: voiceChoicePage
+        case 1: accountPage
+        case 2: agentPage
+        case 3: githubPage
+        case 4: projectsDirectoryPage
+        case 5: readinessPage
+        case 6: shortcutPage
+        default: buildPage
         }
-    }
-
-    private var bridgePage: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            Label("Connect the sandboxed app to Fractal CLI", systemImage: "cable.connector")
-                .font(.system(size: 31, weight: .bold, design: .rounded))
-            Text("The App Store edition never receives unrestricted access to your coding agents, Git credentials, or home folder. A local authenticated bridge asks your installed Fractal CLI to perform builds outside the app sandbox.")
-                .font(.title3)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            explanation(
-                icon: "terminal",
-                title: "1. Install the local bridge",
-                detail: "Open Terminal and run: fractal bridge install"
-            )
-            explanation(
-                icon: "key.fill",
-                title: "2. Copy the pairing token",
-                detail: "The command prints a local pairing token. It is stored only on this Mac and should be treated like a local password."
-            )
-            explanation(
-                icon: "lock.shield",
-                title: "Why Fractal asks for Keychain access",
-                detail: "Fractal saves only this local bridge pairing token in Apple Keychain so another app cannot read it from a settings file. The token authenticates requests to Fractal CLI on 127.0.0.1. Fractal does not read your Apple, GitHub, or coding-agent passwords."
-            )
-
-            VStack(alignment: .leading, spacing: 9) {
-                Text("Pairing token").font(.headline)
-                HStack {
-                    SecureField("Paste the token from Terminal", text: $bridgeToken)
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit { showKeychainExplanation = true }
-                    Button {
-                        pasteBridgeToken()
-                    } label: {
-                        Label("Paste token", systemImage: "doc.on.clipboard")
-                    }
-                    .help("Paste the entire Fractal bridge token from the clipboard")
-                }
-                HStack {
-                    Button("Save securely and check bridge") {
-                        showKeychainExplanation = true
-                    }
-                    .disabled(bridgeToken.trimmingCharacters(in: .whitespacesAndNewlines).count < 48)
-                    if readiness.snapshot.fractalCLIInstalled {
-                        Label("Bridge connected", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                    }
-                    Spacer()
-                    if !bridgeToken.isEmpty {
-                        Text("\(bridgeToken.trimmingCharacters(in: .whitespacesAndNewlines).count) characters")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                if let message = readiness.bridgeMessage {
-                    Text(message).font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            .padding(16)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
-
-            Link(
-                "Open setup and troubleshooting",
-                destination: URL(string: "https://fractalsociety.com/support")!
-            )
-        }
-        .padding(44)
-        .alert("Allow secure Keychain storage?", isPresented: $showKeychainExplanation) {
-            Button("Not now", role: .cancel) {}
-            Button("Continue") {
-                readiness.pairBridge(token: bridgeToken)
-            }
-        } message: {
-            Text("Fractal Voice will store only the local bridge pairing token in Apple Keychain. It uses the token to prove that build requests sent to Fractal CLI on this Mac are authorized. The token is not uploaded and this does not give Fractal access to your other passwords.")
-        }
-    }
-
-    private func pasteBridgeToken() {
-        guard let clipboard = NSPasteboard.general.string(forType: .string) else {
-            readiness.reportBridgeMessage("The clipboard does not contain text.")
-            return
-        }
-        let token = clipboard.trimmingCharacters(in: .whitespacesAndNewlines)
-        bridgeToken = token
-        showKeychainExplanation = true
     }
 
     private var voiceChoicePage: some View {

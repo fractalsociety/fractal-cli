@@ -59,6 +59,10 @@ pub(crate) enum Command {
     Graph(GraphArgs),
     /// Validate or inspect the repository harness policy without writing.
     Harness(HarnessArgs),
+    /// Record, inspect, or revoke external human-review gates.
+    Gate(GateArgs),
+    /// Inspect or govern queued graph amendments.
+    Amendment(AmendmentArgs),
     /// Run a compiled graph through Coordinate (stub).
     Run(RunArgs),
     /// Run the graph morphogenesis loop (stub).
@@ -106,10 +110,58 @@ pub(crate) enum Command {
     ConnectX(ConnectXArgs),
     /// Preview or confirm a project and GitHub repository visibility change.
     Visibility(VisibilityArgs),
-    /// Deprecated compatibility bridge; external desktop apps should use `handoff`.
+    /// Deprecated compatibility parser. Use `handoff`; this command is hidden
+    /// and never starts the removed loopback bridge.
+    #[command(hide = true)]
     Bridge(BridgeArgs),
     /// Print the Fractal CLI version.
     Version,
+}
+
+/// Arguments accepted by `fractal amendment`.
+#[derive(Debug, Args)]
+pub(crate) struct AmendmentArgs {
+    /// Amendment control-plane operation.
+    #[command(subcommand)]
+    pub(crate) command: AmendmentCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AmendmentCommand {
+    /// List every pending graph amendment without changing the queue.
+    List(AmendmentListArgs),
+    /// Reject one pending graph amendment. Without `--yes`, print a read-only
+    /// preview that can be reviewed before the exact target is removed.
+    Reject(AmendmentRejectArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct AmendmentListArgs {
+    /// Project workspace containing the pending amendment queue.
+    #[arg(long, required = true, value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+    /// Print a stable JSON report.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct AmendmentRejectArgs {
+    /// Exact pending amendment command ID to reject.
+    #[arg(value_name = "COMMAND_ID")]
+    pub(crate) command_id: String,
+    /// Project workspace containing the pending amendment queue.
+    #[arg(long, required = true, value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+    /// Human-readable reason recorded in the owner-only rejection audit.
+    #[arg(long, required = true, value_name = "TEXT")]
+    pub(crate) reason: String,
+    /// Apply the rejection. Without this flag the command is read-only.
+    #[arg(long)]
+    pub(crate) yes: bool,
+    /// Print a stable JSON report.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 /// Arguments accepted by `fractal harness`.
@@ -118,6 +170,110 @@ pub(crate) struct HarnessArgs {
     /// Harness policy operation.
     #[command(subcommand)]
     pub(crate) command: HarnessCommand,
+}
+
+/// Arguments accepted by fractal gate.
+#[derive(Debug, Args)]
+pub(crate) struct GateArgs {
+    #[command(subcommand)]
+    pub(crate) command: GateCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum GateCommand {
+    /// Preview or append one immutable external-gate approval.
+    Record(GateRecordArgs),
+    /// Show the append-only external-gate ledger.
+    Show(GateShowArgs),
+    /// Preview or append one exact approval revocation.
+    Revoke(GateRevokeArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GateRecordArgs {
+    /// Project workspace containing .fractal/project.fractal.
+    #[arg(long, default_value = ".", value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+    /// Graph node that declares the external gate.
+    #[arg(long, visible_alias = "node-id", value_name = "NODE")]
+    pub(crate) node: String,
+    /// Exact declared gate name (for example security_review).
+    #[arg(long, value_name = "GATE")]
+    pub(crate) gate: String,
+    /// Repo-relative evidence file.
+    #[arg(long, visible_alias = "evidence-path", value_name = "PATH")]
+    pub(crate) evidence: PathBuf,
+    /// Local reviewer identity; never taken from a worker checkout.
+    #[arg(long, value_name = "ID")]
+    pub(crate) reviewer_id: String,
+    /// Human-readable reviewer label.
+    #[arg(long, default_value = "", value_name = "LABEL")]
+    pub(crate) reviewer_label: String,
+    /// Bounded reviewer role (security_review requires security_reviewer).
+    #[arg(long, value_name = "ROLE")]
+    pub(crate) role: String,
+    /// Local attestation text or reference.
+    #[arg(long, value_name = "TEXT")]
+    pub(crate) attestation: String,
+    /// Apply the exact previewed record. Without this flag the command is read-only.
+    #[arg(long)]
+    pub(crate) yes: bool,
+    /// Content hash printed by the preview; required with --yes to detect
+    /// document, ledger, or evidence drift between commands.
+    #[arg(long, visible_alias = "expected-hash", value_name = "HASH")]
+    pub(crate) expected_content_hash: Option<String>,
+    /// Print a stable JSON report.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GateShowArgs {
+    /// Project workspace containing .fractal/project.fractal.
+    #[arg(long, default_value = ".", value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+    /// Restrict output to one node.
+    #[arg(long, visible_alias = "node-id", value_name = "NODE")]
+    pub(crate) node: Option<String>,
+    /// Restrict output to one gate.
+    #[arg(long, value_name = "GATE")]
+    pub(crate) gate: Option<String>,
+    /// Print a stable JSON report.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GateRevokeArgs {
+    /// Project workspace containing .fractal/project.fractal.
+    #[arg(long, default_value = ".", value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+    /// Exact content hash printed by gate record/show.
+    #[arg(long, visible_alias = "record-hash", value_name = "HASH")]
+    pub(crate) approval_hash: String,
+    /// Local revoker identity.
+    #[arg(long, value_name = "ID")]
+    pub(crate) reviewer_id: String,
+    /// Human-readable revoker label.
+    #[arg(long, default_value = "", value_name = "LABEL")]
+    pub(crate) reviewer_label: String,
+    /// Bounded revoker role.
+    #[arg(long, value_name = "ROLE")]
+    pub(crate) role: String,
+    /// Local revocation attestation text or reference.
+    #[arg(long, value_name = "TEXT")]
+    pub(crate) attestation: String,
+    /// Apply the exact previewed revocation. Without this flag it is read-only.
+    #[arg(long)]
+    pub(crate) yes: bool,
+    /// Content hash printed by the preview; required with --yes to detect
+    /// approval, project, or ledger drift. Old approval evidence may drift or
+    /// be deleted without blocking an exact revocation.
+    #[arg(long, visible_alias = "expected-hash", value_name = "HASH")]
+    pub(crate) expected_content_hash: Option<String>,
+    /// Print a stable JSON report.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -249,24 +405,35 @@ pub(crate) struct VisibilityArgs {
 #[derive(Debug, clap::Args)]
 pub(crate) struct BridgeArgs {
     #[command(subcommand)]
-    pub(crate) command: BridgeCommand,
+    pub(crate) command: Option<BridgeCommand>,
 }
+
+/// Stable migration output for scripts that still invoke the removed bridge
+/// command. Keep the parser above so old invocations receive this message
+/// instead of an opaque unknown-command error, but never dispatch a bridge
+/// server, launch agent, or pairing-token operation.
+pub(crate) const BRIDGE_MIGRATION_MESSAGE: &str =
+    "`fractal bridge` is no longer available. Use `fractal handoff --name 'PROJECT NAME'` and pass the build request on stdin.";
 
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub(crate) enum BridgeCommand {
     /// Run the loopback-only bridge in the foreground.
+    #[command(hide = true)]
     Serve {
         #[arg(long, default_value_t = 18_372)]
         port: u16,
     },
     /// Install and start the per-user launch agent.
+    #[command(hide = true)]
     Install {
         #[arg(long, default_value_t = 18_372)]
         port: u16,
     },
     /// Print the pairing token for entry into Fractal Voice.
+    #[command(hide = true)]
     Token,
     /// Verify that the local bridge is reachable.
+    #[command(hide = true)]
     Status {
         #[arg(long, default_value_t = 18_372)]
         port: u16,
@@ -337,6 +504,22 @@ pub(crate) struct ResumeArgs {
     /// Board port to serve the resumed graph on.
     #[arg(long, default_value_t = DEFAULT_GRAPH_PORT)]
     pub(crate) port: u16,
+
+    /// Run remaining worker nodes in isolated Git worktrees and integrate their
+    /// declared outputs serially into the canonical workspace.
+    #[arg(long)]
+    pub(crate) hybrid: bool,
+
+    /// Explicitly reroute eligible released tool-failure nodes from one pinned
+    /// provider to another active provider (for example claude=codex-luna).
+    /// May be repeated; valid only with `--hybrid`.
+    #[arg(
+        long,
+        value_name = "SOURCE=TARGET",
+        requires = "hybrid",
+        action = clap::ArgAction::Append
+    )]
+    pub(crate) reroute_unavailable: Vec<String>,
 }
 
 /// Arguments accepted by `fractal clean`.
@@ -644,8 +827,10 @@ pub(crate) enum GraphCommand {
     Status(GraphStatusArgs),
     /// Load a committed execution graph from the local store.
     Show(GraphShowArgs),
-    /// Inspect and compare the additive failure/lesson graph.
-    Failure(GraphFailureArgs),
+    /// Compile a bounded PRD task range into a canonical child graph.
+    PlanPrd(GraphPlanPrdArgs),
+    /// Validate and compile an existing fractal-plan.json without invoking a planner.
+    CompilePlan(GraphCompilePlanArgs),
     /// Audit projects from a frozen repository inventory shard.
     Audit(GraphAuditArgs),
     /// Compose a read-only master graph from a frozen repository inventory.
@@ -661,94 +846,6 @@ pub(crate) enum GraphCommand {
     /// Internal foreground Rust board server.
     #[command(hide = true)]
     Serve(GraphServeArgs),
-}
-
-/// Arguments accepted by `fractal graph failure`.
-#[derive(Debug, Args)]
-pub(crate) struct GraphFailureArgs {
-    #[command(subcommand)]
-    pub(crate) command: GraphFailureCommand,
-}
-
-/// Read-only failure graph inspection operations.
-#[derive(Debug, Subcommand)]
-pub(crate) enum GraphFailureCommand {
-    /// Show a bounded failure graph summary or one record and its related edges.
-    Show(GraphFailureShowArgs),
-    /// Validate the canonical failure graph envelope and references.
-    Validate(GraphFailureValidateArgs),
-    /// Select the same evidence-backed lessons supplied to a future worker.
-    Lessons(GraphFailureLessonsArgs),
-    /// Compare failure graph records between a git revision and the workspace.
-    Diff(GraphFailureDiffArgs),
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct GraphFailureShowArgs {
-    /// Project workspace containing `.fractal/project.fractal`.
-    #[arg(long, value_name = "PATH")]
-    pub(crate) repo: PathBuf,
-
-    /// Failure, lesson, or edge key to inspect in detail.
-    #[arg(long, value_name = "KEY")]
-    pub(crate) id: Option<String>,
-
-    /// Print the stable JSON response instead of a human summary.
-    #[arg(long)]
-    pub(crate) json: bool,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct GraphFailureValidateArgs {
-    /// Project workspace containing `.fractal/project.fractal`.
-    #[arg(long, value_name = "PATH")]
-    pub(crate) repo: PathBuf,
-
-    /// Print the stable JSON validation response.
-    #[arg(long)]
-    pub(crate) json: bool,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct GraphFailureLessonsArgs {
-    /// Project workspace containing `.fractal/project.fractal`.
-    #[arg(long, value_name = "PATH")]
-    pub(crate) repo: PathBuf,
-
-    /// Graph node ID used as the primary lesson selector.
-    #[arg(long, value_name = "ID")]
-    pub(crate) node: String,
-
-    /// Optional capability selector used by the worker lesson ranker.
-    #[arg(long, value_name = "VALUE")]
-    pub(crate) capability: Option<String>,
-
-    /// Optional failure-code selector used by the worker lesson ranker.
-    #[arg(long = "failure-code", value_name = "VALUE")]
-    pub(crate) failure_code: Option<String>,
-
-    /// Print the stable JSON response.
-    #[arg(long)]
-    pub(crate) json: bool,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct GraphFailureDiffArgs {
-    /// Project workspace containing `.fractal/project.fractal`.
-    #[arg(long, value_name = "PATH")]
-    pub(crate) repo: PathBuf,
-
-    /// Safe git revision containing `.fractal/project.fractal` to use as base.
-    #[arg(long, value_name = "REF")]
-    pub(crate) base: String,
-
-    /// Safe git revision for the head; defaults to the workspace file.
-    #[arg(long, value_name = "REF")]
-    pub(crate) head: Option<String>,
-
-    /// Print the stable JSON response.
-    #[arg(long)]
-    pub(crate) json: bool,
 }
 
 /// Arguments accepted by `fractal graph board`.
@@ -942,6 +1039,71 @@ pub(crate) struct GraphShowArgs {
     pub(crate) json: bool,
 }
 
+/// Arguments accepted by `fractal graph plan-prd`.
+#[derive(Debug, Args)]
+pub(crate) struct GraphPlanPrdArgs {
+    /// Project workspace containing `.fractal/project.fractal`.
+    #[arg(long, required = true, value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+
+    /// PRD Markdown path relative to the project workspace.
+    #[arg(long, required = true, value_name = "RELATIVE_PATH")]
+    pub(crate) prd: PathBuf,
+
+    /// First inclusive PRD task identifier.
+    #[arg(long, required = true, value_name = "INT-NNN")]
+    pub(crate) from: String,
+
+    /// Last inclusive PRD task identifier.
+    #[arg(long, required = true, value_name = "INT-NNN")]
+    pub(crate) through: String,
+
+    /// Expected current project graph hash.
+    #[arg(long = "expected-parent-hash", required = true, value_name = "SHA256")]
+    pub(crate) expected_parent_hash: String,
+
+    /// Commit the compiled child graph and repoint the project at it.
+    #[arg(long)]
+    pub(crate) yes: bool,
+
+    /// Print a stable JSON report instead of human-readable diagnostics.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+/// Arguments accepted by `fractal graph compile-plan`.
+#[derive(Debug, Args)]
+pub(crate) struct GraphCompilePlanArgs {
+    /// Project workspace that will receive `.fractal/project.fractal` on apply.
+    #[arg(long, required = true, value_name = "PATH")]
+    pub(crate) repo: PathBuf,
+
+    /// Existing fractal-plan.json path, absolute or relative to the project workspace.
+    #[arg(long, required = true, value_name = "RELATIVE_OR_ABSOLUTE_PATH")]
+    pub(crate) plan: PathBuf,
+
+    /// Commit the compiled graph and repoint the project at it.
+    #[arg(long)]
+    pub(crate) yes: bool,
+
+    /// Replace an existing halted graph while preserving only semantically
+    /// unchanged, dependency-closed completed work.
+    #[arg(long, requires = "yes")]
+    pub(crate) preserve_execution: bool,
+
+    /// Force a node to reopen even when its semantic task identity is unchanged.
+    #[arg(
+        long = "reopen",
+        value_name = "NODE_ID",
+        requires = "preserve_execution"
+    )]
+    pub(crate) reopen: Vec<String>,
+
+    /// Print a stable JSON report instead of human-readable diagnostics.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
 /// Arguments accepted by `fractal graph status`.
 #[derive(Debug, Args)]
 pub(crate) struct GraphStatusArgs {
@@ -973,6 +1135,11 @@ pub(crate) struct RunArgs {
     /// checks out ready nodes) instead of enqueuing through Coordinate.
     #[arg(long)]
     pub(crate) local: bool,
+
+    /// Run worker nodes in isolated Git worktrees, then let Fractal integrate
+    /// their commits serially before trusted verification.
+    #[arg(long, requires = "local")]
+    pub(crate) hybrid: bool,
 
     /// Coordinate SQLite store (defaults to `$FRACTAL_HOME/coordinate.sqlite3`).
     #[arg(long, value_name = "PATH")]
@@ -1257,10 +1424,6 @@ pub(crate) struct ArchitectArgs {
     #[arg(long, default_value_t = 10)]
     pub(crate) poll_secs: u64,
 
-    /// Keep this many independent specialist-team objectives queued for concurrent planning.
-    #[arg(long, default_value_t = 4)]
-    pub(crate) planning_lanes: usize,
-
     /// Refuse a new team above this one-minute-load/logical-core ratio.
     #[arg(long, default_value_t = 1.25)]
     pub(crate) max_load_per_core: f64,
@@ -1293,6 +1456,7 @@ pub(crate) struct ArchitectArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn parses_bare_request() {
@@ -1402,6 +1566,70 @@ mod tests {
         assert!(args.json);
         assert!(args.graph_hash.starts_with("sha256:"));
 
+        let plan = Cli::try_parse_from([
+            "fractal",
+            "graph",
+            "plan-prd",
+            "--repo",
+            "/tmp/project",
+            "--prd",
+            "docs/implementation.md",
+            "--from",
+            "INT-008",
+            "--through",
+            "INT-061",
+            "--expected-parent-hash",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--yes",
+            "--json",
+        ])
+        .unwrap();
+        let Some(Command::Graph(GraphArgs {
+            command: GraphCommand::PlanPrd(args),
+        })) = plan.command
+        else {
+            panic!("expected graph plan-prd command");
+        };
+        assert_eq!(args.repo, PathBuf::from("/tmp/project"));
+        assert_eq!(args.prd, PathBuf::from("docs/implementation.md"));
+        assert_eq!(args.from, "INT-008");
+        assert_eq!(args.through, "INT-061");
+        assert!(args.yes);
+        assert!(args.json);
+
+        let compile_plan = Cli::try_parse_from([
+            "fractal",
+            "graph",
+            "compile-plan",
+            "--repo",
+            "/tmp/project",
+            "--plan",
+            "fractal-plan.json",
+            "--yes",
+            "--preserve-execution",
+            "--reopen",
+            "companion_export_contract_tests",
+            "--reopen",
+            "integration_verify",
+            "--json",
+        ])
+        .unwrap();
+        let Some(Command::Graph(GraphArgs {
+            command: GraphCommand::CompilePlan(args),
+        })) = compile_plan.command
+        else {
+            panic!("expected graph compile-plan command");
+        };
+        assert_eq!(args.repo, PathBuf::from("/tmp/project"));
+        assert_eq!(args.plan, PathBuf::from("fractal-plan.json"));
+        assert!(args.yes);
+        assert!(args.preserve_execution);
+        assert_eq!(
+            args.reopen,
+            ["companion_export_contract_tests", "integration_verify"]
+        );
+        assert!(args.json);
+
         let board = Cli::try_parse_from([
             "fractal",
             "graph",
@@ -1489,120 +1717,6 @@ mod tests {
                 })
             })) if inventory == std::path::Path::new("/tmp/inventory.json")
         ));
-
-        let failure_show = Cli::try_parse_from([
-            "fractal",
-            "graph",
-            "failure",
-            "show",
-            "--repo",
-            "/tmp/project",
-            "--id",
-            "failure:build:tool_failure",
-            "--json",
-        ])
-        .unwrap();
-        let Some(Command::Graph(GraphArgs {
-            command:
-                GraphCommand::Failure(GraphFailureArgs {
-                    command:
-                        GraphFailureCommand::Show(GraphFailureShowArgs {
-                            repo,
-                            id,
-                            json: true,
-                        }),
-                }),
-        })) = failure_show.command
-        else {
-            panic!("expected graph failure show command");
-        };
-        assert_eq!(repo, PathBuf::from("/tmp/project"));
-        assert_eq!(id.as_deref(), Some("failure:build:tool_failure"));
-
-        let failure_validate = Cli::try_parse_from([
-            "fractal",
-            "graph",
-            "failure",
-            "validate",
-            "--repo",
-            "/tmp/project",
-        ])
-        .unwrap();
-        assert!(matches!(
-            failure_validate.command,
-            Some(Command::Graph(GraphArgs {
-                command: GraphCommand::Failure(GraphFailureArgs {
-                    command: GraphFailureCommand::Validate(GraphFailureValidateArgs {
-                        repo,
-                        json: false,
-                    })
-                })
-            })) if repo == std::path::Path::new("/tmp/project")
-        ));
-
-        let failure_lessons = Cli::try_parse_from([
-            "fractal",
-            "graph",
-            "failure",
-            "lessons",
-            "--repo",
-            "/tmp/project",
-            "--node",
-            "build",
-            "--capability",
-            "verify",
-            "--failure-code",
-            "tool_failure",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            failure_lessons.command,
-            Some(Command::Graph(GraphArgs {
-                command: GraphCommand::Failure(GraphFailureArgs {
-                    command: GraphFailureCommand::Lessons(GraphFailureLessonsArgs {
-                        repo,
-                        node,
-                        capability: Some(capability),
-                        failure_code: Some(failure_code),
-                        json: true,
-                    })
-                })
-            })) if repo == std::path::Path::new("/tmp/project")
-                && node == "build"
-                && capability == "verify"
-                && failure_code == "tool_failure"
-        ));
-
-        let failure_diff = Cli::try_parse_from([
-            "fractal",
-            "graph",
-            "failure",
-            "diff",
-            "--repo",
-            "/tmp/project",
-            "--base",
-            "HEAD",
-            "--head",
-            "main",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            failure_diff.command,
-            Some(Command::Graph(GraphArgs {
-                command: GraphCommand::Failure(GraphFailureArgs {
-                    command: GraphFailureCommand::Diff(GraphFailureDiffArgs {
-                        repo,
-                        base,
-                        head: Some(head),
-                        json: true,
-                    })
-                })
-            })) if repo == std::path::Path::new("/tmp/project")
-                && base == "HEAD"
-                && head == "main"
-        ));
     }
 
     #[test]
@@ -1624,6 +1738,66 @@ mod tests {
                 "shard {shard:?} should fail"
             );
         }
+    }
+
+    #[test]
+    fn parses_gate_preview_tokens_for_record_and_revoke() {
+        let token = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let record = Cli::try_parse_from([
+            "fractal",
+            "gate",
+            "record",
+            "--node",
+            "secure",
+            "--gate",
+            "security_review",
+            "--evidence",
+            "review.txt",
+            "--reviewer-id",
+            "reviewer",
+            "--role",
+            "security_reviewer",
+            "--attestation",
+            "approve:graph:secure:security_review",
+            "--yes",
+            "--expected-content-hash",
+            token,
+        ])
+        .unwrap();
+        let Some(Command::Gate(GateArgs {
+            command: GateCommand::Record(args),
+        })) = record.command
+        else {
+            panic!("expected gate record command");
+        };
+        assert!(args.yes);
+        assert_eq!(args.expected_content_hash.as_deref(), Some(token));
+
+        let revoke = Cli::try_parse_from([
+            "fractal",
+            "gate",
+            "revoke",
+            "--approval-hash",
+            token,
+            "--reviewer-id",
+            "revoker",
+            "--role",
+            "security_reviewer",
+            "--attestation",
+            "revoke:graph:secure:security_review:approval",
+            "--yes",
+            "--expected-content-hash",
+            token,
+        ])
+        .unwrap();
+        let Some(Command::Gate(GateArgs {
+            command: GateCommand::Revoke(args),
+        })) = revoke.command
+        else {
+            panic!("expected gate revoke command");
+        };
+        assert!(args.yes);
+        assert_eq!(args.expected_content_hash.as_deref(), Some(token));
     }
 
     #[test]
@@ -1731,8 +1905,6 @@ mod tests {
             "1.5",
             "--min-free-memory-gib",
             "12",
-            "--planning-lanes",
-            "8",
             "--launch",
             "--once",
             "--json",
@@ -1744,7 +1916,6 @@ mod tests {
         assert_eq!(args.max_teams, 7);
         assert_eq!(args.max_load_per_core, 1.5);
         assert_eq!(args.min_free_memory_gib, 12.0);
-        assert_eq!(args.planning_lanes, 8);
         assert!(args.launch && args.once && args.json);
         assert!(Cli::try_parse_from(["fractal", "architect", "--launch", "--stop"]).is_err());
     }
@@ -1910,6 +2081,42 @@ mod tests {
                 .command,
             Some(Command::Status(StatusArgs { running: true }))
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["fractal", "resume", "45", "--hybrid"])
+                .unwrap()
+                .command,
+            Some(Command::Resume(ResumeArgs {
+                number: 45,
+                hybrid: true,
+                ..
+            }))
+        ));
+        let rerouted = Cli::try_parse_from([
+            "fractal",
+            "resume",
+            "45",
+            "--hybrid",
+            "--reroute-unavailable",
+            "claude=codex-luna",
+        ])
+        .unwrap();
+        assert!(matches!(
+            rerouted.command,
+            Some(Command::Resume(ResumeArgs {
+                number: 45,
+                hybrid: true,
+                ref reroute_unavailable,
+                ..
+            })) if reroute_unavailable == &["claude=codex-luna"]
+        ));
+        assert!(Cli::try_parse_from([
+            "fractal",
+            "resume",
+            "45",
+            "--reroute-unavailable",
+            "claude=codex-luna",
+        ])
+        .is_err());
         assert!(Cli::try_parse_from(["fractal", "stop", "--all", "--project", "app"]).is_err());
     }
 
@@ -2112,6 +2319,27 @@ mod tests {
     }
 
     #[test]
+    fn legacy_bridge_is_parseable_only_for_deterministic_migration() {
+        let bare = Cli::try_parse_from(["fractal", "bridge"]).unwrap();
+        assert!(matches!(bare.command, Some(Command::Bridge(_))));
+        for command in ["serve", "install", "token", "status"] {
+            let cli = Cli::try_parse_from(["fractal", "bridge", command]).unwrap();
+            assert!(matches!(cli.command, Some(Command::Bridge(_))));
+        }
+
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("bridge"));
+        let bridge_help = Cli::try_parse_from(["fractal", "bridge", "--help"])
+            .expect_err("bridge help exits through clap");
+        let bridge_help = bridge_help.to_string();
+        assert!(bridge_help.contains("Deprecated compatibility parser"));
+        assert!(!bridge_help.contains("serve"));
+        assert!(!bridge_help.contains("install"));
+        assert!(!bridge_help.contains("token"));
+        assert!(BRIDGE_MIGRATION_MESSAGE.contains("fractal handoff"));
+    }
+
+    #[test]
     fn efficiency_defaults_to_suggest_with_no_grants() {
         let cli = Cli::try_parse_from(["fractal", "efficiency"]).unwrap();
         let Some(Command::Efficiency(args)) = cli.command else {
@@ -2230,6 +2458,24 @@ mod tests {
             panic!("expected run command");
         };
         assert_eq!(args.efficiency.efficiency_mode, EfficiencyModeArg::Suggest);
+
+        let hybrid = Cli::try_parse_from([
+            "fractal",
+            "run",
+            "--local",
+            "--hybrid",
+            "--graph-file",
+            "graph.json",
+        ])
+        .unwrap();
+        let Some(Command::Run(args)) = hybrid.command else {
+            panic!("expected hybrid run command");
+        };
+        assert!(args.local && args.hybrid);
+        assert!(
+            Cli::try_parse_from(["fractal", "run", "--hybrid", "--graph-file", "graph.json"])
+                .is_err()
+        );
     }
 
     #[test]
@@ -2290,5 +2536,82 @@ mod tests {
                 command: HarnessCommand::Show(HarnessPolicyArgs { ref repo, json: false })
             })) if repo == &PathBuf::from(".")
         ));
+    }
+
+    #[test]
+    fn parses_amendment_list_and_reject_controls() {
+        let list = Cli::try_parse_from([
+            "fractal",
+            "amendment",
+            "list",
+            "--repo",
+            "/tmp/project",
+            "--json",
+        ])
+        .unwrap();
+        let Some(Command::Amendment(AmendmentArgs {
+            command:
+                AmendmentCommand::List(AmendmentListArgs {
+                    ref repo,
+                    json: true,
+                }),
+        })) = list.command
+        else {
+            panic!("expected amendment list command");
+        };
+        assert_eq!(repo, &PathBuf::from("/tmp/project"));
+
+        let reject = Cli::try_parse_from([
+            "fractal",
+            "amendment",
+            "reject",
+            "command-7",
+            "--repo",
+            "/tmp/project",
+            "--reason",
+            "stale request",
+            "--yes",
+            "--json",
+        ])
+        .unwrap();
+        let Some(Command::Amendment(AmendmentArgs {
+            command:
+                AmendmentCommand::Reject(AmendmentRejectArgs {
+                    ref command_id,
+                    ref repo,
+                    ref reason,
+                    yes: true,
+                    json: true,
+                }),
+        })) = reject.command
+        else {
+            panic!("expected amendment reject command");
+        };
+        assert_eq!(command_id, "command-7");
+        assert_eq!(repo, &PathBuf::from("/tmp/project"));
+        assert_eq!(reason, "stale request");
+    }
+
+    #[test]
+    fn amendment_reject_requires_safe_inputs() {
+        assert!(Cli::try_parse_from(["fractal", "amendment", "list"]).is_err());
+        assert!(Cli::try_parse_from([
+            "fractal",
+            "amendment",
+            "reject",
+            "command-7",
+            "--repo",
+            "/tmp/project",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "fractal",
+            "amendment",
+            "reject",
+            "command-7",
+            "--reason",
+            "stale request",
+        ])
+        .is_err());
     }
 }

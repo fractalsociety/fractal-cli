@@ -10,7 +10,6 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
     private var statusItem: NSStatusItem!
     private var hotKey: GlobalHotKey?
     private var onboardingWindow: NSWindow?
-    private var inferXSettingsWindow: NSWindow?
     private var observations = Set<AnyCancellable>()
     private var externalHandoffTimer: Timer?
     private var setupComplete = false
@@ -47,11 +46,6 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
-        // Fractal Voice is primarily a menu-bar app, so AppKit does not create
-        // the normal application Edit menu for us.  SecureField still relies
-        // on that responder-chain menu for the standard Cmd-V key equivalent.
-        // Install it before any settings window can become first responder.
-        configureTextEditingMenu()
         configureStatusItem()
         setupComplete = OnboardingProgress.isComplete()
         selectedVoiceMode = VoiceInputMode.selected()
@@ -140,10 +134,6 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
 
     func application(_ application: NSApplication, open urls: [URL]) {
         guard urls.count == 1 else { return }
-        if InferXProvider.isSettingsURL(urls[0]) {
-            showInferXSettings()
-            return
-        }
         do {
             if urls[0].host?.lowercased() == "visibility" {
                 let handoff = try WebsiteVisibilityHandoff(url: urls[0])
@@ -413,7 +403,6 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         }
 
         menu.addItem(item("Show Welcome", #selector(showOnboarding)))
-        menu.addItem(item("InferX API Key…", #selector(showInferXSettings)))
         if !coordinator.isExternalBuild && coordinator.microphoneDenied {
             menu.addItem(item("Open Microphone Settings", #selector(openMicrophoneSettings)))
         }
@@ -640,67 +629,6 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         presentOnboarding(initialPage: 0)
     }
 
-    @objc private func showInferXSettings() {
-        // The deep-link can be delivered while the app is already running,
-        // including older launches that predate the menu setup above.
-        configureTextEditingMenu()
-        if let inferXSettingsWindow {
-            inferXSettingsWindow.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            return
-        }
-
-        NSApp.setActivationPolicy(.regular)
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 380),
-            styleMask: [.titled, .closable, .miniaturizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "InferX API Key"
-        window.center()
-        window.collectionBehavior.insert(.moveToActiveSpace)
-        window.contentView = NSHostingView(rootView: InferXSettingsView())
-        window.isReleasedWhenClosed = false
-        window.delegate = self
-        inferXSettingsWindow = window
-        window.orderFrontRegardless()
-        window.makeKey()
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    /// Ensure native text controls (including the InferX SecureField) have a
-    /// standard responder-chain Edit menu even though Fractal Voice is a
-    /// status-item application rather than a document app.
-    private func configureTextEditingMenu() {
-        let mainMenu = NSApp.mainMenu ?? NSMenu()
-        if mainMenu.item(withTitle: "Edit") == nil {
-            let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
-            editItem.submenu = Self.makeTextEditingMenu()
-            mainMenu.addItem(editItem)
-        }
-        NSApp.mainMenu = mainMenu
-    }
-
-    /// Kept separate so the responder-chain contract can be covered without
-    /// opening a window or reading from the clipboard in a unit test.
-    @MainActor
-    static func makeTextEditingMenu() -> NSMenu {
-        let menu = NSMenu(title: "Edit")
-        let entries: [(String, Selector, String)] = [
-            ("Cut", #selector(NSText.cut(_:)), "x"),
-            ("Copy", #selector(NSText.copy(_:)), "c"),
-            ("Paste", #selector(NSText.paste(_:)), "v"),
-            ("Select All", #selector(NSText.selectAll(_:)), "a"),
-        ]
-        for (title, action, keyEquivalent) in entries {
-            let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
-            item.keyEquivalentModifierMask = [.command]
-            menu.addItem(item)
-        }
-        return menu
-    }
-
     @objc private func showProjectLocation() {
         if onboardingWindow != nil {
             onboardingWindow?.close()
@@ -746,13 +674,7 @@ final class FractalVoiceApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
     }
 
     func windowWillClose(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow else { return }
-        if window === onboardingWindow {
-            onboardingWindow = nil
-        }
-        if window === inferXSettingsWindow {
-            inferXSettingsWindow = nil
-        }
+        onboardingWindow = nil
     }
 
     @objc private func openProjects() {

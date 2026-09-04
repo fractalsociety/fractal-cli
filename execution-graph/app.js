@@ -4,7 +4,6 @@ const NS = "http://www.w3.org/2000/svg";
 const state = {
   data: null, view: "overview", selected: null, initialized: false,
   pausing: false, estimatedSaved: 0,
-  liveSnapshot: null, announcementTimer: null, lastAnnouncement: "",
   failure: {
     data: null, loading: false, error: null, open: false, selected: "",
     filters: { q: "", state: [], code: "", component: "", lesson: "" }
@@ -12,114 +11,6 @@ const state = {
 };
 const statusNames = { complete: "Complete", active: "In progress", incomplete: "Incomplete" };
 let masterBrowser = null;
-let threeGraph = null;
-
-function runtimeNodeState(node) {
-  const assignment = node?.assignment || null;
-  const evidence = node?.evidence || null;
-  const status = assignment?.state === "completed" ? "complete"
-    : assignment?.state === "checked_out" ? "active" : String(node?.status || "incomplete");
-  return {
-    status,
-    assignment: assignment ? {
-      agent_id: assignment.agent_id || "", agent_label: assignment.agent_label || "", state: assignment.state || "",
-      checked_out_at: assignment.checked_out_at || "", completed_at: assignment.completed_at || "", released_at: assignment.released_at || ""
-    } : null,
-    evidence: evidence ? JSON.stringify(evidence) : ""
-  };
-}
-
-/* Compare only server-reported facts.  Initial snapshots are quiet so opening
- * a graph never invents a completion animation; every later transition is
- * bounded and deterministic for the two-second poll cadence. */
-function classifyTransitions(previous, next) {
-  const prior = new Map((previous?.nodes || []).map(node => [node.id, runtimeNodeState(node)]));
-  const transitions = [];
-  (next?.nodes || []).forEach(node => {
-    const before = prior.get(node.id);
-    if (!before) return;
-    const after = runtimeNodeState(node);
-    if (before.status !== "active" && after.status === "active") transitions.push({ id: node.id, type: "became_active", detail: node.objective || node.title });
-    if (before.status !== "complete" && after.status === "complete") transitions.push({ id: node.id, type: "completed", detail: node.objective || node.title });
-    if (before.status === "active" && after.assignment?.state === "released") transitions.push({ id: node.id, type: "released", detail: node.objective || node.title });
-    const beforeAssignment = JSON.stringify(before.assignment || null);
-    const afterAssignment = JSON.stringify(after.assignment || null);
-    if (beforeAssignment !== afterAssignment && !((before.status === "active" && after.status === "complete") || (before.status === "active" && after.assignment?.state === "released"))) {
-      transitions.push({ id: node.id, type: "assignment_changed", detail: after.assignment?.agent_label || after.assignment?.agent_id || "assignment changed" });
-    }
-    if (before.evidence !== after.evidence) {
-      transitions.push({ id: node.id, type: after.evidence.includes('"passed":false') ? "failed_verification" : "evidence_updated", detail: node.evidence?.outcome || "evidence updated" });
-    }
-  });
-  return transitions.slice(0, 64);
-}
-
-// Expose the pure classifier for offline diagnostics and controller tests while
-// keeping snapshot ownership in this polling layer.
-window.FractalExecutionTransitions = { classifyTransitions };
-
-function activeRunModel() {
-  if (!window.FractalThreeGraph || !state.data) return null;
-  return window.FractalThreeGraph.normalizeGraphPayload(state.data, state.view);
-}
-
-function renderLiveHud(model, transitions = []) {
-  const hud = document.getElementById("live-work-hud");
-  if (!hud || !model) return;
-  const active = (model.nodes || []).filter(node => node.status === "active");
-  const progress = model.execution?.progress;
-  const phase = String(model.execution?.phase || "planning").replaceAll("_", " ");
-  const settled = model.nodes.length > 0 && active.length === 0 && model.nodes.every(node => node.status === "complete");
-  const agents = settled ? [] : [...new Set(active.map(node => node.assignment?.agent_label || node.assignment?.agent_id).filter(Boolean))];
-  const selected = state.selected ? model.nodes.find(node => node.id === state.selected.id) : null;
-  const objective = settled ? "Run complete — all nodes settled." : selected?.objective || active[0]?.objective || progress?.message || "Waiting for the next eligible node.";
-  const why = settled ? "All nodes completed; no agent is active." : selected?.why?.reason || active[0]?.why?.reason || (progress?.agent_label ? `Assigned to ${progress.agent_label}.` : "The coordinator is evaluating dependencies.");
-  document.getElementById("live-work-phase").textContent = phase.toUpperCase();
-  document.getElementById("live-work-agents").textContent = agents.length ? agents.join(" · ") : "No active agent";
-  document.getElementById("live-work-objective").textContent = objective;
-  document.getElementById("live-work-why").textContent = why;
-  hud.classList.toggle("calm", settled || (!active.length && phase === "completed"));
-  if (!transitions.length) return;
-  const announcement = transitions.map(item => {
-    const label = item.detail || item.id;
-    if (item.type === "completed") return `${label} completed.`;
-    if (item.type === "released") return `${label} was released for review.`;
-    if (item.type === "failed_verification") return `${label} has failed verification.`;
-    if (item.type === "became_active") return `${label} is now active.`;
-    return `${label} changed.`;
-  }).join(" ");
-  if (announcement === state.lastAnnouncement) return;
-  state.lastAnnouncement = announcement;
-  const live = document.getElementById("transition-announcements");
-  if (!live) return;
-  clearTimeout(state.announcementTimer);
-  state.announcementTimer = setTimeout(() => { live.textContent = announcement; }, 120);
-}
-
-function disposeThreeGraph() {
-  if (!threeGraph) return;
-  threeGraph.destroy();
-  threeGraph = null;
-}
-
-function ensureThreeGraph() {
-  if (threeGraph || !window.FractalThreeGraph || queryMode() === "master") return threeGraph;
-  const mount = document.getElementById("graph-3d");
-  if (!mount) return null;
-  threeGraph = window.FractalThreeGraph.createThreeGraph({
-    mount,
-    accessibleList: document.getElementById("graph-accessible-list"),
-    fallbackSvg: document.getElementById("graph"),
-    onSelect: (id, kind) => {
-      const model = state.view === "overview" ? state.data?.overview : state.data?.groups?.find(group => group.id === state.view);
-      const nodes = model?.tasks || model?.nodes || [];
-      const node = nodes.find(item => item.id === id);
-      if (node) selectNode(node, kind || (state.view === "overview" ? "milestone" : "task"));
-    },
-    onOpenMilestone: openMilestone
-  });
-  return threeGraph;
-}
 
 function queryMode() {
   return new URLSearchParams(window.location.search).get("mode") === "master" ? "master" : "individual";
@@ -127,6 +18,7 @@ function queryMode() {
 
 function setBoardMode(mode) {
   document.body.classList.toggle("master-active", mode === "master");
+  document.body.classList.toggle("canonical-master", mode === "master");
   document.getElementById("master-browser").classList.toggle("hidden", mode !== "master");
   /* Pause is an execution control and must never appear to apply to the
    * read-only estate view. Individual mode lets renderRunControl restore it
@@ -153,9 +45,23 @@ function individualUrl() {
   return `${window.location.pathname}${params.toString() ? `?${params}` : ""}`;
 }
 
+function mountCanonicalGraph() {
+  const host = document.querySelector(".canonical-graph-shell > div");
+  if (!host) return;
+  host.setAttribute("data-fractal-graph-ui", "");
+  if (window.FractalGraphUI && typeof window.FractalGraphUI.mount === "function") {
+    void window.FractalGraphUI.mount({
+      element: host,
+      snapshotUrl: "/api/snapshot",
+      queryUrl: "/api/intelligence/query"
+    });
+  }
+}
+
 function switchToIndividual(push = true) {
   if (push) history.pushState(null, "", individualUrl());
   setBoardMode("individual");
+  mountCanonicalGraph();
   loadGraph();
 }
 
@@ -163,10 +69,6 @@ function switchToMaster(push = true) {
   const params = new URLSearchParams(window.location.search);
   params.set("mode", "master");
   if (push) history.pushState(null, "", `${window.location.pathname}?${params}`);
-  /* The master browser owns its own SVG scene. Release the decorative WebGL
-   * controller while it is hidden so its RAF loop and canvas cannot outlive
-   * the individual graph view. It will be recreated on the next visit. */
-  disposeThreeGraph();
   setBoardMode("master");
   /* Rebuild the modular controller when entering master so URL state (q,
    * filters, selection, and view) is authoritative after an individual visit. */
@@ -442,10 +344,6 @@ function renderGraph() {
   const svg = document.getElementById("graph");
   svg.replaceChildren();
   const taskView = state.view !== "overview";
-  // A single-group individual board opens directly in task view on first
-  // load, so keep the architecture back control in sync with the rendered
-  // view instead of relying only on the explicit milestone-open path.
-  document.getElementById("back")?.classList.toggle("hidden", !taskView);
   const group = taskView ? state.data.groups.find(item => item.id === state.view) : null;
   const nodes = taskView ? group.tasks : state.data.overview.nodes;
   const edges = taskView ? group.edges : state.data.overview.edges;
@@ -526,31 +424,14 @@ function renderGraph() {
   nodes.forEach(node => {
     const [x, y] = positions[node.id];
     const assignment = taskView ? node.assignment : null;
-    const graphApi = window.FractalThreeGraph || {};
-    const taskNumber = taskView && typeof graphApi.canonicalTaskNumber === "function"
-      ? graphApi.canonicalTaskNumber(node)
-      : null;
-    const taskLabel = taskNumber ? `Task ${taskNumber}` : "Task number unavailable";
-    const overview = typeof graphApi.oneLineOverview === "function"
-      ? graphApi.oneLineOverview(node)
-      : String(node.objective || node.instruction || node.title || `Task ${node.id} has no recorded purpose.`).replace(/\s+/g, " ").trim();
     const failureCount = taskView
       ? failureCountForNode(node.id)
       : (state.failure.data?.summary?.total || 0);
     const agentLabel = assignment?.agent_label || assignment?.agent_id || "";
-    const whyReason = node.why?.reason
-      || (node.why?.ready === true ? "Ready to work." : node.why?.ready === false
-        ? `Blocked by ${(node.why?.blocked_by || []).join(", ") || "dependency"}.`
-        : "Dependency explanation not recorded.");
-    const objective = node.objective || node.title;
-    const evidenceSummary = node.evidence?.verification?.passed === true ? "verified evidence"
-      : node.evidence?.verification?.passed === false ? "verification failed" : node.evidence?.outcome || "no outcome recorded";
     const item = svgElement("g", {
-      class: `node ${node.status}${assignment?.state === "released" ? " released" : ""}${state.selected?.id === node.id ? " selected" : ""}`,
+      class: `node ${node.status}${state.selected?.id === node.id ? " selected" : ""}`,
       transform: `translate(${x},${y})`, tabindex: "0", role: "button",
-      "aria-label": `${taskLabel}, ${node.id}, ${node.title}, ${statusNames[node.status]}, ${overview}, objective ${objective}, ${whyReason}, ${evidenceSummary}${agentLabel ? `, agent ${agentLabel}` : ""}`,
-      "aria-selected": state.selected?.id === node.id ? "true" : "false",
-      "aria-current": state.selected?.id === node.id ? "true" : "false"
+      "aria-label": `${node.id}, ${node.title}, ${statusNames[node.status]}${agentLabel ? `, agent ${agentLabel}` : ""}`
     });
     item.append(svgElement("rect", { class: "node-aura", x: -width / 2 - 7, y: -height / 2 - 7, width: width + 14, height: height + 14, rx: 8 }));
     item.append(svgElement("rect", { class: "node-body", x: -width / 2, y: -height / 2, width, height, rx: 4 }));
@@ -561,11 +442,6 @@ function renderGraph() {
     const idText = svgElement("text", { class: "id-label", x: -width / 2 + 17, y: -height / 2 + 22 });
     idText.textContent = node.id;
     item.append(idText);
-    if (taskView) {
-      const numberText = svgElement("text", { class: "task-number-label", x: -width / 2 + 17, y: -height / 2 + 10 });
-      numberText.textContent = taskLabel;
-      item.append(numberText);
-    }
     if (failureCount > 0) {
       const failureBadge = svgElement("g", {
         class: "failure-badge",
@@ -625,39 +501,9 @@ function renderGraph() {
     item.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") select(); });
     svg.append(item);
   });
-  const three = ensureThreeGraph();
-  if (three && state.data && window.FractalThreeGraph) {
-    const normalized = window.FractalThreeGraph.normalizeGraphPayload(state.data, state.view);
-    const transitions = state.liveSnapshot ? classifyTransitions(state.liveSnapshot, normalized) : [];
-    normalized.transitions = transitions;
-    state.liveSnapshot = normalized;
-    renderLiveHud(normalized, transitions);
-    three.update(normalized, state.selected?.id || null);
-  }
-}
-
-function taskDetailFor(node) {
-  const api = window.FractalThreeGraph;
-  const model = state.view === "overview"
-    ? state.data?.overview
-    : state.data?.groups?.find(group => group.id === state.view);
-  if (api?.buildTaskDetail) return api.buildTaskDetail(node, model || null);
-  const overview = String(node?.objective || node?.instruction || node?.title || `Task ${node?.id || "unknown"} has no recorded purpose.`).replace(/\s+/g, " ").trim();
-  return {
-    taskNumber: null,
-    overview: overview.length <= 180 ? overview : `${overview.slice(0, 179)}…`,
-    purpose: node?.objective || "Purpose not recorded.",
-    why: { ready: null, reason: "Dependency explanation not recorded.", blockedBy: [] },
-    dependencies: Array.isArray(node?.depends_on) ? node.depends_on : [],
-    execution: { wave: null, mode: null, parallelGroup: null }, capability: node?.capability || null,
-    instruction: node?.instruction || null, expectedOutput: node?.expected_output || null,
-    agent: node?.assignment ? { id: node.assignment.agent_id || "", label: node.assignment.agent_label || "", state: node.assignment.state || "" } : null,
-    evidence: node?.evidence || {}, gate: node?.gate || null
-  };
 }
 
 function selectNode(node, kind) {
-  const detail = kind === "task" ? taskDetailFor(node) : null;
   state.selected = { ...node, kind };
   document.getElementById("inspector-empty").classList.add("hidden");
   document.getElementById("inspector-content").classList.remove("hidden");
@@ -666,83 +512,35 @@ function selectNode(node, kind) {
   pill.textContent = statusNames[node.status];
   document.getElementById("node-kind").textContent = kind === "milestone" ? "EXECUTION MILESTONE" : (node.kind || "TASK").toUpperCase();
   document.getElementById("node-title").textContent = node.title;
-  document.getElementById("node-task-number").textContent = kind === "task"
-    ? (detail.taskNumber ? `Task ${detail.taskNumber}` : "Task number unavailable")
-    : "";
   document.getElementById("node-id").textContent = node.id;
-  document.getElementById("node-overview").textContent = detail?.overview || node.objective || node.title;
   document.getElementById("node-source").textContent = `${state.data.source} · line ${node.line}`;
-  document.getElementById("node-gate").textContent = detail?.gate || (kind === "milestone" ? "Open milestone to inspect gate criteria" : "Gate criteria not recorded.");
-  const why = node.why || { ready: null, blocked_by: [], reason: "Dependency explanation not recorded." };
-  const readiness = detail?.why || {
-    ready: typeof why.ready === "boolean" ? why.ready : null,
-    reason: why.reason || "Dependency explanation not recorded.",
-    blockedBy: Array.isArray(why.blocked_by) ? why.blocked_by : []
-  };
-  document.getElementById("node-objective").textContent = detail?.purpose || node.objective || "Purpose not recorded.";
-  const readinessSummary = readiness.ready === true
-    ? `Ready · ${readiness.reason || "Dependency explanation not recorded."}`
-    : readiness.ready === false
-      ? `Blocked · ${readiness.reason || "Dependency explanation not recorded."}`
-      : (readiness.reason || "Dependency explanation not recorded.");
-  /* Keep the stable #node-why child in the inspector.  Updating the parent
-   * #node-readiness.textContent would remove that child and make the next
-   * selection throw when it tries to update the readiness copy again. */
-  document.getElementById("node-why").textContent = readinessSummary;
-  document.getElementById("node-readiness").dataset.ready = readiness.ready == null
-    ? "unknown" : readiness.ready ? "true" : "false";
-  document.getElementById("node-dependencies").textContent = detail
-    ? (detail.dependencies.length ? detail.dependencies.join(" · ") : "No dependencies recorded.")
-    : (Array.isArray(node.depends_on) && node.depends_on.length ? node.depends_on.join(" · ") : "No dependencies recorded.");
-  const evidence = detail?.evidence || node.evidence || {};
-  const verification = evidence.verification || {};
-  const evidenceElement = document.getElementById("node-evidence");
-  evidenceElement.className = verification.passed === false ? "evidence-failed" : verification.passed === true ? "evidence-passed" : "";
-  const evidenceParts = [];
-  if (evidence.outcome) evidenceParts.push(String(evidence.outcome).replaceAll("_", " "));
-  if (verification.passed === true) evidenceParts.push("verification passed");
-  else if (verification.passed === false) evidenceParts.push("verification failed");
-  if (verification.evidence_refs?.length) evidenceParts.push(`${verification.evidence_refs.length} evidence ref${verification.evidence_refs.length === 1 ? "" : "s"}`);
-  if (evidence.attempt_count) evidenceParts.push(`attempt ${evidence.attempt_count}`);
-  evidenceElement.textContent = evidenceParts.length ? evidenceParts.join(" · ") : "No evidence recorded yet.";
-  const assignmentForEvent = node.assignment || null;
-  const eventTime = evidence.finished_at || evidence.started_at || assignmentForEvent?.completed_at || assignmentForEvent?.released_at || assignmentForEvent?.checked_out_at;
-  const eventLabel = evidence.finished_at ? "Evidence finished" : evidence.started_at ? "Work started" : assignmentForEvent?.completed_at ? "Assignment completed" : assignmentForEvent?.released_at ? "Assignment released" : assignmentForEvent?.checked_out_at ? "Assignment checked out" : "No runtime event recorded";
-  document.getElementById("node-last-event").textContent = eventTime ? `${eventLabel} · ${new Date(eventTime).toLocaleString()}` : eventLabel;
+  document.getElementById("node-gate").textContent = node.gate || (kind === "milestone" ? "Open milestone to inspect gate criteria" : "Inherited from milestone");
   const assignmentWrap = document.getElementById("node-assignment-wrap");
-  if (kind === "task") {
+  if (kind === "task" && node.assignment) {
+    const assignment = node.assignment;
     assignmentWrap.classList.remove("hidden");
-    const assignment = detail?.agent;
-    document.getElementById("node-agent").textContent = assignment
-      ? (assignment.label || assignment.id || "No agent assigned.")
-      : "No agent assigned.";
-    const activity = assignment?.state ? assignment.state.replaceAll("_", " ") : "No agent assigned.";
-    const at = assignmentForEvent?.completed_at || assignmentForEvent?.released_at || assignmentForEvent?.checked_out_at;
+    document.getElementById("node-agent").textContent = assignment.agent_label || assignment.agent_id;
+    const activity = (assignment.state || "checked_out").replace("_", " ");
+    const at = assignment.completed_at || assignment.released_at || assignment.checked_out_at;
     document.getElementById("node-assignment").textContent = at ? `${activity} · ${new Date(at).toLocaleString()}` : activity;
   } else {
     assignmentWrap.classList.add("hidden");
   }
   const executionWrap = document.getElementById("node-execution-wrap");
-  const capabilityWrap = document.getElementById("node-capability-wrap");
-  const instructionWrap = document.getElementById("node-instruction-wrap");
-  const expectedOutputWrap = document.getElementById("node-expected-output-wrap");
-  if (kind === "task") {
+  if (kind === "task" && node.execution) {
     executionWrap.classList.remove("hidden");
-    document.getElementById("node-execution-wave").textContent = detail?.execution.wave == null ? "Execution wave not recorded." : String(detail.execution.wave);
-    document.getElementById("node-execution-mode").textContent = detail?.execution.mode || "Execution mode not recorded.";
-    document.getElementById("node-execution-group").textContent = detail?.execution.parallelGroup || "Parallel group not recorded.";
-    document.getElementById("node-execution").textContent = `${document.getElementById("node-execution-wave").textContent} · ${document.getElementById("node-execution-mode").textContent} · ${document.getElementById("node-execution-group").textContent}`;
-    capabilityWrap.classList.remove("hidden");
-    document.getElementById("node-capability").textContent = detail?.capability || "Capability not recorded.";
-    instructionWrap.classList.remove("hidden");
-    document.getElementById("node-instruction").textContent = detail?.instruction || "Instruction not recorded.";
-    expectedOutputWrap.classList.remove("hidden");
-    document.getElementById("node-expected-output").textContent = detail?.expectedOutput || "Expected output not recorded.";
+    const group = node.execution.parallel_group ? ` · ${node.execution.parallel_group}` : "";
+    document.getElementById("node-execution").textContent =
+      `Wave ${node.execution.wave} · ${node.execution.mode}${group}`;
   } else {
     executionWrap.classList.add("hidden");
-    capabilityWrap.classList.add("hidden");
+  }
+  const instructionWrap = document.getElementById("node-instruction-wrap");
+  if (kind === "task" && node.instruction) {
+    instructionWrap.classList.remove("hidden");
+    document.getElementById("node-instruction").textContent = node.instruction;
+  } else {
     instructionWrap.classList.add("hidden");
-    expectedOutputWrap.classList.add("hidden");
   }
   const progressWrap = document.getElementById("node-progress-wrap");
   const open = document.getElementById("open-milestone");
@@ -758,17 +556,12 @@ function selectNode(node, kind) {
     open.classList.add("hidden");
   }
   renderGraph();
-  if (kind === "task") {
-    const focusRef = detail?.taskNumber || node.id;
-    threeGraph?.focus?.(focusRef);
-  }
 }
 
 function openMilestone(id) {
   const group = state.data.groups.find(item => item.id === id);
   state.view = id;
   state.selected = null;
-  state.liveSnapshot = null;
   document.getElementById("graph-kicker").textContent = `${id} · EXECUTABLE CHECKLIST`;
   document.getElementById("graph-title").textContent = group.title;
   document.getElementById("back").classList.remove("hidden");
@@ -780,7 +573,6 @@ function openMilestone(id) {
 function showOverview() {
   state.view = "overview";
   state.selected = null;
-  state.liveSnapshot = null;
   document.getElementById("graph-kicker").textContent = "COMPILED EXECUTION PLAN";
   document.getElementById("graph-title").textContent = "Runtime implementation";
   document.getElementById("back").classList.add("hidden");
@@ -960,13 +752,6 @@ document.getElementById("failure-history-toggle")?.addEventListener("click", () 
   persistFailureUrl(true);
   renderFailureHistory();
   if (state.failure.open && !state.failure.data) loadFailureGraph(false);
-});
-document.getElementById("graph-reset-camera")?.addEventListener("click", () => threeGraph?.resetCamera());
-document.getElementById("graph-list-toggle")?.addEventListener("click", event => {
-  const list = document.getElementById("graph-accessible-list");
-  if (!list) return;
-  const open = list.classList.toggle("hidden");
-  event.currentTarget.setAttribute("aria-expanded", String(!open));
 });
 
 window.addEventListener("popstate", () => {

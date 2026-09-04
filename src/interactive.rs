@@ -79,6 +79,8 @@ pub(crate) fn run(fractalwork_override: Option<&Path>, coordinate_flag: bool) ->
                     &completed,
                     Some(&completed),
                     false,
+                    false,
+                    None,
                     None,
                 );
             } else {
@@ -236,7 +238,9 @@ fn task_group_for(classification: &Result<intent::TaskClassification>, request: 
 fn setup_agents() -> Result<Vec<String>> {
     let available = execute::available_agents();
     if available.is_empty() {
-        println!("No build agents (claude/codex/cursor/hermes) found on PATH — preview only.\n");
+        println!(
+            "No build agents (claude/codex/cursor/hermes/opencode) found on PATH — preview only.\n"
+        );
         return Ok(Vec::new());
     }
 
@@ -335,6 +339,7 @@ fn pick_model(agent: &str) -> Result<Option<String>> {
             "nvidia/nemotron-3-super-120b-a12b:free",
             "nvidia/nemotron-3-ultra-550b-a55b:free",
         ],
+        "opencode" => &["zai-coding-plan/glm-5.3"],
         _ => &[],
     };
     if !menu.is_empty() {
@@ -431,7 +436,14 @@ pub(crate) fn execute_ingested(
     // Voice/typed control command: "resume project 3" continues that numbered
     // project regardless of the current folder, instead of starting a build.
     if let Some(number) = crate::projects::parse_resume_command(request) {
-        return resume_project(number, fractalwork_override, port, coordinate_flag);
+        return resume_project(
+            number,
+            fractalwork_override,
+            port,
+            coordinate_flag,
+            false,
+            &[],
+        );
     }
 
     let workspace = match workspace_override {
@@ -449,7 +461,7 @@ pub(crate) fn execute_ingested(
     }
     let agents = execute::detect_agents();
     if agents.is_empty() {
-        anyhow::bail!("no build agents (claude/codex/cursor/hermes) found on PATH");
+        anyhow::bail!("no build agents (claude/codex/cursor/hermes/opencode) found on PATH");
     }
     let backend = Backend::resolve(coordinate_flag);
 
@@ -480,6 +492,8 @@ pub(crate) fn execute_ingested(
             &completed,
             Some(&completed),
             false,
+            false,
+            None,
             efficiency,
         ));
     }
@@ -603,6 +617,118 @@ fn managed_project_slug(request: &str) -> String {
     }
 }
 
+fn reroute_provider(value: &str, allow_lead: bool) -> Option<&'static str> {
+    match value.trim() {
+        "claude" => Some("claude"),
+        "cursor" | "cursor-agent" => Some("cursor"),
+        "hermes" => Some("hermes"),
+        "opencode" => Some("opencode"),
+        "codex-luna" => Some("codex-luna"),
+        "codex" if allow_lead => Some("codex"),
+        _ => None,
+    }
+}
+
+fn resume_provider_reroutes(
+    workspace: &Path,
+    graph: &serde_json::Value,
+    specs: &[String],
+    completed: &BTreeSet<String>,
+    agents: &[String],
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut requested = std::collections::BTreeMap::new();
+    for spec in specs {
+        let (source, target) = spec
+            .split_once('=')
+            .with_context(|| format!("invalid resume reroute `{spec}`; expected SOURCE=TARGET"))?;
+        let source = reroute_provider(source, true).with_context(|| {
+            format!(
+                "unsupported resume reroute source provider `{}`",
+                source.trim()
+            )
+        })?;
+        let target = reroute_provider(target, false).with_context(|| {
+            format!(
+                "unsupported resume reroute target provider `{}`; use codex-luna for Codex workers",
+                target.trim()
+            )
+        })?;
+        if source == target {
+            anyhow::bail!("resume reroute source and target are both `{source}`");
+        }
+        if requested
+            .insert(source.to_owned(), target.to_owned())
+            .is_some()
+        {
+            anyhow::bail!("duplicate resume reroute source provider `{source}`");
+        }
+        if !agents
+            .iter()
+            .any(|agent| crate::execute::agent_matches_requirement(agent, target))
+        {
+            anyhow::bail!(
+                "resume reroute target `{target}` is not present in the active roster [{}]",
+                agents.join(", ")
+            );
+        }
+    }
+    if requested.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+
+    let document = crate::project_file::load(workspace)?;
+    let mut reroutes = std::collections::BTreeMap::new();
+    let mut matched_sources = BTreeSet::new();
+    for node in graph
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = node.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if completed.contains(id) {
+            continue;
+        }
+        let Some(required) = node
+            .pointer("/executor/agent")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|provider| reroute_provider(provider, true))
+        else {
+            continue;
+        };
+        let Some(target) = requested.get(required) else {
+            continue;
+        };
+        let released_by_source = document
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.assignments.get(id))
+            .is_some_and(|assignment| {
+                assignment.state == "released"
+                    && crate::execute::agent_matches_requirement(&assignment.agent_id, required)
+            });
+        let eligible_failure = document.learning.nodes.get(id).is_some_and(|record| {
+            record.outcome == Some(crate::learning_data::NodeOutcome::FailedExecution)
+                && record.failure_code == Some(crate::learning_data::FailureCode::ToolFailure)
+        });
+        if released_by_source && eligible_failure {
+            reroutes.insert(id.to_owned(), target.clone());
+            matched_sources.insert(required.to_owned());
+        }
+    }
+    for source in requested.keys() {
+        if !matched_sources.contains(source) {
+            anyhow::bail!(
+                "resume reroute `{source}={}` matched no incomplete released node with failed_execution/tool_failure",
+                requested[source]
+            );
+        }
+    }
+    Ok(reroutes)
+}
+
 /// Resume a project by its stable number — used by `fractal resume <N>` and by the
 /// voice/typed "resume project N" command. Continues from the saved checkpoint.
 pub(crate) fn resume_project(
@@ -610,7 +736,12 @@ pub(crate) fn resume_project(
     fractalwork_override: Option<&Path>,
     port: u16,
     coordinate_flag: bool,
+    hybrid: bool,
+    reroute_unavailable: &[String],
 ) -> Result<Option<crate::execute::RunOutcome>> {
+    if !hybrid && !reroute_unavailable.is_empty() {
+        anyhow::bail!("--reroute-unavailable requires --hybrid");
+    }
     let Some(project) = crate::projects::by_number(number) else {
         anyhow::bail!("no project #{number} — run `fractal projects` to see the list");
     };
@@ -632,6 +763,13 @@ pub(crate) fn resume_project(
             workspace.display()
         );
     }
+    let backend = Backend::resolve(coordinate_flag);
+    if hybrid && backend == Backend::Coordinate {
+        anyhow::bail!("hybrid resume requires the in-process backend, not Coordinate");
+    }
+    if hybrid {
+        crate::execute::validate_hybrid_workspace(&workspace)?;
+    }
     if crate::graph_store::load_graph(&cp.current_graph_hash).is_err() {
         let document = crate::project_file::load(&workspace)?;
         if document.graph_hash != cp.current_graph_hash {
@@ -645,10 +783,20 @@ pub(crate) fn resume_project(
     }
     let agents = execute::detect_agents();
     if agents.is_empty() {
-        anyhow::bail!("no build agents (claude/codex/cursor/hermes) found on PATH");
+        anyhow::bail!("no build agents (claude/codex/cursor/hermes/opencode) found on PATH");
     }
     let mut completed: BTreeSet<String> = cp.completed.iter().cloned().collect();
     completed.extend(crate::project_file::completed_nodes(&workspace));
+    let reroutes = resume_provider_reroutes(
+        &workspace,
+        &graph_store::load_graph(&cp.current_graph_hash)?,
+        reroute_unavailable,
+        &completed,
+        &agents,
+    )?;
+    for (node, target) in &reroutes {
+        println!("  ↻ resume reroute: {node} → {target}");
+    }
     println!(
         "↻ Resuming project #{number} ({}) — {}/{} tasks already done, continuing the rest…\n",
         project.label,
@@ -663,12 +811,14 @@ pub(crate) fn resume_project(
         &cp.request,
         &workspace,
         &agents,
-        Backend::resolve(coordinate_flag),
+        backend,
         port,
         &task_group,
         &completed,
         Some(&completed),
         false,
+        hybrid,
+        Some(&reroutes),
         None,
     ))
 }
@@ -759,6 +909,8 @@ fn execute_request(
                 &BTreeSet::new(),
                 None,
                 planning_browser_opened,
+                false,
+                None,
                 efficiency,
             )
         }
@@ -785,6 +937,8 @@ fn drive_committed_graph(
     resume_completed: &BTreeSet<String>,
     board_preseed: Option<&BTreeSet<String>>,
     browser_already_open: bool,
+    hybrid: bool,
+    resume_reroutes: Option<&std::collections::BTreeMap<String, String>>,
     efficiency: Option<&crate::efficiency_config::EfficiencyConfig>,
 ) -> Option<crate::execute::RunOutcome> {
     let _run = match crate::run_control::RunGuard::start_or_join(workspace, request, port) {
@@ -921,6 +1075,8 @@ fn drive_committed_graph(
             &facts,
             request,
             resume_completed,
+            hybrid,
+            resume_reroutes,
             Some(efficiency),
         ),
         None => crate::orchestrate::run_end_to_end(
@@ -932,6 +1088,8 @@ fn drive_committed_graph(
             &facts,
             request,
             resume_completed,
+            hybrid,
+            resume_reroutes,
         ),
     };
     let elapsed = crate::ui::format_elapsed(spinner.stop());
@@ -995,7 +1153,10 @@ fn map_classification(classification: &intent::TaskClassification) -> IntentClas
 
 #[cfg(test)]
 mod tests {
-    use super::{install_managed_agent_instructions, managed_project_slug};
+    use super::{
+        install_managed_agent_instructions, managed_project_slug, resume_provider_reroutes,
+    };
+    use std::collections::BTreeSet;
 
     #[test]
     fn managed_voice_project_slugs_are_portable_and_bounded() {
@@ -1005,6 +1166,95 @@ mod tests {
         );
         assert_eq!(managed_project_slug("⚡️"), "voice-project");
         assert!(managed_project_slug(&"project ".repeat(20)).len() <= 48);
+    }
+
+    #[test]
+    fn resume_reroutes_only_released_tool_failures_from_the_named_provider() {
+        let workspace = std::env::temp_dir().join(format!(
+            "fractal-resume-reroute-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut graph = serde_json::json!({
+            "schema":"fractal.execution_graph.v1",
+            "graph_id":"fg_resume_reroute",
+            "goal":"Reroute unavailable provider",
+            "nodes":[
+                {"id":"tool_failure","capability":"code.generate","instruction":"build","executor":{"agent":"claude"}},
+                {"id":"timeout","capability":"code.generate","instruction":"build","executor":{"agent":"claude"}},
+                {"id":"completed","capability":"code.generate","instruction":"build","executor":{"agent":"claude"}}
+            ],
+            "edges":[]
+        });
+        graph["graph_hash"] =
+            serde_json::Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::project_file::persist(&workspace, &graph, "Resume reroute").unwrap();
+        for node in ["tool_failure", "timeout", "completed"] {
+            crate::project_file::checkout_start_node(&workspace, node, "claude:1", "Claude")
+                .unwrap();
+        }
+        crate::project_file::release_node(
+            &workspace,
+            "tool_failure",
+            "claude:1",
+            Some((
+                crate::learning_data::NodeOutcome::FailedExecution,
+                crate::learning_data::FailureCode::ToolFailure,
+            )),
+        )
+        .unwrap();
+        crate::project_file::release_node(
+            &workspace,
+            "timeout",
+            "claude:1",
+            Some((
+                crate::learning_data::NodeOutcome::FailedExecution,
+                crate::learning_data::FailureCode::Timeout,
+            )),
+        )
+        .unwrap();
+        crate::project_file::finish_node(
+            &workspace,
+            "completed",
+            "claude:1",
+            crate::learning_data::NodeOutcome::UnverifiedSuccess,
+        )
+        .unwrap();
+        let completed = BTreeSet::from(["completed".to_owned()]);
+        let agents = vec!["codex".to_owned(), "codex-luna:1".to_owned()];
+
+        let reroutes = resume_provider_reroutes(
+            &workspace,
+            &graph,
+            &["claude=codex-luna".to_owned()],
+            &completed,
+            &agents,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reroutes,
+            std::collections::BTreeMap::from([(
+                "tool_failure".to_owned(),
+                "codex-luna".to_owned()
+            )])
+        );
+        let error = resume_provider_reroutes(
+            &workspace,
+            &graph,
+            &["hermes=codex-luna".to_owned()],
+            &completed,
+            &agents,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("matched no incomplete released node"));
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]

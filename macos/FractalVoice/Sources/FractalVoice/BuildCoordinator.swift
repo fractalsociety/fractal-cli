@@ -320,7 +320,6 @@ final class BuildCoordinator: ObservableObject {
     private var outputLineBuffer = ""
     private var hud: RecordingHUD?
     private var stopCommand: Process?
-    private var bridgeBuildTask: Task<Void, Never>?
     private var stopRequested = false
     private var restartRequested = false
     private var activeWorkspace: URL?
@@ -347,7 +346,7 @@ final class BuildCoordinator: ObservableObject {
     let logURL = AppRuntime.logURL
 
     var hasActiveBuild: Bool {
-        process?.isRunning == true || bridgeBuildTask != nil
+        process?.isRunning == true
     }
 
     var canAcceptExternalBuild: Bool {
@@ -572,9 +571,7 @@ final class BuildCoordinator: ObservableObject {
             "--no-webui",
             "--log-disable"
         ]
-        // Granite is a local transcription process; keep provider credentials
-        // out of unrelated child-process environments.
-        server.environment = Self.processEnvironment(includeInferX: false)
+        server.environment = Self.processEnvironment()
         server.standardInput = FileHandle.nullDevice
         server.standardOutput = FileHandle.nullDevice
         server.standardError = FileHandle.nullDevice
@@ -604,8 +601,6 @@ final class BuildCoordinator: ObservableObject {
 
     func shutdown() {
         recordingTimeout?.cancel()
-        bridgeBuildTask?.cancel()
-        bridgeBuildTask = nil
         graniteServerBaseURL = nil
         if graniteServerProcess?.isRunning == true {
             graniteServerProcess?.terminate()
@@ -685,7 +680,7 @@ final class BuildCoordinator: ObservableObject {
                 beginDialogueRecording(purpose: .nameConfirmation)
                 return
             default:
-                if process != nil || bridgeBuildTask != nil {
+                if process != nil {
                     beginAmendmentRecording()
                     return
                 }
@@ -837,7 +832,7 @@ final class BuildCoordinator: ObservableObject {
             "--\(request.target)",
             "--yes",
         ]
-        var environment = Self.processEnvironment(includeInferX: true)
+        var environment = Self.processEnvironment()
         environment["FRACTAL_VISIBILITY_RECEIVER"] = "1"
         environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
         task.environment = environment
@@ -943,7 +938,7 @@ final class BuildCoordinator: ObservableObject {
             "--token", token,
             "--server", server.absoluteString,
         ]
-        task.environment = Self.processEnvironment(includeInferX: true)
+        task.environment = Self.processEnvironment()
         task.standardOutput = combinedOutput
         task.standardError = combinedOutput
         outputBuffer = ""
@@ -1091,21 +1086,13 @@ final class BuildCoordinator: ObservableObject {
     }
 
     func stopAllBuilds() {
-        #if APP_STORE
-        Task.detached(priority: .userInitiated) {
-            try? LocalBridge.stop(project: nil, all: true)
-        }
-        latestActivity = "Stop requested for all Fractal builds"
-        return
-        #else
         guard let executable = Self.fractalExecutable() else { return }
         let stop = Process()
         stop.executableURL = executable
         stop.arguments = ["stop", "--all"]
-        stop.environment = Self.processEnvironment(includeInferX: true)
+        stop.environment = Self.processEnvironment()
         try? stop.run()
         latestActivity = "Stop requested for all Fractal builds"
-        #endif
     }
 
     func stopCurrentBuild() {
@@ -1249,9 +1236,7 @@ final class BuildCoordinator: ObservableObject {
             shortAnswer: purpose == .requestConfirmation
                 || purpose == .nameConfirmation
         )
-        // Granite is a local transcription process; keep provider credentials
-        // out of unrelated child-process environments.
-        task.environment = Self.processEnvironment(includeInferX: false)
+        task.environment = Self.processEnvironment()
         task.standardInput = FileHandle.nullDevice
         task.standardOutput = stdout
         task.standardError = FileHandle.nullDevice
@@ -1530,23 +1515,6 @@ final class BuildCoordinator: ObservableObject {
     private func submitAmendment(_ transcript: String) {
         state = .building
         presentBuildingStatus("Sending graph change to the lead planner…")
-        #if APP_STORE
-        Task { [weak self] in
-            do {
-                let result = try await Task.detached(priority: .userInitiated) {
-                    try LocalBridge.amend(transcript)
-                }.value
-                guard let self else { return }
-                let message = result.output
-                    .split(separator: "\n")
-                    .last
-                    .map(String.init) ?? "Branch request accepted"
-                self.setActivity(message)
-            } catch {
-                self?.setActivity("Branch request was not accepted: \(error.localizedDescription)")
-            }
-        }
-        #else
         guard let executable = Self.fractalExecutable() else {
             setActivity("Fractal CLI is missing")
             return
@@ -1560,7 +1528,7 @@ final class BuildCoordinator: ObservableObject {
                 "ingest", "--source", "fractal-mac-app",
                 "--format", "text", "--stdin", "--amend",
             ] + Self.efficiencyCLIArguments(EfficiencyControls.load())
-            command.environment = Self.processEnvironment(includeInferX: true)
+            command.environment = Self.processEnvironment()
             command.standardInput = stdin
             command.standardOutput = output
             command.standardError = output
@@ -1582,7 +1550,6 @@ final class BuildCoordinator: ObservableObject {
                 }
             }
         }
-        #endif
     }
 
     private func amendmentFailed(_ error: Error) {
@@ -1732,6 +1699,23 @@ final class BuildCoordinator: ObservableObject {
         "Okay, I will call it “\(compact(name, limit: 80))”. Is that correct?"
     }
 
+    /// Native voice and external text requests share the stdin ingest boundary.
+    /// Keeping the argv construction in one pure helper makes it impossible for
+    /// an App Store build to silently fall back to the retired loopback bridge.
+    nonisolated static func nativeTextIngestArguments(
+        projectName: String,
+        efficiency: EfficiencyControls = .default
+    ) -> [String] {
+        [
+            "ingest",
+            "--source", "fractal-mac-app",
+            "--format", "text",
+            "--stdin",
+            "--managed-project",
+            "--project-name", projectName,
+        ] + Self.efficiencyCLIArguments(efficiency)
+    }
+
     private func startBuild(
         transcript: String,
         projectName: String,
@@ -1752,19 +1736,6 @@ final class BuildCoordinator: ObservableObject {
             recordingFailed(VoiceAppError.noSpeech)
             return
         }
-        #if APP_STORE
-        startBridgeBuild(transcript: transcript, projectName: projectName)
-        if vocabularyResult?.appliedCorrections.isEmpty ?? true {
-            setActivity("Heard: “\(Self.compact(transcript, limit: 180))”")
-        } else {
-            appendLog(
-                "[voice] applied \(vocabularyResult?.appliedCorrections.count ?? 0) "
-                + "local vocabulary correction(s)\n"
-            )
-            setActivity("Understood: “\(Self.compact(transcript, limit: 180))”")
-        }
-        return
-        #else
         guard let executable = Self.fractalExecutable() else {
             recordingFailed(VoiceAppError.cliMissing)
             return
@@ -1774,15 +1745,11 @@ final class BuildCoordinator: ObservableObject {
         let stdin = Pipe()
         let combinedOutput = Pipe()
         task.executableURL = executable
-        task.arguments = [
-            "ingest",
-            "--source", "fractal-mac-app",
-            "--format", "text",
-            "--stdin",
-            "--managed-project",
-            "--project-name", projectName,
-        ] + Self.efficiencyCLIArguments(efficiencyControls)
-        var environment = Self.processEnvironment(includeInferX: true)
+        task.arguments = Self.nativeTextIngestArguments(
+            projectName: projectName,
+            efficiency: efficiencyControls
+        )
+        var environment = Self.processEnvironment()
         if isExternalBuild {
             environment["FRACTAL_EXTERNAL_TEXT"] = "1"
         }
@@ -1825,32 +1792,7 @@ final class BuildCoordinator: ObservableObject {
         } catch {
             recordingFailed(error)
         }
-        #endif
     }
-
-    #if APP_STORE
-    private func startBridgeBuild(transcript: String, projectName: String) {
-        outputBuffer = ""
-        outputLineBuffer = ""
-        activeWorkspace = nil
-        bridgeBuildTask?.cancel()
-        bridgeBuildTask = Task { [weak self] in
-            do {
-                let result = try await Task.detached(priority: .userInitiated) {
-                    try LocalBridge.build(request: transcript, projectName: projectName)
-                }.value
-                guard !Task.isCancelled, let self else { return }
-                self.consume(result.output)
-                self.finished(exitCode: result.exitCode)
-            } catch is CancellationError {
-                return
-            } catch {
-                guard !Task.isCancelled else { return }
-                self?.recordingFailed(error)
-            }
-        }
-    }
-    #endif
 
     private func recordingFailed(_ error: Error) {
         recordingTimeout?.cancel()
@@ -2008,12 +1950,6 @@ final class BuildCoordinator: ObservableObject {
             transcribing.terminate()
             return
         }
-        #if APP_STORE
-        Task.detached(priority: .userInitiated) {
-            try? LocalBridge.stop(project: nil, all: false)
-        }
-        return
-        #else
         guard let running = process else {
             return
         }
@@ -2031,7 +1967,7 @@ final class BuildCoordinator: ObservableObject {
             running.terminate()
             return
         }
-        stop.environment = Self.processEnvironment(includeInferX: true)
+        stop.environment = Self.processEnvironment()
         stop.standardInput = FileHandle.nullDevice
         stop.standardOutput = FileHandle.nullDevice
         stop.standardError = FileHandle.nullDevice
@@ -2050,7 +1986,6 @@ final class BuildCoordinator: ObservableObject {
         } catch {
             running.terminate()
         }
-        #endif
     }
 
     private func finishRequestedStopBeforeBuild() {
@@ -2088,7 +2023,6 @@ final class BuildCoordinator: ObservableObject {
     private func finished(exitCode: Int32) {
         process = nil
         stopCommand = nil
-        bridgeBuildTask = nil
         if stopRequested {
             let restart = restartRequested
             stopRequested = false
@@ -2484,13 +2418,7 @@ final class BuildCoordinator: ObservableObject {
         return candidates.first { fileManager.isExecutableFile(atPath: $0.path) }
     }
 
-    /// Environment for child processes. InferX credentials are added only to
-    /// Fractal CLI launches; local voice helpers explicitly pass
-    /// `includeInferX: false` so a token cannot leak to unrelated processes.
-    nonisolated static func processEnvironment(
-        includeInferX: Bool = false,
-        keyProvider: @Sendable () -> String? = { InferXProvider.storedAPIKey() }
-    ) -> [String: String] {
+    nonisolated static func processEnvironment() -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
         let home = AppRuntime.homeURL.path
         let additions = [
@@ -2504,16 +2432,6 @@ final class BuildCoordinator: ObservableObject {
         environment["PATH"] = additions.joined(separator: ":")
         environment["HOME"] = home
         environment["FRACTAL_PROJECTS_DIR"] = AppRuntime.projectsURL.path
-        // Never inherit a token supplied by the app's own environment. A
-        // configured Keychain value is the sole source for CLI injection.
-        environment.removeValue(forKey: InferXProvider.environmentKey)
-        environment.removeValue(forKey: InferXProvider.enabledEnvironmentKey)
-        if includeInferX,
-           let rawKey = keyProvider(),
-           let key = try? InferXProvider.normalizedAPIKey(rawKey) {
-            environment[InferXProvider.environmentKey] = key
-            environment[InferXProvider.enabledEnvironmentKey] = "1"
-        }
         let lead = UserDefaults.standard.string(forKey: "selectedLeadAgent")?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if let lead, ["codex", "cursor", "claude", "hermes"].contains(lead) {

@@ -1,5 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,8 +18,97 @@ const BOARD_START_TIMEOUT: Duration = Duration::from_secs(6);
 const BOARD_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const BOARD_PROJECTS_SCHEMA: &str = "fractal.board_projects.v1";
 const FAILURE_GRAPH_VIEW_SCHEMA: &str = "fractal.failure_graph_view.v1";
+const GRAPH_SNAPSHOT_SCHEMA: &str = "fractal.graph_snapshot.v1";
+const INTELLIGENCE_SNAPSHOT_SCHEMA: &str = "fractal.intelligence.snapshot.v1";
+const INTELLIGENCE_QUERY_SCHEMA: &str = "fractal.intelligence.query.v1";
+const INTELLIGENCE_QUERY_RESPONSE_SCHEMA: &str = "fractal.intelligence.query_response.v1";
+const GRAPH_UI_BUNDLE_ID: &str = "fractal-graph-ui.v1";
+const MAX_QUERY_BODY_BYTES: u64 = 16 * 1024;
+const MAX_QUERY_CHARS: usize = 512;
+const MAX_QUERY_LENSES: usize = 7;
+const MAX_QUERY_ROOTS: usize = 32;
+const MAX_QUERY_DEPTH: u32 = 32;
+const MAX_QUERY_NODES: usize = 1_000;
+const MAX_QUERY_EDGES: usize = 2_000;
+const LENS_IDS: [&str; 7] = [
+    "overview",
+    "execution",
+    "resource_economic",
+    "memory_knowledge",
+    "trace_evidence",
+    "failure_learning",
+    "agent_model_tool_harness",
+];
 const READ_ONLY_API_ERROR: &str =
     "the Rust board API is read-only; use `fractal node` for transitions";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntelligenceQueryRequest {
+    schema: String,
+    query: String,
+    modality: QueryModality,
+    #[serde(default)]
+    project_key: Option<String>,
+    #[serde(default)]
+    lens_ids: Vec<String>,
+    #[serde(default)]
+    root_ids: Vec<String>,
+    #[serde(default)]
+    bounds: QueryBounds,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum QueryModality {
+    Text,
+    Voice,
+}
+
+impl QueryModality {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Voice => "voice",
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueryBounds {
+    #[serde(default)]
+    max_depth: Option<u32>,
+    #[serde(default)]
+    max_nodes: Option<usize>,
+    #[serde(default)]
+    max_edges: Option<usize>,
+}
+
+#[derive(Debug)]
+struct QueryApiError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+
+impl QueryApiError {
+    fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode(400),
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn payload_too_large() -> Self {
+        Self {
+            status: StatusCode(413),
+            code: "query_too_large",
+            message: format!("query body exceeds {MAX_QUERY_BODY_BYTES} bytes"),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct BoardPayload {
@@ -1520,7 +1611,7 @@ fn failure_summary_for_workspace(workspace: &Path) -> (Value, Option<String>) {
 }
 
 fn respond(
-    request: tiny_http::Request,
+    mut request: tiny_http::Request,
     workspace: &Path,
     viewer_dir: &Path,
     token: &str,
@@ -1543,6 +1634,58 @@ fn respond(
                 "project": identity.get("project"),
             }),
         );
+    }
+    if matches!(route, "/api/snapshot" | "/api/intelligence/snapshot") {
+        if request.method() != &Method::Get {
+            return send_json(
+                request,
+                StatusCode(405),
+                &json!({"error": "snapshot is read-only", "code": "read_only"}),
+            );
+        }
+        return send_json(request, StatusCode(200), &graph_snapshot(workspace)?);
+    }
+    if matches!(route, "/api/query" | "/api/intelligence/query") {
+        if request.method() != &Method::Post {
+            return send_json(
+                request,
+                StatusCode(405),
+                &json!({"error": "query requires POST", "code": "method_not_allowed"}),
+            );
+        }
+        let content_type_ok = request.headers().iter().any(|header| {
+            header.field.equiv("Content-Type")
+                && header
+                    .value
+                    .as_str()
+                    .to_ascii_lowercase()
+                    .starts_with("application/json")
+        });
+        if !content_type_ok {
+            return send_json(
+                request,
+                StatusCode(415),
+                &json!({"error": "Content-Type must be application/json", "code": "unsupported_media_type"}),
+            );
+        }
+        let query = match read_query_request(&mut request) {
+            Ok(query) => query,
+            Err(error) => {
+                return send_json(
+                    request,
+                    error.status,
+                    &json!({"error": error.message, "code": error.code}),
+                )
+            }
+        };
+        return match intelligence_query(workspace, &query) {
+            Ok(response) => send_json(request, StatusCode(200), &response),
+            Err(error) => send_json(
+                request,
+                error.status,
+                &json!({"error": error.message, "code": error.code}),
+            ),
+        };
     }
     if route == "/api/failure-graph" && request.method() != &Method::Get {
         return send_json(
@@ -1616,8 +1759,9 @@ fn serve_board_asset(request: tiny_http::Request, route: &str, viewer_dir: &Path
         "/styles.css" => "styles.css",
         "/master-graph.js" => "master-graph.js",
         "/master-graph.css" => "master-graph.css",
-        "/three-graph.js" => "three-graph.js",
-        "/vendor/three.min.js" => "vendor/three.min.js",
+        "/fractal-graph-ui.js" => "fractal-graph-ui.js",
+        "/fractal-graph-ui.css" => "fractal-graph-ui.css",
+        "/fractal-graph-ui.manifest.json" => "fractal-graph-ui.manifest.json",
         "/assets/favicon.svg" => "assets/favicon.svg",
         "/assets/fractal-graph-field.png" => "assets/fractal-graph-field.png",
         _ => {
@@ -1637,6 +1781,7 @@ fn serve_board_asset(request: tiny_http::Request, route: &str, viewer_dir: &Path
         Some("html") => "text/html; charset=utf-8",
         Some("js") => "application/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
         _ => "application/octet-stream",
@@ -1655,8 +1800,11 @@ fn embedded_asset(relative: &str) -> &'static [u8] {
         "styles.css" => include_bytes!("../execution-graph/styles.css"),
         "master-graph.js" => include_bytes!("../execution-graph/master-graph.js"),
         "master-graph.css" => include_bytes!("../execution-graph/master-graph.css"),
-        "three-graph.js" => include_bytes!("../execution-graph/three-graph.js"),
-        "vendor/three.min.js" => include_bytes!("../execution-graph/vendor/three.min.js"),
+        "fractal-graph-ui.js" => include_bytes!("../execution-graph/fractal-graph-ui.js"),
+        "fractal-graph-ui.css" => include_bytes!("../execution-graph/fractal-graph-ui.css"),
+        "fractal-graph-ui.manifest.json" => {
+            include_bytes!("../execution-graph/fractal-graph-ui.manifest.json")
+        }
         "assets/favicon.svg" => include_bytes!("../execution-graph/assets/favicon.svg"),
         "assets/fractal-graph-field.png" => {
             include_bytes!("../execution-graph/assets/fractal-graph-field.png")
@@ -1719,45 +1867,17 @@ fn project_view(workspace: &Path, token: &str) -> Result<Value> {
                 Some("checked_out") => "active",
                 _ => "incomplete",
             };
-            let objective = node
-                .get("objective")
-                .or_else(|| node.get("title"))
-                .or_else(|| node.get("instruction"))
-                .and_then(Value::as_str)
-                .unwrap_or(&id);
-            let capability = node
-                .get("capability")
-                .and_then(Value::as_str)
-                .unwrap_or("implementation");
-            let depends_on = graph_predecessors(&project.graph, &id);
-            let why = readiness_projection(&depends_on, assignments, node);
-            let evidence = safe_learning_evidence(project.learning.nodes.get(&id));
-            let task_number = canonical_task_number(node);
-            let expected_output = canonical_expected_output(node);
             json!({
                 "id": id,
                 "title": node.get("title").or_else(|| node.get("objective")).and_then(Value::as_str).unwrap_or(&id),
-                // These are bounded, read-only conveniences.  The immutable
-                // graph remains the authority; runtime state below continues
-                // to come from the existing project projection.
-                "task_number": task_number,
-                "expected_output": expected_output,
-                "objective": bounded_text(Some(objective), 280),
-                "capability": bounded_text(Some(capability), 160),
-                "depends_on": depends_on,
                 "kind": if node.get("capability").and_then(Value::as_str) == Some("control.verify") { "gate" } else { "task" },
                 "status": status,
                 "checked": status == "complete",
                 "line": 0,
                 "instruction": node.get("instruction").and_then(Value::as_str).unwrap_or(""),
-                "gate": node.get("verification_plan")
-                    .and_then(Value::as_str)
-                    .or_else(|| node.get("efficiency").and_then(|value| value.get("verification_plan")).and_then(Value::as_str))
-                    .unwrap_or(""),
-                "assignment": safe_assignment(assignment),
+                "gate": node.get("verification_plan").and_then(Value::as_str).unwrap_or(""),
+                "assignment": assignment,
                 "execution": node.get("execution").cloned().unwrap_or(Value::Null),
-                "why": why,
-                "evidence": evidence,
             })
         })
         .collect();
@@ -1798,7 +1918,6 @@ fn project_view(workspace: &Path, token: &str) -> Result<Value> {
         .as_ref()
         .map(|execution| execution.phase.as_str())
         .unwrap_or("planning");
-    let execution_view = safe_execution_view(project.execution.as_ref());
     Ok(json!({
         "schema": "fractal.execution_graph_view.v1",
         "title": project.project.title,
@@ -1812,7 +1931,6 @@ fn project_view(workspace: &Path, token: &str) -> Result<Value> {
         "source": ".fractal/project.fractal",
         "source_mtime": project.updated_at,
         "development": {"visible": false, "steps": []},
-        "execution": execution_view,
         "run_control": {"available": true, "phase": phase, "token": token},
         "totals": {
             "complete": complete,
@@ -1846,218 +1964,1184 @@ fn project_view(workspace: &Path, token: &str) -> Result<Value> {
     }))
 }
 
-/// Return the immutable graph's non-failure predecessors in stable order.  The
-/// execution graph, rather than learning records or assignment side data, is
-/// the authority for dependency explanations.
-fn graph_predecessors(graph: &Value, node_id: &str) -> Vec<String> {
-    let mut predecessors = std::collections::BTreeSet::new();
-    for edge in graph
-        .get("edges")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if edge.get("to").and_then(Value::as_str) != Some(node_id)
-            || edge.get("condition").and_then(Value::as_str) == Some("failure")
-        {
-            continue;
-        }
-        if let Some(from) = edge.get("from").and_then(Value::as_str) {
-            if !from.is_empty() {
-                predecessors.insert(from.chars().take(160).collect::<String>());
+fn graph_snapshot(workspace: &Path) -> Result<Value> {
+    let project = crate::project_file::load(workspace)?;
+    let intelligence = project_intelligence(&project);
+    Ok(json!({
+        "schema": GRAPH_SNAPSHOT_SCHEMA,
+        "bundle": GRAPH_UI_BUNDLE_ID,
+        "project_key": project.project.slug,
+        "project": project.project,
+        "graph": project.graph,
+        "execution": project.execution,
+        "learning": project.learning,
+        "efficiency": project.efficiency,
+        "intelligence": intelligence,
+    }))
+}
+
+fn project_intelligence(project: &crate::project_file::FractalProject) -> Value {
+    let mut derived = derived_project_intelligence(project);
+    let Some(supplied) = project
+        .extra
+        .get("intelligence")
+        .and_then(Value::as_object)
+        .filter(|value| {
+            value.get("schema").and_then(Value::as_str) == Some(INTELLIGENCE_SNAPSHOT_SCHEMA)
+        })
+    else {
+        return derived;
+    };
+    let mut merged = supplied.clone();
+    let mut lenses = derived
+        .get_mut("lenses")
+        .and_then(Value::as_object_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    if let Some(authoritative) = supplied.get("lenses").and_then(Value::as_object) {
+        for lens_id in LENS_IDS {
+            if let Some(lens) = authoritative.get(lens_id).filter(|value| value.is_object()) {
+                lenses.insert(lens_id.to_owned(), lens.clone());
             }
         }
     }
-    predecessors.into_iter().take(64).collect()
+    merged.insert(
+        "schema".to_owned(),
+        Value::String(INTELLIGENCE_SNAPSHOT_SCHEMA.to_owned()),
+    );
+    merged.insert("lenses".to_owned(), Value::Object(lenses));
+    Value::Object(merged)
 }
 
-fn readiness_projection(
-    predecessors: &[String],
-    assignments: Option<
-        &std::collections::BTreeMap<String, crate::project_file::ExecutionAssignment>,
-    >,
-    node: &Value,
+fn lens_record(
+    id: impl Into<String>,
+    record_type: &str,
+    label: impl Into<String>,
+    summary: impl Into<String>,
+    properties: serde_json::Map<String, Value>,
 ) -> Value {
-    let blocked_by: Vec<String> = predecessors
+    json!({
+        "id": id.into(),
+        "type": record_type,
+        "label": label.into(),
+        "summary": summary.into(),
+        "properties": properties,
+    })
+}
+
+fn derived_lens(
+    lens_id: &str,
+    nodes: Vec<Value>,
+    edges: Vec<Value>,
+    source_hashes: &[String],
+    generated_at: &str,
+) -> Value {
+    let available = !nodes.is_empty() || !edges.is_empty();
+    let mut lens = json!({
+        "lens_id": lens_id,
+        "label": lens_label(lens_id),
+        "summary": lens_summary(lens_id),
+        "availability": if available { "available" } else { "unavailable" },
+        "nodes": nodes,
+        "edges": edges,
+        "provenance": {
+            "source_hashes": source_hashes,
+            "generated_at": generated_at,
+            "derivation": "canonical_project_projection",
+        },
+    });
+    if available {
+        let node_count = lens["nodes"].as_array().map_or(0, Vec::len);
+        let edge_count = lens["edges"].as_array().map_or(0, Vec::len);
+        lens.as_object_mut().expect("derived lens object").insert(
+            "counts".to_owned(),
+            json!({"nodes": node_count, "edges": edge_count}),
+        );
+    }
+    lens
+}
+
+fn insert_if_some<T: serde::Serialize>(
+    properties: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<T>,
+) {
+    if let Some(value) = value.and_then(|item| serde_json::to_value(item).ok()) {
+        properties.insert(key.to_owned(), value);
+    }
+}
+
+fn safe_evidence_list(evidence: &[crate::failure_graph::EvidenceRef]) -> Vec<Value> {
+    evidence
         .iter()
-        .filter(|id| {
-            assignments
-                .and_then(|items| items.get(*id))
-                .map(|assignment| assignment.state.as_str() == "completed")
-                != Some(true)
-        })
-        .cloned()
-        .collect();
-    let ready = blocked_by.is_empty();
-    let reason = if !ready {
-        if blocked_by.len() == 1 {
-            format!("Waiting for dependency {} to complete.", blocked_by[0])
-        } else {
-            format!(
-                "Waiting for dependencies {} to complete.",
-                blocked_by.join(", ")
-            )
-        }
-    } else if predecessors.is_empty() {
-        "No dependencies; node is eligible.".to_owned()
-    } else if let Some(wave) = node
-        .get("execution")
-        .and_then(|execution| execution.get("wave"))
-        .and_then(Value::as_i64)
-    {
-        format!(
-            "Dependencies {} completed; wave {} is eligible.",
-            predecessors.join(", "),
-            wave
-        )
-    } else {
-        format!(
-            "Dependencies {} completed; node is eligible.",
-            predecessors.join(", ")
-        )
-    };
-    json!({ "ready": ready, "blocked_by": blocked_by, "reason": reason })
-}
-
-fn bounded_text(value: Option<&str>, limit: usize) -> Value {
-    value
-        .map(|text| text.chars().take(limit).collect::<String>())
-        .map(Value::String)
-        .unwrap_or(Value::Null)
-}
-
-/// Return the immutable graph's canonical execution number without deriving a
-/// value from display order.  The execution field is authoritative for the
-/// Rust projection; malformed, empty, and non-string values are intentionally
-/// omitted from the public projection.
-fn canonical_task_number(node: &Value) -> Option<String> {
-    node.get("execution")
-        .and_then(|execution| execution.get("task_number"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        // The task number is an immutable graph identity convenience.  Keep
-        // the exact canonical string rather than deriving or truncating it.
-        .map(str::to_owned)
-}
-
-/// Project only the first bounded expected-artifact string recorded on the
-/// canonical node.  Learning records, evidence paths, and unknown flattened
-/// fields are deliberately not consulted here.
-fn canonical_expected_output(node: &Value) -> Option<String> {
-    [
-        node.get("output"),
-        node.get("expected_output"),
-        node.get("efficiency")
-            .and_then(|efficiency| efficiency.get("expected_artifact")),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(Value::as_str)
-    .find(|value| !value.is_empty())
-    .map(|value| value.chars().take(320).collect())
-}
-
-fn bounded_strings(values: &[String], limit: usize) -> Vec<String> {
-    values
-        .iter()
-        .filter(|value| !value.is_empty())
-        .take(limit)
-        .map(|value| value.chars().take(240).collect())
+        .map(safe_evidence)
+        .filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
         .collect()
 }
 
-/// Keep assignments backwards compatible while excluding flattened unknown
-/// fields that could contain credentials or workspace details.
-fn safe_assignment(assignment: Option<&crate::project_file::ExecutionAssignment>) -> Value {
-    let Some(assignment) = assignment else {
-        return Value::Null;
-    };
+fn economic_lens_nodes(
+    project: &crate::project_file::FractalProject,
+    graph_nodes: &[Value],
+) -> Vec<Value> {
+    let mut nodes = Vec::new();
+    for node in graph_nodes {
+        let Some(id) = node.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut properties = serde_json::Map::new();
+        if let Some(value) = node.pointer("/policy_contract/budgets") {
+            properties.insert("declared_policy_budget".to_owned(), value.clone());
+        }
+        if let Some(value) = node.get("budget") {
+            properties.insert("declared_runtime_budget".to_owned(), value.clone());
+        }
+        if let Some(value) = node.pointer("/efficiency/estimated_remaining_tokens") {
+            properties.insert("estimated_remaining_tokens".to_owned(), value.clone());
+        }
+        if properties.is_empty() {
+            continue;
+        }
+        properties.insert(
+            "measurement_state".to_owned(),
+            Value::String("declared_estimate".to_owned()),
+        );
+        properties.insert("task_id".to_owned(), Value::String(id.to_owned()));
+        nodes.push(lens_record(
+            format!("economic:budget:{id}"),
+            "declared_budget",
+            node.get("title").and_then(Value::as_str).unwrap_or(id),
+            "Declared limits and planning estimates; not observed usage.",
+            properties,
+        ));
+    }
+    if let Some(efficiency) = &project.efficiency {
+        let realized_evidence = efficiency
+            .episodes
+            .iter()
+            .any(|episode| episode.realized_tokens_saved.is_some());
+        for episode in &efficiency.episodes {
+            let mut properties = serde_json::Map::new();
+            properties.insert(
+                "measurement_state".to_owned(),
+                Value::String(
+                    if episode.realized_tokens_saved.is_some() {
+                        "observed_and_estimated"
+                    } else {
+                        "estimated"
+                    }
+                    .to_owned(),
+                ),
+            );
+            properties.insert(
+                "estimated_tokens_avoided".to_owned(),
+                json!(episode.estimated_tokens_avoided),
+            );
+            properties.insert(
+                "confidence_adjusted_tokens_avoided".to_owned(),
+                json!(episode.confidence_adjusted_tokens_avoided),
+            );
+            properties.insert("confidence".to_owned(), json!(episode.confidence));
+            properties.insert(
+                "estimation_basis".to_owned(),
+                Value::String(episode.estimation_basis.clone()),
+            );
+            properties.insert("accepted".to_owned(), Value::Bool(episode.accepted));
+            properties.insert(
+                "waste_type".to_owned(),
+                Value::String(episode.waste_type.as_str().to_owned()),
+            );
+            properties.insert(
+                "proposed_action".to_owned(),
+                Value::String(episode.proposed_action.as_str().to_owned()),
+            );
+            insert_if_some(
+                &mut properties,
+                "realized_tokens_saved",
+                episode.realized_tokens_saved,
+            );
+            insert_if_some(
+                &mut properties,
+                "realization_basis",
+                episode.realization_basis.clone(),
+            );
+            nodes.push(lens_record(
+                format!("economic:efficiency:{}", episode.episode_id),
+                "efficiency_episode",
+                format!("Efficiency estimate for {}", episode.detected_node),
+                if episode.realized_tokens_saved.is_some() {
+                    "Estimated and observed values are separately named and evidence-linked."
+                } else {
+                    "Estimate only; no realized savings are claimed."
+                },
+                properties,
+            ));
+        }
+        for (scope, aggregate) in [
+            ("build", &efficiency.build),
+            ("lifetime", &efficiency.lifetime),
+        ] {
+            let mut properties = serde_json::Map::new();
+            properties.insert(
+                "measurement_state".to_owned(),
+                Value::String(
+                    if realized_evidence {
+                        "observed_and_estimated"
+                    } else {
+                        "estimated"
+                    }
+                    .to_owned(),
+                ),
+            );
+            if aggregate.episode_count > 0 {
+                properties.insert("episode_count".to_owned(), json!(aggregate.episode_count));
+            }
+            if aggregate.gross_estimated_tokens_avoided > 0 {
+                properties.insert(
+                    "gross_estimated_tokens_avoided".to_owned(),
+                    json!(aggregate.gross_estimated_tokens_avoided),
+                );
+            }
+            if aggregate.confidence_adjusted_tokens_avoided > 0 {
+                properties.insert(
+                    "confidence_adjusted_tokens_avoided".to_owned(),
+                    json!(aggregate.confidence_adjusted_tokens_avoided),
+                );
+            }
+            if aggregate.estimated_cost_avoided > 0.0 {
+                properties.insert(
+                    "estimated_cost_avoided".to_owned(),
+                    json!(aggregate.estimated_cost_avoided),
+                );
+            }
+            if realized_evidence {
+                properties.insert(
+                    "realized_tokens_saved".to_owned(),
+                    json!(aggregate.realized_tokens_saved),
+                );
+                properties.insert(
+                    "realized_cost_avoided".to_owned(),
+                    json!(aggregate.realized_cost_avoided),
+                );
+            }
+            if properties.len() > 1 {
+                nodes.push(lens_record(
+                    format!("economic:aggregate:{scope}"),
+                    "efficiency_aggregate",
+                    format!("{scope} efficiency"),
+                    if realized_evidence {
+                        "Aggregate with separately named estimated and evidence-backed realized values."
+                    } else {
+                        "Estimate-only aggregate; realized values are intentionally omitted."
+                    },
+                    properties,
+                ));
+            }
+        }
+    }
+    for record in project.learning.nodes.values() {
+        if record.estimated_cost.is_none() && record.actual_cost.is_none() {
+            continue;
+        }
+        let mut properties = serde_json::Map::new();
+        properties.insert("task_id".to_owned(), Value::String(record.node_id.clone()));
+        properties.insert(
+            "measurement_state".to_owned(),
+            Value::String(
+                if record.actual_cost.is_some() {
+                    "observed_and_estimated"
+                } else {
+                    "estimated"
+                }
+                .to_owned(),
+            ),
+        );
+        insert_if_some(&mut properties, "estimated_cost", record.estimated_cost);
+        insert_if_some(&mut properties, "observed_cost", record.actual_cost);
+        nodes.push(lens_record(
+            format!("economic:cost:{}", record.node_id),
+            "task_cost",
+            record.objective.clone(),
+            "Task cost fields retain their declared estimated or observed meaning.",
+            properties,
+        ));
+    }
+    nodes
+}
+
+fn memory_lens(project: &crate::project_file::FractalProject) -> (Vec<Value>, Vec<Value>) {
+    let mut nodes = Vec::new();
+    let mut included = BTreeSet::new();
+    for record in project.learning.nodes.values() {
+        if record.outcome.is_none()
+            && record.notes.is_none()
+            && record.artifacts_produced.is_empty()
+            && record.consumed_by.is_empty()
+            && !record.human_intervention
+        {
+            continue;
+        }
+        included.insert(record.node_id.clone());
+        let mut properties = serde_json::Map::new();
+        properties.insert("task_id".to_owned(), Value::String(record.node_id.clone()));
+        insert_if_some(&mut properties, "outcome", record.outcome);
+        insert_if_some(&mut properties, "notes", record.notes.clone());
+        if !record.artifacts_produced.is_empty() {
+            properties.insert(
+                "artifacts_produced".to_owned(),
+                json!(record.artifacts_produced),
+            );
+        }
+        if !record.consumed_by.is_empty() {
+            properties.insert("consumed_by".to_owned(), json!(record.consumed_by));
+        }
+        properties.insert("attempt_count".to_owned(), json!(record.attempt_count));
+        properties.insert("reopen_count".to_owned(), json!(record.reopen_count));
+        if record.human_intervention {
+            properties.insert("human_intervention".to_owned(), Value::Bool(true));
+        }
+        nodes.push(lens_record(
+            format!("memory:node:{}", record.node_id),
+            "learning_record",
+            record.objective.clone(),
+            match record.outcome {
+                Some(crate::learning_data::NodeOutcome::VerifiedSuccess) => {
+                    "Verified learning outcome recorded by the canonical project."
+                }
+                Some(_) => "Learning outcome recorded without upgrading its verification status.",
+                None => "Learning record with evidence or notes and no claimed outcome.",
+            },
+            properties,
+        ));
+    }
+    for (index, edit) in project.learning.graph_edits.iter().enumerate() {
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "graph_before_hash".to_owned(),
+            Value::String(edit.graph_before_hash.clone()),
+        );
+        properties.insert("actor".to_owned(), Value::String(edit.actor.clone()));
+        properties.insert("trigger".to_owned(), Value::String(edit.trigger.clone()));
+        properties.insert(
+            "timestamp".to_owned(),
+            Value::String(edit.timestamp.clone()),
+        );
+        properties.insert(
+            "action".to_owned(),
+            serde_json::to_value(&edit.action).unwrap_or(Value::Null),
+        );
+        nodes.push(lens_record(
+            format!("memory:graph-edit:{index}"),
+            "graph_edit_learning",
+            format!("Graph edit {}", index + 1),
+            "Canonical graph-edit memory with its original trigger and actor.",
+            properties,
+        ));
+    }
+    let edges = project
+        .learning
+        .nodes
+        .values()
+        .flat_map(|record| {
+            record
+                .depends_on
+                .iter()
+                .filter(|dependency| {
+                    included.contains(&record.node_id) && included.contains(*dependency)
+                })
+                .map(|dependency| {
+                    json!({
+                        "id": format!("memory-edge:{dependency}:{}", record.node_id),
+                        "source": format!("memory:node:{dependency}"),
+                        "target": format!("memory:node:{}", record.node_id),
+                        "type": "depends_on",
+                    })
+                })
+        })
+        .collect();
+    (nodes, edges)
+}
+
+fn trace_lens(project: &crate::project_file::FractalProject) -> (Vec<Value>, Vec<Value>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    if let Some(execution) = &project.execution {
+        for (node_id, assignment) in &execution.assignments {
+            let mut properties = serde_json::Map::new();
+            properties.insert("task_id".to_owned(), Value::String(node_id.clone()));
+            properties.insert("state".to_owned(), Value::String(assignment.state.clone()));
+            properties.insert(
+                "agent_id".to_owned(),
+                Value::String(assignment.agent_id.clone()),
+            );
+            properties.insert(
+                "agent_label".to_owned(),
+                Value::String(assignment.agent_label.clone()),
+            );
+            properties.insert(
+                "checked_out_at".to_owned(),
+                Value::String(assignment.checked_out_at.clone()),
+            );
+            insert_if_some(
+                &mut properties,
+                "completed_at",
+                assignment.completed_at.clone(),
+            );
+            insert_if_some(
+                &mut properties,
+                "released_at",
+                assignment.released_at.clone(),
+            );
+            nodes.push(lens_record(
+                format!("trace:assignment:{node_id}"),
+                "assignment_trace",
+                format!("Assignment for {node_id}"),
+                "Execution assignment state from the canonical project.",
+                properties,
+            ));
+        }
+    }
+    for record in project.learning.nodes.values() {
+        let Some(verification) = &record.verification else {
+            continue;
+        };
+        let mut properties = serde_json::Map::new();
+        properties.insert("task_id".to_owned(), Value::String(record.node_id.clone()));
+        insert_if_some(&mut properties, "type", verification.kind.clone());
+        insert_if_some(&mut properties, "passed", verification.passed);
+        if !verification.evidence_refs.is_empty() {
+            properties.insert(
+                "evidence_refs".to_owned(),
+                json!(verification.evidence_refs),
+            );
+        }
+        nodes.push(lens_record(
+            format!("trace:verification:{}", record.node_id),
+            "verification_evidence",
+            format!("Verification for {}", record.node_id),
+            if verification.evidence_refs.is_empty() {
+                "Verification state is recorded without inventing proof references."
+            } else {
+                "Verification state with canonical opaque evidence references."
+            },
+            properties,
+        ));
+        if project
+            .execution
+            .as_ref()
+            .is_some_and(|execution| execution.assignments.contains_key(&record.node_id))
+        {
+            edges.push(json!({
+                "id": format!("trace-edge:{}", record.node_id),
+                "source": format!("trace:assignment:{}", record.node_id),
+                "target": format!("trace:verification:{}", record.node_id),
+                "type": "verified_by",
+            }));
+        }
+    }
+    (nodes, edges)
+}
+
+fn failure_learning_lens(
+    project: &crate::project_file::FractalProject,
+) -> (Vec<Value>, Vec<Value>, Option<String>) {
+    let graph = crate::project_file::failure_graph(project);
+    let mut nodes = Vec::new();
+    let mut ids = BTreeSet::new();
+    for failure in graph.failures.values() {
+        ids.insert(failure.id.clone());
+        let mut properties = serde_json::Map::new();
+        properties.insert("task_id".to_owned(), Value::String(failure.node_id.clone()));
+        properties.insert(
+            "failure_code".to_owned(),
+            Value::String(failure.failure_code.clone()),
+        );
+        properties.insert("outcome".to_owned(), Value::String(failure.outcome.clone()));
+        properties.insert(
+            "state".to_owned(),
+            serde_json::to_value(failure.state).unwrap_or(Value::Null),
+        );
+        properties.insert("attempt".to_owned(), json!(failure.attempt));
+        let evidence = safe_evidence_list(&failure.evidence);
+        if !evidence.is_empty() {
+            properties.insert("evidence".to_owned(), Value::Array(evidence));
+        }
+        if let Some(resolution) = &failure.resolution {
+            properties.insert(
+                "resolution".to_owned(),
+                json!({
+                    "success": resolution.success,
+                    "summary": resolution.summary,
+                    "evidence": safe_evidence_list(&resolution.evidence),
+                }),
+            );
+        }
+        nodes.push(lens_record(
+            failure.id.clone(),
+            "failure",
+            failure.summary.clone(),
+            "Canonical failure record; resolution and evidence appear only when recorded.",
+            properties,
+        ));
+    }
+    for lesson in graph.lessons.values() {
+        ids.insert(lesson.id.clone());
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "status".to_owned(),
+            serde_json::to_value(lesson.status).unwrap_or(Value::Null),
+        );
+        let evidence = safe_evidence_list(&lesson.evidence);
+        if !evidence.is_empty() {
+            properties.insert("evidence".to_owned(), Value::Array(evidence));
+        }
+        insert_if_some(&mut properties, "capability", lesson.capability.clone());
+        insert_if_some(&mut properties, "component", lesson.component.clone());
+        nodes.push(lens_record(
+            lesson.id.clone(),
+            "lesson",
+            lesson.summary.clone(),
+            "Canonical lesson retaining its recorded adoption status.",
+            properties,
+        ));
+    }
+    for record in project.learning.nodes.values() {
+        let Some(failure_code) = record.failure_code else {
+            continue;
+        };
+        let code = serde_json::to_value(failure_code)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".to_owned());
+        let id = format!("learning-failure:{}:{code}", record.node_id);
+        if ids.contains(&id) {
+            continue;
+        }
+        let mut properties = serde_json::Map::new();
+        properties.insert("task_id".to_owned(), Value::String(record.node_id.clone()));
+        properties.insert("failure_code".to_owned(), Value::String(code));
+        insert_if_some(&mut properties, "outcome", record.outcome);
+        properties.insert("attempt_count".to_owned(), json!(record.attempt_count));
+        ids.insert(id.clone());
+        nodes.push(lens_record(
+            id,
+            "learning_failure",
+            record.objective.clone(),
+            "Learning record reports a failure without claiming a separate lesson or resolution.",
+            properties,
+        ));
+    }
+    let edges = graph
+        .edges
+        .values()
+        .filter(|edge| ids.contains(&edge.from) && ids.contains(&edge.to))
+        .map(|edge| {
+            json!({
+                "id": edge.id,
+                "source": edge.from,
+                "target": edge.to,
+                "type": edge.edge_type.as_str(),
+            })
+        })
+        .collect();
+    (
+        nodes,
+        edges,
+        (!graph.failure_graph_hash.is_empty()).then_some(graph.failure_graph_hash),
+    )
+}
+
+fn agent_harness_lens(
+    project: &crate::project_file::FractalProject,
+    graph_nodes: &[Value],
+) -> (Vec<Value>, Vec<Value>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let assignments = project
+        .execution
+        .as_ref()
+        .map(|execution| &execution.assignments);
+    for node in graph_nodes {
+        let Some(id) = node.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let learned_executor = project
+            .learning
+            .nodes
+            .get(id)
+            .and_then(|record| record.executor.as_ref());
+        let assignment = assignments.and_then(|items| items.get(id));
+        if learned_executor.is_some() || assignment.is_some() {
+            let mut properties = serde_json::Map::new();
+            properties.insert("task_id".to_owned(), Value::String(id.to_owned()));
+            insert_if_some(
+                &mut properties,
+                "agent",
+                learned_executor
+                    .and_then(|executor| executor.agent.clone())
+                    .or_else(|| assignment.map(|value| value.agent_label.clone())),
+            );
+            insert_if_some(
+                &mut properties,
+                "model",
+                learned_executor.and_then(|executor| executor.model.clone()),
+            );
+            insert_if_some(
+                &mut properties,
+                "version",
+                learned_executor.and_then(|executor| executor.version.clone()),
+            );
+            insert_if_some(
+                &mut properties,
+                "state",
+                assignment.map(|value| value.state.clone()),
+            );
+            nodes.push(lens_record(
+                format!("agent:assignment:{id}"),
+                "agent_assignment",
+                format!("Agent for {id}"),
+                "Recorded executor metadata and current assignment state.",
+                properties,
+            ));
+        }
+        let mut properties = serde_json::Map::new();
+        properties.insert("task_id".to_owned(), Value::String(id.to_owned()));
+        if let Some(capability) = node.get("capability") {
+            properties.insert("capability".to_owned(), capability.clone());
+        }
+        if let Some(executor) = node.get("executor") {
+            properties.insert("declared_executor".to_owned(), executor.clone());
+        }
+        if let Some(routes) = node.get("route_candidates") {
+            properties.insert("route_candidates".to_owned(), routes.clone());
+        }
+        if let Some(profile) = node.pointer("/policy_contract/sandbox_profile") {
+            properties.insert("sandbox_profile".to_owned(), profile.clone());
+        }
+        if let Some(provenance) = node.pointer("/policy_contract/provenance") {
+            properties.insert("policy_provenance".to_owned(), provenance.clone());
+        }
+        if properties.len() > 1 {
+            nodes.push(lens_record(
+                format!("harness:binding:{id}"),
+                "harness_binding",
+                node.get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id),
+                "Declared capability, provider route, and sandbox metadata from the execution graph.",
+                properties,
+            ));
+            if learned_executor.is_some() || assignment.is_some() {
+                edges.push(json!({
+                    "id": format!("agent-harness:{id}"),
+                    "source": format!("agent:assignment:{id}"),
+                    "target": format!("harness:binding:{id}"),
+                    "type": "executes_with",
+                }));
+            }
+        }
+    }
+    (nodes, edges)
+}
+
+fn derived_project_intelligence(project: &crate::project_file::FractalProject) -> Value {
+    let graph_nodes = project
+        .graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let graph_edges = project
+        .graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let economic_nodes = economic_lens_nodes(project, &graph_nodes);
+    let (memory_nodes, memory_edges) = memory_lens(project);
+    let (trace_nodes, trace_edges) = trace_lens(project);
+    let (failure_nodes, failure_edges, failure_hash) = failure_learning_lens(project);
+    let (agent_nodes, agent_edges) = agent_harness_lens(project, &graph_nodes);
+    let mut source_hashes = BTreeSet::from([project.graph_hash.clone()]);
+    if let Some(efficiency) = &project.efficiency {
+        if !efficiency.config_hash.is_empty() {
+            source_hashes.insert(efficiency.config_hash.clone());
+        }
+    }
+    if let Some(hash) = failure_hash {
+        source_hashes.insert(hash);
+    }
+    let source_hashes: Vec<String> = source_hashes.into_iter().collect();
+    let mut lenses = serde_json::Map::new();
+    lenses.insert(
+        "overview".to_owned(),
+        derived_lens(
+            "overview",
+            graph_nodes.clone(),
+            graph_edges.clone(),
+            &source_hashes,
+            &project.updated_at,
+        ),
+    );
+    lenses.insert(
+        "execution".to_owned(),
+        derived_lens(
+            "execution",
+            graph_nodes,
+            graph_edges,
+            &source_hashes,
+            &project.updated_at,
+        ),
+    );
+    for (lens_id, nodes, edges) in [
+        ("resource_economic", economic_nodes, Vec::new()),
+        ("memory_knowledge", memory_nodes, memory_edges),
+        ("trace_evidence", trace_nodes, trace_edges),
+        ("failure_learning", failure_nodes, failure_edges),
+        ("agent_model_tool_harness", agent_nodes, agent_edges),
+    ] {
+        lenses.insert(
+            lens_id.to_owned(),
+            derived_lens(lens_id, nodes, edges, &source_hashes, &project.updated_at),
+        );
+    }
     json!({
-        "agent_id": assignment.agent_id.chars().take(160).collect::<String>(),
-        "agent_label": assignment.agent_label.chars().take(160).collect::<String>(),
-        "state": assignment.state.chars().take(40).collect::<String>(),
-        "checked_out_at": bounded_text(Some(&assignment.checked_out_at), 80),
-        "completed_at": bounded_text(assignment.completed_at.as_deref(), 80),
-        "released_at": bounded_text(assignment.released_at.as_deref(), 80),
+        "schema": INTELLIGENCE_SNAPSHOT_SCHEMA,
+        "source": {
+            "kind": "canonical_project_projection",
+            "schema": project.schema,
+        },
+        "generated_at": project.updated_at,
+        "lenses": lenses,
     })
 }
 
-fn safe_learning_evidence(record: Option<&crate::learning_data::NodeRecord>) -> Value {
-    let Some(record) = record else {
-        return json!({
-            "started_at": null,
-            "finished_at": null,
-            "attempt_count": 0,
-            "outcome": null,
-            "failure_code": null,
-            "verification": {"type": null, "passed": null, "evidence_refs": []},
-            "artifacts_produced": [],
-            "consumed_by": [],
-            "executor": {"agent": null, "model": null, "version": null},
-            "human_intervention": false,
-            "reopen_count": 0,
-        });
-    };
-    let verification = record
-        .verification
-        .as_ref()
-        .map(|verification| {
-            json!({
-                "type": bounded_text(verification.kind.as_deref(), 80),
-                "passed": verification.passed,
-                "evidence_refs": bounded_strings(&verification.evidence_refs, 32),
-            })
-        })
-        .unwrap_or_else(|| json!({"type": null, "passed": null, "evidence_refs": []}));
-    let executor = record
-        .executor
-        .as_ref()
-        .map(|executor| {
-            json!({
-                "agent": bounded_text(executor.agent.as_deref(), 160),
-                "model": bounded_text(executor.model.as_deref(), 160),
-                "version": bounded_text(executor.version.as_deref(), 120),
-            })
-        })
-        .unwrap_or_else(|| json!({"agent": null, "model": null, "version": null}));
+fn lens_label(lens_id: &str) -> &'static str {
+    match lens_id {
+        "overview" => "Overview",
+        "execution" => "Execution",
+        "resource_economic" => "Economics",
+        "memory_knowledge" => "Memory",
+        "trace_evidence" => "Traces & evidence",
+        "failure_learning" => "Failures & lessons",
+        "agent_model_tool_harness" => "Agents & tools",
+        _ => "Unavailable",
+    }
+}
+
+fn lens_summary(lens_id: &str) -> &'static str {
+    match lens_id {
+        "overview" => "The full bounded project picture across every available authority.",
+        "execution" => "Tasks, dependencies, waves, status, and active ownership.",
+        "resource_economic" => {
+            "Estimates, observed usage, bills, receipts, rewards, and finality remain distinct."
+        }
+        "memory_knowledge" => "Verified outcomes and reusable knowledge recorded for future work.",
+        "trace_evidence" => {
+            "Assignments, verification evidence, and causal execution observations."
+        }
+        "failure_learning" => "Failures, repair observations, resolutions, and adopted lessons.",
+        "agent_model_tool_harness" => "Assigned agents, models, tools, and harness boundaries.",
+        _ => "No lens data is available.",
+    }
+}
+
+fn unavailable_lens(lens_id: &str) -> Value {
     json!({
-        "started_at": bounded_text(record.started_at.as_deref(), 80),
-        "finished_at": bounded_text(record.finished_at.as_deref(), 80),
-        "attempt_count": record.attempt_count,
-        "outcome": record.outcome.as_ref().and_then(|outcome| serde_json::to_value(outcome).ok()),
-        "failure_code": record.failure_code.as_ref().and_then(|code| serde_json::to_value(code).ok()),
-        "verification": verification,
-        "artifacts_produced": bounded_strings(&record.artifacts_produced, 32),
-        "consumed_by": bounded_strings(&record.consumed_by, 32),
-        "executor": executor,
-        "human_intervention": record.human_intervention,
-        "reopen_count": record.reopen_count,
+        "lens_id": lens_id,
+        "label": lens_label(lens_id),
+        "summary": lens_summary(lens_id),
+        "availability": "unavailable",
+        "nodes": [],
+        "edges": [],
     })
 }
 
-fn safe_execution_view(execution: Option<&crate::project_file::ExecutionState>) -> Value {
-    let Some(execution) = execution else {
-        return json!({
-            "phase": "planning",
-            "updated_at": null,
-            "progress": null,
-        });
-    };
-    let progress = execution.progress.as_ref().map(|progress| {
-        json!({
-            "message": progress.message.chars().take(280).collect::<String>(),
-            "step": progress.step,
-            "elapsed_seconds": progress.elapsed_seconds,
-            "agent_label": progress.agent_label.chars().take(160).collect::<String>(),
-            "source": progress.source.chars().take(80).collect::<String>(),
-            "updated_at": bounded_text(Some(&progress.updated_at), 80),
-        })
-    });
+fn fallback_graph_lens(snapshot: &Value, lens_id: &str) -> Value {
+    let graph = snapshot.get("graph").cloned().unwrap_or_else(|| json!({}));
+    let nodes = graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let edges = graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     json!({
-        "phase": bounded_text(Some(&execution.phase), 40),
-        "updated_at": bounded_text(Some(&execution.updated_at), 80),
-        "progress": progress,
+        "lens_id": lens_id,
+        "label": lens_label(lens_id),
+        "summary": lens_summary(lens_id),
+        "availability": if nodes.is_empty() { "unavailable" } else { "available" },
+        "counts": {"nodes": nodes.len(), "edges": edges.len()},
+        "nodes": nodes,
+        "edges": edges,
+        "provenance": {
+            "source_hashes": graph.get("graph_hash").and_then(Value::as_str).map(|hash| vec![hash]).unwrap_or_default(),
+        },
     })
+}
+
+fn canonical_intelligence(snapshot: &Value) -> Value {
+    let supplied = snapshot
+        .get("intelligence")
+        .and_then(Value::as_object)
+        .filter(|value| {
+            value.get("schema").and_then(Value::as_str) == Some(INTELLIGENCE_SNAPSHOT_SCHEMA)
+        });
+    let supplied_lenses = supplied
+        .and_then(|value| value.get("lenses"))
+        .and_then(Value::as_object);
+    let mut lenses = serde_json::Map::new();
+    for lens_id in LENS_IDS {
+        let lens = supplied_lenses
+            .and_then(|items| items.get(lens_id))
+            .filter(|value| value.is_object())
+            .cloned()
+            .unwrap_or_else(|| match lens_id {
+                "overview" | "execution" => fallback_graph_lens(snapshot, lens_id),
+                _ => unavailable_lens(lens_id),
+            });
+        lenses.insert(lens_id.to_owned(), lens);
+    }
+    let mut result = supplied.cloned().unwrap_or_default();
+    result.insert(
+        "schema".to_owned(),
+        Value::String(INTELLIGENCE_SNAPSHOT_SCHEMA.to_owned()),
+    );
+    result.insert("lenses".to_owned(), Value::Object(lenses));
+    Value::Object(result)
+}
+
+fn node_id(value: &Value) -> Option<&str> {
+    value
+        .get("id")
+        .or_else(|| value.get("node_id"))
+        .and_then(Value::as_str)
+}
+
+fn edge_endpoints(value: &Value) -> Option<(&str, &str)> {
+    let source = value
+        .get("source")
+        .or_else(|| value.get("from"))
+        .or_else(|| value.get("source_id"))
+        .and_then(Value::as_str)?;
+    let target = value
+        .get("target")
+        .or_else(|| value.get("to"))
+        .or_else(|| value.get("target_id"))
+        .and_then(Value::as_str)?;
+    Some((source, target))
+}
+
+fn query_terms(query: &str) -> Vec<String> {
+    const STOP_WORDS: [&str; 20] = [
+        "show",
+        "find",
+        "me",
+        "the",
+        "a",
+        "an",
+        "and",
+        "graph",
+        "overview",
+        "execution",
+        "economic",
+        "economics",
+        "memory",
+        "traces",
+        "evidence",
+        "failures",
+        "lessons",
+        "agents",
+        "tools",
+        "tasks",
+    ];
+    query
+        .split(|character: char| {
+            !character.is_alphanumeric() && character != '_' && character != '-'
+        })
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(str::to_ascii_lowercase)
+        .filter(|term| !STOP_WORDS.contains(&term.as_str()))
+        .collect()
+}
+
+fn inferred_lens_ids(query: &str) -> Vec<String> {
+    let lower = query.to_ascii_lowercase();
+    let mut lenses = Vec::new();
+    let patterns = [
+        (
+            "failure_learning",
+            ["failure", "lesson", "repair"].as_slice(),
+        ),
+        ("trace_evidence", ["trace", "evidence", "span"].as_slice()),
+        (
+            "memory_knowledge",
+            ["memory", "knowledge", "remember"].as_slice(),
+        ),
+        (
+            "resource_economic",
+            ["economic", "cost", "budget", "bill", "receipt", "reward"].as_slice(),
+        ),
+        (
+            "agent_model_tool_harness",
+            ["agent", "model", "tool", "harness"].as_slice(),
+        ),
+        (
+            "execution",
+            ["execution", "task", "wave", "milestone"].as_slice(),
+        ),
+    ];
+    for (lens_id, terms) in patterns {
+        if terms.iter().any(|term| lower.contains(term)) {
+            lenses.push(lens_id.to_owned());
+        }
+    }
+    if lenses.is_empty() {
+        lenses.push("overview".to_owned());
+    }
+    lenses
+}
+
+fn validate_query(query: &IntelligenceQueryRequest) -> std::result::Result<(), QueryApiError> {
+    if query.schema != INTELLIGENCE_QUERY_SCHEMA {
+        return Err(QueryApiError::bad_request(
+            "invalid_schema",
+            format!("schema must be {INTELLIGENCE_QUERY_SCHEMA}"),
+        ));
+    }
+    let query_length = query.query.chars().count();
+    if query.query.trim().is_empty() || query_length > MAX_QUERY_CHARS {
+        return Err(QueryApiError::bad_request(
+            "invalid_query",
+            format!("query must contain 1..={MAX_QUERY_CHARS} characters"),
+        ));
+    }
+    if query.lens_ids.len() > MAX_QUERY_LENSES {
+        return Err(QueryApiError::bad_request(
+            "too_many_lenses",
+            format!("lens_ids is limited to {MAX_QUERY_LENSES} entries"),
+        ));
+    }
+    if let Some(invalid) = query
+        .lens_ids
+        .iter()
+        .find(|lens| !LENS_IDS.contains(&lens.as_str()))
+    {
+        return Err(QueryApiError::bad_request(
+            "unknown_lens",
+            format!("unknown lens_id {invalid}"),
+        ));
+    }
+    if query.root_ids.len() > MAX_QUERY_ROOTS {
+        return Err(QueryApiError::bad_request(
+            "too_many_roots",
+            format!("root_ids is limited to {MAX_QUERY_ROOTS} entries"),
+        ));
+    }
+    if query.bounds.max_depth.unwrap_or(0) > MAX_QUERY_DEPTH
+        || query.bounds.max_nodes.unwrap_or(100) > MAX_QUERY_NODES
+        || query.bounds.max_edges.unwrap_or(200) > MAX_QUERY_EDGES
+    {
+        return Err(QueryApiError::bad_request(
+            "bounds_exceeded",
+            format!(
+                "bounds may not exceed max_depth={MAX_QUERY_DEPTH}, max_nodes={MAX_QUERY_NODES}, max_edges={MAX_QUERY_EDGES}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn read_query_request(
+    request: &mut tiny_http::Request,
+) -> std::result::Result<IntelligenceQueryRequest, QueryApiError> {
+    let declared_length = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("Content-Length"))
+        .and_then(|header| header.value.as_str().parse::<u64>().ok());
+    if declared_length.is_some_and(|length| length > MAX_QUERY_BODY_BYTES) {
+        return Err(QueryApiError::payload_too_large());
+    }
+    let mut body = Vec::new();
+    request
+        .as_reader()
+        .take(MAX_QUERY_BODY_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| QueryApiError::bad_request("invalid_body", "could not read query body"))?;
+    if body.len() as u64 > MAX_QUERY_BODY_BYTES {
+        return Err(QueryApiError::payload_too_large());
+    }
+    parse_query_request(&body)
+}
+
+fn parse_query_request(
+    body: &[u8],
+) -> std::result::Result<IntelligenceQueryRequest, QueryApiError> {
+    let query = serde_json::from_slice::<IntelligenceQueryRequest>(body).map_err(|error| {
+        QueryApiError::bad_request("invalid_body", format!("invalid query body: {error}"))
+    })?;
+    validate_query(&query)?;
+    Ok(query)
+}
+
+fn bounded_lens(lens: &Value, query: &IntelligenceQueryRequest) -> Value {
+    if lens.get("availability").and_then(Value::as_str) == Some("unavailable") {
+        return lens.clone();
+    }
+    let source_nodes = lens
+        .get("nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let source_edges = lens
+        .get("edges")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let terms = query_terms(&query.query);
+    let matching: BTreeSet<String> = source_nodes
+        .iter()
+        .filter_map(|node| {
+            let id = node_id(node)?;
+            let searchable = serde_json::to_string(node).ok()?.to_ascii_lowercase();
+            (terms.is_empty() || terms.iter().any(|term| searchable.contains(term)))
+                .then(|| id.to_owned())
+        })
+        .collect();
+    let mut selected = if query.root_ids.is_empty() {
+        matching.clone()
+    } else {
+        query.root_ids.iter().cloned().collect()
+    };
+    if !query.root_ids.is_empty() {
+        let mut outgoing: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for edge in &source_edges {
+            if let Some((source, target)) = edge_endpoints(edge) {
+                outgoing
+                    .entry(source.to_owned())
+                    .or_default()
+                    .push(target.to_owned());
+            }
+        }
+        let max_depth = query.bounds.max_depth.unwrap_or(0);
+        let mut queue: VecDeque<(String, u32)> =
+            query.root_ids.iter().cloned().map(|id| (id, 0)).collect();
+        while let Some((id, depth)) = queue.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+            for target in outgoing.get(&id).into_iter().flatten() {
+                if selected.insert(target.clone()) {
+                    queue.push_back((target.clone(), depth + 1));
+                }
+            }
+        }
+        if !terms.is_empty() {
+            selected.retain(|id| matching.contains(id) || query.root_ids.contains(id));
+        }
+    }
+    let node_limit = query.bounds.max_nodes.unwrap_or(100);
+    let edge_limit = query.bounds.max_edges.unwrap_or(200);
+    let nodes: Vec<Value> = source_nodes
+        .iter()
+        .filter(|node| node_id(node).is_some_and(|id| selected.contains(id)))
+        .take(node_limit)
+        .cloned()
+        .collect();
+    let node_ids: BTreeSet<&str> = nodes.iter().filter_map(node_id).collect();
+    let edges: Vec<Value> = source_edges
+        .iter()
+        .filter(|edge| {
+            edge_endpoints(edge).is_some_and(|(source, target)| {
+                node_ids.contains(source) && node_ids.contains(target)
+            })
+        })
+        .take(edge_limit)
+        .cloned()
+        .collect();
+    let mut result = lens.clone();
+    if !result.is_object() {
+        result = unavailable_lens("unknown");
+    }
+    let object = result.as_object_mut().expect("lens object");
+    object.insert("nodes".to_owned(), Value::Array(nodes.clone()));
+    object.insert("edges".to_owned(), Value::Array(edges.clone()));
+    object.insert(
+        "counts".to_owned(),
+        json!({"nodes": nodes.len(), "edges": edges.len()}),
+    );
+    object.insert(
+        "truncated".to_owned(),
+        Value::Bool(source_nodes.len() > nodes.len() || source_edges.len() > edges.len()),
+    );
+    result
+}
+
+fn intelligence_query(
+    workspace: &Path,
+    query: &IntelligenceQueryRequest,
+) -> std::result::Result<Value, QueryApiError> {
+    let snapshot = graph_snapshot(workspace).map_err(|error| QueryApiError {
+        status: StatusCode(409),
+        code: "snapshot_unavailable",
+        message: format!("canonical graph snapshot unavailable: {error:#}"),
+    })?;
+    let project_key = snapshot
+        .get("project_key")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if query
+        .project_key
+        .as_deref()
+        .is_some_and(|requested| requested != project_key)
+    {
+        return Err(QueryApiError {
+            status: StatusCode(404),
+            code: "project_not_found",
+            message: "project_key does not match the board's bound project".to_owned(),
+        });
+    }
+    let intelligence = canonical_intelligence(&snapshot);
+    let lenses = intelligence
+        .get("lenses")
+        .and_then(Value::as_object)
+        .expect("canonical intelligence lenses");
+    let requested = if query.lens_ids.is_empty() {
+        inferred_lens_ids(&query.query)
+    } else {
+        query.lens_ids.clone()
+    };
+    let mut selected = serde_json::Map::new();
+    for lens_id in requested {
+        if let Some(lens) = lenses.get(&lens_id) {
+            selected.insert(lens_id, bounded_lens(lens, query));
+        }
+    }
+    Ok(json!({
+        "schema": INTELLIGENCE_QUERY_RESPONSE_SCHEMA,
+        "project_key": project_key,
+        "query": {
+            "schema": INTELLIGENCE_QUERY_SCHEMA,
+            "query": query.query,
+            "modality": query.modality.as_str(),
+            "lens_ids": selected.keys().cloned().collect::<Vec<_>>(),
+            "root_ids": query.root_ids,
+            "bounds": {
+                "max_depth": query.bounds.max_depth.unwrap_or(0),
+                "max_nodes": query.bounds.max_nodes.unwrap_or(100),
+                "max_edges": query.bounds.max_edges.unwrap_or(200),
+            },
+        },
+        "intelligence": {
+            "schema": INTELLIGENCE_SNAPSHOT_SCHEMA,
+            "source": {"kind": "canonical_project", "path": ".fractal/project.fractal"},
+            "lenses": selected,
+        },
+    }))
 }
 
 fn resolve_exec_graph_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
@@ -2238,6 +3322,113 @@ mod tests {
         project.graph_hash
     }
 
+    fn write_projection_project(workspace: &Path) -> String {
+        fs::create_dir_all(workspace.join(".fractal")).unwrap();
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "nodes": [{
+                "id": "n1",
+                "title": "Repair compiler",
+                "instruction": "repair the compiler regression",
+                "capability": "code.generate",
+                "executor": {"provider": "cursor-cli"},
+                "route_candidates": ["cursor-cli", "codex"],
+                "budget": {"timeout_ms": 120000},
+                "efficiency": {"estimated_remaining_tokens": 2400},
+                "policy_contract": {
+                    "budgets": {"max_cost_usd": 5, "max_input_tokens": 12000},
+                    "sandbox_profile": "workspace-write",
+                    "provenance": "prd:canonical"
+                }
+            }],
+            "edges": []
+        });
+        let graph_hash = fractal_contracts::canonical_sha256(&graph).expect("hash graph");
+        graph
+            .as_object_mut()
+            .unwrap()
+            .insert("graph_hash".to_owned(), json!(graph_hash));
+        crate::project_file::persist(workspace, &graph, "Projection fixture").unwrap();
+        crate::project_file::mutate_document(workspace, |project| {
+            assert!(!project.extra.contains_key("intelligence"));
+            project.execution = Some(
+                serde_json::from_value(json!({
+                    "schema": "fractal.execution_state.v1",
+                    "phase": "executing",
+                    "assignments": {
+                        "n1": {
+                            "agent_id": "agent-cursor-1",
+                            "agent_label": "cursor-cli",
+                            "state": "completed",
+                            "checked_out_at": "2026-08-24T10:00:00Z",
+                            "completed_at": "2026-08-24T10:02:00Z"
+                        }
+                    },
+                    "updated_at": "2026-08-24T10:02:00Z"
+                }))
+                .expect("typed execution fixture"),
+            );
+            project.learning.nodes.insert(
+                "n1".to_owned(),
+                serde_json::from_value(json!({
+                    "node_id": "n1",
+                    "node_type": "task",
+                    "objective": "Repair compiler",
+                    "depends_on": [],
+                    "finished_at": "2026-08-24T10:02:00Z",
+                    "executor": {
+                        "agent": "cursor-cli",
+                        "model": "cursor-agent",
+                        "version": "2026.08"
+                    },
+                    "attempt_count": 2,
+                    "outcome": "unverified_success",
+                    "failure_code": "tool_failure",
+                    "verification": {
+                        "type": "test_suite",
+                        "passed": true,
+                        "evidence_refs": ["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+                    },
+                    "artifacts_produced": ["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+                    "estimated_cost": 1.75,
+                    "actual_cost": 1.25,
+                    "notes": "Compiler repair completed; promotion is still pending."
+                }))
+                .expect("typed learning fixture"),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let mut failures = crate::failure_graph::FailureGraph::empty();
+        let failure_id = crate::failure_graph::failure_id("n1", "tool_failure");
+        failures.failures.insert(
+            failure_id.clone(),
+            crate::failure_graph::FailureRecord {
+                id: failure_id,
+                node_id: "n1".to_owned(),
+                attempt: 1,
+                failure_code: "tool_failure".to_owned(),
+                outcome: "failed_execution".to_owned(),
+                summary: "Compiler command failed before the retry.".to_owned(),
+                ..Default::default()
+            },
+        );
+        failures.lessons.insert(
+            "lesson:inspect-generated-output".to_owned(),
+            crate::failure_graph::LessonRecord {
+                id: "lesson:inspect-generated-output".to_owned(),
+                summary: "Inspect generated output before retrying the compiler.".to_owned(),
+                capability: Some("code.generate".to_owned()),
+                component: Some("compiler".to_owned()),
+                ..Default::default()
+            },
+        );
+        crate::failure_graph::normalize(&mut failures).unwrap();
+        crate::project_file::replace_failure_graph(workspace, failures).unwrap();
+        graph_hash
+    }
+
     fn sha256_prefixed(bytes: &[u8]) -> String {
         let digest = Sha256::digest(bytes);
         let mut out = String::with_capacity(71);
@@ -2352,6 +3543,36 @@ mod tests {
     }
 
     #[test]
+    fn embedded_graph_ui_is_the_provenance_pinned_society_bundle() {
+        let js = embedded_asset("fractal-graph-ui.js");
+        let css = embedded_asset("fractal-graph-ui.css");
+        let js_text = String::from_utf8_lossy(js);
+        let css_text = String::from_utf8_lossy(css);
+        let manifest: Value =
+            serde_json::from_slice(embedded_asset("fractal-graph-ui.manifest.json")).unwrap();
+        assert!(js_text.contains(GRAPH_UI_BUNDLE_ID));
+        assert!(js_text.contains("Query graph"));
+        assert!(js_text.contains("execution-flow--rootless"));
+        assert!(css_text.contains(".fractal-graph-query[hidden]"));
+        assert!(css_text.contains(".execution-canvas.has-tasks"));
+        assert_eq!(manifest["schema"], "fractal.graph_ui_bundle.v1");
+        assert_eq!(manifest["renderer"], GRAPH_UI_BUNDLE_ID);
+        assert_eq!(
+            manifest["source_repository"],
+            "fractalsociety/fractalsociety-website"
+        );
+        assert_ne!(manifest["source_commit"], "pending");
+        assert_eq!(
+            manifest["asset_hashes"]["fractal-graph-ui.js"],
+            sha256_prefixed(js)
+        );
+        assert_eq!(
+            manifest["asset_hashes"]["fractal-graph-ui.css"],
+            sha256_prefixed(css)
+        );
+    }
+
+    #[test]
     fn master_board_launch_url_selects_master_mode() {
         assert_eq!(master_board_url(8093), "http://127.0.0.1:8093/?mode=master");
     }
@@ -2387,8 +3608,11 @@ mod tests {
 
     #[test]
     fn board_identity_payload_is_derived_from_the_canonical_project() {
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let identity = board_identity(workspace).unwrap();
+        let _guard = test_lock();
+        let root = temp_root("identity");
+        let workspace = root.join("project");
+        write_minimal_project(&workspace, "Identity project");
+        let identity = board_identity(&workspace).unwrap();
         let canonical_workspace = workspace.canonicalize().unwrap();
         let canonical_workspace = canonical_workspace.to_string_lossy();
         assert_eq!(
@@ -2404,7 +3628,8 @@ mod tests {
             Some(canonical_workspace.as_ref())
         );
         let graph_hash = identity.get("graph_hash").and_then(Value::as_str).unwrap();
-        assert!(identity_matches_value(&identity, workspace, graph_hash));
+        assert!(identity_matches_value(&identity, &workspace, graph_hash));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2600,202 +3825,193 @@ mod tests {
     }
 
     #[test]
-    fn project_view_projects_bounded_task_number_and_expected_output_without_mutating_graph() {
+    fn canonical_graph_snapshot_exposes_the_shared_typed_contract() {
         let _guard = test_lock();
-        let root = temp_root("task-detail-projection");
+        let root = temp_root("canonical-snapshot");
         let workspace = root.join("solo");
-        fs::create_dir_all(workspace.join(".fractal")).unwrap();
-        let mut graph = json!({
-            "schema": "fractal.execution_graph.v1",
-            "nodes": [
-                {
-                    "id": "populated",
-                    "title": "Populated",
-                    "objective": "Inspect task",
-                    "execution": {"task_number": "2.1", "wave": 2},
-                    "output": "canonical output",
-                    "expected_output": "secondary output",
-                    "efficiency": {"expected_artifact": "fallback output"}
-                },
-                {
-                    "id": "missing",
-                    "title": "Missing",
-                    "execution": {"task_number": ""}
-                }
-            ],
-            "edges": []
-        });
-        let graph_hash = fractal_contracts::canonical_sha256(&graph).unwrap();
-        graph["graph_hash"] = json!(graph_hash);
-        crate::project_file::persist(&workspace, &graph, "Solo").unwrap();
-        let canonical = crate::project_file::load(&workspace).unwrap();
-        let canonical_graph = canonical.graph.clone();
-        let canonical_hash = canonical.graph_hash.clone();
+        write_minimal_project(&workspace, "Solo");
+        let snapshot = graph_snapshot(&workspace).unwrap();
+        assert_eq!(snapshot["schema"], GRAPH_SNAPSHOT_SCHEMA);
+        assert_eq!(snapshot["bundle"], GRAPH_UI_BUNDLE_ID);
+        assert!(snapshot["graph"]["nodes"].is_array());
+        assert!(snapshot.get("execution").is_some());
+        assert!(snapshot.get("learning").is_some());
+        assert!(snapshot.get("efficiency").is_some());
+        assert!(snapshot.get("intelligence").is_some());
 
-        let view = project_view(&workspace, "token").unwrap();
-        assert_eq!(view["schema"], "fractal.execution_graph_view.v1");
-        assert_eq!(view["graph"]["graph_hash"], canonical_hash);
-        assert_eq!(view["graph"], canonical_graph);
-        let tasks = view["groups"][0]["tasks"].as_array().unwrap();
-        assert_eq!(tasks[0]["task_number"], "2.1");
-        assert_eq!(tasks[0]["expected_output"], "canonical output");
-        assert_eq!(tasks[1]["task_number"], Value::Null);
-        assert_eq!(tasks[1]["expected_output"], Value::Null);
-
+        let intelligence = canonical_intelligence(&snapshot);
+        assert_eq!(intelligence["schema"], INTELLIGENCE_SNAPSHOT_SCHEMA);
+        let lenses = intelligence["lenses"].as_object().unwrap();
+        assert_eq!(lenses.len(), LENS_IDS.len());
+        assert_eq!(lenses["overview"]["availability"], "available");
+        assert_eq!(lenses["execution"]["availability"], "available");
+        assert_eq!(lenses["resource_economic"]["availability"], "unavailable");
+        assert!(lenses["resource_economic"].get("counts").is_none());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn project_view_falls_back_to_nested_efficiency_verification_plan() {
+    fn typed_intelligence_query_is_bounded_and_fail_closed() {
+        let valid = br#"{
+          "schema":"fractal.intelligence.query.v1",
+          "query":"show execution tasks",
+          "modality":"text",
+          "lens_ids":["execution"],
+          "bounds":{"max_depth":2,"max_nodes":20,"max_edges":40}
+        }"#;
+        let parsed = parse_query_request(valid).unwrap();
+        assert_eq!(parsed.lens_ids, vec!["execution"]);
+
+        let unknown_field = br#"{
+          "schema":"fractal.intelligence.query.v1",
+          "query":"show execution",
+          "modality":"text",
+          "ambient_authority":true
+        }"#;
+        assert_eq!(
+            parse_query_request(unknown_field).unwrap_err().code,
+            "invalid_body"
+        );
+
+        let unknown_lens = br#"{
+          "schema":"fractal.intelligence.query.v1",
+          "query":"show credentials",
+          "modality":"text",
+          "lens_ids":["credential_store"]
+        }"#;
+        assert_eq!(
+            parse_query_request(unknown_lens).unwrap_err().code,
+            "unknown_lens"
+        );
+
+        let excessive = format!(
+            r#"{{"schema":"{INTELLIGENCE_QUERY_SCHEMA}","query":"show tasks","modality":"voice","bounds":{{"max_nodes":{}}}}}"#,
+            MAX_QUERY_NODES + 1
+        );
+        assert_eq!(
+            parse_query_request(excessive.as_bytes()).unwrap_err().code,
+            "bounds_exceeded"
+        );
+    }
+
+    #[test]
+    fn intelligence_query_preserves_unavailable_and_filters_canonical_nodes() {
         let _guard = test_lock();
-        let root = temp_root("gate-fallback");
+        let root = temp_root("canonical-query");
         let workspace = root.join("solo");
-        fs::create_dir_all(workspace.join(".fractal")).unwrap();
-        let mut graph = json!({
-            "schema": "fractal.execution_graph.v1",
-            "nodes": [{
-                "id": "verify",
-                "title": "Verify",
-                "capability": "control.verify",
-                "efficiency": {"verification_plan": "cargo test board"}
-            }],
-            "edges": []
-        });
-        let graph_hash = fractal_contracts::canonical_sha256(&graph).unwrap();
-        graph["graph_hash"] = json!(graph_hash);
-        crate::project_file::persist(&workspace, &graph, "Solo").unwrap();
-        let view = project_view(&workspace, "token").unwrap();
-        let gate = &view["groups"][0]["tasks"][0]["gate"];
-        assert_eq!(gate, "cargo test board");
+        write_minimal_project(&workspace, "Solo");
+
+        let execution = parse_query_request(
+            br#"{
+              "schema":"fractal.intelligence.query.v1",
+              "query":"Task one",
+              "modality":"text",
+              "lens_ids":["execution"],
+              "bounds":{"max_nodes":1,"max_edges":1}
+            }"#,
+        )
+        .unwrap();
+        let response = intelligence_query(&workspace, &execution).unwrap();
+        assert_eq!(response["schema"], INTELLIGENCE_QUERY_RESPONSE_SCHEMA);
+        assert_eq!(
+            response["intelligence"]["lenses"]["execution"]["counts"]["nodes"],
+            1
+        );
+
+        let economics = parse_query_request(
+            br#"{
+              "schema":"fractal.intelligence.query.v1",
+              "query":"show economics",
+              "modality":"voice"
+            }"#,
+        )
+        .unwrap();
+        let response = intelligence_query(&workspace, &economics).unwrap();
+        let lens = &response["intelligence"]["lenses"]["resource_economic"];
+        assert_eq!(lens["availability"], "unavailable");
+        assert_eq!(lens["nodes"].as_array().unwrap().len(), 0);
+        assert!(lens.get("counts").is_none());
+        let encoded = serde_json::to_string(lens).unwrap();
+        assert!(!encoded.contains("realized_tokens_saved"));
+        assert!(!encoded.contains("observed_cost"));
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn project_view_projects_runtime_progress_readiness_and_safe_learning_evidence() {
+    fn intelligence_query_derives_all_lenses_without_precomputed_intelligence() {
         let _guard = test_lock();
-        let root = temp_root("live-projection");
-        let workspace = root.join("solo");
-        fs::create_dir_all(workspace.join(".fractal")).unwrap();
-        let mut graph = json!({
-            "schema": "fractal.execution_graph.v1",
-            "nodes": [
-                {"id": "plan", "title": "Plan", "objective": "Plan the work", "capability": "planning"},
-                {"id": "build", "title": "Build", "objective": "Build the change", "capability": "code.generate", "execution": {"wave": 2}},
-                {"id": "review", "title": "Review", "objective": "Review evidence", "capability": "control.verify", "execution": {"wave": 3}}
-            ],
-            "edges": [
-                {"from": "plan", "to": "build", "condition": "success"},
-                {"from": "build", "to": "review", "condition": "success"},
-                {"from": "plan", "to": "review", "condition": "failure"}
-            ]
-        });
-        let graph_hash = fractal_contracts::canonical_sha256(&graph).unwrap();
-        graph["graph_hash"] = json!(graph_hash);
-        crate::project_file::persist(&workspace, &graph, "Solo").unwrap();
-        crate::project_file::set_execution_phase(&workspace, "planning").unwrap();
-        crate::project_file::update_planning_progress(
-            &workspace,
-            "Selecting eligible workers",
-            2,
-            17,
-            "Luna · Planner",
-            "planner",
-        )
-        .unwrap();
-        let planning = project_view(&workspace, "token").unwrap();
-        assert_eq!(planning["execution"]["phase"], "planning");
-        assert_eq!(
-            planning["execution"]["progress"]["message"],
-            "Selecting eligible workers"
-        );
-        assert_eq!(
-            planning["execution"]["progress"]["agent_label"],
-            "Luna · Planner"
-        );
+        let root = temp_root("derived-intelligence");
+        let workspace = root.join("project");
+        write_projection_project(&workspace);
+        let project = crate::project_file::load(&workspace).unwrap();
+        assert!(!project.extra.contains_key("intelligence"));
 
-        crate::project_file::checkout_start_node(
-            &workspace,
-            "plan",
-            "agent-plan",
-            "Luna · Planner",
-        )
-        .unwrap();
-        crate::project_file::finish_node(
-            &workspace,
-            "plan",
-            "agent-plan",
-            crate::learning_data::NodeOutcome::UnverifiedSuccess,
-        )
-        .unwrap();
-        crate::project_file::checkout_start_node(
-            &workspace,
-            "build",
-            "agent-build",
-            "Luna · Builder",
-        )
-        .unwrap();
-        crate::project_file::record_verification_result(
-            &workspace,
-            "build",
-            false,
-            vec!["evidence:build-failed".to_owned()],
-        )
-        .unwrap();
-        crate::project_file::release_node(
-            &workspace,
-            "build",
-            "agent-build",
-            Some((
-                crate::learning_data::NodeOutcome::FailedVerification,
-                crate::learning_data::FailureCode::WeakVerifier,
-            )),
-        )
-        .unwrap();
-        crate::project_file::record_verification_result(
-            &workspace,
-            "build",
-            false,
-            vec!["evidence:build-failed".to_owned()],
-        )
-        .unwrap();
-
-        // Flattened learning extras are intentionally not part of the public
-        // projection, even when they are non-secret diagnostic fields.
-        let mut document = crate::project_file::load(&workspace).unwrap();
-        document
-            .learning
-            .nodes
-            .get_mut("build")
-            .unwrap()
-            .extra
-            .insert("unknown_flattened".to_owned(), json!("should-not-ship"));
-        fs::write(
-            crate::project_file::path(&workspace),
-            serde_json::to_vec_pretty(&document).unwrap(),
-        )
-        .unwrap();
-
-        let view = project_view(&workspace, "token").unwrap();
-        assert_eq!(view["execution"]["phase"], "executing");
-        let tasks = view["groups"][0]["tasks"].as_array().unwrap();
-        let task = |id: &str| tasks.iter().find(|item| item["id"] == id).unwrap();
-        assert!(task("build")["why"]["ready"].as_bool().unwrap());
+        let snapshot = graph_snapshot(&workspace).unwrap();
+        let intelligence = &snapshot["intelligence"];
         assert_eq!(
-            task("build")["why"]["blocked_by"].as_array().unwrap().len(),
-            0
+            intelligence["source"]["kind"],
+            "canonical_project_projection"
         );
-        assert_eq!(task("review")["why"]["ready"], false);
-        assert_eq!(task("review")["why"]["blocked_by"], json!(["build"]));
-        assert_eq!(task("build")["assignment"]["state"], "released");
-        assert_eq!(task("build")["evidence"]["failure_code"], "weak_verifier");
-        assert_eq!(task("build")["evidence"]["verification"]["passed"], false);
-        assert_eq!(
-            task("build")["evidence"]["verification"]["evidence_refs"],
-            json!(["evidence:build-failed"])
-        );
-        let encoded = serde_json::to_string(&task("build")["evidence"]).unwrap();
-        assert!(!encoded.contains("unknown_flattened"));
-        assert!(!encoded.contains("should-not-ship"));
+        for lens_id in LENS_IDS {
+            assert_eq!(
+                intelligence["lenses"][lens_id]["availability"], "available",
+                "{lens_id} should derive from canonical project fields"
+            );
+        }
+
+        let economics =
+            serde_json::to_string(&intelligence["lenses"]["resource_economic"]).unwrap();
+        assert!(economics.contains("declared_estimate"));
+        assert!(economics.contains("estimated_cost"));
+        assert!(economics.contains("observed_cost"));
+        assert!(!economics.contains("realized_tokens_saved"));
+
+        let memory = serde_json::to_string(&intelligence["lenses"]["memory_knowledge"]).unwrap();
+        assert!(memory.contains("unverified_success"));
+        assert!(memory.contains("without upgrading its verification status"));
+
+        let traces = serde_json::to_string(&intelligence["lenses"]["trace_evidence"]).unwrap();
+        assert!(traces.contains("assignment_trace"));
+        assert!(traces.contains("sha256:aaaaaaaa"));
+
+        let failures = serde_json::to_string(&intelligence["lenses"]["failure_learning"]).unwrap();
+        assert!(failures.contains("\"type\":\"failure\""));
+        assert!(failures.contains("\"type\":\"lesson\""));
+
+        let agents =
+            serde_json::to_string(&intelligence["lenses"]["agent_model_tool_harness"]).unwrap();
+        assert!(agents.contains("cursor-cli"));
+        assert!(agents.contains("cursor-agent"));
+        assert!(agents.contains("harness_binding"));
+
+        for (lens_id, query_text) in [
+            ("overview", "show overview"),
+            ("execution", "show execution"),
+            ("resource_economic", "show economics"),
+            ("memory_knowledge", "show memory"),
+            ("trace_evidence", "show traces"),
+            ("failure_learning", "show failures and lessons"),
+            ("agent_model_tool_harness", "show agents and tools"),
+        ] {
+            let request = parse_query_request(
+                serde_json::to_string(&json!({
+                    "schema": INTELLIGENCE_QUERY_SCHEMA,
+                    "query": query_text,
+                    "modality": "text",
+                    "lens_ids": [lens_id]
+                }))
+                .unwrap()
+                .as_bytes(),
+            )
+            .unwrap();
+            let response = intelligence_query(&workspace, &request).unwrap();
+            let lens = &response["intelligence"]["lenses"][lens_id];
+            assert_eq!(lens["availability"], "available");
+            assert!(
+                lens["counts"]["nodes"].as_u64().unwrap_or(0) > 0,
+                "{lens_id} query should return derived records"
+            );
+        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2803,6 +4019,9 @@ mod tests {
     fn asset_allowlist_includes_master_modules_and_rejects_traversal_paths() {
         assert!(!embedded_asset("master-graph.js").is_empty());
         assert!(!embedded_asset("master-graph.css").is_empty());
+        assert!(!embedded_asset("fractal-graph-ui.js").is_empty());
+        assert!(!embedded_asset("fractal-graph-ui.css").is_empty());
+        assert!(!embedded_asset("fractal-graph-ui.manifest.json").is_empty());
         assert!(embedded_asset("../secrets.txt").is_empty());
         assert!(embedded_asset("/etc/passwd").is_empty());
     }

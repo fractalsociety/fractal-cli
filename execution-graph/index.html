@@ -8,8 +8,10 @@
     <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="styles.css">
     <link rel="stylesheet" href="master-graph.css">
+    <link rel="stylesheet" href="fractal-graph-ui.css">
   </head>
   <body>
+    <script>if(new URLSearchParams(location.search).get("mode")==="master")document.body.classList.add("canonical-master");</script>
     <div class="ambient" aria-hidden="true"></div>
     <header class="topbar">
       <a class="brand" href="/" aria-label="Fractal execution graph home">
@@ -37,6 +39,14 @@
 
     <main>
       <section id="master-browser" class="master-browser hidden" aria-label="Master graph browser"></section>
+      <section class="canonical-graph-shell" aria-label="Canonical Fractal project graph">
+        <div
+          data-fractal-graph-ui
+          data-snapshot-url="/api/snapshot"
+          data-query-url="/api/intelligence/query"
+          data-refresh-ms="2000"
+        >Loading canonical graph…</div>
+      </section>
       <section class="hero">
         <div class="eyebrow"><span>WORK /</span> FRACTAL-MAC-RUNTIME-PRD</div>
         <h1>Build intelligence<br><em>you can inspect.</em></h1>
@@ -68,19 +78,6 @@
                  labelled group rather than an image (which hides descendants
                  from assistive technology). -->
             <svg id="graph" role="group" aria-label="Fractal Runtime PRD execution graph"></svg>
-            <div id="graph-3d" class="graph-3d-mount hidden" aria-label="Three dimensional execution graph"></div>
-            <div class="graph-3d-controls" aria-label="Graph camera controls">
-              <button id="graph-reset-camera" type="button" aria-label="Reset camera to fit graph">RESET CAMERA</button>
-              <button id="graph-list-toggle" type="button" aria-expanded="false" aria-controls="graph-accessible-list">NODE LIST</button>
-            </div>
-            <section class="live-work-hud" id="live-work-hud" aria-label="Live execution status">
-              <div class="live-work-hud-head"><span>LIVE WORK</span><b id="live-work-phase">PLANNING</b></div>
-              <p class="live-work-agent" id="live-work-agents">No active agent</p>
-              <div class="live-work-row"><small>OBJECTIVE</small><span id="live-work-objective">Waiting for the next eligible node.</span></div>
-              <div class="live-work-row"><small>WHY NOW</small><span id="live-work-why">The coordinator is evaluating dependencies.</span></div>
-            </section>
-            <div id="graph-accessible-list" class="graph-accessible-list hidden" aria-label="Execution graph nodes"></div>
-            <div id="transition-announcements" class="sr-only" aria-live="polite" aria-atomic="true"></div>
             <div class="graph-hint">Select a milestone to inspect its executable checklist</div>
           </div>
         </div>
@@ -95,24 +92,15 @@
             <div class="status-pill" id="node-status"></div>
             <p class="node-kind" id="node-kind"></p>
             <h3 id="node-title"></h3>
-            <p class="node-task-number" id="node-task-number"></p>
             <p class="node-id" id="node-id"></p>
-            <p class="node-overview" id="node-overview"></p>
             <div class="node-progress" id="node-progress-wrap">
               <span><b id="node-progress-label"></b><small id="node-progress-count"></small></span>
               <div><i id="node-progress"></i></div>
             </div>
             <dl>
-              <div id="node-objective-wrap" class="node-purpose-wrap"><dt>PURPOSE</dt><dd id="node-purpose"><strong id="node-objective"></strong></dd></div>
-              <div id="node-readiness-wrap"><dt>WHY / READINESS</dt><dd id="node-readiness"><span id="node-why"></span></dd></div>
-              <div id="node-dependencies-wrap"><dt>DEPENDENCIES</dt><dd id="node-dependencies"></dd></div>
-              <div id="node-execution-wrap"><dt>EXECUTION WAVE</dt><dd id="node-execution-wave"></dd><dt>EXECUTION MODE</dt><dd id="node-execution-mode"></dd><dt>PARALLEL GROUP</dt><dd id="node-execution-group"></dd><dd id="node-execution" class="sr-only"></dd></div>
-              <div id="node-capability-wrap"><dt>CAPABILITY</dt><dd id="node-capability"></dd></div>
-              <div id="node-instruction-wrap"><dt>INSTRUCTION</dt><dd id="node-instruction"></dd></div>
-              <div id="node-expected-output-wrap"><dt>EXPECTED OUTPUT</dt><dd id="node-expected-output"></dd></div>
-              <div id="node-assignment-wrap"><dt>AGENT</dt><dd id="node-agent"></dd><dt class="assignment-state-label">ACTIVITY</dt><dd id="node-assignment"></dd></div>
-              <div id="node-evidence-wrap"><dt>EVIDENCE</dt><dd id="node-evidence"></dd></div>
-              <div id="node-last-event-wrap"><dt>LAST EVENT</dt><dd id="node-last-event"></dd></div>
+              <div class="hidden" id="node-assignment-wrap"><dt>AGENT</dt><dd id="node-agent"></dd><dt class="assignment-state-label">ACTIVITY</dt><dd id="node-assignment"></dd></div>
+              <div class="hidden" id="node-execution-wrap"><dt>EXECUTION</dt><dd id="node-execution"></dd></div>
+              <div class="hidden" id="node-instruction-wrap"><dt>INSTRUCTION</dt><dd id="node-instruction"></dd></div>
               <div><dt>SOURCE</dt><dd id="node-source"></dd></div>
               <div><dt>GATE</dt><dd id="node-gate"></dd></div>
             </dl>
@@ -142,8 +130,8 @@
       <span>Native MLX thinks · Containers act · Policy controls · Verifiers decide</span>
     </footer>
     <script src="master-graph.js"></script>
-    <script src="vendor/three.min.js"></script>
-    <script src="three-graph.js"></script>
     <script src="app.js"></script>
+    <script>if(document.body.classList.contains("canonical-master"))document.querySelector("[data-fractal-graph-ui]").removeAttribute("data-fractal-graph-ui");</script>
+    <script src="fractal-graph-ui.js"></script>
   </body>
 </html>

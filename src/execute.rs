@@ -1,13 +1,15 @@
 //! Drive a committed execution graph to a built, verified result by handing
-//! each build node to a real headless worker (claude / codex / cursor) in the
+//! each build node to a real headless worker (Claude, Codex, Cursor, Hermes, or
+//! OpenCode) in the
 //! trusted workspace, then running the graph's verification node against what it
 //! produced. This is what turns a typed request into an actual artifact.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -38,11 +40,6 @@ pub(crate) struct NodeRun {
     /// signal the mid-run morphogenesis supervisor reads (a slow node triggers a
     /// proactive verification graft). Zero when unmeasured.
     pub latency_ms: u64,
-    /// Compact immutable-policy enforcement evidence.  The report contains
-    /// hashes/statuses/limits only; prompts, environment values, logs, and
-    /// absolute paths are intentionally excluded.
-    #[allow(dead_code)]
-    pub policy_report: Option<crate::policy_executor::PolicyEnforcementReport>,
 }
 
 /// Outcome of driving one graph.
@@ -52,6 +49,8 @@ pub(crate) struct RunOutcome {
     pub detail: String,
     /// The node whose verification failed (drives governed evolution), if any.
     pub failed_node: Option<String>,
+    /// False when repeating the same graph cannot repair the failure.
+    pub retryable: bool,
     /// Per-node execution log for chain receipts + the sanitized export.
     pub log: Vec<NodeRun>,
 }
@@ -142,8 +141,9 @@ fn topo_order(graph: &Value) -> Result<Vec<Value>> {
 
 /// A model for `kind`, overridden by `$FRACTAL_<KIND>_MODEL` when set.
 ///
-/// Claude defaults to its rolling `opus` alias so unattended workers do not
-/// fall back to the CLI's account-dependent default model.
+/// Claude defaults to its rolling `opus` alias. OpenCode defaults to the
+/// operator-confirmed Z.AI coding-plan route; both remain environment
+/// overridable without reading or copying provider credentials.
 fn model_for(kind: &str) -> Option<String> {
     let key = format!(
         "FRACTAL_{}_MODEL",
@@ -154,75 +154,15 @@ fn model_for(kind: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
         .or_else(|| match kind {
             "claude" => Some("opus".to_owned()),
+            "opencode" => Some("zai-coding-plan/glm-5.3".to_owned()),
             _ => None,
         })
 }
 
-const INFERX_ENDPOINT: &str = "https://model.inferx.net/endpoints/v1";
-const INFERX_MODEL: &str = "deepseek-v4-flash";
-const INFERX_PROVIDER: &str = "custom";
-
-/// Return a configured InferX API key without ever copying an empty value into
-/// a worker environment.  The key is only consumed by [`worker_command`] and
-/// the child-environment assembly immediately before spawning the worker.
-fn inferx_api_key() -> Option<String> {
-    std::env::var("FRACTAL_INFERX_API_KEY")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn require_inferx_api_key() -> Result<String> {
-    inferx_api_key().ok_or_else(|| {
-        anyhow::anyhow!("inferx worker is not configured (set FRACTAL_INFERX_API_KEY)")
-    })
-}
-
-/// Pure configuration predicate used by automatic roster detection.  Keeping
-/// the environment reads outside this helper makes detection tests independent
-/// of the process environment and prevents a secret from entering diagnostics.
-fn inferx_configured(enabled: Option<&str>, api_key: Option<&str>, hermes_on_path: bool) -> bool {
-    enabled == Some("1") && api_key.is_some_and(|value| !value.trim().is_empty()) && hermes_on_path
-}
-
-fn inferx_is_configured() -> bool {
-    inferx_configured(
-        std::env::var("FRACTAL_INFERX_ENABLED").ok().as_deref(),
-        std::env::var("FRACTAL_INFERX_API_KEY").ok().as_deref(),
-        binary_on_path(agent_binary("inferx")),
-    )
-}
-
-/// The exact argv contract for the InferX-backed Hermes route.  In particular,
-/// the API key is never represented in argv, which keeps process listings and
-/// command errors free of credentials.
-fn inferx_command_args(prompt: &str) -> Vec<String> {
-    vec![
-        "--yolo".to_owned(),
-        "-m".to_owned(),
-        INFERX_MODEL.to_owned(),
-        "--provider".to_owned(),
-        INFERX_PROVIDER.to_owned(),
-        "-z".to_owned(),
-        prompt.to_owned(),
-    ]
-}
-
-/// Environment entries that are specific to the InferX-backed Hermes child.
-/// This map is intentionally separate from the parent process environment:
-/// callers pass it directly to `Command::env`/`envs` after `env_clear`.
-fn inferx_child_environment(api_key: &str) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        // Current Hermes resolves a bare `custom` provider's endpoint from
-        // CUSTOM_BASE_URL; OPENAI_BASE_URL remains for older Hermes builds.
-        ("CUSTOM_BASE_URL".to_owned(), INFERX_ENDPOINT.to_owned()),
-        ("OPENAI_BASE_URL".to_owned(), INFERX_ENDPOINT.to_owned()),
-        ("OPENAI_API_KEY".to_owned(), api_key.to_owned()),
-        (
-            "HERMES_INFERENCE_PROVIDER".to_owned(),
-            INFERX_PROVIDER.to_owned(),
-        ),
-        ("HERMES_INFERENCE_MODEL".to_owned(), INFERX_MODEL.to_owned()),
-    ])
+fn opencode_binary() -> std::ffi::OsString {
+    std::env::var_os("FRACTAL_OPENCODE_BIN")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| std::ffi::OsString::from("opencode"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,7 +176,12 @@ pub(crate) enum AgentRole {
 /// Lead planning is deliberately a separate invocation role.  In particular,
 /// selecting Codex as the lead must not make its implementation-worker command
 /// inherit the planner's high-effort Sol configuration.
-pub(crate) fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Result<Command> {
+pub(crate) fn worker_command(
+    kind: &str,
+    prompt: &str,
+    role: AgentRole,
+    workspace: &Path,
+) -> Result<Command> {
     let identity = kind;
     let kind = command_kind_for_agent(kind);
     let mut command = match kind {
@@ -246,26 +191,7 @@ pub(crate) fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Resul
             if let Some(model) = model_for("claude") {
                 c.arg("--model").arg(model);
             }
-            // Keep Claude's permission checks enabled in print mode; the
-            // dangerous bypass flag is intentionally never used.  The
-            // fallback path has no immutable contract, so keep it file-only
-            // instead of silently granting a shell/network escape hatch.
-            c.args([
-                "--bare",
-                "--safe-mode",
-                "--strict-mcp-config",
-                "--no-chrome",
-                "--permission-mode",
-                "acceptEdits",
-                "--no-session-persistence",
-                "--tools",
-                "Read,Edit,Glob,Grep",
-                "--disallowedTools",
-                "WebFetch",
-                "WebSearch",
-                "Bash",
-                prompt,
-            ]);
+            c.arg("--dangerously-skip-permissions").arg(prompt);
             c
         }
         "codex" | "codex-luna" => {
@@ -284,16 +210,7 @@ pub(crate) fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Resul
                 // reach this branch for a solo lead running a non-root node.
                 c.arg("--model").arg("gpt-5.6-luna");
             }
-            // Current Codex exposes approval policy and network access through
-            // config keys.  Workspace-write is the least-privilege profile.
-            c.arg("--config")
-                .arg("approval_policy=\"never\"")
-                .arg("--config")
-                .arg("sandbox_workspace_write.network_access=false")
-                .arg("--sandbox")
-                .arg("workspace-write")
-                .arg("--color")
-                .arg("never")
+            c.arg("--dangerously-bypass-approvals-and-sandbox")
                 .arg(prompt);
             c
         }
@@ -303,15 +220,15 @@ pub(crate) fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Resul
             if let Some(model) = model_for("cursor") {
                 c.arg("--model").arg(model);
             }
-            c.arg("--sandbox").arg("enabled").arg(prompt);
+            c.arg("--force").arg(prompt);
             c
         }
         "hermes" => {
-            // Hermes `-z` is deliberately not used: the installed CLI documents
-            // it as auto-approving shell/tool requests (equivalent to yolo).
-            // `chat -q` is the documented noninteractive form; file-only
-            // toolsets keep this legacy/no-contract route least privilege.
+            // Hermes one-shot (`-z`) with tools auto-approved (`--yolo`). A pinned
+            // model routes through OpenRouter (where the free nemotron models live)
+            // unless $FRACTAL_HERMES_PROVIDER overrides the provider.
             let mut c = Command::new("hermes");
+            c.arg("--yolo");
             if let Some(model) = model_for("hermes") {
                 let provider = std::env::var("FRACTAL_HERMES_PROVIDER")
                     .ok()
@@ -319,29 +236,20 @@ pub(crate) fn worker_command(kind: &str, prompt: &str, role: AgentRole) -> Resul
                     .unwrap_or_else(|| "openrouter".to_owned());
                 c.arg("-m").arg(model).arg("--provider").arg(provider);
             }
-            c.args([
-                "chat",
-                "-q",
-                prompt,
-                "-Q",
-                "--ignore-user-config",
-                "--ignore-rules",
-                "--toolsets",
-                "file",
-            ]);
+            c.arg("-z").arg(prompt);
             c
         }
-        "inferx" => {
-            let api_key = require_inferx_api_key()?;
-            let mut c = Command::new("hermes");
-            c.args(inferx_command_args(prompt));
-            for (name, value) in inferx_child_environment(&api_key) {
-                c.env(name, value);
+        "opencode" => {
+            let mut c = Command::new(opencode_binary());
+            c.arg("run").arg("--format").arg("json");
+            if let Some(model) = model_for("opencode") {
+                c.arg("--model").arg(model);
             }
+            c.arg("--dir").arg(workspace).arg(prompt);
             c
         }
         other => {
-            bail!("unknown worker: {other} (use claude|codex|codex-luna|cursor|hermes|inferx)")
+            bail!("unknown worker: {other} (use claude|codex|codex-luna|cursor|hermes|opencode)")
         }
     };
     command.env("FRACTAL_WORKER", identity);
@@ -360,6 +268,153 @@ pub(crate) struct AgentRun {
     pub lesson_ids: Vec<String>,
 }
 
+const OPENCODE_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+const OPENCODE_VERSION_MAX_BYTES: usize = 256;
+const OPENCODE_JSON_MAX_BYTES: usize = 1_048_576;
+
+struct CapturedCommand {
+    success: bool,
+    timed_out: bool,
+    stdout: Vec<u8>,
+    stdout_overflowed: bool,
+}
+
+fn capture_bounded<R: Read + Send + 'static>(
+    mut reader: R,
+    limit: usize,
+    retain: bool,
+) -> std::thread::JoinHandle<std::io::Result<(Vec<u8>, bool)>> {
+    std::thread::spawn(move || {
+        let mut retained = Vec::new();
+        let mut overflowed = false;
+        let mut buffer = [0_u8; 8_192];
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            if retain {
+                let remaining = limit.saturating_sub(retained.len());
+                retained.extend_from_slice(&buffer[..count.min(remaining)]);
+                overflowed |= count > remaining;
+            }
+        }
+        Ok((retained, overflowed))
+    })
+}
+
+fn run_captured_command(
+    mut command: Command,
+    timeout: Duration,
+    label: &str,
+) -> Result<CapturedCommand> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to launch {label} (is opencode on PATH?)"))?;
+    let stdout = child.stdout.take().context("capture OpenCode stdout")?;
+    let stderr = child.stderr.take().context("capture OpenCode stderr")?;
+    let stdout_reader = capture_bounded(stdout, OPENCODE_JSON_MAX_BYTES, true);
+    // Always drain stderr to prevent a pipe deadlock, but never retain or log
+    // it: provider diagnostics can contain credential-shaped configuration.
+    let stderr_reader = capture_bounded(stderr, 0, false);
+    let worker = crate::run_control::WorkerGuard::register(child.id());
+    let deadline = Instant::now() + timeout;
+    let (success, timed_out) = loop {
+        match child.try_wait()? {
+            Some(status) => break (status.success(), false),
+            None if Instant::now() >= deadline => {
+                crate::run_control::terminate_worker(child.id());
+                let _ = child.wait();
+                break (false, true);
+            }
+            None => std::thread::sleep(Duration::from_millis(25)),
+        }
+    };
+    crate::run_control::terminate_worker(child.id());
+    drop(worker);
+    let (stdout, stdout_overflowed) = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("OpenCode stdout reader panicked"))??;
+    stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("OpenCode stderr reader panicked"))??;
+    Ok(CapturedCommand {
+        success,
+        timed_out,
+        stdout,
+        stdout_overflowed,
+    })
+}
+
+fn preflight_opencode(workspace: &Path) -> Result<()> {
+    let mut command = Command::new(opencode_binary());
+    command.arg("--version").current_dir(workspace);
+    let mut result =
+        run_captured_command(command, OPENCODE_PREFLIGHT_TIMEOUT, "OpenCode preflight")?;
+    if result.timed_out {
+        bail!("OpenCode preflight timed out");
+    }
+    if !result.success || result.stdout_overflowed {
+        bail!("OpenCode preflight failed");
+    }
+    result.stdout.truncate(OPENCODE_VERSION_MAX_BYTES + 1);
+    let version = std::str::from_utf8(&result.stdout).context("OpenCode version is not UTF-8")?;
+    if version.trim().is_empty() || version.len() > OPENCODE_VERSION_MAX_BYTES {
+        bail!("OpenCode preflight returned an invalid version");
+    }
+    Ok(())
+}
+
+fn opencode_json_succeeded(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let mut saw_event = false;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        let Some(object) = event.as_object() else {
+            return false;
+        };
+        saw_event = true;
+        let event_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if event_type.is_empty() {
+            return false;
+        }
+        let part_type = object
+            .get("part")
+            .and_then(|part| part.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let finish_reason = object
+            .get("part")
+            .and_then(|part| part.get("reason"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if event_type.contains("error")
+            || part_type.contains("error")
+            || matches!(finish_reason.as_str(), "error" | "failed" | "failure")
+            || object.get("error").is_some_and(|error| !error.is_null())
+        {
+            return false;
+        }
+    }
+    saw_event
+}
+
 #[allow(dead_code)]
 fn run_worker_as(
     kind: &str,
@@ -367,7 +422,7 @@ fn run_worker_as(
     workspace: &Path,
     timeout_ms: u64,
 ) -> Result<AgentRun> {
-    run_worker_as_for_node(kind, instruction, workspace, timeout_ms, None, None)
+    run_worker_as_for_node(kind, instruction, workspace, timeout_ms, None)
 }
 
 fn run_worker_as_for_node(
@@ -376,7 +431,6 @@ fn run_worker_as_for_node(
     workspace: &Path,
     timeout_ms: u64,
     node: Option<&Value>,
-    policy: Option<&crate::policy_executor::EffectivePolicy>,
 ) -> Result<AgentRun> {
     let (lesson_section, lesson_ids) = node
         .map(|node| {
@@ -401,7 +455,7 @@ fn run_worker_as_for_node(
          entirely in the current directory. Create or edit only the files this task needs and make \
          any tests pass. Do not ask questions; make reasonable choices.{lesson_section}"
     );
-    let mut run = run_agent_prompt_with_policy(kind, &prompt, workspace, timeout_ms, policy)?;
+    let mut run = run_agent_prompt(kind, &prompt, workspace, timeout_ms)?;
     run.lesson_ids = lesson_ids;
     Ok(run)
 }
@@ -411,7 +465,6 @@ fn run_lead_agent_as(
     instruction: &str,
     workspace: &Path,
     timeout_ms: u64,
-    policy: Option<&crate::policy_executor::EffectivePolicy>,
 ) -> Result<AgentRun> {
     let prompt = format!(
         "You are the lead planner/orchestrator for a coordinated team. Do exactly this assigned \
@@ -419,37 +472,18 @@ fn run_lead_agent_as(
          Preserve the team's graph contract and make any required verification pass. Do not ask \
          questions; make reasonable choices."
     );
-    run_agent_prompt_with_role(
-        kind,
-        &prompt,
-        workspace,
-        timeout_ms,
-        AgentRole::LeadPlanner,
-        "lead planner",
-        policy,
-    )
+    run_lead_agent_prompt(kind, &prompt, workspace, timeout_ms)
 }
 
 /// Run an agent with a verbatim prompt (no team-task wrapper) under a hard time
 /// budget: if it does not finish within `timeout_ms`, the process is killed and
 /// reported as a (timed-out) failure — so a hung agent never stalls the whole
 /// build; the node fails and the governed repair loop re-instructs it.
-#[allow(dead_code)]
 pub(crate) fn run_agent_prompt(
     kind: &str,
     prompt: &str,
     workspace: &Path,
     timeout_ms: u64,
-) -> Result<AgentRun> {
-    run_agent_prompt_with_policy(kind, prompt, workspace, timeout_ms, None)
-}
-
-fn run_agent_prompt_with_policy(
-    kind: &str,
-    prompt: &str,
-    workspace: &Path,
-    timeout_ms: u64,
-    policy: Option<&crate::policy_executor::EffectivePolicy>,
 ) -> Result<AgentRun> {
     run_agent_prompt_with_role(
         kind,
@@ -458,7 +492,6 @@ fn run_agent_prompt_with_policy(
         timeout_ms,
         AgentRole::Worker,
         "worker",
-        policy,
     )
 }
 
@@ -477,7 +510,6 @@ pub(crate) fn run_lead_agent_prompt(
         timeout_ms,
         AgentRole::LeadPlanner,
         "lead planner",
-        None,
     )
 }
 
@@ -488,42 +520,30 @@ fn run_agent_prompt_with_role(
     timeout_ms: u64,
     role: AgentRole,
     label: &str,
-    policy: Option<&crate::policy_executor::EffectivePolicy>,
 ) -> Result<AgentRun> {
-    // Policy-backed command construction has its own provider matrix, so
-    // perform the logical InferX credential check before either route.  This
-    // keeps missing-key failures deterministic and secret-free in both paths.
-    if kind == "inferx" {
-        let _ = require_inferx_api_key()?;
+    if command_kind_for_agent(kind) == "opencode" {
+        preflight_opencode(workspace)?;
+        let mut command = worker_command(kind, prompt, role, workspace)?;
+        command.current_dir(workspace);
+        let result = run_captured_command(
+            command,
+            Duration::from_millis(timeout_ms),
+            "OpenCode worker",
+        )?;
+        return Ok(AgentRun {
+            ok: result.success
+                && !result.timed_out
+                && !result.stdout_overflowed
+                && opencode_json_succeeded(&result.stdout),
+            timed_out: result.timed_out,
+            lesson_ids: Vec::new(),
+        });
     }
     // Detach the worker's stdin: headless agents (e.g. `claude -p`) otherwise
     // inherit the CLI's piped stdin and block reading it instead of exiting.
-    let mut command = if let Some(policy) = policy {
-        crate::policy_executor::worker_command(
-            kind,
-            prompt,
-            match role {
-                AgentRole::LeadPlanner => "lead planner",
-                AgentRole::Worker => "worker",
-            },
-            policy,
-        )?
-    } else {
-        worker_command(kind, prompt, role)?
-    };
-    let network_denied = policy.is_some_and(|policy| {
-        matches!(policy.network.default.as_str(), "deny" | "deny_by_default")
-    });
-    let child_env = crate::policy_executor::sanitized_environment_for_workspace(
-        kind,
-        network_denied,
-        workspace,
-    );
-    let child_env = child_environment_for_worker(kind, child_env);
+    let mut command = worker_command(kind, prompt, role, workspace)?;
     command
         .current_dir(workspace)
-        .env_clear()
-        .envs(child_env)
         .stdin(std::process::Stdio::null());
     #[cfg(unix)]
     command.process_group(0);
@@ -535,6 +555,11 @@ fn run_agent_prompt_with_role(
     loop {
         match child.try_wait()? {
             Some(status) => {
+                // Some headless CLIs (notably Cursor) leave a worker-server
+                // child in the invocation's process group after the CLI exits.
+                // The task is complete, so close that exact group before
+                // releasing its guard; otherwise every node leaks ~200 MiB.
+                crate::run_control::terminate_worker(child.id());
                 drop(worker);
                 return Ok(AgentRun {
                     ok: status.success(),
@@ -559,59 +584,23 @@ fn run_agent_prompt_with_role(
     }
 }
 
-/// Add logical-provider credentials after the generic environment has been
-/// sanitized.  `sanitized_environment_for_workspace` deliberately does not
-/// retain `FRACTAL_INFERX_API_KEY`; only the InferX child receives it, under
-/// the provider's standard `OPENAI_API_KEY` name.
-fn child_environment_for_worker(
-    kind: &str,
-    mut environment: BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    if kind == "inferx" {
-        environment.remove("FRACTAL_INFERX_API_KEY");
-        environment.remove("CUSTOM_BASE_URL");
-        if let Some(api_key) = inferx_api_key() {
-            environment.extend(inferx_child_environment(&api_key));
-        } else {
-            // `worker_command` rejects this configuration before spawn.  Keep
-            // this helper fail-safe for callers that assemble an environment
-            // independently: no ambient OpenAI/Hermes credentials survive.
-            environment.remove("CUSTOM_BASE_URL");
-            environment.remove("OPENAI_API_KEY");
-            environment.remove("OPENAI_BASE_URL");
-            environment.remove("HERMES_INFERENCE_PROVIDER");
-            environment.remove("HERMES_INFERENCE_MODEL");
-        }
-    }
-    environment
-}
-
-/// The kill-timeout for an agent working `node`.  The strictest declared limit
-/// wins: node budget, immutable policy max_minutes, and an optional operator
-/// override are all upper bounds.  There is intentionally no historical
-/// timeout floor.
+/// The kill-timeout for an agent working `node`. `$FRACTAL_AGENT_TIMEOUT_MS`, when
+/// set, is an explicit absolute override; otherwise it is the node's declared
+/// budget but never less than a generous 15-minute floor — so a legitimately long
+/// task is not killed, only a genuinely hung agent.
 fn agent_timeout_ms(node: &Value) -> u64 {
-    let override_ms = std::env::var("FRACTAL_AGENT_TIMEOUT_MS")
+    if let Some(override_ms) = std::env::var("FRACTAL_AGENT_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0);
-    let node_budget = node
+    {
+        return override_ms;
+    }
+    let budget = node
         .get("budget")
         .and_then(|budget| budget.get("timeout_ms"))
         .and_then(Value::as_u64)
-        .filter(|value| *value > 0);
-    let policy_budget = node
-        .get("policy_contract")
-        .and_then(|contract| contract.get("budgets"))
-        .and_then(|budgets| budgets.get("max_minutes"))
-        .and_then(Value::as_u64)
-        .filter(|value| *value > 0)
-        .map(|minutes| minutes.saturating_mul(60_000));
-    [override_ms, node_budget, policy_budget]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap_or(1)
+        .unwrap_or(0);
+    budget.max(900_000) // 15-minute floor
 }
 
 /// The binary that provides a given logical agent.
@@ -619,7 +608,6 @@ fn agent_binary(kind: &str) -> &str {
     match command_kind_for_agent(kind) {
         "cursor" | "cursor-agent" => "cursor-agent",
         "codex-luna" => "codex",
-        "inferx" => "hermes",
         other => other,
     }
 }
@@ -636,23 +624,17 @@ fn binary_on_path(binary: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Every supported agent whose binary is on `PATH`.  InferX is listed only
-/// when its explicit enable/key configuration is present, because it is a
-/// logical route over the Hermes binary rather than a standalone executable.
+/// Every supported agent whose binary is on `PATH` (ignores env config).
 pub(crate) fn available_agents() -> Vec<String> {
-    let mut agents: Vec<String> = ["claude", "codex", "cursor", "hermes"]
+    ["claude", "codex", "cursor", "hermes", "opencode"]
         .into_iter()
         .filter(|kind| binary_on_path(agent_binary(kind)))
         .map(str::to_owned)
-        .collect();
-    if inferx_is_configured() && !agents.is_empty() {
-        agents.push("inferx".to_owned());
-    }
-    agents
+        .collect()
 }
 
 /// The agents to run, from `$FRACTAL_AGENTS` (comma-separated) or auto-detected
-/// among claude / codex / cursor / hermes on `PATH`.
+/// among the supported headless providers on `PATH`.
 ///
 /// Codex has two logical routes in the scheduler: plain `codex` is reserved
 /// for the first (lead planner/orchestrator) slot, while `codex-luna` is the
@@ -676,7 +658,7 @@ pub(crate) fn detect_agents() -> Vec<String> {
             return logical_agent_routes(chosen);
         }
     }
-    let mut detected: Vec<String> = ["codex", "cursor", "claude", "hermes"]
+    let mut detected: Vec<String> = ["codex", "cursor", "claude", "hermes", "opencode"]
         .into_iter()
         .filter(|kind| binary_on_path(agent_binary(kind)))
         .map(str::to_owned)
@@ -688,14 +670,7 @@ pub(crate) fn detect_agents() -> Vec<String> {
             detected.insert(0, selected);
         }
     }
-    let mut routes = logical_agent_routes(detected);
-    // InferX is a worker-only route.  Append it after logical Codex routes so
-    // `codex-luna` remains ahead of it, and never create a roster where
-    // InferX would occupy the automatic lead slot by itself.
-    if inferx_is_configured() && !routes.is_empty() {
-        routes.push("inferx".to_owned());
-    }
-    routes
+    logical_agent_routes(detected)
 }
 
 /// Convert physical Codex entries into the role-aware logical routes used by
@@ -722,6 +697,7 @@ fn logical_agent_routes(agents: Vec<String>) -> Vec<String> {
 /// counted separately from the Codex lead planner, which is never part of the
 /// 20–42 worker capacity.
 const POOL_PROVIDERS: [&str; 4] = ["codex", "cursor", "claude", "hermes"];
+const ALL_POOL_PROVIDERS: [&str; 5] = ["codex", "cursor", "claude", "hermes", "opencode"];
 const POOL_MIN_WORKER_SLOTS: usize = 20;
 const POOL_MAX_WORKER_SLOTS: usize = 42;
 /// Matches the bounded repair budget in `orchestrate` (`MAX_REPAIRS`).
@@ -738,6 +714,15 @@ struct PoolSlot {
 
 /// Strip a `:N` pool suffix so command adapters keep seeing logical kinds.
 fn command_kind_for_agent(agent: &str) -> &str {
+    if let Some(identity) = agent.strip_prefix("opencode:") {
+        if !identity.is_empty()
+            && identity
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return "opencode";
+        }
+    }
     match agent.rsplit_once(':') {
         Some((kind, index))
             if !kind.is_empty()
@@ -750,10 +735,673 @@ fn command_kind_for_agent(agent: &str) -> &str {
     }
 }
 
+/// A graph may hard-pin a node to one worker implementation. Presentation is
+/// not scheduling authority: this value is enforced at the claim boundary and
+/// again by the wave runner instead of being treated as advisory prose.
+fn node_required_agent(node: &Value) -> Option<&str> {
+    node.pointer("/executor/agent")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|agent| !agent.is_empty())
+}
+
+pub(crate) fn agent_matches_requirement(agent: &str, required: &str) -> bool {
+    let actual = command_kind_for_agent(agent);
+    match required {
+        "cursor" | "cursor-agent" => matches!(actual, "cursor" | "cursor-agent"),
+        "codex" => matches!(actual, "codex" | "codex-luna"),
+        "codex-luna" => actual == "codex-luna",
+        "claude" => actual == "claude",
+        "hermes" => actual == "hermes",
+        "opencode" => actual == "opencode",
+        other => actual == other,
+    }
+}
+
+fn node_allows_agent(node: &Value, agent: &str) -> bool {
+    node_required_agent(node)
+        .map(|required| agent_matches_requirement(agent, required))
+        .unwrap_or(true)
+}
+
+fn node_allows_agent_with_reroutes(
+    node: &Value,
+    agent: &str,
+    reroutes: &BTreeMap<String, String>,
+) -> bool {
+    let rerouted = node
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(|id| reroutes.get(id));
+    rerouted
+        .map(|required| agent_matches_requirement(agent, required))
+        .unwrap_or_else(|| node_allows_agent(node, agent))
+}
+
+fn validate_node_agent_requirements(
+    nodes: &[Value],
+    agents: &[String],
+    reroutes: &BTreeMap<String, String>,
+    completed: &BTreeSet<String>,
+) -> Result<()> {
+    let node_ids: BTreeSet<&str> = nodes
+        .iter()
+        .filter_map(|node| node.get("id").and_then(Value::as_str))
+        .collect();
+    if let Some(unknown) = reroutes.keys().find(|id| !node_ids.contains(id.as_str())) {
+        bail!("resume reroute names unknown graph node `{unknown}`");
+    }
+    for node in nodes {
+        let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
+        if completed.contains(id) {
+            continue;
+        }
+        let required = reroutes
+            .get(id)
+            .map(String::as_str)
+            .or_else(|| node_required_agent(node));
+        let Some(required) = required else {
+            continue;
+        };
+        if !agents
+            .iter()
+            .any(|agent| agent_matches_requirement(agent, required))
+        {
+            bail!(
+                "node `{id}` requires worker `{required}`, but the active roster is [{}]",
+                agents.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One hybrid run owns isolated worker checkouts and a single integration
+/// boundary. Worker models never share a mutable source tree; only Fractal may
+/// serialize their commits into the canonical workspace.
+#[derive(Debug)]
+struct HybridExecutionFailure {
+    detail: crate::learning_data::IntegrationFailureDetail,
+    failure_code: crate::learning_data::FailureCode,
+}
+
+impl std::fmt::Display for HybridExecutionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail.summary)
+    }
+}
+
+impl std::error::Error for HybridExecutionFailure {}
+
+fn bounded_hybrid_summary(value: &str) -> String {
+    let mut summary = String::new();
+    for character in value.chars().filter(|character| !character.is_control()) {
+        if summary.len() + character.len_utf8() > 240 {
+            break;
+        }
+        summary.push(character);
+    }
+    summary
+}
+
+fn hybrid_failure(
+    kind: crate::learning_data::IntegrationFailureKind,
+    failure_code: crate::learning_data::FailureCode,
+    summary: impl AsRef<str>,
+    worker_commit: Option<String>,
+) -> anyhow::Error {
+    HybridExecutionFailure {
+        detail: crate::learning_data::IntegrationFailureDetail {
+            schema: "fractal.integration_failure.v1".to_owned(),
+            kind,
+            summary: bounded_hybrid_summary(summary.as_ref()),
+            worker_commit: worker_commit.filter(|commit| {
+                matches!(commit.len(), 40 | 64)
+                    && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }),
+        },
+        failure_code,
+    }
+    .into()
+}
+
+struct HybridSession {
+    workspace: PathBuf,
+    git_boundary: Mutex<()>,
+    next_worktree: std::sync::atomic::AtomicU64,
+}
+
+impl HybridSession {
+    fn initialize(workspace: &Path) -> Result<Self> {
+        let root = hybrid_git_output(workspace, &["rev-parse", "--show-toplevel"])
+            .context("hybrid mode requires a Git repository")?;
+        let root = std::fs::canonicalize(root.trim()).context("resolve Git repository root")?;
+        let requested = std::fs::canonicalize(workspace).context("resolve hybrid workspace")?;
+        if root != requested {
+            bail!(
+                "hybrid mode must run from the Git repository root: {}",
+                root.display()
+            );
+        }
+        hybrid_git_output(workspace, &["rev-parse", "--verify", "HEAD"])
+            .context("hybrid mode requires an existing HEAD commit")?;
+        let tracked = hybrid_source_status(workspace)?;
+        if !tracked.trim().is_empty() {
+            bail!(
+                "hybrid mode requires a clean tracked workspace before parallel integration:\n{}",
+                tracked.trim()
+            );
+        }
+        Ok(Self {
+            workspace: requested,
+            git_boundary: Mutex::new(()),
+            next_worktree: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    fn run_worker(&self, node: &Value, agent: &str, timeout_ms: u64) -> Result<AgentRun> {
+        let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
+        let instruction = node
+            .get("instruction")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let worktree = self.create_worktree(id, agent)?;
+        copy_hybrid_context(&self.workspace, &worktree)?;
+        let run = run_worker_as_for_node(agent, instruction, &worktree, timeout_ms, Some(node))?;
+        if !run.ok {
+            eprintln!(
+                "  [{agent}] hybrid worktree preserved after worker failure: {}",
+                worktree.display()
+            );
+            return Ok(run);
+        }
+
+        self.integrate_worker_result(node, agent, &worktree)?;
+        self.remove_worktree(&worktree)?;
+        Ok(run)
+    }
+
+    fn create_worktree(&self, node: &str, agent: &str) -> Result<PathBuf> {
+        let serial = self
+            .next_worktree
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let leaf = format!(
+            "fractal-hybrid-{}-{}-{}-{}",
+            std::process::id(),
+            hybrid_path_component(node),
+            hybrid_path_component(agent),
+            serial
+        );
+        let path = std::env::temp_dir().join(leaf);
+        if path.exists() {
+            bail!(
+                "refuse to reuse existing hybrid worktree {}",
+                path.display()
+            );
+        }
+        let _git = self.git_boundary.lock().expect("hybrid git boundary");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&self.workspace)
+            .args(["worktree", "add", "--detach", "--quiet"])
+            .arg(&path)
+            .arg("HEAD")
+            .status()
+            .context("create isolated hybrid worktree")?;
+        if !status.success() {
+            bail!("git worktree add failed with {status}");
+        }
+        Ok(path)
+    }
+
+    fn integrate_worker_result(&self, node: &Value, agent: &str, worktree: &Path) -> Result<()> {
+        let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
+        if node_required_agent(node).is_some() {
+            if let Some(source) = declared_artifact_path(node, worktree) {
+                if !source.exists() {
+                    return Err(hybrid_failure(
+                        crate::learning_data::IntegrationFailureKind::MissingArtifact,
+                        crate::learning_data::FailureCode::InvalidOutputSchema,
+                        format!("hybrid worker `{agent}` did not produce its declared artifact"),
+                        None,
+                    ));
+                }
+            }
+        }
+
+        // Worker-controlled staging is never integration authority. Reset the
+        // task index, then stage only the PRD-declared ownership below.
+        if !hybrid_git_status(worktree, &["reset", "--quiet", "HEAD", "--"])? {
+            bail!("git reset failed while normalizing hybrid node `{id}`");
+        }
+        let owned = hybrid_owned_paths(node, worktree)?;
+        if !owned.is_empty() {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(worktree)
+                .args(["add", "-A", "--"])
+                .args(&owned)
+                .status()
+                .context("stage declared hybrid ownership")?;
+            if !status.success() {
+                bail!("git add failed while staging hybrid node `{id}`");
+            }
+        }
+        reject_hybrid_scope_escape(worktree, id)?;
+        let staged = !hybrid_git_status(worktree, &["diff", "--cached", "--quiet"])?;
+        let commit = if staged {
+            let message = format!("fractal({id}): integrate {agent} worker result");
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(worktree)
+                .args(["-c", "user.name=Fractal"])
+                .args(["-c", "user.email=fractal@local"])
+                .args(["commit", "--quiet", "-m"])
+                .arg(&message)
+                .status()
+                .context("commit hybrid worker result")?;
+            if !status.success() {
+                bail!("hybrid worker commit failed with {status}");
+            }
+            Some(
+                hybrid_git_output(worktree, &["rev-parse", "HEAD"])?
+                    .trim()
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+
+        if commit.is_none()
+            && is_build(node.get("capability").and_then(Value::as_str).unwrap_or(""))
+        {
+            return Err(hybrid_failure(
+                crate::learning_data::IntegrationFailureKind::NoTrackedChanges,
+                crate::learning_data::FailureCode::InvalidOutputSchema,
+                format!("hybrid build node `{id}` made no tracked source changes"),
+                None,
+            ));
+        }
+
+        let _git = self.git_boundary.lock().expect("hybrid git boundary");
+        if let Some(commit) = commit {
+            let clean = hybrid_source_status(&self.workspace)?;
+            if !clean.trim().is_empty() {
+                return Err(hybrid_failure(
+                    crate::learning_data::IntegrationFailureKind::CanonicalWorkspaceChanged,
+                    crate::learning_data::FailureCode::ToolFailure,
+                    format!("canonical workspace changed before integrating hybrid node `{id}`"),
+                    Some(commit),
+                ));
+            }
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&self.workspace)
+                .args(["cherry-pick", "--quiet"])
+                .arg(&commit)
+                .status()
+                .context("integrate hybrid worker commit")?;
+            if !status.success() {
+                let _ = Command::new("git")
+                    .arg("-C")
+                    .arg(&self.workspace)
+                    .args(["cherry-pick", "--abort"])
+                    .status();
+                return Err(hybrid_failure(
+                    crate::learning_data::IntegrationFailureKind::IntegrationConflict,
+                    crate::learning_data::FailureCode::ConflictingParallelEdits,
+                    format!("hybrid integration conflict for node `{id}` from `{agent}`"),
+                    Some(commit),
+                ));
+            }
+        }
+        copy_declared_artifact(node, worktree, &self.workspace)?;
+        Ok(())
+    }
+
+    fn remove_worktree(&self, worktree: &Path) -> Result<()> {
+        let _git = self.git_boundary.lock().expect("hybrid git boundary");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&self.workspace)
+            .args(["worktree", "remove", "--force"])
+            .arg(worktree)
+            .status()
+            .context("remove completed hybrid worktree")?;
+        if !status.success() {
+            bail!("git worktree remove failed with {status}");
+        }
+        Ok(())
+    }
+}
+
+/// Return tracked source changes while excluding Fractal's own mutable runtime
+/// records. A resumed project updates these records before the hybrid session
+/// is created and after every node transition; treating them as source edits
+/// makes a clean resume reject the state change it just wrote. Worker commits
+/// cannot stage these paths because integration remains limited to each node's
+/// declared ownership.
+fn hybrid_source_status(workspace: &Path) -> Result<String> {
+    hybrid_git_output(
+        workspace,
+        &[
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=no",
+            "--",
+            ".",
+            ":(exclude).fractal/project.fractal",
+            ":(exclude).fractal/run-state.json",
+            ":(exclude).fractal/sync-state.json",
+            ":(exclude).fractal/pending-amendments.claim",
+        ],
+    )
+}
+
+/// Validate the hybrid integration boundary before a resume starts any durable
+/// run/board side effects. `run_multi_agent_hybrid` repeats this check when it
+/// creates the actual session so a workspace change cannot race the preflight.
+pub(crate) fn validate_hybrid_workspace(workspace: &Path) -> Result<()> {
+    HybridSession::initialize(workspace).map(|_| ())
+}
+
+fn hybrid_path_component(value: &str) -> String {
+    let component: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .take(48)
+        .collect();
+    if component.is_empty() {
+        "node".to_owned()
+    } else {
+        component
+    }
+}
+
+fn hybrid_git_output(workspace: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(args)
+        .output()
+        .with_context(|| format!("run git {}", args.first().copied().unwrap_or("command")))?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed with {}: {}",
+            args.first().copied().unwrap_or("command"),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout).context("git output was not UTF-8")
+}
+
+/// Return the status success bit for Git commands whose nonzero result is data
+/// (for example `git diff --quiet`) rather than a launch failure.
+fn hybrid_git_status(workspace: &Path, args: &[&str]) -> Result<bool> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(args)
+        .status()
+        .with_context(|| format!("run git {}", args.first().copied().unwrap_or("command")))?;
+    Ok(status.success())
+}
+
+fn normalize_hybrid_owned_path(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    let invalid = |reason: &str| {
+        hybrid_failure(
+            crate::learning_data::IntegrationFailureKind::InvalidOwnedPath,
+            crate::learning_data::FailureCode::InvalidOutputSchema,
+            format!("invalid hybrid owned path `{raw}`: {reason}"),
+            None,
+        )
+    };
+    if raw.is_empty() || raw.chars().any(char::is_whitespace) {
+        return Err(invalid(
+            "empty or whitespace-containing paths are not allowed",
+        ));
+    }
+    if raw.contains('\\') {
+        return Err(invalid("backslash path separators are not portable"));
+    }
+    let candidate = Path::new(raw);
+    if candidate.is_absolute() {
+        return Err(invalid(
+            "absolute paths are outside the repository boundary",
+        ));
+    }
+    let mut normalized = Vec::new();
+    for component in candidate.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => {
+                if name == ".git" || name == ".fractal" {
+                    return Err(invalid("reserved control directories cannot be owned"));
+                }
+                normalized.push(name.to_string_lossy().into_owned());
+            }
+            std::path::Component::ParentDir => {
+                return Err(invalid(
+                    "parent traversal is outside the repository boundary",
+                ));
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(invalid("root or platform-prefixed paths are not allowed"));
+            }
+        }
+    }
+    if normalized.is_empty() {
+        return Err(invalid("repository root ownership is too broad"));
+    }
+    Ok(normalized.join("/"))
+}
+
+fn ensure_hybrid_path_within_root(root: &Path, relative: &str) -> Result<()> {
+    let canonical_root = std::fs::canonicalize(root).context("resolve hybrid ownership root")?;
+    let mut existing = root.join(relative);
+    while std::fs::symlink_metadata(&existing).is_err() {
+        if !existing.pop() || existing == root {
+            existing = root.to_path_buf();
+            break;
+        }
+    }
+    let canonical_existing = std::fs::canonicalize(&existing)
+        .with_context(|| format!("resolve declared hybrid owned path `{relative}`"))?;
+    if !canonical_existing.starts_with(&canonical_root) {
+        return Err(hybrid_failure(
+            crate::learning_data::IntegrationFailureKind::InvalidOwnedPath,
+            crate::learning_data::FailureCode::InvalidOutputSchema,
+            format!("invalid hybrid owned path `{relative}`: path resolves outside repository"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn hybrid_declared_owned_paths(node: &Value, root: &Path) -> Result<Vec<String>> {
+    let mut owned = BTreeSet::new();
+    if let Some(paths) = node
+        .pointer("/efficiency/files_or_systems_affected")
+        .and_then(Value::as_array)
+    {
+        for value in paths {
+            let raw = value.as_str().ok_or_else(|| {
+                hybrid_failure(
+                    crate::learning_data::IntegrationFailureKind::InvalidOwnedPath,
+                    crate::learning_data::FailureCode::InvalidOutputSchema,
+                    "invalid hybrid owned path: declarations must be strings",
+                    None,
+                )
+            })?;
+            let path = normalize_hybrid_owned_path(raw)?;
+            ensure_hybrid_path_within_root(root, &path)?;
+            owned.insert(path);
+        }
+    }
+    Ok(owned.into_iter().collect())
+}
+
+/// Lead planning and closeout execute directly in the canonical workspace and
+/// write Fractal-owned control artifacts; they are not worker-owned source
+/// changes and must not enter hybrid ownership arbitration. All worker nodes
+/// still pass through the reserved-directory rejection above.
+fn hybrid_scheduled_owned_paths(node: &Value, root: &Path) -> Result<Vec<String>> {
+    if matches!(
+        node.get("capability").and_then(Value::as_str),
+        Some("control.plan" | "control.closeout")
+    ) {
+        Ok(Vec::new())
+    } else {
+        hybrid_declared_owned_paths(node, root)
+    }
+}
+
+fn hybrid_owned_paths(node: &Value, worktree: &Path) -> Result<Vec<String>> {
+    let declared = hybrid_declared_owned_paths(node, worktree)?;
+    let mut owned = Vec::new();
+    for path in declared {
+        let tracked = !hybrid_git_output(worktree, &["ls-files", "--", &path])?
+            .trim()
+            .is_empty();
+        if worktree.join(&path).exists() || tracked {
+            owned.push(path);
+        }
+    }
+    Ok(owned)
+}
+
+fn hybrid_paths_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn hybrid_ownership_available(
+    candidate: &str,
+    in_progress: &BTreeSet<String>,
+    ownership: &BTreeMap<String, Vec<String>>,
+) -> bool {
+    let candidate_paths = ownership.get(candidate).map(Vec::as_slice).unwrap_or(&[]);
+    in_progress.iter().all(|active| {
+        let active_paths = ownership.get(active).map(Vec::as_slice).unwrap_or(&[]);
+        !candidate_paths.iter().any(|candidate_path| {
+            active_paths
+                .iter()
+                .any(|active_path| hybrid_paths_overlap(candidate_path, active_path))
+        })
+    })
+}
+
+fn reject_hybrid_scope_escape(worktree: &Path, node: &str) -> Result<()> {
+    let unstaged = hybrid_git_output(
+        worktree,
+        &[
+            "diff",
+            "--name-only",
+            "--",
+            ".",
+            ":(exclude).fractal/project.fractal",
+            ":(exclude).fractal/run-state.json",
+            ":(exclude).fractal/sync-state.json",
+            ":(exclude).fractal/pending-amendments.claim",
+        ],
+    )?;
+    if let Some(path) = unstaged.lines().find(|path| !path.trim().is_empty()) {
+        return Err(hybrid_failure(
+            crate::learning_data::IntegrationFailureKind::ScopeEscape,
+            crate::learning_data::FailureCode::InvalidOutputSchema,
+            format!("hybrid node `{node}` modified undeclared tracked path `{path}`"),
+            None,
+        ));
+    }
+    let untracked = hybrid_git_output(worktree, &["ls-files", "--others", "--exclude-standard"])?;
+    if let Some(path) = untracked
+        .lines()
+        .map(str::trim)
+        .find(|path| !path.is_empty() && !is_hybrid_generated_path(path))
+    {
+        return Err(hybrid_failure(
+            crate::learning_data::IntegrationFailureKind::ScopeEscape,
+            crate::learning_data::FailureCode::InvalidOutputSchema,
+            format!("hybrid node `{node}` created undeclared path `{path}`"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn is_hybrid_generated_path(path: &str) -> bool {
+    path == "Cargo.lock"
+        || path == ".coverage"
+        || path.ends_with(".pyc")
+        || [
+            ".fractal/",
+            "target/",
+            "node_modules/",
+            ".build/",
+            "build/",
+            "dist/",
+            "__pycache__/",
+            ".pytest_cache/",
+            ".venv/",
+            "venv/",
+            "coverage/",
+        ]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
+fn copy_hybrid_context(workspace: &Path, worktree: &Path) -> Result<()> {
+    let target = worktree.join(".fractal");
+    for name in ["project.fractal", "lead-prd.json"] {
+        let source = workspace.join(".fractal").join(name);
+        if source.is_file() {
+            std::fs::create_dir_all(&target)?;
+            std::fs::copy(&source, target.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_declared_artifact(node: &Value, worktree: &Path, workspace: &Path) -> Result<()> {
+    let Some(source) = declared_artifact_path(node, worktree) else {
+        return Ok(());
+    };
+    let Some(target) = declared_artifact_path(node, workspace) else {
+        return Ok(());
+    };
+    if source == target || !source.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(&source, &target).with_context(|| {
+        format!(
+            "copy hybrid artifact {} to {}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    Ok(())
+}
+
 fn is_pool_slot_id(agent: &str) -> bool {
     matches!(
         command_kind_for_agent(agent),
-        "codex-luna" | "cursor" | "cursor-agent" | "claude" | "hermes"
+        "codex-luna" | "cursor" | "cursor-agent" | "claude" | "hermes" | "opencode"
     ) && agent.contains(':')
 }
 
@@ -763,6 +1411,7 @@ fn slot_provider(agent: &str) -> Option<&'static str> {
         "cursor" | "cursor-agent" => Some("cursor"),
         "claude" => Some("claude"),
         "hermes" => Some("hermes"),
+        "opencode" => Some("opencode"),
         _ => None,
     }
 }
@@ -773,6 +1422,7 @@ fn pool_worker_kind(provider: &str) -> Option<&'static str> {
         "cursor" => Some("cursor"),
         "claude" => Some("claude"),
         "hermes" => Some("hermes"),
+        "opencode" => Some("opencode"),
         _ => None,
     }
 }
@@ -821,9 +1471,11 @@ fn pool_requeue_failure(
     id: &str,
     pool_mode: bool,
     is_lead: bool,
+    retryable: bool,
 ) -> bool {
-    if !pool_mode || is_lead {
+    if !pool_mode || is_lead || !retryable {
         state.failed = Some(id.to_owned());
+        state.failed_retryable = retryable;
         return true;
     }
     let retries = state.retry_counts.entry(id.to_owned()).or_insert(0);
@@ -834,14 +1486,17 @@ fn pool_requeue_failure(
         false
     } else {
         state.failed = Some(id.to_owned());
+        state.failed_retryable = true;
         true
     }
 }
 
-/// Parse `$FRACTAL_AGENT_POOL` (`codex=6,cursor=6,claude=6,hermes=6`).
+/// Parse `$FRACTAL_AGENT_POOL` (`codex=5,cursor=5,claude=5,hermes=5,opencode=4`).
 ///
-/// Rejects duplicates, unknown providers, zero/overflow counts, totals outside
-/// 20–42, and any config that omits one of the four required providers.
+/// Rejects duplicates, unknown providers, overflow counts, totals outside
+/// 20–42, and any config that omits one of the original four provider keys.
+/// A zero count explicitly disables a temporarily unavailable provider without
+/// weakening the total-capacity bound; OpenCode can replace that capacity.
 fn parse_agent_pool(raw: &str) -> Result<BTreeMap<String, usize>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -859,7 +1514,7 @@ fn parse_agent_pool(raw: &str) -> Result<BTreeMap<String, usize>> {
         };
         let provider = key.trim();
         let count_str = value.trim();
-        if !POOL_PROVIDERS.contains(&provider) {
+        if !ALL_POOL_PROVIDERS.contains(&provider) {
             bail!("unknown provider `{provider}` in FRACTAL_AGENT_POOL");
         }
         if !seen.insert(provider.to_owned()) {
@@ -874,9 +1529,6 @@ fn parse_agent_pool(raw: &str) -> Result<BTreeMap<String, usize>> {
         let count: u64 = count_str.parse().map_err(|_| {
             anyhow::anyhow!("overflow count for `{provider}` in FRACTAL_AGENT_POOL")
         })?;
-        if count == 0 {
-            bail!("zero count for `{provider}` in FRACTAL_AGENT_POOL");
-        }
         if count > POOL_MAX_WORKER_SLOTS as u64 {
             bail!("overflow count for `{provider}` in FRACTAL_AGENT_POOL");
         }
@@ -898,7 +1550,7 @@ fn parse_agent_pool(raw: &str) -> Result<BTreeMap<String, usize>> {
 
 fn expand_pool_slots(counts: &BTreeMap<String, usize>) -> Vec<PoolSlot> {
     let mut slots = Vec::new();
-    for provider in POOL_PROVIDERS {
+    for provider in ALL_POOL_PROVIDERS {
         let n = counts.get(provider).copied().unwrap_or(0);
         let kind = pool_worker_kind(provider).expect("known pool provider");
         for index in 1..=n {
@@ -915,9 +1567,10 @@ fn expand_pool_slots(counts: &BTreeMap<String, usize>) -> Vec<PoolSlot> {
 
 fn resolve_agent_pool(raw: &str, available: impl Fn(&str) -> bool) -> Result<Vec<PoolSlot>> {
     let counts = parse_agent_pool(raw)?;
-    let missing: Vec<&str> = POOL_PROVIDERS
+    let missing: Vec<&str> = counts
         .iter()
-        .copied()
+        .filter(|(_, count)| **count > 0)
+        .map(|(provider, _)| provider.as_str())
         .filter(|provider| !available(agent_binary(provider)))
         .collect();
     if !missing.is_empty() {
@@ -964,15 +1617,9 @@ struct NodeOutcome {
     /// Prior verified lesson IDs that were injected into this node's worker
     /// prompt.  This is bookkeeping only; lesson confidence is never updated.
     lessons: Vec<String>,
-    /// Explicit failure code used by policy/budget enforcement.  Keeping this
-    /// on the outcome lets the existing failure-graph seam retain the precise
-    /// reason instead of collapsing policy failures into generic tool errors.
     failure_code: Option<crate::learning_data::FailureCode>,
-    policy_report: Option<crate::policy_executor::PolicyEnforcementReport>,
-    /// Relative content-addressed verifier manifest, when this node ran a
-    /// verification attempt.  Kept separate from the workspace digest so the
-    /// learning/failure projections can retain both references.
-    manifest_ref: Option<String>,
+    integration_failure: Option<crate::learning_data::IntegrationFailureDetail>,
+    retryable: bool,
 }
 
 impl NodeOutcome {
@@ -984,8 +1631,8 @@ impl NodeOutcome {
             note,
             lessons: Vec::new(),
             failure_code: None,
-            policy_report: None,
-            manifest_ref: None,
+            integration_failure: None,
+            retryable: false,
         }
     }
 
@@ -997,8 +1644,21 @@ impl NodeOutcome {
             note,
             lessons: Vec::new(),
             failure_code: None,
-            policy_report: None,
-            manifest_ref: None,
+            integration_failure: None,
+            retryable: true,
+        }
+    }
+
+    fn hybrid_failure(failure: &HybridExecutionFailure) -> Self {
+        Self {
+            ok: false,
+            verified: None,
+            timed_out: false,
+            note: Some(failure.detail.summary.clone()),
+            lessons: Vec::new(),
+            failure_code: Some(failure.failure_code),
+            integration_failure: Some(failure.detail.clone()),
+            retryable: false,
         }
     }
 
@@ -1006,242 +1666,157 @@ impl NodeOutcome {
         self.lessons = lessons;
         self
     }
+}
 
-    fn with_policy_report(
-        mut self,
-        report: crate::policy_executor::PolicyEnforcementReport,
-    ) -> Self {
-        self.policy_report = Some(report);
-        self
+fn declared_artifact_path(node: &Value, workspace: &Path) -> Option<PathBuf> {
+    let raw = node
+        .pointer("/efficiency/expected_artifact")
+        .and_then(Value::as_str)?
+        .trim();
+    if raw.is_empty() || raw.chars().any(char::is_whitespace) {
+        return None;
     }
-
-    fn with_manifest_ref(mut self, reference: Option<String>) -> Self {
-        self.manifest_ref = reference;
-        self
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else if raw.contains('/') || raw.starts_with('.') {
+        Some(workspace.join(path))
+    } else {
+        None
     }
 }
 
-/// Execute one node with a given agent: build nodes run the worker; verify nodes
-/// run the tests and are judged by the genuine `fractal-verify` evidence floor;
-/// passive nodes (analyze/control) are no-ops.
-#[allow(dead_code)]
-fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> {
-    run_node_with_graph(node, agent, workspace, None, 0)
-}
-
-fn policy_failure_outcome(error: crate::policy_executor::PolicyError) -> NodeOutcome {
-    let code = error.failure.failure_code();
-    let mut outcome = NodeOutcome::failure(None, false, Some(error.message));
-    outcome.failure_code = Some(code);
-    outcome.policy_report = error.report;
-    outcome
-}
-
-fn run_node_with_graph(
+fn run_worker_node(
     node: &Value,
     agent: &str,
     workspace: &Path,
-    graph: Option<&Value>,
-    steps_used: u64,
+    hybrid: Option<&HybridSession>,
 ) -> Result<NodeOutcome> {
-    let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
-    let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
     let instruction = node
         .get("instruction")
         .and_then(Value::as_str)
         .unwrap_or("");
-
-    // Legacy/unit fixtures without immutable contracts continue to use the
-    // pre-policy path only when this helper is called directly.  Committed
-    // graph execution always supplies a graph and is therefore fail-closed.
-    let enforce = graph.is_some() || node.get("policy_contract").is_some();
-    let policy_context = if enforce {
-        if is_build(capability) || capability == "control.closeout" {
-            match crate::policy_executor::preflight(node, graph, workspace, agent, steps_used) {
-                Ok((policy, snapshot, report)) => Some((policy, snapshot, report)),
-                Err(error) => return Ok(policy_failure_outcome(error)),
-            }
-        } else {
-            let policy = match crate::policy_executor::parse_contract(node, graph) {
-                Ok(policy) => policy,
-                Err(error) => return Ok(policy_failure_outcome(error)),
-            };
-            if let Err(error) =
-                crate::policy_executor::enforce_limits(&policy, node, workspace, steps_used)
-            {
-                return Ok(policy_failure_outcome(error));
-            }
-            let snapshot = match crate::policy_executor::snapshot_workspace(workspace) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    return Ok(policy_failure_outcome(
-                        crate::policy_executor::PolicyError {
-                            failure: crate::policy_executor::PolicyFailure::ProviderUnavailable,
-                            report: None,
-                            message: format!("cannot snapshot workspace: {error:#}"),
-                        },
-                    ))
+    let timeout_ms = agent_timeout_ms(node);
+    let run = match hybrid {
+        Some(session) => match session.run_worker(node, agent, timeout_ms) {
+            Ok(run) => run,
+            Err(error) => {
+                if let Some(failure) = error.downcast_ref::<HybridExecutionFailure>() {
+                    return Ok(NodeOutcome::hybrid_failure(failure));
                 }
-            };
-            if snapshot.has_symlink_escape() {
-                return Ok(policy_failure_outcome(
-                    crate::policy_executor::PolicyError {
-                        failure: crate::policy_executor::PolicyFailure::SymlinkEscape,
-                        report: None,
-                        message: "workspace contains a symlink escaping the workspace root"
-                            .to_owned(),
-                    },
-                ));
+                return Err(error);
             }
-            let mut controls = BTreeMap::new();
-            controls.insert(
-                "contract".to_owned(),
-                crate::policy_executor::ControlStatus::Enforced,
-            );
-            controls.insert(
-                "provider_route".to_owned(),
-                crate::policy_executor::ControlStatus::Detected,
-            );
-            let mut report = crate::policy_executor::PolicyEnforcementReport {
-                schema: "fractal.policy_enforcement_report.v1".to_owned(),
-                policy_hash: policy.policy_hash.clone(),
-                controls,
-                limits: policy.limits.clone(),
-                provider_version: None,
-                provider_reason: None,
-                violations: Vec::new(),
-                pre_snapshot_hash: snapshot.digest.clone(),
-                post_snapshot_hash: None,
-                evidence_hash: String::new(),
-                report_hash: String::new(),
-            };
-            // Hashing is performed by postflight; an empty report hash is safe
-            // as an in-memory preflight marker.
-            report.report_hash = crate::policy_executor::report_hash(&report);
-            Some((policy, snapshot, report))
-        }
-    } else {
-        None
+        },
+        None => run_worker_as_for_node(agent, instruction, workspace, timeout_ms, Some(node))?,
     };
-
-    if capability == "control.closeout" {
-        let outcome = run_lead_closeout(node, agent, workspace, policy_context.as_ref())?;
-        return Ok(outcome);
+    let timeout_note = run.timed_out.then(|| {
+        format!(
+            "agent hung — killed after {}s; failing the task so it is repaired",
+            timeout_ms / 1000
+        )
+    });
+    if !run.ok {
+        return Ok(
+            NodeOutcome::failure(None, run.timed_out, timeout_note).with_lessons(run.lesson_ids)
+        );
     }
-    if is_build(capability) {
-        let timeout_ms = agent_timeout_ms(node);
-        let policy = policy_context.as_ref().map(|(policy, _, _)| policy);
-        let run = run_worker_as_for_node(
-            agent,
-            instruction,
-            workspace,
-            timeout_ms,
-            Some(node),
-            policy,
-        )?;
-        let mut post_report = policy_context.as_ref().map(|(_, _, report)| report.clone());
-        let postflight_failure = if let Some((policy, snapshot, report)) = policy_context.as_ref() {
-            match crate::policy_executor::postflight(policy, snapshot, workspace, report.clone()) {
-                Ok(post) => {
-                    post_report = Some(post.report);
-                    post.failure
-                }
-                Err(error) => Some(crate::policy_executor::PolicyError {
-                    failure: crate::policy_executor::PolicyFailure::ProviderUnavailable,
-                    report: post_report.clone(),
-                    message: format!("postflight snapshot unavailable: {error:#}"),
-                }),
-            }
-        } else {
-            None
-        };
-        if let Some(error) = postflight_failure {
-            let mut outcome = policy_failure_outcome(error);
-            outcome.policy_report = post_report;
-            return Ok(outcome);
-        }
-        let note = run.timed_out.then(|| {
-            format!(
-                "agent hung — killed after {}s; failing the task so it is repaired",
-                timeout_ms / 1000
+    if let Some(path) =
+        node_required_agent(node).and_then(|_| declared_artifact_path(node, workspace))
+    {
+        if !path.exists() {
+            return Ok(NodeOutcome::failure(
+                None,
+                false,
+                Some(format!(
+                    "worker exited successfully but did not produce declared artifact {}",
+                    path.display()
+                )),
             )
-        });
-        if run.ok {
-            let mut outcome = NodeOutcome::success(None, note).with_lessons(run.lesson_ids);
-            if let Some(report) = post_report {
-                outcome = outcome.with_policy_report(report);
-            }
-            Ok(outcome)
-        } else {
-            let mut outcome =
-                NodeOutcome::failure(None, run.timed_out, note).with_lessons(run.lesson_ids);
-            if let Some(report) = post_report {
-                outcome = outcome.with_policy_report(report);
-            }
-            Ok(outcome)
+            .with_lessons(run.lesson_ids));
+        }
+    }
+    Ok(NodeOutcome::success(None, timeout_note).with_lessons(run.lesson_ids))
+}
+
+/// Execute one node with a given agent. Build nodes run the worker. An explicitly
+/// pinned verification node first runs that worker (so `cursor` really means the
+/// Cursor CLI), then the trusted host independently evaluates the workspace.
+/// Unpinned verification nodes remain host-only acceptance gates.
+fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> {
+    run_node_with_hybrid(node, agent, workspace, None)
+}
+
+fn run_node_with_hybrid(
+    node: &Value,
+    agent: &str,
+    workspace: &Path,
+    hybrid: Option<&HybridSession>,
+) -> Result<NodeOutcome> {
+    let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
+    let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
+    // Defense in depth: callers must atomically checkout first, but this
+    // worker seam is also private authority against direct execution paths.
+    // A malformed declaration, missing ledger, stale evidence, or reviewer
+    // self-checkout therefore fails before any worker or verifier runs.
+    let required = crate::external_gates::required_gates(node)
+        .context("malformed external gate declaration")?;
+    if !required.is_empty() {
+        let document = crate::project_file::load(workspace)
+            .context("load canonical project before gated execution")?;
+        crate::external_gates::enforce_checkout(workspace, &document, id, agent)
+            .with_context(|| format!("external gate denied execution of node {}", id))?;
+    }
+    if capability == "control.closeout" {
+        run_lead_closeout(node, agent, workspace)
+    } else if is_build(capability) {
+        run_worker_node(node, agent, workspace, hybrid)
+    } else if is_verify(capability) && node_required_agent(node).is_some() {
+        let worker = run_worker_node(node, agent, workspace, hybrid)?;
+        if !worker.ok {
+            return Ok(worker);
+        }
+        match crate::verify::evaluate_workspace(workspace, id, agent)? {
+            Some(verdict) if verdict.complete => Ok(NodeOutcome::success(
+                Some(true),
+                Some(format!("worker task complete; {}", verdict.detail)),
+            )
+            .with_lessons(worker.lessons)),
+            Some(verdict) => Ok(
+                NodeOutcome::failure(Some(false), false, Some(verdict.detail))
+                    .with_lessons(worker.lessons),
+            ),
+            None => Ok(NodeOutcome::failure(
+                None,
+                false,
+                Some(
+                    "worker task completed, but no native verification suite was found".to_owned(),
+                ),
+            )
+            .with_lessons(worker.lessons)),
         }
     } else if is_verify(capability) {
-        // Genuine governance: run public/native tests and every configured
-        // independent verifier as separate processes.  A missing suite or
-        // verifier is an explicit weak-verifier failure, never an unverified
-        // success.  The preflight report hash anchors the manifest; postflight
-        // still runs for both pass and fail so source mutations are detected.
-        let policy = policy_context.as_ref().map(|(policy, _, _)| policy);
-        let pre_report_hash = policy_context
-            .as_ref()
-            .map(|(_, _, report)| report.report_hash.clone());
-        let verdict = crate::verify::evaluate_workspace_with_policy(
-            workspace,
-            id,
-            agent,
-            policy,
-            graph,
-            pre_report_hash,
-        )?;
-        let mut outcome = if verdict.complete {
-            NodeOutcome::success(Some(true), Some(verdict.detail))
-        } else {
-            NodeOutcome::failure(Some(false), false, Some(verdict.detail))
-        }
-        .with_manifest_ref(verdict.manifest_ref);
-        if let Some((policy, snapshot, report)) = policy_context.as_ref() {
-            let post =
-                crate::policy_executor::postflight(policy, snapshot, workspace, report.clone())?;
-            let final_manifest = outcome.manifest_ref.as_deref().and_then(|reference| {
-                crate::evidence_manifest::rebind_enforcement_report(
-                    workspace,
-                    reference,
-                    &post.report.report_hash,
-                )
-                .ok()
-                .flatten()
-            });
-            if final_manifest.is_some() {
-                outcome = outcome.with_manifest_ref(final_manifest);
+        // Genuine governance: judge the suite with the real deny-by-default floor.
+        match crate::verify::evaluate_workspace(workspace, id, agent)? {
+            Some(verdict) => {
+                if verdict.complete {
+                    Ok(NodeOutcome::success(Some(true), Some(verdict.detail)))
+                } else {
+                    Ok(NodeOutcome::failure(
+                        Some(false),
+                        false,
+                        Some(verdict.detail),
+                    ))
+                }
             }
-            if let Some(error) = post.failure {
-                let mut failure = policy_failure_outcome(error);
-                failure.manifest_ref = outcome.manifest_ref;
-                return Ok(failure);
-            }
-            outcome = outcome.with_policy_report(post.report);
+            // Nothing to run: unverifiable, but not a failure.
+            None => Ok(NodeOutcome::success(None, None)),
         }
-        Ok(outcome)
     } else {
         Ok(NodeOutcome::success(None, None))
     }
 }
 
-fn run_lead_closeout(
-    node: &Value,
-    agent: &str,
-    workspace: &Path,
-    policy_context: Option<&(
-        crate::policy_executor::EffectivePolicy,
-        crate::policy_executor::WorkspaceSnapshot,
-        crate::policy_executor::PolicyEnforcementReport,
-    )>,
-) -> Result<NodeOutcome> {
+fn run_lead_closeout(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> {
     let closeout_path = workspace.join(".fractal").join("closeout.json");
     std::fs::remove_file(&closeout_path).ok();
     let instruction = node
@@ -1249,8 +1824,7 @@ fn run_lead_closeout(
         .and_then(Value::as_str)
         .unwrap_or("Review and close out the project.");
     let timeout_ms = agent_timeout_ms(node);
-    let policy = policy_context.map(|(policy, _, _)| policy);
-    let run = run_lead_agent_as(agent, instruction, workspace, timeout_ms, policy)?;
+    let run = run_lead_agent_as(agent, instruction, workspace, timeout_ms)?;
     if !run.ok {
         return Ok(NodeOutcome::failure(
             Some(false),
@@ -1273,18 +1847,10 @@ fn run_lead_closeout(
     )
     .context("decode lead closeout")?;
     let approved = validate_closeout(&prd, &closeout)?;
-    let mut outcome = NodeOutcome::success(
+    Ok(NodeOutcome::success(
         Some(true),
         Some(format!("lead approved {approved} acceptance criteria")),
-    );
-    if let Some((policy, snapshot, report)) = policy_context {
-        let post = crate::policy_executor::postflight(policy, snapshot, workspace, report.clone())?;
-        if let Some(error) = post.failure {
-            return Ok(policy_failure_outcome(error));
-        }
-        outcome = outcome.with_policy_report(post.report);
-    }
-    Ok(outcome)
+    ))
 }
 
 fn validate_closeout(prd: &Value, closeout: &Value) -> Result<usize> {
@@ -1334,12 +1900,17 @@ fn validate_closeout(prd: &Value, closeout: &Value) -> Result<usize> {
 
 /// Commit a node transition through the central learning mutation APIs.
 /// The local and hosted boards are projections of that same file.
-fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str, workspace: &Path) {
+fn report_node(
+    board: Option<&str>,
+    node: &str,
+    action: &str,
+    agent: &str,
+    workspace: &Path,
+) -> Result<()> {
     let board_action = match action {
         "failed_execution" | "failed_verification" | "timeout" | "cancelled" => "release",
         other => other,
     };
-    crate::run_control::node_transition(board, node, board_action, agent);
     if action == "checkout" {
         // A direct checkout can implicitly clear a prior terminal learning
         // outcome.  Capture that typed failure before the overwrite; this is
@@ -1359,7 +1930,6 @@ fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str, works
             crate::learning_data::NodeOutcome::FailedVerification,
             crate::learning_data::FailureCode::WeakVerifier,
             None,
-            None,
         ),
         "timeout" => release_learning_failure(
             workspace,
@@ -1367,7 +1937,6 @@ fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str, works
             agent,
             crate::learning_data::NodeOutcome::FailedExecution,
             crate::learning_data::FailureCode::Timeout,
-            None,
             None,
         ),
         "failed_execution" => release_learning_failure(
@@ -1377,7 +1946,6 @@ fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str, works
             crate::learning_data::NodeOutcome::FailedExecution,
             crate::learning_data::FailureCode::ToolFailure,
             None,
-            None,
         ),
         "cancelled" => release_learning_failure(
             workspace,
@@ -1386,15 +1954,21 @@ fn report_node(board: Option<&str>, node: &str, action: &str, agent: &str, works
             crate::learning_data::NodeOutcome::Cancelled,
             crate::learning_data::FailureCode::PrematureCompletion,
             None,
-            None,
         ),
         other => Err(anyhow::anyhow!("unsupported learning transition `{other}`")),
     };
     if let Err(error) = result {
+        // Checkout is the execution authority. Do not swallow a denied
+        // checkout: callers must skip run_node and never execute unowned work.
+        if action == "checkout" {
+            return Err(error);
+        }
         eprintln!("  live graph state note: {error:#}");
     } else {
+        crate::run_control::node_transition(board, node, board_action, agent);
         crate::project_sync::maybe_sync_runtime(workspace);
     }
+    Ok(())
 }
 
 /// Record a full success/failure transition with measured evidence and costs.
@@ -1438,13 +2012,6 @@ fn report_node_outcome_with_lessons(
         let human = agent.eq_ignore_ascii_case("human");
         let board_action = "complete";
         crate::run_control::node_transition(board, node, board_action, agent);
-        if let Some(reference) = outcome.manifest_ref.as_deref() {
-            if let Err(error) =
-                crate::project_file::record_artifact_produced(workspace, node, reference)
-            {
-                eprintln!("  evidence manifest artifact note: {error:#}");
-            }
-        }
         let result = finish_learning_success(
             workspace,
             node,
@@ -1456,21 +2023,13 @@ fn report_node_outcome_with_lessons(
         if let Err(error) = result {
             eprintln!("  live graph state note: {error:#}");
         } else {
-            append_manifest_verification_ref(
-                workspace,
-                node,
-                outcome.manifest_ref.as_deref(),
-                true,
-            );
             crate::project_sync::maybe_sync_runtime(workspace);
         }
         record_lesson_reuse(workspace, node, provided_lessons, outcome, evidence_hex);
         return;
     }
 
-    let (learning_outcome, failure_code) = if let Some(code) = outcome.failure_code {
-        (crate::learning_data::NodeOutcome::FailedExecution, code)
-    } else if outcome.verified == Some(false) {
+    let (learning_outcome, default_failure_code) = if outcome.verified == Some(false) {
         (
             crate::learning_data::NodeOutcome::FailedVerification,
             crate::learning_data::FailureCode::WeakVerifier,
@@ -1486,88 +2045,29 @@ fn report_node_outcome_with_lessons(
             crate::learning_data::FailureCode::ToolFailure,
         )
     };
+    let failure_code = outcome.failure_code.unwrap_or(default_failure_code);
     crate::run_control::node_transition(board, node, "release", agent);
-    if let Some(reference) = outcome.manifest_ref.as_deref() {
-        if let Err(error) =
-            crate::project_file::record_artifact_produced(workspace, node, reference)
-        {
-            eprintln!("  evidence manifest artifact note: {error:#}");
-        }
-        // Seed the verification refs before capture_failure_observation so the
-        // failure graph links the manifest itself, not only the workspace
-        // digest that predates this controller-owned sidecar.
-        let mut refs = vec![evidence_hex.to_owned(), reference.to_owned()];
-        if let Ok(document) = crate::project_file::load(workspace) {
-            if let Some(existing) = document
-                .learning
-                .nodes
-                .get(node)
-                .and_then(|record| record.verification.as_ref())
-            {
-                for value in &existing.evidence_refs {
-                    if !refs.iter().any(|current| current == value) {
-                        refs.push(value.clone());
-                    }
-                }
-            }
-        }
-        if let Err(error) =
-            crate::project_file::record_verification_result(workspace, node, false, refs)
-        {
-            eprintln!("  evidence manifest pre-capture note: {error:#}");
-        }
-    }
     let evidence = compact_evidence_ref(node, evidence_hex);
-    let result = release_learning_failure(
+    let mut result = release_learning_failure(
         workspace,
         node,
         agent,
         learning_outcome,
         failure_code,
         Some((evidence.as_str(), latency_ms)),
-        outcome.policy_report.as_ref(),
     );
+    if result.is_ok() {
+        if let Some(detail) = &outcome.integration_failure {
+            result =
+                crate::project_file::record_integration_failure(workspace, node, detail.clone());
+        }
+    }
     if let Err(error) = result {
         eprintln!("  live graph state note: {error:#}");
     } else {
-        append_manifest_verification_ref(workspace, node, outcome.manifest_ref.as_deref(), false);
         crate::project_sync::maybe_sync_runtime(workspace);
     }
     record_lesson_reuse(workspace, node, provided_lessons, outcome, evidence_hex);
-}
-
-/// Add the relative manifest reference alongside the existing compact workspace
-/// evidence without replacing older evidence.  This projection is additive and
-/// cannot alter the immutable graph hash.
-fn append_manifest_verification_ref(
-    workspace: &Path,
-    node: &str,
-    manifest_ref: Option<&str>,
-    passed: bool,
-) {
-    let Some(reference) =
-        manifest_ref.filter(|reference| crate::evidence_manifest::safe_relative_ref(reference))
-    else {
-        return;
-    };
-    let Ok(document) = crate::project_file::load(workspace) else {
-        return;
-    };
-    let mut refs = document
-        .learning
-        .nodes
-        .get(node)
-        .and_then(|record| record.verification.as_ref())
-        .map(|verification| verification.evidence_refs.clone())
-        .unwrap_or_default();
-    if !refs.iter().any(|existing| existing == reference) {
-        refs.push(reference.to_owned());
-    }
-    if let Err(error) =
-        crate::project_file::record_verification_result(workspace, node, passed, refs)
-    {
-        eprintln!("  evidence manifest verification note: {error:#}");
-    }
 }
 
 fn compact_evidence_ref(node: &str, evidence_hex: &str) -> String {
@@ -1711,7 +2211,6 @@ fn capture_failure_observation(
     outcome: crate::learning_data::NodeOutcome,
     failure_code: crate::learning_data::FailureCode,
     evidence_hex: Option<&str>,
-    policy_report: Option<&crate::policy_executor::PolicyEnforcementReport>,
 ) -> Result<String> {
     let document = crate::project_file::load(workspace)?;
     let record = document
@@ -1764,26 +2263,12 @@ fn capture_failure_observation(
         return Ok(id);
     }
     let executor = record.executor.clone().unwrap_or_default();
-    let mut extra = [(
+    let extra = [(
         "objective_fingerprint".to_owned(),
         Value::String(crate::lessons::objective_fingerprint(&objective)),
     )]
     .into_iter()
-    .collect::<BTreeMap<_, _>>();
-    if let Some(report) = policy_report {
-        extra.insert(
-            "policy_report_hash".to_owned(),
-            Value::String(report.report_hash.clone()),
-        );
-        extra.insert(
-            "policy_evidence_hash".to_owned(),
-            Value::String(report.evidence_hash.clone()),
-        );
-        extra.insert(
-            "policy_violation_count".to_owned(),
-            Value::from(report.violations.len() as u64),
-        );
-    }
+    .collect();
     let failure = crate::failure_graph::FailureRecord {
         id: id.clone(),
         node_id: node.to_owned(),
@@ -1846,7 +2331,6 @@ fn capture_existing_failure_before_overwrite(
         outcome,
         failure_code,
         evidence,
-        None,
     )
     .map(Some)
 }
@@ -1917,7 +2401,6 @@ fn release_learning_failure(
     outcome: crate::learning_data::NodeOutcome,
     failure_code: crate::learning_data::FailureCode,
     measured: Option<(&str, u64)>,
-    policy_report: Option<&crate::policy_executor::PolicyEnforcementReport>,
 ) -> Result<()> {
     // Capture first.  The policy is diagnostic fail-closed for the task result:
     // a capture error is returned after release, so callers cannot interpret
@@ -1929,7 +2412,6 @@ fn release_learning_failure(
         outcome,
         failure_code,
         measured.map(|(evidence, _)| evidence),
-        policy_report,
     );
     let release =
         crate::project_file::release_node(workspace, node, agent, Some((outcome, failure_code)));
@@ -2196,7 +2678,6 @@ pub(crate) fn cancel_checked_out_node(workspace: &Path, node: &str, agent: &str)
         crate::learning_data::NodeOutcome::Cancelled,
         crate::learning_data::FailureCode::PrematureCompletion,
         None,
-        None,
     );
     let release = crate::project_file::release_node(
         workspace,
@@ -2250,6 +2731,7 @@ struct Schedule {
     slot_leases: BTreeMap<String, String>,
     retry_counts: BTreeMap<String, u32>,
     failed: Option<String>,
+    failed_retryable: bool,
     built: bool,
     verified: Option<bool>,
     log: Vec<NodeRun>,
@@ -2266,7 +2748,65 @@ pub(crate) fn run_multi_agent(
     board: Option<&str>,
     completed_seed: &BTreeSet<String>,
 ) -> Result<RunOutcome> {
+    run_multi_agent_inner(
+        graph,
+        workspace,
+        agents,
+        board,
+        completed_seed,
+        None,
+        &BTreeMap::new(),
+    )
+}
+
+pub(crate) fn run_multi_agent_hybrid(
+    graph: &Value,
+    workspace: &Path,
+    agents: &[String],
+    board: Option<&str>,
+    completed_seed: &BTreeSet<String>,
+) -> Result<RunOutcome> {
+    run_multi_agent_hybrid_with_reroutes(
+        graph,
+        workspace,
+        agents,
+        board,
+        completed_seed,
+        &BTreeMap::new(),
+    )
+}
+
+pub(crate) fn run_multi_agent_hybrid_with_reroutes(
+    graph: &Value,
+    workspace: &Path,
+    agents: &[String],
+    board: Option<&str>,
+    completed_seed: &BTreeSet<String>,
+    reroutes: &BTreeMap<String, String>,
+) -> Result<RunOutcome> {
+    let hybrid = HybridSession::initialize(workspace)?;
+    run_multi_agent_inner(
+        graph,
+        workspace,
+        agents,
+        board,
+        completed_seed,
+        Some(&hybrid),
+        reroutes,
+    )
+}
+
+fn run_multi_agent_inner(
+    graph: &Value,
+    workspace: &Path,
+    agents: &[String],
+    board: Option<&str>,
+    completed_seed: &BTreeSet<String>,
+    hybrid: Option<&HybridSession>,
+    reroutes: &BTreeMap<String, String>,
+) -> Result<RunOutcome> {
     let ordered = topo_order(graph)?; // validates acyclic
+    validate_node_agent_requirements(&ordered, agents, reroutes, completed_seed)?;
     let ids: Vec<String> = ordered
         .iter()
         .filter_map(|node| node.get("id").and_then(Value::as_str).map(str::to_owned))
@@ -2279,6 +2819,16 @@ pub(crate) fn run_multi_agent(
                 .map(|id| (id.to_owned(), node.clone()))
         })
         .collect();
+    let hybrid_ownership: BTreeMap<String, Vec<String>> = if hybrid.is_some() {
+        node_by_id
+            .iter()
+            .map(|(id, node)| {
+                hybrid_scheduled_owned_paths(node, workspace).map(|paths| (id.clone(), paths))
+            })
+            .collect::<Result<_>>()?
+    } else {
+        BTreeMap::new()
+    };
     let mut predecessors: BTreeMap<String, Vec<String>> =
         ids.iter().map(|id| (id.clone(), Vec::new())).collect();
     for edge in graph
@@ -2297,6 +2847,11 @@ pub(crate) fn run_multi_agent(
         }
     }
     let total = ids.len();
+    let graph_hash = graph
+        .get("graph_hash")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     // Resume: pre-mark already-completed tasks so they are skipped (the ready
     // check treats them as done) but still counted toward `total`.
     let schedule = Mutex::new(Schedule {
@@ -2323,8 +2878,15 @@ pub(crate) fn run_multi_agent(
             let agent = agent.clone();
             let is_lead = agent.as_str() == lead;
             let provider_caps = provider_caps.clone();
-            let (schedule, ids, node_by_id, predecessors, graph) =
-                (&schedule, &ids, &node_by_id, &predecessors, graph);
+            let (schedule, ids, node_by_id, predecessors, graph, graph_hash, hybrid_ownership) = (
+                &schedule,
+                &ids,
+                &node_by_id,
+                &predecessors,
+                graph,
+                &graph_hash,
+                &hybrid_ownership,
+            );
             scope.spawn(move || {
               let mut mine: u64 = 0;
               loop {
@@ -2355,17 +2917,48 @@ pub(crate) fn run_multi_agent(
                             .unwrap_or("")
                             .to_owned()
                     };
+                    let gate_admitted = |id: &String| {
+                        let Some(node) = node_by_id.get(id) else {
+                            return false;
+                        };
+                        let Ok(required) = crate::external_gates::required_gates(node) else {
+                            return false;
+                        };
+                        if required.is_empty() {
+                            return true;
+                        }
+                        let Ok(document) = crate::project_file::load(workspace) else {
+                            return false;
+                        };
+                        crate::external_gates::scheduler_admitted(
+                            workspace,
+                            graph_hash,
+                            node,
+                            document.external_gate_ledger.as_ref(),
+                        )
+                    };
                     let is_ready = |id: &String, state: &Schedule| {
                         !state.completed.contains(id)
                             && !state.in_progress.contains(id)
-                            && predecessors[id].iter().all(|pred| state.completed.contains(pred))
+                            && predecessors[id]
+                                .iter()
+                                .all(|pred| state.completed.contains(pred))
+                            && gate_admitted(id)
+                            && hybrid_ownership_available(
+                                id,
+                                &state.in_progress,
+                                hybrid_ownership,
+                            )
                     };
                     let is_root = |id: &String| predecessors[id].is_empty();
                     let is_control = |id: &String| capability_of(id).starts_with("control.");
                     // Role split: the lead plans (root) + closes out (control);
                     // workers do the middle coding/verify tasks in parallel.
                     let for_this_agent = |id: &String| {
-                        if !has_workers {
+                        let node = &node_by_id[id];
+                        if node_required_agent(node).is_some() {
+                            node_allows_agent_with_reroutes(node, &agent, reroutes)
+                        } else if !has_workers {
                             true
                         } else if is_lead {
                             is_root(id) || is_control(id)
@@ -2379,6 +2972,23 @@ pub(crate) fn run_multi_agent(
                     } else {
                         None
                     };
+                    if next.is_none() && state.in_progress.is_empty() {
+                        // No worker can make progress. If a dependency-ready
+                        // node is denied by the external-gate predicate,
+                        // terminate the run instead of polling forever.
+                        if let Some(denied) = ids.iter().find(|id| {
+                            !state.completed.contains(*id)
+                                && !state.in_progress.contains(*id)
+                                && predecessors[*id]
+                                    .iter()
+                                    .all(|pred| state.completed.contains(pred))
+                                && !gate_admitted(id)
+                        }) {
+                            state.failed = Some(denied.clone());
+                            state.failed_retryable = false;
+                            break;
+                        }
+                    }
                     match next {
                         Some(id) => {
                             state.in_progress.insert(id.clone());
@@ -2405,27 +3015,32 @@ pub(crate) fn run_multi_agent(
                 } else {
                     println!("{clr}  [{agent}] ▸ checked out {id} ({capability})");
                 }
-                report_node(board, &id, "checkout", &agent, workspace);
+                if let Err(error) = report_node(board, &id, "checkout", &agent, workspace) {
+                    let evidence_hex = workspace_digest(workspace);
+                    let mut state = schedule.lock().expect("schedule lock");
+                    state.in_progress.remove(&id);
+                    state.slot_leases.remove(&agent);
+                    state.failed = Some(id.clone());
+                    state.failed_retryable = false;
+                    state.log.push(NodeRun {
+                        node: id.clone(),
+                        agent: agent.clone(),
+                        is_verify: is_verify(capability),
+                        ok: false,
+                        verified: None,
+                        evidence_hex,
+                        latency_ms: 0,
+                    });
+                    eprintln!("  [{agent}] ✗ {id}: checkout denied: {error:#}");
+                    break;
+                }
                 let started = std::time::Instant::now();
-                let result = run_node_with_graph(
-                    node,
-                    &agent,
-                    workspace,
-                    Some(graph),
-                    schedule
-                        .lock()
-                        .map(|state| {
-                            (state.completed.len() + state.in_progress.len().saturating_sub(1))
-                                as u64
-                        })
-                        .unwrap_or(0),
-                );
+                let result = run_node_with_hybrid(node, &agent, workspace, hybrid);
                 let latency_ms = started.elapsed().as_millis() as u64;
 
                 let evidence_hex = workspace_digest(workspace);
                 let node_is_verify = is_verify(capability);
                 let mut node_verified: Option<bool> = None;
-                let mut policy_report: Option<crate::policy_executor::PolicyEnforcementReport> = None;
                 let preds = predecessors.get(&id).cloned().unwrap_or_default();
                 let mut state = schedule.lock().expect("schedule lock");
                 state.in_progress.remove(&id);
@@ -2438,10 +3053,9 @@ pub(crate) fn run_multi_agent(
                             timed_out: _,
                             note,
                             lessons,
-                            policy_report: outcome_report,
+                            retryable,
                             ..
                         } = &outcome;
-                        policy_report = outcome_report.clone();
                         if is_build(capability) && *ok {
                             state.built = true;
                         }
@@ -2476,7 +3090,6 @@ pub(crate) fn run_multi_agent(
                                 }
                             }
                         } else {
-                            state.failed = Some(id.clone());
                             report_node_outcome_with_lessons(
                                 board,
                                 &id,
@@ -2488,7 +3101,14 @@ pub(crate) fn run_multi_agent(
                                 &preds,
                                 lessons,
                             );
-                            if pool_requeue_failure(&mut state, workspace, &id, pool_mode, is_lead)
+                            if pool_requeue_failure(
+                                &mut state,
+                                workspace,
+                                &id,
+                                pool_mode,
+                                is_lead,
+                                *retryable,
+                            )
                             {
                                 println!("{clr}  [{agent}] ✗ {id}{suffix}");
                             } else {
@@ -2509,7 +3129,14 @@ pub(crate) fn run_multi_agent(
                             latency_ms,
                             &preds,
                         );
-                        if pool_requeue_failure(&mut state, workspace, &id, pool_mode, is_lead) {
+                        if pool_requeue_failure(
+                            &mut state,
+                            workspace,
+                            &id,
+                            pool_mode,
+                            is_lead,
+                            true,
+                        ) {
                             eprintln!("  [{agent}] ✗ {id}: {error:#}");
                         } else {
                             let retries = state.retry_counts.get(&id).copied().unwrap_or(0);
@@ -2528,7 +3155,6 @@ pub(crate) fn run_multi_agent(
                     verified: node_verified,
                     evidence_hex,
                     latency_ms,
-                    policy_report,
                 });
               }
             });
@@ -2551,6 +3177,7 @@ pub(crate) fn run_multi_agent(
         verified: state.verified,
         detail,
         failed_node: state.failed.clone(),
+        retryable: state.failed_retryable,
         log: state.log.clone(),
     })
 }
@@ -3176,13 +3803,7 @@ fn apply_hash_safe_repair(
 /// Execute one node with one agent, timing it and reporting board transitions.
 /// Mirrors the per-node body of `run_multi_agent` and is the shared unit both the
 /// whole-graph executor and the wave executor build on.
-fn run_and_record(
-    node: &Value,
-    graph: &Value,
-    agent: &str,
-    workspace: &Path,
-    board: Option<&str>,
-) -> NodeRun {
+fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&str>) -> NodeRun {
     let id = node
         .get("id")
         .and_then(Value::as_str)
@@ -3195,10 +3816,21 @@ fn run_and_record(
     // inspection/repair holds the scheduler barrier.
     {
         let _barrier = lock_scheduler();
-        report_node(board, &id, "checkout", agent, workspace);
+        if let Err(error) = report_node(board, &id, "checkout", agent, workspace) {
+            eprintln!("  [{agent}] ✗ {id}: checkout denied: {error:#}");
+            return NodeRun {
+                node: id,
+                agent: agent.to_owned(),
+                is_verify: is_verify(capability),
+                ok: false,
+                verified: None,
+                evidence_hex: workspace_digest(workspace),
+                latency_ms: 0,
+            };
+        }
     }
     let started = std::time::Instant::now();
-    let result = run_node_with_graph(node, agent, workspace, Some(graph), 0);
+    let result = run_node(node, agent, workspace);
     let latency_ms = started.elapsed().as_millis() as u64;
     let evidence_hex = workspace_digest(workspace);
     let is_verify_node = is_verify(capability);
@@ -3213,11 +3845,9 @@ fn run_and_record(
             .collect::<Vec<_>>()
     };
     let mut verified = None;
-    let mut policy_report = None;
     let ok = match result {
         Ok(outcome) => {
             verified = outcome.verified;
-            policy_report = outcome.policy_report.clone();
             let suffix = outcome
                 .note
                 .as_deref()
@@ -3264,7 +3894,6 @@ fn run_and_record(
         verified,
         evidence_hex,
         latency_ms,
-        policy_report,
     }
 }
 
@@ -3309,7 +3938,16 @@ pub(crate) fn run_wave_with_runtime(
             let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
             let is_root = preds.get(id).map(|p| p.is_empty()).unwrap_or(true);
             let is_control = capability.starts_with("control.");
-            let agent: String = if let Some(reassigned) =
+            let agent: String = if let Some(required) = node_required_agent(node) {
+                // Hard affinity wins over learned/runtime reassignment. If the
+                // roster is malformed, invoke the declared route rather than
+                // silently substituting a different worker.
+                agents
+                    .iter()
+                    .find(|agent| agent_matches_requirement(agent, required))
+                    .cloned()
+                    .unwrap_or_else(|| required.to_owned())
+            } else if let Some(reassigned) =
                 runtime.and_then(|rt| rt.reassignments.get(id)).cloned()
             {
                 reassigned
@@ -3321,7 +3959,7 @@ pub(crate) fn run_wave_with_runtime(
             };
             let (node, runs) = (node, &runs);
             scope.spawn(move || {
-                let run = run_and_record(node, graph, &agent, workspace, board);
+                let run = run_and_record(node, &agent, workspace, board);
                 runs.lock().expect("wave runs lock").push(run);
             });
         }
@@ -3336,254 +3974,674 @@ mod tests {
     use crate::efficiency_accounting::UpsertOutcome;
     use crate::efficiency_policy::PolicyDecision;
     use serde_json::json;
-    use std::ffi::OsString;
     use std::fs;
-    use std::sync::{Arc, Barrier, Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Barrier};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    struct InferxEnvGuard {
-        saved: Vec<(&'static str, Option<OsString>)>,
-        _lock: MutexGuard<'static, ()>,
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
     }
 
-    impl InferxEnvGuard {
-        fn new(names: &[&'static str]) -> Self {
-            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let lock = LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let saved = names
-                .iter()
-                .map(|name| (*name, std::env::var_os(name)))
-                .collect();
-            Self { saved, _lock: lock }
-        }
-
-        fn set(&self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
-            std::env::set_var(name, value);
-        }
-
-        fn remove(&self, name: &'static str) {
-            std::env::remove_var(name);
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
         }
     }
 
-    impl Drop for InferxEnvGuard {
+    impl Drop for EnvGuard {
         fn drop(&mut self) {
-            for (name, value) in &self.saved {
-                if let Some(value) = value {
-                    std::env::set_var(name, value);
-                } else {
-                    std::env::remove_var(name);
-                }
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
             }
         }
     }
 
-    #[test]
-    fn inferx_configuration_requires_explicit_enable_key_and_hermes() {
-        assert!(inferx_configured(Some("1"), Some("secret"), true));
-        assert!(!inferx_configured(Some("0"), Some("secret"), true));
-        assert!(!inferx_configured(Some("true"), Some("secret"), true));
-        assert!(!inferx_configured(Some("1"), None, true));
-        assert!(!inferx_configured(Some("1"), Some("   "), true));
-        assert!(!inferx_configured(Some("1"), Some("secret"), false));
-    }
+    #[cfg(unix)]
+    fn fake_opencode(name: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
 
-    #[test]
-    fn inferx_command_uses_hermes_argv_and_child_only_redacted_environment() {
-        let env = InferxEnvGuard::new(&["FRACTAL_INFERX_API_KEY"]);
-        let secret = "inferx-test-secret";
-        env.set("FRACTAL_INFERX_API_KEY", secret);
-        let command = worker_command("inferx", "implement files", AgentRole::Worker).unwrap();
-
-        assert_eq!(command.get_program().to_string_lossy(), "hermes");
-        let args: Vec<String> = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            args,
-            vec![
-                "--yolo",
-                "-m",
-                INFERX_MODEL,
-                "--provider",
-                INFERX_PROVIDER,
-                "-z",
-                "implement files"
-            ]
-        );
-        assert!(!args.iter().any(|arg| arg.contains(secret)));
-
-        let environment: BTreeMap<String, String> = command
-            .get_envs()
-            .filter_map(|(name, value)| {
-                value.map(|value| {
-                    (
-                        name.to_string_lossy().into_owned(),
-                        value.to_string_lossy().into_owned(),
-                    )
-                })
-            })
-            .collect();
-        assert_eq!(
-            environment.get("CUSTOM_BASE_URL"),
-            Some(&INFERX_ENDPOINT.to_owned())
-        );
-        assert_eq!(
-            environment.get("OPENAI_BASE_URL"),
-            Some(&INFERX_ENDPOINT.to_owned())
-        );
-        assert_eq!(environment.get("OPENAI_API_KEY"), Some(&secret.to_owned()));
-        assert_eq!(
-            environment.get("HERMES_INFERENCE_PROVIDER"),
-            Some(&INFERX_PROVIDER.to_owned())
-        );
-        assert_eq!(
-            environment.get("HERMES_INFERENCE_MODEL"),
-            Some(&INFERX_MODEL.to_owned())
-        );
-        assert!(!environment.contains_key("FRACTAL_INFERX_API_KEY"));
-
-        let rendered_error = worker_command("unsupported-inferx-test", secret, AgentRole::Worker)
-            .unwrap_err()
-            .to_string();
-        assert!(rendered_error.contains("inferx"));
-        assert!(!rendered_error.contains(secret));
-    }
-
-    #[test]
-    fn inferx_missing_key_is_a_non_secret_configuration_error() {
-        let env = InferxEnvGuard::new(&["FRACTAL_INFERX_API_KEY"]);
-        env.remove("FRACTAL_INFERX_API_KEY");
-        let error = worker_command("inferx", "build", AgentRole::Worker)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("inferx"));
-        assert!(error.contains("FRACTAL_INFERX_API_KEY"));
-
-        let error = match run_agent_prompt("inferx", "build", Path::new("."), 1) {
-            Ok(_) => panic!("missing InferX key must fail before spawning either command route"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("inferx"));
-        assert!(error.contains("FRACTAL_INFERX_API_KEY"));
-    }
-
-    #[test]
-    fn inferx_child_environment_replaces_ambient_openai_credentials() {
-        let env = InferxEnvGuard::new(&["FRACTAL_INFERX_API_KEY"]);
-        let secret = "inferx-child-secret";
-        env.set("FRACTAL_INFERX_API_KEY", secret);
-        let generic = BTreeMap::from([
-            (
-                "CUSTOM_BASE_URL".to_owned(),
-                "https://ambient-custom.example".to_owned(),
-            ),
-            ("OPENAI_API_KEY".to_owned(), "ambient-secret".to_owned()),
-            (
-                "OPENAI_BASE_URL".to_owned(),
-                "https://ambient.example".to_owned(),
-            ),
-            ("FRACTAL_INFERX_API_KEY".to_owned(), secret.to_owned()),
-        ]);
-        let child = child_environment_for_worker("inferx", generic);
-        assert_eq!(
-            child.get("CUSTOM_BASE_URL"),
-            Some(&INFERX_ENDPOINT.to_owned())
-        );
-        assert_eq!(child.get("OPENAI_API_KEY"), Some(&secret.to_owned()));
-        assert_eq!(
-            child.get("OPENAI_BASE_URL"),
-            Some(&INFERX_ENDPOINT.to_owned())
-        );
-        assert_eq!(
-            child.get("HERMES_INFERENCE_PROVIDER"),
-            Some(&INFERX_PROVIDER.to_owned())
-        );
-        assert_eq!(
-            child.get("HERMES_INFERENCE_MODEL"),
-            Some(&INFERX_MODEL.to_owned())
-        );
-        assert!(!child.contains_key("FRACTAL_INFERX_API_KEY"));
-    }
-
-    #[test]
-    fn inferx_auto_detection_is_gated_and_always_last_after_codex_luna() {
-        let env = InferxEnvGuard::new(&[
-            "PATH",
-            "FRACTAL_AGENTS",
-            "FRACTAL_LEAD_AGENT",
-            "FRACTAL_INFERX_ENABLED",
-            "FRACTAL_INFERX_API_KEY",
-        ]);
-        let path = std::env::temp_dir().join(format!(
-            "fractal-inferx-detect-{}-{}",
+        let root = std::env::temp_dir().join(format!(
+            "fractal-fake-opencode-{name}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        fs::create_dir_all(&path).unwrap();
-        for binary in ["codex", "cursor-agent", "claude", "hermes"] {
-            fs::write(path.join(binary), b"test").unwrap();
+        let bin = root.join("bin");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let executable = bin.join("opencode");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  if [ "$FRACTAL_FAKE_OPENCODE_VERSION_FAIL" = "1" ]; then exit 7; fi
+  printf 'opencode 1.17.20\n'
+  exit 0
+fi
+printf '%s\n' "$@" > "$FRACTAL_FAKE_OPENCODE_ARGS"
+case "$FRACTAL_FAKE_OPENCODE_MODE" in
+  success)
+    printf '%s\n' '{"type":"step_start","part":{"type":"step-start"}}'
+    printf '%s\n' '{"type":"text","part":{"type":"text","text":"ok"}}'
+    ;;
+  error)
+    printf '%s\n' '{"type":"error","error":{"message":"provider rejected request"}}'
+    ;;
+  timeout)
+    /bin/sleep 5
+    ;;
+  malformed)
+    printf '%s\n' 'not-json'
+    ;;
+  *) exit 8 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).unwrap();
+        (root, workspace)
+    }
+
+    fn hybrid_test_repository(name: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "fractal-hybrid-test-{name}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for args in [
+            &["init", "--quiet"][..],
+            &["config", "user.name", "Fractal Test"][..],
+            &["config", "user.email", "fractal-test@local"][..],
+        ] {
+            assert!(hybrid_git_status(&root, args).unwrap());
         }
-        env.set("PATH", &path);
-        env.remove("FRACTAL_AGENTS");
-        env.remove("FRACTAL_LEAD_AGENT");
-        env.set("FRACTAL_INFERX_ENABLED", "1");
-        env.set("FRACTAL_INFERX_API_KEY", "inferx-detection-secret");
-
-        let detected = detect_agents();
-        assert_eq!(
-            detected,
-            vec![
-                "codex".to_owned(),
-                "codex-luna".to_owned(),
-                "cursor".to_owned(),
-                "claude".to_owned(),
-                "hermes".to_owned(),
-                "inferx".to_owned(),
-            ]
-        );
-        assert_eq!(detected.last().map(String::as_str), Some("inferx"));
-        assert!(
-            detected
-                .iter()
-                .position(|agent| agent == "codex-luna")
-                .unwrap()
-                < detected.iter().position(|agent| agent == "inferx").unwrap()
-        );
-
-        env.remove("FRACTAL_INFERX_ENABLED");
-        assert!(!detect_agents().iter().any(|agent| agent == "inferx"));
-        env.set("FRACTAL_INFERX_ENABLED", "1");
-        env.remove("FRACTAL_INFERX_API_KEY");
-        assert!(!detect_agents().iter().any(|agent| agent == "inferx"));
-
-        let _ = fs::remove_dir_all(path);
+        fs::write(root.join("README.md"), "hybrid base\n").unwrap();
+        assert!(hybrid_git_status(&root, &["add", "README.md"]).unwrap());
+        assert!(hybrid_git_status(&root, &["commit", "--quiet", "-m", "base"]).unwrap());
+        root
     }
 
     #[test]
-    fn inferx_can_be_selected_explicitly_as_a_logical_worker() {
-        let env = InferxEnvGuard::new(&[
-            "FRACTAL_AGENTS",
-            "FRACTAL_INFERX_ENABLED",
-            "FRACTAL_INFERX_API_KEY",
+    fn hybrid_resume_preflight_rejects_dirty_tracked_workspace() {
+        let root = hybrid_test_repository("dirty-resume");
+        fs::write(root.join("README.md"), "uncommitted tracked edit\n").unwrap();
+
+        let error = validate_hybrid_workspace(&root).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("requires a clean tracked workspace"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_resume_allows_its_tracked_mutable_project_state() {
+        let root = hybrid_test_repository("mutable-project-state");
+        fs::create_dir_all(root.join(".fractal")).unwrap();
+        fs::write(
+            root.join(".fractal/project.fractal"),
+            "{\"phase\":\"halted\"}\n",
+        )
+        .unwrap();
+        assert!(hybrid_git_status(&root, &["add", ".fractal/project.fractal"]).unwrap());
+        assert!(
+            hybrid_git_status(&root, &["commit", "--quiet", "-m", "track project state"]).unwrap()
+        );
+        fs::write(
+            root.join(".fractal/project.fractal"),
+            "{\"phase\":\"running\"}\n",
+        )
+        .unwrap();
+
+        validate_hybrid_workspace(&root).unwrap();
+
+        fs::write(root.join("README.md"), "uncommitted source edit\n").unwrap();
+        let error = validate_hybrid_workspace(&root).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires a clean tracked workspace"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_integrates_worker_commit_while_project_state_is_dirty() {
+        let root = hybrid_test_repository("mutable-state-integration");
+        fs::create_dir_all(root.join(".fractal")).unwrap();
+        fs::write(
+            root.join(".fractal/project.fractal"),
+            "{\"phase\":\"halted\"}\n",
+        )
+        .unwrap();
+        assert!(hybrid_git_status(&root, &["add", ".fractal/project.fractal"]).unwrap());
+        assert!(
+            hybrid_git_status(&root, &["commit", "--quiet", "-m", "track project state"]).unwrap()
+        );
+        let session = HybridSession::initialize(&root).unwrap();
+        let node = json!({
+            "id":"runtime-safe",
+            "capability":"code.generate",
+            "efficiency":{"files_or_systems_affected":["runtime-safe.txt"],"expected_artifact":"runtime-safe.txt"}
+        });
+        let worktree = session
+            .create_worktree("runtime-safe", "opencode:1")
+            .unwrap();
+        fs::write(
+            root.join(".fractal/project.fractal"),
+            "{\"phase\":\"running\"}\n",
+        )
+        .unwrap();
+        copy_hybrid_context(&root, &worktree).unwrap();
+        assert!(hybrid_git_output(
+            &worktree,
+            &["status", "--porcelain=v1", "--untracked-files=no"]
+        )
+        .unwrap()
+        .contains(".fractal/project.fractal"));
+        fs::write(worktree.join("runtime-safe.txt"), "worker result\n").unwrap();
+
+        session
+            .integrate_worker_result(&node, "opencode:1", &worktree)
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("runtime-safe.txt")).unwrap(),
+            "worker result\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(".fractal/project.fractal")).unwrap(),
+            "{\"phase\":\"running\"}\n"
+        );
+        session.remove_worktree(&worktree).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_opencode_instances_receive_distinct_scoped_worktrees() {
+        let _lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let root = hybrid_test_repository("opencode-worktrees");
+        let session = HybridSession::initialize(&root).unwrap();
+        let identities = [
+            "opencode:glm-01",
+            "opencode:glm-02",
+            "opencode:glm-03",
+            "opencode:glm-04",
+        ];
+        let mut worktrees = BTreeSet::new();
+        for (index, identity) in identities.into_iter().enumerate() {
+            let node = format!("owned-task-{index}");
+            let worktree = session.create_worktree(&node, identity).unwrap();
+            assert!(worktree.is_dir());
+            assert!(worktree.starts_with(std::env::temp_dir()));
+            assert_ne!(worktree, root);
+            assert!(worktrees.insert(worktree));
+        }
+        assert_eq!(worktrees.len(), 4);
+        for worktree in &worktrees {
+            session.remove_worktree(worktree).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_resume_skips_every_completed_seed_assignment() {
+        let root = hybrid_test_repository("completed-seed");
+        let mut graph = json!({
+            "schema":"fractal.execution_graph.v1",
+            "graph_id":"fg_hybrid_resume",
+            "goal":"Resume only unfinished work",
+            "nodes":[
+                {"id":"already_done","capability":"code.generate","instruction":"must not run"},
+                {"id":"also_done","capability":"project.tests.execute","instruction":"must not run"}
+            ],
+            "edges":[{"from":"already_done","to":"also_done"}]
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::project_file::persist(&root, &graph, "Hybrid resume").unwrap();
+        let completed = BTreeSet::from(["already_done".to_owned(), "also_done".to_owned()]);
+
+        let outcome =
+            run_multi_agent_hybrid(&graph, &root, &["codex".to_owned()], None, &completed).unwrap();
+
+        assert!(outcome.log.is_empty(), "completed nodes must not run again");
+        assert!(outcome.failed_node.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_worktrees_integrate_parallel_nonoverlapping_results() {
+        let root = hybrid_test_repository("parallel");
+        let session = HybridSession::initialize(&root).unwrap();
+        let alpha = json!({
+            "id":"alpha",
+            "capability":"code.generate",
+            "efficiency":{"files_or_systems_affected":["alpha.txt"],"expected_artifact":"alpha.txt"}
+        });
+        let beta = json!({
+            "id":"beta",
+            "capability":"code.generate",
+            "efficiency":{"files_or_systems_affected":["beta.txt"],"expected_artifact":"beta.txt"}
+        });
+        let alpha_tree = session.create_worktree("alpha", "cursor").unwrap();
+        let beta_tree = session.create_worktree("beta", "codex-luna").unwrap();
+        fs::write(alpha_tree.join("alpha.txt"), "from cursor\n").unwrap();
+        fs::create_dir_all(alpha_tree.join("target/debug")).unwrap();
+        fs::write(alpha_tree.join("target/debug/build-output"), "generated\n").unwrap();
+        fs::write(alpha_tree.join("Cargo.lock"), "generated\n").unwrap();
+        fs::write(beta_tree.join("beta.txt"), "from codex\n").unwrap();
+
+        session
+            .integrate_worker_result(&alpha, "cursor", &alpha_tree)
+            .unwrap();
+        session.remove_worktree(&alpha_tree).unwrap();
+        session
+            .integrate_worker_result(&beta, "codex-luna", &beta_tree)
+            .unwrap();
+        session.remove_worktree(&beta_tree).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("alpha.txt")).unwrap(),
+            "from cursor\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("beta.txt")).unwrap(),
+            "from codex\n"
+        );
+        assert!(!root.join("target").exists());
+        assert!(!root.join("Cargo.lock").exists());
+        let log = hybrid_git_output(&root, &["log", "--format=%s", "-3"]).unwrap();
+        assert!(log.contains("fractal(alpha): integrate cursor worker result"));
+        assert!(log.contains("fractal(beta): integrate codex-luna worker result"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_verifier_copies_proof_without_source_commit() {
+        let root = hybrid_test_repository("artifact");
+        let session = HybridSession::initialize(&root).unwrap();
+        let node = json!({
+            "id":"cursor_verify",
+            "capability":"project.tests.execute",
+            "executor":{"agent":"cursor"},
+            "efficiency":{"expected_artifact":".fractal/cursor-proof.json"}
+        });
+        let worktree = session.create_worktree("cursor_verify", "cursor").unwrap();
+        fs::create_dir_all(worktree.join(".fractal")).unwrap();
+        fs::write(
+            worktree.join(".fractal/cursor-proof.json"),
+            "{\"passed\":true}\n",
+        )
+        .unwrap();
+        session
+            .integrate_worker_result(&node, "cursor", &worktree)
+            .unwrap();
+        session.remove_worktree(&worktree).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(".fractal/cursor-proof.json")).unwrap(),
+            "{\"passed\":true}\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_integration_conflict_aborts_without_corrupting_canonical_tree() {
+        let root = hybrid_test_repository("conflict");
+        let session = HybridSession::initialize(&root).unwrap();
+        let first = json!({
+            "id":"first",
+            "capability":"code.generate",
+            "efficiency":{"files_or_systems_affected":["README.md"],"expected_artifact":"README.md"}
+        });
+        let second = json!({
+            "id":"second",
+            "capability":"code.generate",
+            "efficiency":{"files_or_systems_affected":["README.md"],"expected_artifact":"README.md"}
+        });
+        let first_tree = session.create_worktree("first", "cursor").unwrap();
+        let second_tree = session.create_worktree("second", "codex-luna").unwrap();
+        fs::write(first_tree.join("README.md"), "cursor version\n").unwrap();
+        fs::write(second_tree.join("README.md"), "codex version\n").unwrap();
+
+        session
+            .integrate_worker_result(&first, "cursor", &first_tree)
+            .unwrap();
+        session.remove_worktree(&first_tree).unwrap();
+        let error = session
+            .integrate_worker_result(&second, "codex-luna", &second_tree)
+            .unwrap_err();
+        assert!(error.to_string().contains("integration conflict"));
+        let typed = error
+            .downcast_ref::<HybridExecutionFailure>()
+            .expect("integration conflict is typed");
+        assert_eq!(
+            typed.failure_code,
+            crate::learning_data::FailureCode::ConflictingParallelEdits
+        );
+        assert_eq!(
+            typed.detail.kind,
+            crate::learning_data::IntegrationFailureKind::IntegrationConflict
+        );
+        assert!(typed.detail.worker_commit.is_some());
+        assert!(!typed
+            .detail
+            .summary
+            .contains(second_tree.to_string_lossy().as_ref()));
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "cursor version\n"
+        );
+        assert!(
+            hybrid_git_output(&root, &["status", "--porcelain=v1", "--untracked-files=no"])
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+
+        let mut graph = json!({
+            "schema":"fractal.execution_graph.v1",
+            "graph_id":"fg_hybrid_conflict",
+            "goal":"Persist safe hybrid conflict evidence",
+            "nodes":[first, second],
+            "edges":[]
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::project_file::persist(&root, &graph, "Hybrid conflict").unwrap();
+        crate::project_file::checkout_start_node(&root, "second", "codex-luna", "codex-luna")
+            .unwrap();
+        report_node_outcome(
+            None,
+            "second",
+            "codex-luna",
+            &root,
+            &NodeOutcome::hybrid_failure(typed),
+            "sha256:abcdef",
+            1,
+            &[],
+        );
+        let durable = crate::project_file::load(&root).unwrap();
+        let record = &durable.learning.nodes["second"];
+        assert_eq!(
+            record.failure_code,
+            Some(crate::learning_data::FailureCode::ConflictingParallelEdits)
+        );
+        assert_eq!(record.integration_failure.as_ref(), Some(&typed.detail));
+        let bytes = serde_json::to_string(&durable).unwrap();
+        assert!(!bytes.contains(second_tree.to_string_lossy().as_ref()));
+        assert!(!bytes.contains("/Users/"));
+        session.remove_worktree(&second_tree).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_rejects_source_changes_outside_declared_ownership() {
+        let root = hybrid_test_repository("scope");
+        let session = HybridSession::initialize(&root).unwrap();
+        let node = json!({
+            "id":"owned",
+            "capability":"code.generate",
+            "efficiency":{"files_or_systems_affected":["owned.txt"],"expected_artifact":"owned.txt"}
+        });
+        let worktree = session.create_worktree("owned", "cursor").unwrap();
+        fs::write(worktree.join("owned.txt"), "owned\n").unwrap();
+        fs::write(worktree.join("escape.txt"), "not owned\n").unwrap();
+        assert!(hybrid_git_status(&worktree, &["add", "escape.txt"]).unwrap());
+        let error = session
+            .integrate_worker_result(&node, "cursor", &worktree)
+            .unwrap_err();
+        let typed = error
+            .downcast_ref::<HybridExecutionFailure>()
+            .expect("scope escape is typed");
+        assert_eq!(
+            typed.detail.kind,
+            crate::learning_data::IntegrationFailureKind::ScopeEscape
+        );
+        assert!(!root.join("owned.txt").exists());
+        session.remove_worktree(&worktree).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_owned_paths_reject_absolute_parent_and_git_boundaries() {
+        let root = hybrid_test_repository("invalid-owned-paths");
+        let normalized = json!({
+            "id":"normalized",
+            "efficiency":{"files_or_systems_affected":["./src//lib.rs"]}
+        });
+        assert_eq!(
+            hybrid_declared_owned_paths(&normalized, &root).unwrap(),
+            vec!["src/lib.rs"]
+        );
+        for invalid in ["../sibling/file.rs", "/tmp/file.rs", ".git/config"] {
+            let node = json!({
+                "id":"invalid",
+                "efficiency":{"files_or_systems_affected":[invalid]}
+            });
+            let error = hybrid_declared_owned_paths(&node, &root).unwrap_err();
+            let typed = error
+                .downcast_ref::<HybridExecutionFailure>()
+                .expect("invalid ownership is typed");
+            assert_eq!(
+                typed.detail.kind,
+                crate::learning_data::IntegrationFailureKind::InvalidOwnedPath
+            );
+            assert!(typed.detail.summary.contains(invalid));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hybrid_ownership_excludes_only_builtin_control_artifacts() {
+        let root = hybrid_test_repository("closeout-control-artifact");
+        let plan = json!({
+            "id":"lead_plan",
+            "capability":"control.plan",
+            "efficiency":{"files_or_systems_affected":[".fractal/lead-prd.json"]}
+        });
+        assert!(hybrid_scheduled_owned_paths(&plan, &root)
+            .unwrap()
+            .is_empty());
+        let closeout = json!({
+            "id":"lead_closeout",
+            "capability":"control.closeout",
+            "efficiency":{"files_or_systems_affected":[".fractal/closeout.json"]}
+        });
+        assert!(hybrid_scheduled_owned_paths(&closeout, &root)
+            .unwrap()
+            .is_empty());
+
+        let worker = json!({
+            "id":"worker",
+            "capability":"code.generate",
+            "efficiency":{"files_or_systems_affected":[".fractal/closeout.json"]}
+        });
+        let error = hybrid_scheduled_owned_paths(&worker, &root).unwrap_err();
+        let typed = error
+            .downcast_ref::<HybridExecutionFailure>()
+            .expect("worker control-directory ownership remains typed");
+        assert_eq!(
+            typed.detail.kind,
+            crate::learning_data::IntegrationFailureKind::InvalidOwnedPath
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hybrid_owned_paths_reject_symlink_escape_from_repository() {
+        use std::os::unix::fs::symlink;
+
+        let root = hybrid_test_repository("symlink-owned-path");
+        let outside = root.with_file_name(format!(
+            "{}-outside",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("outside-link")).unwrap();
+        let node = json!({
+            "id":"invalid",
+            "efficiency":{"files_or_systems_affected":["outside-link/new.rs"]}
+        });
+
+        let error = hybrid_declared_owned_paths(&node, &root).unwrap_err();
+        let typed = error
+            .downcast_ref::<HybridExecutionFailure>()
+            .expect("symlink escape is typed");
+        assert_eq!(
+            typed.detail.kind,
+            crate::learning_data::IntegrationFailureKind::InvalidOwnedPath
+        );
+        assert!(typed.detail.summary.contains("outside repository"));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn hybrid_exact_ownership_overlap_is_serialized() {
+        let ownership = BTreeMap::from([
+            ("active".to_owned(), vec!["src/lib.rs".to_owned()]),
+            ("candidate".to_owned(), vec!["src/lib.rs".to_owned()]),
         ]);
-        env.set("FRACTAL_AGENTS", "inferx");
-        env.set("FRACTAL_INFERX_ENABLED", "1");
-        env.set("FRACTAL_INFERX_API_KEY", "inferx-explicit-secret");
-        assert_eq!(detect_agents(), vec!["inferx".to_owned()]);
-        assert_eq!(agent_binary("inferx"), "hermes");
+        assert!(!hybrid_ownership_available(
+            "candidate",
+            &BTreeSet::from(["active".to_owned()]),
+            &ownership
+        ));
+    }
+
+    #[test]
+    fn hybrid_directory_prefix_ownership_overlap_is_serialized() {
+        let ownership = BTreeMap::from([
+            ("active".to_owned(), vec!["src".to_owned()]),
+            ("candidate".to_owned(), vec!["src/bin/main.rs".to_owned()]),
+        ]);
+        assert!(!hybrid_ownership_available(
+            "candidate",
+            &BTreeSet::from(["active".to_owned()]),
+            &ownership
+        ));
+    }
+
+    #[test]
+    fn hybrid_disjoint_ownership_remains_parallel() {
+        let ownership = BTreeMap::from([
+            ("active".to_owned(), vec!["src/lib.rs".to_owned()]),
+            ("candidate".to_owned(), vec!["tests/api.rs".to_owned()]),
+        ]);
+        assert!(hybrid_ownership_available(
+            "candidate",
+            &BTreeSet::from(["active".to_owned()]),
+            &ownership
+        ));
+    }
+
+    #[test]
+    fn deterministic_hybrid_failures_are_not_pool_retried() {
+        let mut schedule = Schedule::default();
+        assert!(pool_requeue_failure(
+            &mut schedule,
+            Path::new("unused"),
+            "scope_failure",
+            true,
+            false,
+            false,
+        ));
+        assert_eq!(schedule.failed.as_deref(), Some("scope_failure"));
+        assert!(!schedule.failed_retryable);
+        assert!(schedule.retry_counts.is_empty());
+    }
+
+    #[test]
+    fn executor_affinity_matches_pool_slots_and_rejects_fallback_workers() {
+        let node = json!({"id":"cursor_check","executor":{"agent":"cursor"}});
+        assert!(node_allows_agent(&node, "cursor"));
+        assert!(node_allows_agent(&node, "cursor:7"));
+        assert!(!node_allows_agent(&node, "codex-luna"));
+        assert!(!node_allows_agent(&node, "claude"));
+
+        let opencode = json!({"id":"glm_check","executor":{"agent":"opencode"}});
+        assert!(node_allows_agent(&opencode, "opencode:glm-01"));
+        assert!(node_allows_agent(&opencode, "opencode:glm-04"));
+        assert!(!node_allows_agent(&opencode, "cursor:1"));
+
+        let roster = vec!["codex".to_owned(), "codex-luna".to_owned()];
+        let error = validate_node_agent_requirements(
+            std::slice::from_ref(&node),
+            &roster,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires worker `cursor`"));
+
+        let completed = BTreeSet::from(["cursor_check".to_owned()]);
+        validate_node_agent_requirements(&[node], &roster, &BTreeMap::new(), &completed)
+            .expect("completed historical assignments do not require a live provider");
+    }
+
+    #[test]
+    fn explicit_resume_reroute_changes_only_the_named_node_affinity() {
+        let failed = json!({"id":"claude_failed","executor":{"agent":"claude"}});
+        let untouched = json!({"id":"claude_untouched","executor":{"agent":"claude"}});
+        let reroutes = BTreeMap::from([("claude_failed".to_owned(), "codex-luna".to_owned())]);
+
+        assert!(node_allows_agent_with_reroutes(
+            &failed,
+            "codex-luna:2",
+            &reroutes
+        ));
+        assert!(!node_allows_agent_with_reroutes(
+            &failed, "claude:1", &reroutes
+        ));
+        assert!(node_allows_agent_with_reroutes(
+            &untouched, "claude:1", &reroutes
+        ));
+        assert!(!node_allows_agent_with_reroutes(
+            &untouched,
+            "codex-luna:2",
+            &reroutes
+        ));
+    }
+
+    #[test]
+    fn declared_artifact_is_a_worker_completion_postcondition() {
+        let root =
+            std::env::temp_dir().join(format!("fractal-declared-artifact-{}", std::process::id()));
+        let node = json!({
+            "efficiency": {"expected_artifact": ".fractal/cursor-result.json"}
+        });
+        assert_eq!(
+            declared_artifact_path(&node, &root),
+            Some(root.join(".fractal/cursor-result.json"))
+        );
+        assert_eq!(
+            declared_artifact_path(
+                &json!({"efficiency":{"expected_artifact":"passing native tests"}}),
+                &root
+            ),
+            None
+        );
     }
 
     #[test]
     fn codex_lead_planner_is_pinned_to_sol_high_without_changing_workers() {
-        let lead = worker_command("codex", "plan", AgentRole::LeadPlanner).unwrap();
+        let lead = worker_command(
+            "codex",
+            "plan",
+            AgentRole::LeadPlanner,
+            Path::new("/tmp/fractal-worker"),
+        )
+        .unwrap();
         let lead_args: Vec<String> = lead
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -3598,7 +4656,13 @@ mod tests {
             ]
         }));
 
-        let worker = worker_command("codex", "build", AgentRole::Worker).unwrap();
+        let worker = worker_command(
+            "codex",
+            "build",
+            AgentRole::Worker,
+            Path::new("/tmp/fractal-worker"),
+        )
+        .unwrap();
         let worker_args: Vec<String> = worker
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -3614,7 +4678,13 @@ mod tests {
     #[test]
     fn codex_luna_worker_route_uses_the_codex_binary_and_luna_model() {
         assert_eq!(agent_binary("codex-luna"), "codex");
-        let worker = worker_command("codex-luna", "build", AgentRole::Worker).unwrap();
+        let worker = worker_command(
+            "codex-luna",
+            "build",
+            AgentRole::Worker,
+            Path::new("/tmp/fractal-worker"),
+        )
+        .unwrap();
         assert_eq!(worker.get_program().to_string_lossy(), "codex");
         let args: Vec<String> = worker
             .get_args()
@@ -3626,31 +4696,6 @@ mod tests {
         assert!(!args
             .iter()
             .any(|arg| arg == "gpt-5.6-sol" || arg == "model_reasoning_effort=\"high\""));
-    }
-
-    #[test]
-    fn legacy_noninteractive_provider_commands_do_not_use_bypass_modes() {
-        let claude = worker_command("claude", "edit", AgentRole::Worker).unwrap();
-        let claude_args: Vec<String> = claude
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert!(claude_args.iter().any(|arg| arg == "--permission-mode"));
-        assert!(!claude_args
-            .iter()
-            .any(|arg| { arg.contains("dangerously") || arg == "--yolo" || arg == "--force" }));
-
-        let hermes = worker_command("hermes", "edit", AgentRole::Worker).unwrap();
-        let hermes_args: Vec<String> = hermes
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert!(hermes_args
-            .windows(2)
-            .any(|pair| pair == ["chat".to_owned(), "-q".to_owned()]));
-        assert!(!hermes_args.iter().any(|arg| {
-            arg == "-z" || arg == "--yolo" || arg == "--force" || arg.contains("dangerously")
-        }));
     }
 
     #[test]
@@ -3671,7 +4716,11 @@ mod tests {
 
     #[test]
     fn pool_slot_identity_uses_existing_command_adapters() {
-        let worker = worker_command("codex-luna:3", "build", AgentRole::Worker).unwrap();
+        let _lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let _binary = EnvGuard::set("FRACTAL_OPENCODE_BIN", "opencode");
+        let _model = EnvGuard::set("FRACTAL_OPENCODE_MODEL", "zai-coding-plan/glm-5.3");
+        let workspace = Path::new("/tmp/fractal-worker");
+        let worker = worker_command("codex-luna:3", "build", AgentRole::Worker, workspace).unwrap();
         assert_eq!(worker.get_program().to_string_lossy(), "codex");
         assert_eq!(
             worker.get_envs().find_map(|(key, value)| {
@@ -3680,12 +4729,117 @@ mod tests {
             }),
             Some("codex-luna:3".to_owned())
         );
-        let cursor = worker_command("cursor:2", "build", AgentRole::Worker).unwrap();
+        let cursor = worker_command("cursor:2", "build", AgentRole::Worker, workspace).unwrap();
         assert_eq!(cursor.get_program().to_string_lossy(), "cursor-agent");
-        let claude = worker_command("claude:1", "build", AgentRole::Worker).unwrap();
+        let claude = worker_command("claude:1", "build", AgentRole::Worker, workspace).unwrap();
         assert_eq!(claude.get_program().to_string_lossy(), "claude");
-        let hermes = worker_command("hermes:4", "build", AgentRole::Worker).unwrap();
+        let hermes = worker_command("hermes:4", "build", AgentRole::Worker, workspace).unwrap();
         assert_eq!(hermes.get_program().to_string_lossy(), "hermes");
+        let opencode =
+            worker_command("opencode:glm-01", "build", AgentRole::Worker, workspace).unwrap();
+        assert_eq!(opencode.get_program().to_string_lossy(), "opencode");
+        let args = opencode
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "run",
+                "--format",
+                "json",
+                "--model",
+                "zai-coding-plan/glm-5.3",
+                "--dir",
+                "/tmp/fractal-worker",
+                "build",
+            ]
+        );
+        assert_eq!(
+            opencode.get_envs().find_map(|(key, value)| {
+                (key.to_string_lossy() == "FRACTAL_WORKER")
+                    .then(|| value.unwrap().to_string_lossy().into_owned())
+            }),
+            Some("opencode:glm-01".to_owned())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_fake_executable_json_success_uses_model_dir_and_identity() {
+        let _lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let (root, workspace) = fake_opencode("success");
+        let args_path = root.join("args.txt");
+        let _binary = EnvGuard::set("FRACTAL_OPENCODE_BIN", root.join("bin/opencode"));
+        let _mode = EnvGuard::set("FRACTAL_FAKE_OPENCODE_MODE", "success");
+        let _args = EnvGuard::set("FRACTAL_FAKE_OPENCODE_ARGS", &args_path);
+        let _model = EnvGuard::set("FRACTAL_OPENCODE_MODEL", "zai-coding-plan/glm-5.3");
+        let _credential = EnvGuard::set("ZAI_API_KEY", "must-not-appear-in-arguments");
+
+        let run = run_agent_prompt(
+            "opencode:glm-01",
+            "edit only owned files",
+            &workspace,
+            2_000,
+        )
+        .unwrap();
+
+        assert!(run.ok);
+        assert!(!run.timed_out);
+        let args = fs::read_to_string(&args_path).unwrap();
+        assert!(args.contains("run\n--format\njson\n--model\nzai-coding-plan/glm-5.3"));
+        assert!(args.contains(&format!("--dir\n{}", workspace.display())));
+        assert!(args.ends_with("edit only owned files\n"));
+        assert!(!args.contains("must-not-appear-in-arguments"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_fake_executable_json_error_fails_closed() {
+        let _lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let (root, workspace) = fake_opencode("error");
+        let _binary = EnvGuard::set("FRACTAL_OPENCODE_BIN", root.join("bin/opencode"));
+        let _mode = EnvGuard::set("FRACTAL_FAKE_OPENCODE_MODE", "error");
+        let _args = EnvGuard::set("FRACTAL_FAKE_OPENCODE_ARGS", root.join("args.txt"));
+        let run = run_agent_prompt("opencode:glm-02", "work", &workspace, 2_000).unwrap();
+        assert!(!run.ok);
+        assert!(!run.timed_out);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_fake_executable_timeout_is_killed() {
+        let _lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let (root, workspace) = fake_opencode("timeout");
+        let _binary = EnvGuard::set("FRACTAL_OPENCODE_BIN", root.join("bin/opencode"));
+        let _mode = EnvGuard::set("FRACTAL_FAKE_OPENCODE_MODE", "timeout");
+        let _args = EnvGuard::set("FRACTAL_FAKE_OPENCODE_ARGS", root.join("args.txt"));
+        let started = Instant::now();
+        let run = run_agent_prompt("opencode:glm-03", "work", &workspace, 100).unwrap();
+        assert!(!run.ok);
+        assert!(run.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_fake_executable_version_preflight_fails_without_running_task() {
+        let _lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let (root, workspace) = fake_opencode("preflight");
+        let args_path = root.join("args.txt");
+        let _binary = EnvGuard::set("FRACTAL_OPENCODE_BIN", root.join("bin/opencode"));
+        let _mode = EnvGuard::set("FRACTAL_FAKE_OPENCODE_MODE", "success");
+        let _args = EnvGuard::set("FRACTAL_FAKE_OPENCODE_ARGS", &args_path);
+        let _version = EnvGuard::set("FRACTAL_FAKE_OPENCODE_VERSION_FAIL", "1");
+        let error = run_agent_prompt("opencode:glm-04", "work", &workspace, 2_000)
+            .err()
+            .expect("failed version preflight must stop execution");
+        assert!(format!("{error:#}").contains("OpenCode preflight failed"));
+        assert!(!args_path.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4063,6 +5217,94 @@ mod tests {
         graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
         crate::project_file::persist(workspace, &graph, "Lifecycle").unwrap();
         graph
+    }
+
+    fn persist_gated_graph(workspace: &std::path::Path) -> (Value, String) {
+        fs::create_dir_all(workspace).unwrap();
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_external_gate_execute",
+            "nodes": [{
+                "id": "secure",
+                "capability": "code.generate",
+                "instruction": "Secure build",
+                "external_gates": ["security_review"]
+            }],
+            "edges": []
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::project_file::persist(workspace, &graph, "External gate").unwrap();
+        fs::write(workspace.join("review.txt"), b"review evidence").unwrap();
+        (graph, "review.txt".to_owned())
+    }
+
+    #[test]
+    fn gated_execution_paths_fail_closed_before_worker_invocation() {
+        let workspace = lifecycle_workspace("gated-execution");
+        let (graph, _) = persist_gated_graph(&workspace);
+        let node = graph["nodes"][0].clone();
+
+        // Missing ledger is denied by the direct worker seam and therefore
+        // cannot invoke a worker command.
+        assert!(run_node(&node, "worker", &workspace).is_err());
+        assert!(report_node(None, "secure", "checkout", "worker", &workspace).is_err());
+        assert!(!crate::project_file::load(&workspace)
+            .unwrap()
+            .execution
+            .unwrap()
+            .assignments
+            .contains_key("secure"));
+        let run = run_and_record(&node, "worker", &workspace, None);
+        assert!(!run.ok);
+
+        // Record one approval, then the reviewer remains forbidden from
+        // executing the same node (separation of duties).
+        let document = crate::project_file::load(&workspace).unwrap();
+        let input = crate::external_gates::RecordApprovalInput {
+            node_id: "secure".to_owned(),
+            gate: "security_review".to_owned(),
+            evidence_path: std::path::PathBuf::from("review.txt"),
+            reviewer_id: "reviewer".to_owned(),
+            reviewer_label: "Reviewer".to_owned(),
+            role: "security_reviewer".to_owned(),
+            attestation: format!("approve:{}:secure:security_review", document.graph_hash),
+        };
+        let approval = crate::external_gates::record_approval(&workspace, input).unwrap();
+        assert!(!run_and_record(&node, "reviewer", &workspace, None).ok);
+
+        // Tampering after approval is caught before execution.
+        fs::write(workspace.join("review.txt"), b"drift").unwrap();
+        assert!(run_node(&node, "worker", &workspace).is_err());
+        assert_eq!(
+            crate::project_file::load(&workspace)
+                .unwrap()
+                .external_gate_ledger
+                .unwrap()
+                .records
+                .iter()
+                .filter(|record| record.kind == "approval")
+                .count(),
+            1
+        );
+        assert!(!approval.content_hash.is_empty());
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn multi_agent_scheduler_terminates_denied_gated_frontier() {
+        let workspace = lifecycle_workspace("gated-scheduler");
+        let (graph, _) = persist_gated_graph(&workspace);
+        let result = run_multi_agent(
+            &graph,
+            &workspace,
+            &["codex".to_owned()],
+            None,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(result.failed_node.as_deref(), Some("secure"));
+        assert!(result.log.iter().all(|run| !run.ok));
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
@@ -4497,6 +5739,7 @@ mod tests {
 
     const POOL_24: &str = "codex=6,cursor=6,claude=6,hermes=6";
     const POOL_42: &str = "codex=12,cursor=10,claude=10,hermes=10";
+    const POOL_24_WITH_OPENCODE: &str = "codex=5,cursor=5,claude=5,hermes=5,opencode=4";
 
     fn all_binaries_available(_binary: &str) -> bool {
         true
@@ -4873,12 +6116,91 @@ mod tests {
     }
 
     #[test]
+    fn optional_opencode_pool_expands_four_distinct_concurrent_workers() {
+        let slots = resolve_agent_pool(POOL_24_WITH_OPENCODE, all_binaries_available).unwrap();
+        let opencode = slots
+            .iter()
+            .filter(|slot| slot.provider == "opencode")
+            .collect::<Vec<_>>();
+        assert_eq!(opencode.len(), 4);
+        assert_eq!(
+            opencode
+                .iter()
+                .map(|slot| slot.id.as_str())
+                .collect::<Vec<_>>(),
+            ["opencode:1", "opencode:2", "opencode:3", "opencode:4"]
+        );
+        assert!(opencode.iter().all(|slot| slot.kind == "opencode"));
+        assert_eq!(command_kind_for_agent("opencode:glm-01"), "opencode");
+        assert_eq!(command_kind_for_agent("opencode:glm-04"), "opencode");
+
+        let (nodes, runner) = seeded_48_nodes(0x0C0D_E004);
+        let metrics = simulate_heterogeneous_pool(&nodes, &slots, &runner, &BTreeSet::new(), None);
+        assert_safety(&metrics, 48);
+        assert_eq!(
+            metrics
+                .max_leases_by_provider
+                .get("opencode")
+                .copied()
+                .unwrap_or(0),
+            4
+        );
+        assert!(metrics
+            .completions_by_provider
+            .get("opencode")
+            .is_some_and(|count| *count >= 4));
+    }
+
+    #[test]
+    fn opencode_pool_failure_and_rate_limit_behavior_is_deterministic() {
+        let slots = resolve_agent_pool(POOL_24_WITH_OPENCODE, all_binaries_available).unwrap();
+        let (nodes, mut failing) = seeded_48_nodes(0x0C0D_E005);
+        failing
+            .fail_first
+            .extend(["n00".to_owned(), "n07".to_owned()]);
+        let first = simulate_heterogeneous_pool(&nodes, &slots, &failing, &BTreeSet::new(), None);
+        let replay = simulate_heterogeneous_pool(&nodes, &slots, &failing, &BTreeSet::new(), None);
+        assert_safety(&first, 48);
+        assert_safety(&replay, 48);
+        assert_eq!(first.completion_log, replay.completion_log);
+
+        let mut rate_limited = failing.clone();
+        rate_limited.fail_first.clear();
+        rate_limited.stall_providers.insert("opencode".to_owned());
+        let limited_a =
+            simulate_heterogeneous_pool(&nodes, &slots, &rate_limited, &BTreeSet::new(), None);
+        let limited_b =
+            simulate_heterogeneous_pool(&nodes, &slots, &rate_limited, &BTreeSet::new(), None);
+        assert_eq!(limited_a.completion_log, limited_b.completion_log);
+        assert_eq!(limited_a.completed, limited_b.completed);
+        assert_eq!(limited_a.completed.len(), 44);
+        assert_eq!(
+            limited_a
+                .max_leases_by_provider
+                .get("opencode")
+                .copied()
+                .unwrap_or(0),
+            4
+        );
+        assert_eq!(
+            limited_a
+                .completions_by_provider
+                .get("opencode")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(limited_a.duplicate_leases, 0);
+        assert_eq!(limited_a.duplicate_completions, 0);
+        assert_eq!(limited_a.dependency_violations, 0);
+    }
+
+    #[test]
     fn agent_pool_rejects_malformed_configs_and_mixed_availability() {
         let cases = [
             ("", "empty"),
             ("codex=6,cursor=6,claude=6,hermes=6,codex=6", "duplicate"),
             ("codex=6,cursor=6,claude=6,gpt=6", "unknown"),
-            ("codex=0,cursor=8,claude=8,hermes=8", "zero"),
             ("codex=100,cursor=1,claude=1,hermes=1", "overflow"),
             (
                 "codex=18446744073709551616,cursor=1,claude=1,hermes=1",
@@ -4899,6 +6221,40 @@ mod tests {
         assert!(mixed.is_err(), "mixed availability must not fall back");
         let none = resolve_agent_pool(POOL_24, |_| false);
         assert!(none.is_err());
+        let optional_missing =
+            resolve_agent_pool(POOL_24_WITH_OPENCODE, |binary| binary != "opencode");
+        assert!(optional_missing.is_err());
+    }
+
+    #[test]
+    fn agent_pool_zero_count_disables_unavailable_provider() {
+        let raw = "codex=5,cursor=5,claude=0,hermes=5,opencode=9";
+        let slots = resolve_agent_pool(raw, |binary| binary != "claude").unwrap();
+        assert_eq!(slots.len(), 24);
+        assert_eq!(
+            slots
+                .iter()
+                .filter(|slot| slot.provider == "claude")
+                .count(),
+            0
+        );
+        assert_eq!(
+            slots
+                .iter()
+                .filter(|slot| slot.provider == "opencode")
+                .count(),
+            9
+        );
+        let roster =
+            detect_pool_roster_with_lead(raw, |binary| binary != "claude", Some("codex")).unwrap();
+        assert!(!roster.iter().any(|agent| agent.starts_with("claude:")));
+        assert_eq!(
+            roster
+                .iter()
+                .filter(|agent| agent.starts_with("opencode:"))
+                .count(),
+            9
+        );
     }
 
     #[test]

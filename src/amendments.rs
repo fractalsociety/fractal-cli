@@ -1,16 +1,14 @@
 //! Safe mid-build graph amendment queue and lead-planner expansion.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, Metadata, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use crate::compile::{baseline_node_efficiency, node_efficiency_to_graph_value};
 use crate::efficiency::{validate_node_metadata, NodeEfficiencyMetadata};
@@ -18,7 +16,7 @@ use crate::efficiency::{validate_node_metadata, NodeEfficiencyMetadata};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct PendingAmendment {
     pub(crate) command_id: String,
     #[serde(default = "default_action")]
@@ -34,16 +32,269 @@ pub(crate) struct PendingAmendment {
     pub(crate) dependency: Option<String>,
 }
 
+/// A pending amendment together with the queue file that currently owns it.
+///
+/// This is intentionally a compact, JSON-serializable projection for the
+/// control-plane CLI.  The full request remains in `amendment`; `queue_file`
+/// is only a workspace-relative filename and never an arbitrary path.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct PendingAmendmentRecord {
+    #[serde(flatten)]
+    pub(crate) amendment: PendingAmendment,
+    pub(crate) queue: String,
+    pub(crate) queue_file: String,
+    pub(crate) content_hash: String,
+}
+
+/// Safe control-plane projection.  It intentionally omits instruction and
+/// source text; those fields may contain sensitive user or repository data.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct PendingAmendmentCliRecord {
+    pub(crate) amendment: PendingAmendment,
+    pub(crate) command_id: String,
+    pub(crate) action: String,
+    pub(crate) task_ref: String,
+    pub(crate) wave: Option<u32>,
+    pub(crate) dependency: Option<String>,
+    pub(crate) queue: String,
+    pub(crate) queue_file: String,
+    pub(crate) content_hash: String,
+    pub(crate) instruction_bytes: usize,
+    pub(crate) source_bytes: usize,
+}
+
+impl From<PendingAmendmentRecord> for PendingAmendmentCliRecord {
+    fn from(record: PendingAmendmentRecord) -> Self {
+        let instruction_bytes = record.amendment.instruction.len();
+        let source_bytes = record.amendment.source.len();
+        let mut amendment = record.amendment;
+        amendment.instruction = format!("[redacted; {instruction_bytes} bytes]");
+        amendment.source = format!("[redacted; {source_bytes} bytes]");
+        Self {
+            command_id: amendment.command_id.clone(),
+            action: amendment.action.clone(),
+            task_ref: amendment.task_ref.clone(),
+            wave: amendment.wave,
+            dependency: amendment.dependency.clone(),
+            queue: record.queue,
+            queue_file: record.queue_file,
+            content_hash: record.content_hash,
+            instruction_bytes,
+            source_bytes,
+            amendment,
+        }
+    }
+}
+
+/// Durable owner-only audit entry emitted when one amendment is rejected.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct AmendmentRejectionRecord {
+    pub(crate) schema: String,
+    pub(crate) actor: String,
+    pub(crate) command_id: String,
+    pub(crate) reason: String,
+    pub(crate) rejected_at: String,
+    pub(crate) content_hash: String,
+    pub(crate) queue: String,
+    pub(crate) queue_file: String,
+    pub(crate) request: PendingAmendment,
+}
+
 fn default_action() -> String {
     "add_branch".to_owned()
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+const REJECTION_SCHEMA: &str = "fractal.amendment.rejection.v1";
+const MAX_COMMAND_ID_BYTES: usize = 128;
+const MAX_SOURCE_BYTES: usize = 256;
+const MAX_REASON_BYTES: usize = 1_024;
+
+fn control_lock_path(workspace: &Path) -> PathBuf {
+    workspace.join(".fractal").join("pending-amendments.lock")
+}
+
+fn claim_marker_path(workspace: &Path) -> PathBuf {
+    workspace.join(".fractal").join("pending-amendments.claim")
+}
+
+fn rejection_path(workspace: &Path) -> PathBuf {
+    workspace.join(".fractal").join("rejected-amendments.jsonl")
+}
+
+fn rejection_transaction_path(workspace: &Path) -> PathBuf {
+    workspace
+        .join(".fractal")
+        .join("pending-amendments.rejection.txn")
+}
+
+fn workspace_fractal_dir(workspace: &Path, create: bool) -> Result<PathBuf> {
+    if let Ok(metadata) = fs::symlink_metadata(workspace) {
+        if metadata.file_type().is_symlink() {
+            bail!("workspace must not be a symlink: {}", workspace.display());
+        }
+        if !metadata.is_dir() {
+            bail!("workspace is not a directory: {}", workspace.display());
+        }
+    } else if create {
+        fs::create_dir_all(workspace)
+            .with_context(|| format!("create workspace {}", workspace.display()))?;
+    }
+    let directory = workspace.join(".fractal");
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!(
+                ".fractal directory must not be a symlink: {}",
+                directory.display()
+            )
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            bail!(".fractal path is not a directory: {}", directory.display())
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound && create => {
+            fs::create_dir(&directory).with_context(|| {
+                format!("create Fractal control directory {}", directory.display())
+            })?;
+            #[cfg(unix)]
+            {
+                let mut permissions = fs::metadata(&directory)?.permissions();
+                use std::os::unix::fs::PermissionsExt;
+                permissions.set_mode(0o700);
+                fs::set_permissions(&directory, permissions)?;
+            }
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", directory.display()))
+        }
+    }
+    Ok(directory)
+}
+
+/// A short-lived create-new lock that serializes queue rewrites and appends.
+/// Existing locks are never stolen: an owner cannot safely determine whether
+/// another process is still in the middle of an atomic queue operation.
+struct QueueControlLock {
+    path: PathBuf,
+}
+
+impl QueueControlLock {
+    fn acquire(workspace: &Path) -> Result<Self> {
+        workspace_fractal_dir(workspace, true)?;
+        let path = control_lock_path(workspace);
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if metadata.file_type().is_symlink() {
+                bail!("amendment control lock must not be a symlink");
+            }
+            bail!("amendment queue is busy; retry after the active operation completes");
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&path)
+            .with_context(|| format!("acquire amendment queue control lock {}", path.display()))?;
+        file.write_all(b"fractal amendment queue control lock\n")?;
+        file.sync_all().ok();
+        Ok(Self { path })
+    }
+}
+
+impl Drop for QueueControlLock {
+    fn drop(&mut self) {
+        // Never unlink a path that has been replaced by a symlink.  A failed
+        // cleanup is deliberately ignored; leaving the lock causes later
+        // operations to fail closed rather than mutating an unknown target.
+        if let Ok(metadata) = fs::symlink_metadata(&self.path) {
+            if !metadata.file_type().is_symlink() {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
+fn assert_owner_only_file(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect owner-only file {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("owner-only file must not be a symlink: {}", path.display());
+    }
+    if !metadata.is_file() {
+        bail!("owner-only path is not a file: {}", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "owner-only file has non-owner permissions: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_regular_or_absent(path: &Path, label: &str) -> Result<Option<Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("{label} must not be a symlink: {}", path.display());
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            bail!("{label} must be a regular file: {}", path.display());
+        }
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("inspect {label} {}", path.display())),
+    }
+}
+
+fn open_append_nofollow(path: &Path, label: &str) -> Result<File> {
+    ensure_regular_or_absent(path, label)?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
+        .open(path)
+        .with_context(|| format!("open {label} {}", path.display()))?;
+    // Re-lstat after open.  The queue control lock prevents cooperating
+    // writers from replacing this path, while this check rejects a symlink
+    // that was already present or introduced by an uncooperating writer.
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("recheck {label} {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("{label} changed to a non-regular file: {}", path.display());
+    }
+    Ok(file)
+}
+
+fn rename_nofollow(source: &Path, destination: &Path, label: &str) -> Result<()> {
+    ensure_regular_or_absent(source, &format!("{label} source"))?
+        .context("rename source disappeared")?;
+    ensure_regular_or_absent(destination, &format!("{label} destination"))?;
+    fs::rename(source, destination)
+        .with_context(|| format!("publish {label} {}", destination.display()))?;
+    ensure_regular_or_absent(destination, &format!("{label} destination"))?;
+    Ok(())
+}
+
+fn remove_nofollow(path: &Path, label: &str) -> Result<()> {
+    let Some(metadata) = ensure_regular_or_absent(path, label)? else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() {
+        bail!("{label} must not be a symlink: {}", path.display());
+    }
+    fs::remove_file(path).with_context(|| format!("remove {label} {}", path.display()))
+}
+
+#[derive(Debug, Deserialize)]
 struct PlannerDocument {
     tasks: Vec<PlannerTask>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 struct PlannerTask {
     id: String,
     title: String,
@@ -64,6 +315,18 @@ pub(crate) struct AppliedAmendment {
     pub(crate) graph_hash: String,
     /// Existing nodes whose structural lifecycle ended in this edit.
     pub(crate) retired_nodes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RejectionTransaction {
+    schema: String,
+    phase: String,
+    queue_file: String,
+    original_content: String,
+    original_content_hash: String,
+    replacement_content: String,
+    replacement_content_hash: String,
+    record: AmendmentRejectionRecord,
 }
 
 fn queue_path(workspace: &Path) -> PathBuf {
@@ -91,6 +354,7 @@ pub(crate) fn queue(
     instruction: &str,
     source: &str,
 ) -> Result<()> {
+    let command_id = command_id.into();
     if !matches!(action, "add_branch" | "add_wave_task" | "add_team_wave") {
         bail!("unsupported graph amendment action `{action}`");
     }
@@ -105,27 +369,21 @@ pub(crate) fn queue(
     if instruction.is_empty() || instruction.len() > 4_000 {
         bail!("amendment instruction must be 1-4000 characters");
     }
+    let request = PendingAmendment {
+        command_id,
+        action: action.to_owned(),
+        task_ref: task_ref.to_owned(),
+        wave,
+        instruction: instruction.to_owned(),
+        source: source.to_owned(),
+        dependency: None,
+    };
+    validate_pending_request(&request)?;
+    let _lock = QueueControlLock::acquire(workspace)?;
+    recover_rejection_transaction_locked(workspace)?;
     let path = queue_path(workspace);
-    fs::create_dir_all(path.parent().expect("amendment queue has parent"))?;
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(&path)
-        .with_context(|| format!("open amendment queue {}", path.display()))?;
-    serde_json::to_writer(
-        &mut file,
-        &PendingAmendment {
-            command_id: command_id.into(),
-            action: action.to_owned(),
-            task_ref: task_ref.to_owned(),
-            wave,
-            instruction: instruction.to_owned(),
-            source: source.to_owned(),
-            dependency: None,
-        },
-    )?;
+    let mut file = open_append_nofollow(&path, "amendment queue")?;
+    serde_json::to_writer(&mut file, &request)?;
     file.write_all(b"\n")?;
     file.sync_data().ok();
     Ok(())
@@ -142,6 +400,7 @@ pub(crate) fn queue_edit(
     instruction: &str,
     source: &str,
 ) -> Result<()> {
+    let command_id = command_id.into();
     if !is_direct_edit(action) {
         bail!("unsupported direct graph edit action `{action}`");
     }
@@ -165,27 +424,30 @@ pub(crate) fn queue_edit(
     if instruction.len() > 4_000 {
         bail!("amendment instruction must be at most 4000 characters");
     }
+    let request = PendingAmendment {
+        command_id,
+        action: action.to_owned(),
+        task_ref: task_ref.to_owned(),
+        wave: None,
+        instruction: instruction.to_owned(),
+        source: source.to_owned(),
+        dependency: dependency.map(|value| value.trim().to_owned()),
+    };
+    // Direct edits allow an empty instruction for cancel/dependency actions,
+    // so validate their shared queue invariants here and the action-specific
+    // target rules above remain authoritative.
+    if !amendment_command_id_is_valid(&request.command_id) {
+        bail!("invalid amendment command_id `{}`", request.command_id);
+    }
+    bounded_nonempty_text(&request.source, MAX_SOURCE_BYTES, "amendment source")?;
+    if request.instruction.chars().any(char::is_control) {
+        bail!("amendment instruction contains control characters");
+    }
+    let _lock = QueueControlLock::acquire(workspace)?;
+    recover_rejection_transaction_locked(workspace)?;
     let path = queue_path(workspace);
-    fs::create_dir_all(path.parent().expect("amendment queue has parent"))?;
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(&path)
-        .with_context(|| format!("open amendment queue {}", path.display()))?;
-    serde_json::to_writer(
-        &mut file,
-        &PendingAmendment {
-            command_id: command_id.into(),
-            action: action.to_owned(),
-            task_ref: task_ref.to_owned(),
-            wave: None,
-            instruction: instruction.to_owned(),
-            source: source.to_owned(),
-            dependency: dependency.map(|value| value.trim().to_owned()),
-        },
-    )?;
+    let mut file = open_append_nofollow(&path, "amendment queue")?;
+    serde_json::to_writer(&mut file, &request)?;
     file.write_all(b"\n")?;
     file.sync_data().ok();
     Ok(())
@@ -214,7 +476,6 @@ pub(crate) fn apply_pending(
 
 /// Apply one actionable amendment and preserve the rest of the claimed batch.
 /// Coordinators use this to return to worker joins between slow planner calls.
-#[allow(dead_code)]
 pub(crate) fn apply_next_pending(
     graph: Value,
     graph_hash: String,
@@ -222,25 +483,6 @@ pub(crate) fn apply_next_pending(
     lead_agent: &str,
 ) -> (Value, String) {
     apply_pending_limit(graph, graph_hash, workspace, lead_agent, 1)
-}
-
-/// Plan several independent architect objectives concurrently, then commit
-/// their graph mutations in queue order. Parallel work is planning-only;
-/// canonical graph writes remain serialized and hash chained.
-pub(crate) fn apply_planning_batch(
-    graph: Value,
-    graph_hash: String,
-    workspace: &Path,
-    lead_agent: &str,
-    planning_lanes: usize,
-) -> (Value, String) {
-    apply_pending_limit(
-        graph,
-        graph_hash,
-        workspace,
-        lead_agent,
-        planning_lanes.clamp(1, 16),
-    )
 }
 
 fn apply_pending_limit(
@@ -266,12 +508,6 @@ fn apply_pending_limit(
     if pending.is_empty() {
         return (graph, graph_hash);
     }
-    preplan_team_waves(
-        &graph,
-        workspace,
-        lead_agent,
-        pending.iter().take(max_actionable),
-    );
     let mut remaining = Vec::new();
     let mut retryable_failures = Vec::new();
     let mut seen = BTreeSet::new();
@@ -417,14 +653,8 @@ fn record_failed(
     retryable: bool,
 ) -> Result<()> {
     let path = failure_path(workspace);
-    fs::create_dir_all(path.parent().expect("amendment failure queue has parent"))?;
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(&path)
-        .with_context(|| format!("open amendment failure queue {}", path.display()))?;
+    workspace_fractal_dir(workspace, true)?;
+    let mut file = open_append_nofollow(&path, "amendment failure queue")?;
     serde_json::to_writer(
         &mut file,
         &json!({
@@ -462,44 +692,823 @@ fn pending_files(workspace: &Path) -> Vec<PathBuf> {
     paths
 }
 
+fn amendment_command_id_is_valid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_COMMAND_ID_BYTES {
+        return false;
+    }
+    if !bytes[0].is_ascii_alphanumeric() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+        && !value.contains("..")
+}
+
+fn bounded_nonempty_text(value: &str, max_bytes: usize, field: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("{field} must not be empty");
+    }
+    if trimmed.len() > max_bytes {
+        bail!("{field} exceeds {max_bytes} bytes");
+    }
+    if trimmed.chars().any(char::is_control) {
+        bail!("{field} contains control characters");
+    }
+    Ok(())
+}
+
+fn validate_pending_request(request: &PendingAmendment) -> Result<()> {
+    if !amendment_command_id_is_valid(&request.command_id) {
+        bail!("invalid amendment command_id `{}`", request.command_id);
+    }
+    if !matches!(
+        request.action.as_str(),
+        "add_branch"
+            | "add_wave_task"
+            | "add_team_wave"
+            | "split_node"
+            | "reroute_node"
+            | "cancel_node"
+            | "add_dependency"
+            | "remove_dependency"
+    ) {
+        bail!("unsupported amendment action `{}`", request.action);
+    }
+    if is_direct_edit(&request.action)
+        && matches!(
+            request.action.as_str(),
+            "cancel_node" | "add_dependency" | "remove_dependency"
+        )
+        && request.instruction.trim().is_empty()
+    {
+        if request.instruction.chars().any(char::is_control) {
+            bail!("amendment instruction contains control characters");
+        }
+    } else {
+        bounded_nonempty_text(&request.instruction, 4_000, "amendment instruction")?;
+    }
+    bounded_nonempty_text(&request.source, MAX_SOURCE_BYTES, "amendment source")?;
+    if request.action == "add_branch" && !valid_task_ref(request.task_ref.trim()) {
+        bail!("branch amendment task_ref must look like 0.1 or 2.3");
+    }
+    if is_wave_action(&request.action) && !matches!(request.wave, Some(1..)) {
+        bail!("wave amendment requires wave 1 or later");
+    }
+    if is_direct_edit(&request.action) {
+        bounded_nonempty_text(&request.task_ref, 120, "direct amendment task_ref")?;
+    }
+    if matches!(
+        request.action.as_str(),
+        "add_dependency" | "remove_dependency"
+    ) {
+        let dependency = request
+            .dependency
+            .as_deref()
+            .context("dependency edit is missing dependency")?;
+        bounded_nonempty_text(dependency, 120, "amendment dependency")?;
+    }
+    if request.action == "reroute_node" {
+        bounded_nonempty_text(&request.instruction, 4_000, "reroute instruction")?;
+    }
+    Ok(())
+}
+
+fn amendment_content_hash(request: &PendingAmendment) -> Result<String> {
+    let value = serde_json::to_value(request).context("serialize amendment for content hash")?;
+    fractal_contracts::canonical_sha256(&value).context("hash amendment content")
+}
+
+#[derive(Clone, Debug)]
+struct QueueFileSnapshot {
+    path: PathBuf,
+    queue: String,
+    queue_file: String,
+    metadata: Metadata,
+}
+
+fn queue_file_snapshots(workspace: &Path) -> Result<Vec<QueueFileSnapshot>> {
+    let directory = workspace_fractal_dir(workspace, false)?;
+    let live = queue_path(workspace);
+    let mut paths = Vec::new();
+    match fs::symlink_metadata(&live) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!(
+                "pending amendment queue must not be a symlink: {}",
+                live.display()
+            )
+        }
+        Ok(metadata) if metadata.is_file() => paths.push((live, "live".to_owned())),
+        Ok(_) => bail!("pending amendment queue path is not a regular file"),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect pending amendment queue"),
+    }
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("read Fractal control directory"),
+    };
+    for entry in entries {
+        let entry = entry.context("read pending amendment queue entry")?;
+        let candidate = entry.path();
+        let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("pending-amendments.processing-") {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&candidate)
+            .with_context(|| format!("inspect pending queue file {}", candidate.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "pending amendment processing queue must not be a symlink: {}",
+                candidate.display()
+            );
+        }
+        if !metadata.is_file() {
+            bail!(
+                "pending amendment processing queue is not a regular file: {}",
+                candidate.display()
+            );
+        }
+        paths.push((candidate, "processing".to_owned()));
+    }
+    paths.sort_by(|left, right| left.0.cmp(&right.0));
+    paths
+        .into_iter()
+        .map(|(path, queue)| {
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("inspect pending queue file {}", path.display()))?;
+            let queue_file = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .context("pending queue filename is not valid UTF-8")?;
+            Ok(QueueFileSnapshot {
+                path,
+                queue,
+                queue_file,
+                metadata,
+            })
+        })
+        .collect()
+}
+
+fn parse_pending_file_strict(snapshot: &QueueFileSnapshot) -> Result<Vec<PendingAmendment>> {
+    let raw = fs::read_to_string(&snapshot.path)
+        .with_context(|| format!("read pending amendment queue {}", snapshot.path.display()))?;
+    parse_pending_content_strict(&raw, &snapshot.queue_file)
+}
+
+fn parse_pending_content_strict(raw: &str, queue_file: &str) -> Result<Vec<PendingAmendment>> {
+    let mut requests = Vec::new();
+    for (line_number, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() {
+            bail!(
+                "pending amendment queue {} has an empty line {}",
+                queue_file,
+                line_number + 1
+            );
+        }
+        let request: PendingAmendment = serde_json::from_str(line).with_context(|| {
+            format!(
+                "invalid pending amendment JSON in {} line {}",
+                queue_file,
+                line_number + 1
+            )
+        })?;
+        validate_pending_request(&request).with_context(|| {
+            format!(
+                "invalid pending amendment in {} line {}",
+                queue_file,
+                line_number + 1
+            )
+        })?;
+        requests.push(request);
+    }
+    Ok(requests)
+}
+
+fn transaction_queue_path(workspace: &Path, queue_file: &str) -> Result<PathBuf> {
+    if queue_file == "pending-amendments.jsonl" {
+        return Ok(queue_path(workspace));
+    }
+    if !queue_file.starts_with("pending-amendments.processing-")
+        || queue_file.len() > MAX_COMMAND_ID_BYTES + 64
+        || queue_file
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
+    {
+        bail!("invalid rejection transaction queue filename `{queue_file}`");
+    }
+    Ok(workspace.join(".fractal").join(queue_file))
+}
+
+fn raw_queue_content_hash(content: &str) -> Result<String> {
+    fractal_contracts::canonical_sha256(&Value::String(content.to_owned()))
+        .context("hash rejection transaction queue content")
+}
+
+fn write_rejection_transaction(workspace: &Path, transaction: &RejectionTransaction) -> Result<()> {
+    let destination = rejection_transaction_path(workspace);
+    ensure_regular_or_absent(&destination, "rejection transaction marker")?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&destination).with_context(|| {
+        format!(
+            "create rejection transaction marker {}",
+            destination.display()
+        )
+    })?;
+    serde_json::to_writer(&mut file, transaction)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    assert_owner_only_file(&destination)
+}
+
+fn update_rejection_transaction(
+    workspace: &Path,
+    transaction: &RejectionTransaction,
+) -> Result<()> {
+    let destination = rejection_transaction_path(workspace);
+    assert_owner_only_file(&destination)?;
+    let temporary = workspace.join(".fractal").join(format!(
+        ".pending-amendments.txn-tmp-{}",
+        std::process::id()
+    ));
+    ensure_regular_or_absent(&temporary, "rejection transaction temporary")?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .with_context(|| format!("stage rejection transaction {}", temporary.display()))?;
+    serde_json::to_writer(&mut file, transaction)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    rename_nofollow(&temporary, &destination, "rejection transaction update")?;
+    assert_owner_only_file(&destination)
+}
+
+fn audit_record_for_command(
+    workspace: &Path,
+    command_id: &str,
+) -> Result<Option<AmendmentRejectionRecord>> {
+    let destination = rejection_path(workspace);
+    let Some(_) = ensure_regular_or_absent(&destination, "rejected amendment audit file")? else {
+        return Ok(None);
+    };
+    assert_owner_only_file(&destination)?;
+    let raw = fs::read(&destination).context("read rejected amendment audit file")?;
+    let text =
+        std::str::from_utf8(&raw).context("rejected amendment audit file is not valid UTF-8")?;
+    let mut found = None;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            bail!("rejected amendment audit file contains an empty line");
+        }
+        let record: AmendmentRejectionRecord =
+            serde_json::from_str(line).context("invalid rejected amendment audit record")?;
+        if !amendment_command_id_is_valid(&record.command_id)
+            || record.schema != REJECTION_SCHEMA
+            || record.actor != "owner"
+        {
+            bail!("invalid rejected amendment audit record identity");
+        }
+        validate_pending_request(&record.request)
+            .context("invalid request in rejected amendment audit record")?;
+        if amendment_content_hash(&record.request)? != record.content_hash {
+            bail!("rejected amendment audit content hash mismatch");
+        }
+        if record.command_id != record.request.command_id {
+            bail!("rejected amendment audit command_id does not match request");
+        }
+        if record.command_id == command_id {
+            if found.is_some() {
+                bail!("duplicate rejected amendment audit command_id `{command_id}`");
+            }
+            found = Some(record);
+        }
+    }
+    Ok(found)
+}
+
+fn stage_queue_replacement(path: &Path, replacement: &str) -> Result<()> {
+    ensure_regular_or_absent(path, "rejection queue destination")?.context("queue disappeared")?;
+    let parent = path.parent().context("queue path has no parent")?;
+    let temporary = parent.join(format!(
+        ".pending-amendments.recover-tmp-{}",
+        std::process::id()
+    ));
+    ensure_regular_or_absent(&temporary, "rejection queue temporary")?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .with_context(|| format!("stage rejection queue {}", temporary.display()))?;
+    file.write_all(replacement.as_bytes())?;
+    file.sync_all()?;
+    rename_nofollow(&temporary, path, "rejection queue replacement")
+}
+
+/// Recover a rejection transaction while the caller holds the queue control
+/// lock.  A prepared marker is completed or left intact with an error; the
+/// audit is never published until the queue replacement is observable.
+fn recover_rejection_transaction_locked(workspace: &Path) -> Result<()> {
+    let marker = rejection_transaction_path(workspace);
+    let Some(_) = ensure_regular_or_absent(&marker, "rejection transaction marker")? else {
+        return Ok(());
+    };
+    assert_owner_only_file(&marker)?;
+    let raw = fs::read(&marker).context("read rejection transaction marker")?;
+    let text = std::str::from_utf8(&raw).context("rejection transaction marker is not UTF-8")?;
+    let transaction: RejectionTransaction =
+        serde_json::from_str(text.trim()).context("invalid rejection transaction marker")?;
+    if transaction.schema != REJECTION_SCHEMA
+        || !matches!(transaction.phase.as_str(), "prepared" | "queue_committed")
+        || transaction.record.schema != REJECTION_SCHEMA
+        || transaction.record.actor != "owner"
+        || transaction.record.command_id != transaction.record.request.command_id
+    {
+        bail!("invalid rejection transaction marker identity");
+    }
+    validate_pending_request(&transaction.record.request)
+        .context("invalid request in rejection transaction marker")?;
+    if amendment_content_hash(&transaction.record.request)? != transaction.record.content_hash {
+        bail!("rejection transaction content hash mismatch");
+    }
+    if raw_queue_content_hash(&transaction.original_content)? != transaction.original_content_hash
+        || raw_queue_content_hash(&transaction.replacement_content)?
+            != transaction.replacement_content_hash
+    {
+        bail!("rejection transaction queue content hash mismatch");
+    }
+    if (transaction.record.queue == "live" && transaction.queue_file != "pending-amendments.jsonl")
+        || (transaction.record.queue == "processing"
+            && !transaction
+                .queue_file
+                .starts_with("pending-amendments.processing-"))
+    {
+        bail!("rejection transaction queue identity mismatch");
+    }
+    let original_requests =
+        parse_pending_content_strict(&transaction.original_content, &transaction.queue_file)?;
+    if original_requests
+        .iter()
+        .filter(|request| request.command_id == transaction.record.command_id)
+        .count()
+        != 1
+    {
+        bail!("rejection transaction original queue does not contain exactly one target");
+    }
+    let replacement_requests =
+        parse_pending_content_strict(&transaction.replacement_content, &transaction.queue_file)
+            .or_else(|error| {
+                if transaction.replacement_content.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            })?;
+    if replacement_requests
+        .iter()
+        .any(|request| request.command_id == transaction.record.command_id)
+    {
+        bail!("rejection transaction replacement still contains target");
+    }
+    let queue = transaction_queue_path(workspace, &transaction.queue_file)?;
+    let Some(_) = ensure_regular_or_absent(&queue, "rejection transaction queue")? else {
+        bail!("rejection transaction queue disappeared; refusing recovery");
+    };
+    let current = fs::read_to_string(&queue).context("read rejection transaction queue")?;
+    if current != transaction.replacement_content {
+        if current != transaction.original_content {
+            bail!("rejection transaction queue content diverged; refusing recovery");
+        }
+        stage_queue_replacement(&queue, &transaction.replacement_content)?;
+    }
+    let mut committed = transaction.clone();
+    committed.phase = "queue_committed".to_owned();
+    if transaction.phase != "queue_committed" || current != transaction.replacement_content {
+        update_rejection_transaction(workspace, &committed)?;
+    }
+    if let Some(existing) = audit_record_for_command(workspace, &committed.record.command_id)? {
+        if existing != committed.record {
+            bail!("rejected amendment audit conflicts with transaction marker");
+        }
+    } else {
+        write_rejection_file_atomically(workspace, &committed.record)?;
+    }
+    remove_nofollow(&marker, "rejection transaction marker")
+}
+
+/// List every valid amendment currently in the live append queue or a
+/// processing queue left by a coordinator claim.  Duplicate command IDs and
+/// any malformed or symlinked queue data are rejected so callers never act on
+/// an ambiguous control-plane view.
+pub(crate) fn list_pending_amendments(workspace: &Path) -> Result<Vec<PendingAmendmentRecord>> {
+    let _lock = QueueControlLock::acquire(workspace)?;
+    recover_rejection_transaction_locked(workspace)?;
+    let snapshots = queue_file_snapshots(workspace)?;
+    let mut records = Vec::new();
+    let mut seen = BTreeSet::new();
+    for snapshot in snapshots {
+        for amendment in parse_pending_file_strict(&snapshot)? {
+            if !seen.insert(amendment.command_id.clone()) {
+                bail!(
+                    "duplicate or ambiguous amendment command_id `{}`",
+                    amendment.command_id
+                );
+            }
+            records.push(PendingAmendmentRecord {
+                content_hash: amendment_content_hash(&amendment)?,
+                amendment,
+                queue: snapshot.queue.clone(),
+                queue_file: snapshot.queue_file.clone(),
+            });
+        }
+    }
+    Ok(records)
+}
+
+/// Compatibility alias used by control-plane callers that prefer the shorter
+/// operation name.
+pub(crate) fn list_pending_redacted(workspace: &Path) -> Result<Vec<PendingAmendmentCliRecord>> {
+    list_pending_amendments(workspace).map(|records| {
+        records
+            .into_iter()
+            .map(PendingAmendmentCliRecord::from)
+            .collect()
+    })
+}
+
+/// Safe default projection for CLI callers.  Use `list_pending_amendments`
+/// only in internal code that needs to apply or verify the full request.
+pub(crate) fn list_pending(workspace: &Path) -> Result<Vec<PendingAmendmentCliRecord>> {
+    list_pending_redacted(workspace)
+}
+
+fn serialize_queue_requests(requests: &[PendingAmendment]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for request in requests {
+        serde_json::to_writer(&mut bytes, request)?;
+        bytes.push(b'\n');
+    }
+    Ok(bytes)
+}
+
+fn queue_snapshot_bytes(snapshot: &QueueFileSnapshot) -> Result<Vec<u8>> {
+    fs::read(&snapshot.path)
+        .with_context(|| format!("read amendment queue {}", snapshot.path.display()))
+}
+
+fn queue_snapshot_still_matches(snapshot: &QueueFileSnapshot, original_bytes: &[u8]) -> Result<()> {
+    let metadata = fs::symlink_metadata(&snapshot.path).with_context(|| {
+        format!(
+            "recheck amendment queue before atomic rewrite {}",
+            snapshot.path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("amendment queue changed to a non-regular file during rejection");
+    }
+    // The byte comparison is the authoritative race check. Metadata catches
+    // the common case without relying on platform-specific inode APIs.
+    if metadata.len() != snapshot.metadata.len()
+        || fs::read(&snapshot.path).context("re-read amendment queue for race check")?
+            != original_bytes
+    {
+        bail!("amendment queue changed during rejection; retry without mutation");
+    }
+    Ok(())
+}
+
+fn write_rejection_file_atomically(
+    workspace: &Path,
+    record: &AmendmentRejectionRecord,
+) -> Result<()> {
+    let destination = rejection_path(workspace);
+    let existing = match fs::symlink_metadata(&destination) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!("rejected amendment audit file must not be a symlink");
+            }
+            if !metadata.is_file() {
+                bail!("rejected amendment audit path is not a regular file");
+            }
+            assert_owner_only_file(&destination)?;
+            fs::read(&destination).context("read rejected amendment audit file")?
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error).context("inspect rejected amendment audit file"),
+    };
+    let existing_text = std::str::from_utf8(&existing)
+        .context("rejected amendment audit file is not valid UTF-8")?;
+    for line in existing_text.lines() {
+        if line.trim().is_empty() {
+            bail!("rejected amendment audit file contains an empty line");
+        }
+        let prior: AmendmentRejectionRecord =
+            serde_json::from_str(line).context("invalid rejected amendment audit record")?;
+        if prior.schema != REJECTION_SCHEMA
+            || prior.actor != "owner"
+            || prior.command_id != prior.request.command_id
+        {
+            bail!("invalid rejected amendment audit record identity");
+        }
+        validate_pending_request(&prior.request)
+            .context("invalid request in rejected amendment audit record")?;
+        if amendment_content_hash(&prior.request)? != prior.content_hash {
+            bail!("rejected amendment audit content hash mismatch");
+        }
+        if prior.command_id == record.command_id {
+            bail!(
+                "amendment command_id `{}` was already rejected",
+                record.command_id
+            );
+        }
+    }
+    let mut bytes = existing;
+    serde_json::to_writer(&mut bytes, record)?;
+    bytes.push(b'\n');
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let temporary = destination
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(
+            ".rejected-amendments.reject-tmp-{}-{nonce}",
+            std::process::id()
+        ));
+    ensure_regular_or_absent(&temporary, "rejected amendment audit temporary")?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .with_context(|| format!("stage rejected amendment audit {}", temporary.display()))?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    rename_nofollow(&temporary, &destination, "rejected amendment audit")?;
+    assert_owner_only_file(&destination)
+}
+
+/// Atomically reject exactly one queued command.  The target may be in the
+/// live queue or a crash-recovery processing queue, but an active coordinator
+/// claim is never rewritten.  All queue files are checked for duplicate IDs,
+/// symlinks, malformed records, and byte-level races before any mutation.
+pub(crate) fn reject_pending_amendment(
+    workspace: &Path,
+    command_id: &str,
+    reason: &str,
+) -> Result<AmendmentRejectionRecord> {
+    if !amendment_command_id_is_valid(command_id) {
+        bail!("invalid amendment command_id `{command_id}`");
+    }
+    bounded_nonempty_text(reason, MAX_REASON_BYTES, "rejection reason")?;
+    let _lock = QueueControlLock::acquire(workspace)?;
+    recover_rejection_transaction_locked(workspace)?;
+    let marker = claim_marker_path(workspace);
+    if let Ok(metadata) = fs::symlink_metadata(&marker) {
+        if metadata.file_type().is_symlink() {
+            bail!("pending amendment claim marker must not be a symlink");
+        }
+        bail!("pending amendment queue is being processed; rejection refused");
+    }
+    let snapshots = queue_file_snapshots(workspace)?;
+    let mut parsed = Vec::new();
+    let mut all_ids = BTreeSet::new();
+    let mut target: Option<(usize, PendingAmendment)> = None;
+    let mut original_bytes = Vec::new();
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        let bytes = queue_snapshot_bytes(snapshot)?;
+        let requests = parse_pending_file_strict(snapshot)?;
+        for request in &requests {
+            if !all_ids.insert(request.command_id.clone()) {
+                bail!(
+                    "duplicate or ambiguous amendment command_id `{}`",
+                    request.command_id
+                );
+            }
+            if request.command_id == command_id {
+                if target.is_some() {
+                    bail!("duplicate or ambiguous amendment command_id `{command_id}`");
+                }
+                target = Some((index, request.clone()));
+            }
+        }
+        original_bytes.push(bytes);
+        parsed.push(requests);
+    }
+    let (target_index, request) = target
+        .with_context(|| format!("pending amendment command_id `{command_id}` was not found"))?;
+    let snapshot = &snapshots[target_index];
+    let content_hash = amendment_content_hash(&request)?;
+    let rejection = AmendmentRejectionRecord {
+        schema: REJECTION_SCHEMA.to_owned(),
+        actor: "owner".to_owned(),
+        command_id: request.command_id.clone(),
+        reason: reason.trim().to_owned(),
+        rejected_at: crate::project_file::project_timestamp(),
+        content_hash,
+        queue: snapshot.queue.clone(),
+        queue_file: snapshot.queue_file.clone(),
+        request,
+    };
+    let mut rewritten = parsed[target_index].clone();
+    rewritten.retain(|candidate| candidate.command_id != command_id);
+    let replacement = serialize_queue_requests(&rewritten)?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let temporary = snapshot
+        .path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(
+            ".pending-amendments.reject-tmp-{}-{nonce}",
+            std::process::id()
+        ));
+    ensure_regular_or_absent(&temporary, "staged amendment queue rewrite")?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut staged = options
+        .open(&temporary)
+        .with_context(|| format!("stage amendment queue rewrite {}", temporary.display()))?;
+    staged.write_all(&replacement)?;
+    staged.sync_all()?;
+    // Ensure that neither the target nor an unrelated queue gained an entry
+    // after our snapshot.  This preserves concurrent writes by refusing the
+    // operation rather than silently dropping them.
+    for (index, current) in queue_file_snapshots(workspace)?.iter().enumerate() {
+        let Some(snapshot_at_start) = snapshots.get(index) else {
+            let _ = remove_nofollow(&temporary, "staged amendment queue rewrite");
+            bail!("amendment queue changed during rejection; retry without mutation");
+        };
+        if current.queue_file != snapshot_at_start.queue_file {
+            let _ = remove_nofollow(&temporary, "staged amendment queue rewrite");
+            bail!("amendment queue changed during rejection; retry without mutation");
+        }
+        if let Err(error) = queue_snapshot_still_matches(current, &original_bytes[index]) {
+            let _ = remove_nofollow(&temporary, "staged amendment queue rewrite");
+            return Err(error);
+        }
+    }
+    if queue_file_snapshots(workspace)?.len() != snapshots.len() {
+        let _ = remove_nofollow(&temporary, "staged amendment queue rewrite");
+        bail!("amendment queue changed during rejection; retry without mutation");
+    }
+    if let Err(error) = queue_snapshot_still_matches(snapshot, &original_bytes[target_index]) {
+        let _ = remove_nofollow(&temporary, "staged amendment queue rewrite");
+        return Err(error);
+    }
+    if let Some(existing) = audit_record_for_command(workspace, command_id)? {
+        if existing.request != rejection.request || existing.content_hash != rejection.content_hash
+        {
+            remove_nofollow(&temporary, "staged amendment queue rewrite").ok();
+            bail!("rejected amendment audit conflicts with queued request");
+        }
+        // The request was durably rejected before, but an identical request
+        // may have been requeued by a producer.  The queue snapshot and race
+        // checks above still protect this atomic removal; because the audit
+        // already exists, do not append a duplicate record or create a
+        // recovery transaction for it.
+        if let Err(error) = queue_snapshot_still_matches(snapshot, &original_bytes[target_index]) {
+            remove_nofollow(&temporary, "staged amendment queue rewrite").ok();
+            return Err(error);
+        }
+        rename_nofollow(&temporary, &snapshot.path, "amendment queue rejection")?;
+        return Ok(existing);
+    }
+    let original_content = String::from_utf8(original_bytes[target_index].clone())
+        .context("pending amendment queue is not valid UTF-8")?;
+    let replacement_content = String::from_utf8(replacement)
+        .context("staged amendment replacement is not valid UTF-8")?;
+    let transaction = RejectionTransaction {
+        schema: REJECTION_SCHEMA.to_owned(),
+        phase: "prepared".to_owned(),
+        queue_file: snapshot.queue_file.clone(),
+        original_content_hash: raw_queue_content_hash(&original_content)?,
+        replacement_content_hash: raw_queue_content_hash(&replacement_content)?,
+        original_content,
+        replacement_content,
+        record: rejection.clone(),
+    };
+    write_rejection_transaction(workspace, &transaction)?;
+    if let Err(error) = queue_snapshot_still_matches(snapshot, &original_bytes[target_index]) {
+        remove_nofollow(
+            &rejection_transaction_path(workspace),
+            "rejection transaction marker",
+        )
+        .ok();
+        remove_nofollow(&temporary, "staged amendment queue rewrite").ok();
+        return Err(error);
+    }
+    rename_nofollow(&temporary, &snapshot.path, "amendment queue rejection")?;
+    let mut committed = transaction;
+    committed.phase = "queue_committed".to_owned();
+    update_rejection_transaction(workspace, &committed)?;
+    // If this append/replace fails after the queue commit, the durable
+    // transaction marker remains and the next control-plane operation
+    // publishes the audit record before proceeding.
+    write_rejection_file_atomically(workspace, &committed.record)?;
+    remove_nofollow(
+        &rejection_transaction_path(workspace),
+        "rejection transaction marker",
+    )?;
+    Ok(rejection)
+}
+
+/// Compatibility alias for command handlers.
+#[allow(dead_code)]
+pub(crate) fn reject_pending(
+    workspace: &Path,
+    command_id: &str,
+    reason: &str,
+) -> Result<AmendmentRejectionRecord> {
+    reject_pending_amendment(workspace, command_id, reason)
+}
+
 /// Atomically moves the live append queue aside before reading it. New
 /// amendments can then append to a fresh queue while a slow planner runs;
 /// finishing this claim must never rewrite or delete those concurrent writes.
 fn claim_pending(workspace: &Path) -> Result<(Vec<PendingAmendment>, Vec<PathBuf>)> {
+    let _lock = QueueControlLock::acquire(workspace)?;
+    recover_rejection_transaction_locked(workspace)?;
+    let marker = claim_marker_path(workspace);
+    if let Ok(metadata) = fs::symlink_metadata(&marker) {
+        if metadata.file_type().is_symlink() {
+            bail!("pending amendment claim marker must not be a symlink");
+        }
+        bail!("pending amendment queue is already claimed by a coordinator");
+    }
     let mut requests = Vec::new();
     let path = queue_path(workspace);
-    fs::create_dir_all(path.parent().expect("amendment queue has parent"))?;
-    if path.is_file() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
-        let processing = path.with_extension(format!("processing-{}-{nonce}", std::process::id()));
-        fs::rename(&path, &processing).with_context(|| {
-            format!(
-                "claim amendment queue {} as {}",
-                path.display(),
-                processing.display()
-            )
-        })?;
+    workspace_fractal_dir(workspace, true)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("pending amendment queue must not be a symlink");
+        }
+        Ok(metadata) if metadata.is_file() => {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos());
+            let processing =
+                path.with_extension(format!("processing-{}-{nonce}", std::process::id()));
+            if ensure_regular_or_absent(&processing, "amendment processing queue")?.is_some() {
+                bail!("amendment processing queue destination already exists");
+            }
+            rename_nofollow(&path, &processing, "claim amendment queue")?;
+        }
+        Ok(_) => bail!("pending amendment queue path is not a regular file"),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect pending amendment queue"),
     }
-    let claimed = pending_files(workspace)
-        .into_iter()
-        .filter(|candidate| candidate != &path)
-        .collect::<Vec<_>>();
-    for claimed_path in &claimed {
-        read_pending_file(claimed_path, &mut requests);
+    let claimed_snapshots = queue_file_snapshots(workspace)?;
+    let mut seen = BTreeSet::new();
+    let mut claimed = Vec::with_capacity(claimed_snapshots.len());
+    for snapshot in &claimed_snapshots {
+        let file_requests = parse_pending_file_strict(snapshot)?;
+        for request in file_requests {
+            if !seen.insert(request.command_id.clone()) {
+                bail!(
+                    "duplicate or ambiguous amendment command_id `{}`",
+                    request.command_id
+                );
+            }
+            requests.push(request);
+        }
+        claimed.push(snapshot.path.clone());
     }
+    ensure_regular_or_absent(&marker, "pending amendment claim marker")?;
+    let mut marker_options = OpenOptions::new();
+    marker_options.write(true).create_new(true);
+    #[cfg(unix)]
+    marker_options.mode(0o600);
+    let mut marker_file = marker_options
+        .open(&marker)
+        .with_context(|| format!("create amendment claim marker {}", marker.display()))?;
+    serde_json::to_writer(
+        &mut marker_file,
+        &json!({
+            "pid": std::process::id(),
+            "claimed": claimed.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+        }),
+    )?;
+    marker_file.write_all(b"\n")?;
+    marker_file.sync_all().ok();
     Ok((requests, claimed))
-}
-
-fn read_pending_file(path: &Path, requests: &mut Vec<PendingAmendment>) {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return;
-    };
-    requests.extend(
-        raw.lines()
-            .filter_map(|line| serde_json::from_str::<PendingAmendment>(line).ok()),
-    );
 }
 
 fn finish_claim(
@@ -507,16 +1516,23 @@ fn finish_claim(
     claimed_files: &[PathBuf],
     requests: &[PendingAmendment],
 ) -> Result<()> {
+    let _lock = QueueControlLock::acquire(workspace)?;
+    recover_rejection_transaction_locked(workspace)?;
     let path = queue_path(workspace);
-    fs::create_dir_all(path.parent().expect("amendment queue has parent"))?;
+    workspace_fractal_dir(workspace, true)?;
+    ensure_regular_or_absent(&path, "requeue amendment queue")?;
     if !requests.is_empty() {
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options
-            .open(&path)
-            .with_context(|| format!("requeue amendments in {}", path.display()))?;
+        let mut seen = BTreeSet::new();
+        for request in requests {
+            validate_pending_request(request)?;
+            if !seen.insert(request.command_id.clone()) {
+                bail!(
+                    "duplicate or ambiguous requeued amendment command_id `{}`",
+                    request.command_id
+                );
+            }
+        }
+        let mut file = open_append_nofollow(&path, "requeue amendment queue")?;
         for request in requests {
             serde_json::to_writer(&mut file, request)?;
             file.write_all(b"\n")?;
@@ -524,7 +1540,17 @@ fn finish_claim(
         file.sync_data().ok();
     }
     for claimed in claimed_files {
-        let _ = fs::remove_file(claimed);
+        remove_nofollow(claimed, "claimed amendment queue")?;
+    }
+    let marker = claim_marker_path(workspace);
+    if let Ok(metadata) = fs::symlink_metadata(&marker) {
+        if metadata.file_type().is_symlink() {
+            bail!("pending amendment claim marker must not be a symlink");
+        }
+        if !metadata.is_file() {
+            bail!("pending amendment claim marker is not a regular file");
+        }
+        remove_nofollow(&marker, "pending amendment claim marker")?;
     }
     Ok(())
 }
@@ -568,158 +1594,6 @@ fn mark_amendment_applied(graph: &mut Value, command_id: &str) {
     }
 }
 
-fn preplan_team_waves<'a>(
-    graph: &Value,
-    workspace: &Path,
-    lead_agent: &str,
-    requests: impl Iterator<Item = &'a PendingAmendment>,
-) {
-    let requests = requests
-        .filter(|request| request.action == "add_team_wave")
-        .filter(|request| {
-            request
-                .wave
-                .is_some_and(|wave| resolve_wave_flow(graph, wave).is_ok())
-        })
-        .take(planning_lane_limit())
-        .cloned()
-        .collect::<Vec<_>>();
-    if requests.len() < 2 {
-        return;
-    }
-    println!(
-        "  ✦ [{}] planning {} specialist objectives across parallel lanes…",
-        lead_agent,
-        requests.len()
-    );
-    let wall_started = Instant::now();
-    let durations = thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(requests.len());
-        for request in requests {
-            handles.push((
-                request.command_id.clone(),
-                scope.spawn(move || {
-                    let started = Instant::now();
-                    let result = preplan_team_wave(workspace, lead_agent, &request);
-                    (result, started.elapsed().as_millis() as u64)
-                }),
-            ));
-        }
-        let mut durations = Vec::with_capacity(handles.len());
-        for (command_id, handle) in handles {
-            match handle.join() {
-                Ok((Ok(()), elapsed_ms)) => durations.push(elapsed_ms),
-                Ok((Err(error), elapsed_ms)) => {
-                    durations.push(elapsed_ms);
-                    eprintln!(
-                        "  parallel planning note: {command_id} will retry serially: {error:#}"
-                    );
-                }
-                Err(_) => eprintln!(
-                    "  parallel planning note: {command_id} planner panicked and will retry serially"
-                ),
-            }
-        }
-        durations
-    });
-    let parallel_wall_ms = wall_started.elapsed().as_millis() as u64;
-    let serial_equivalent_ms = durations.iter().sum::<u64>();
-    let speedup = if parallel_wall_ms == 0 {
-        0.0
-    } else {
-        serial_equivalent_ms as f64 / parallel_wall_ms as f64
-    };
-    let metrics = json!({
-        "schema": "fractal.planning_metrics.v1",
-        "measured_at_ms": now_epoch_ms(),
-        "planning_lanes": durations.len(),
-        "serial_equivalent_ms": serial_equivalent_ms,
-        "parallel_wall_ms": parallel_wall_ms,
-        "measured_speedup_x": speedup,
-    });
-    if let Err(error) = fs::write(
-        workspace.join(".fractal").join("planning-metrics.json"),
-        serde_json::to_vec_pretty(&metrics).unwrap_or_default(),
-    ) {
-        eprintln!("  parallel planning metrics note: {error}");
-    }
-}
-
-fn now_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn planning_lane_limit() -> usize {
-    std::env::var("FRACTAL_PLANNING_LANES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(4)
-        .clamp(1, 16)
-}
-
-fn preplan_team_wave(workspace: &Path, lead_agent: &str, request: &PendingAmendment) -> Result<()> {
-    let output_path = planner_output_path(workspace, &request.command_id)?;
-    fs::remove_file(&output_path).ok();
-    let prompt = format!(
-        "You are a specialist sub-planner operating as one parallel planning lane for wave {wave}. \
-         Your master architect assigned this single coherent objective:\n\n{instruction}\n\nWrite only \
-         `{output}` using the standard amendment task schema. Produce exactly five independent, \
-         artifact-disjoint implementation or verification tasks for this objective. Every task \
-         must include bounded efficiency metadata, a concrete owned path, measurable acceptance \
-         behavior, and empty `depends_on` plus empty `efficiency.dependencies`; the controller \
-         resolves canonical wave dependencies. These tasks belong to one leader and five workers. \
-         Do not broaden into another objective, join collaboration sessions, start receive loops, \
-         edit product files, or create branches. Bound reconnaissance to twelve read-only commands.",
-        wave = request.wave.unwrap_or_default(),
-        instruction = request.instruction,
-        output = output_path.display(),
-    );
-    let timeout = std::env::var("FRACTAL_AGENT_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(900_000);
-    let run = crate::execute::run_lead_agent_prompt(lead_agent, &prompt, workspace, timeout)
-        .with_context(|| format!("launch parallel sub-planner `{lead_agent}`"))?;
-    if !run.ok {
-        fs::remove_file(&output_path).ok();
-        bail!(
-            "lead planner {}",
-            if run.timed_out { "timed out" } else { "failed" }
-        );
-    }
-    let document = read_planner_document(&output_path, &request.action);
-    if document.is_err() {
-        fs::remove_file(&output_path).ok();
-    }
-    let document = document?;
-    fs::write(&output_path, serde_json::to_vec(&document)?)?;
-    Ok(())
-}
-
-fn planner_output_path(workspace: &Path, command_id: &str) -> Result<PathBuf> {
-    let output_directory = workspace.join(".fractal").join("planner-output");
-    fs::create_dir_all(&output_directory)?;
-    let digest = Sha256::digest(command_id.as_bytes());
-    let suffix = digest[..6]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Ok(output_directory.join(format!("{}-{suffix}.json", sanitize_id(command_id))))
-}
-
-fn read_planner_document(output_path: &Path, action: &str) -> Result<PlannerDocument> {
-    let raw = fs::read_to_string(output_path)
-        .with_context(|| format!("lead planner did not write {}", output_path.display()))?;
-    let mut document: PlannerDocument =
-        serde_json::from_str(&raw).context("lead planner wrote invalid amendment JSON")?;
-    normalize_planner_metadata(&mut document.tasks);
-    validate_tasks(&document.tasks, action)?;
-    Ok(document)
-}
-
 fn apply_one(
     graph: &Value,
     parent_hash: &str,
@@ -741,14 +1615,13 @@ fn apply_one(
             .with_context(|| format!("task {} is not in the current graph", request.task_ref))?;
         (Some(anchor), Vec::new(), Vec::new())
     };
-    let output_path = planner_output_path(workspace, &request.command_id)?;
-    let output_ready = output_path.is_file();
-    let output = output_path.display();
+    let output_path = workspace.join(".fractal").join("fractal-amendment.json");
+    fs::remove_file(&output_path).ok();
     let prompt = if request.action == "add_team_wave" {
         format!(
             "You are the master architect forming one specialist team mission in wave {wave}. \
              The mission request is:\n\n{instruction}\n\nWrite only \
-             `{output}` using the standard amendment task schema. \
+             `.fractal/fractal-amendment.json` using the standard amendment task schema. \
              Produce exactly five independent, artifact-disjoint implementation or verification \
              tasks for one coherent specialization. Every task must include bounded efficiency \
              metadata, a concrete owned path, measurable acceptance behavior, and empty \
@@ -762,13 +1635,12 @@ fn apply_one(
              bearer, or token=. Do not edit product files or create branches now.",
             wave = request.wave.unwrap_or_default(),
             instruction = request.instruction,
-            output = output,
         )
     } else if request.action == "add_wave_task" {
         format!(
             "You are the lead planner adding one peer task to wave {wave} of a live execution \
              graph. The user requested:\n\n{instruction}\n\nWrite only \
-             `{output}` as \
+             `.fractal/fractal-amendment.json` as \
              {{\"tasks\":[{{\"id\":\"short_id\",\"title\":\"...\",\"capability\":\"code.generate\",\
              \"instruction\":\"concrete standalone implementation instruction with files and \
              acceptance behavior\",\"depends_on\":[],\"efficiency\":{{\
@@ -787,13 +1659,12 @@ fn apply_one(
              not edit product files now.",
             wave = request.wave.unwrap_or_default(),
             instruction = request.instruction,
-            output = output,
         )
     } else {
         format!(
             "You are the lead planner amending a live execution graph. The user requested a \
              complete new build branch from task {task_ref} (internal node `{anchor}`):\n\n\
-             {instruction}\n\nWrite only `{output}`. It must be JSON shaped \
+             {instruction}\n\nWrite only `.fractal/fractal-amendment.json`. It must be JSON shaped \
              as {{\"tasks\":[{{\"id\":\"short_id\",\"title\":\"...\",\
              \"capability\":\"code.generate\",\"instruction\":\"concrete standalone implementation \
              instruction with files and acceptance behavior\",\"depends_on\":[\"anchor\"],\
@@ -811,28 +1682,26 @@ fn apply_one(
             task_ref = request.task_ref,
             anchor = anchor.as_deref().unwrap_or_default(),
             instruction = request.instruction,
-            output = output,
         )
     };
     let timeout = std::env::var("FRACTAL_AGENT_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(900_000);
-    if !output_ready {
-        let run = crate::execute::run_lead_agent_prompt(lead_agent, &prompt, workspace, timeout)
-            .with_context(|| format!("launch lead planner `{lead_agent}`"))?;
-        if !run.ok {
-            bail!(
-                "lead planner {}",
-                if run.timed_out { "timed out" } else { "failed" }
-            );
-        }
+    let run = crate::execute::run_lead_agent_prompt(lead_agent, &prompt, workspace, timeout)
+        .with_context(|| format!("launch lead planner `{lead_agent}`"))?;
+    if !run.ok {
+        bail!(
+            "lead planner {}",
+            if run.timed_out { "timed out" } else { "failed" }
+        );
     }
-    let document = read_planner_document(&output_path, &request.action);
-    if document.is_err() {
-        fs::remove_file(&output_path).ok();
-    }
-    let document = document?;
+    let raw = fs::read_to_string(&output_path)
+        .context("lead planner did not write .fractal/fractal-amendment.json")?;
+    let mut document: PlannerDocument =
+        serde_json::from_str(&raw).context("lead planner wrote invalid amendment JSON")?;
+    normalize_planner_metadata(&mut document.tasks);
+    validate_tasks(&document.tasks, &request.action)?;
 
     let (mut harness, work, target) = crate::graph_store::load_source(parent_hash)
         .context("current graph has no recompilable source genome")?;
@@ -907,20 +1776,6 @@ fn apply_one(
 
     let mut child =
         crate::compile::recompile(&work, &harness, &target).context("compile planner amendment")?;
-    if let Some(existing) = graph.get("architect_team_objectives") {
-        child["architect_team_objectives"] = existing.clone();
-    }
-    if request.action == "add_team_wave" {
-        let objectives = child
-            .as_object_mut()
-            .context("compiled graph must be an object")?
-            .entry("architect_team_objectives")
-            .or_insert_with(|| json!({}));
-        objectives
-            .as_object_mut()
-            .context("architect team objectives must be an object")?
-            .insert(request.command_id.clone(), json!(request.instruction));
-    }
     child["parent_graph"] = json!(parent_hash);
     child["evolution_arm"] = json!("user_branch");
     for applied in graph
@@ -936,7 +1791,6 @@ fn apply_one(
     crate::graph_store::rehash_graph(&mut child)?;
     let record = crate::graph_store::commit_graph(&child)?;
     crate::graph_store::persist_source(&record.graph_hash, &harness, &work, &target).ok();
-    fs::remove_file(&output_path).ok();
     Ok(AppliedAmendment {
         command_id: request.command_id.clone(),
         graph: child,
@@ -1790,7 +2644,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_amendment_queue_is_crash_safe_and_exactly_once_by_command_id() {
+    fn duplicate_amendment_ids_fail_closed_without_deleting_processing_queue() {
         let workspace = temp_workspace("amend-exactly-once");
         let graph = editable_graph();
         crate::graph_store::commit_graph(&graph).unwrap();
@@ -1818,17 +2672,10 @@ mod tests {
         .unwrap();
 
         let previous = graph["graph_hash"].as_str().unwrap().to_owned();
-        let (first_graph, first_hash) = apply_pending(graph, previous, &workspace, "lead");
-        assert!(
-            first_graph["applied_amendment_command_ids"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|value| value.as_str() == Some(command_id))
-                .count()
-                == 1
-        );
-        assert!(!has_pending(&workspace));
+        let (first_graph, first_hash) = apply_pending(graph, previous.clone(), &workspace, "lead");
+        assert_eq!(first_hash, previous);
+        assert!(has_pending(&workspace));
+        assert!(list_pending_amendments(&workspace).is_err());
         let applied_nodes = first_graph["nodes"].as_array().unwrap().len();
 
         let (second_graph, second_hash) =
@@ -1838,15 +2685,7 @@ mod tests {
             second_graph["nodes"].as_array().unwrap().len(),
             applied_nodes
         );
-        assert_eq!(
-            second_graph["applied_amendment_command_ids"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|value| value.as_str() == Some(command_id))
-                .count(),
-            1
-        );
+        assert!(has_pending(&workspace));
         std::fs::remove_dir_all(workspace).unwrap();
     }
 
@@ -2378,17 +3217,6 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_planner_outputs_are_command_scoped_and_collision_resistant() {
-        let workspace = temp_workspace("planner-output-paths");
-        let first = planner_output_path(&workspace, "architect-team-0001").unwrap();
-        let second = planner_output_path(&workspace, "architect_team_0001").unwrap();
-        assert_ne!(first, second);
-        assert_eq!(first.parent(), second.parent());
-        assert!(first.starts_with(workspace.join(".fractal/planner-output")));
-        std::fs::remove_dir_all(workspace).ok();
-    }
-
-    #[test]
     fn planner_metadata_is_bounded_before_contract_validation() {
         let unicode = "é".repeat(crate::efficiency::MAX_BASIS_BYTES);
         let mut meta = baseline_node_efficiency(5_000, Vec::new(), &unicode, vec![], &unicode);
@@ -2544,6 +3372,307 @@ mod tests {
             harness["edges"][0],
             json!({"from": "build", "to": "branch.cmd.impl", "condition": "success"})
         );
+    }
+
+    fn control_request(command_id: &str, instruction: &str) -> PendingAmendment {
+        PendingAmendment {
+            command_id: command_id.to_owned(),
+            action: "reroute_node".to_owned(),
+            task_ref: "build".to_owned(),
+            wave: None,
+            instruction: instruction.to_owned(),
+            source: "control-test".to_owned(),
+            dependency: None,
+        }
+    }
+
+    #[test]
+    fn control_listing_reads_live_and_processing_queues_with_hashes() {
+        let workspace = temp_workspace("control-list");
+        queue_edit(
+            &workspace,
+            "live-control",
+            "reroute_node",
+            "build",
+            None,
+            "live route",
+            "control-test",
+        )
+        .unwrap();
+        let processing =
+            queue_path(&workspace).with_extension(format!("processing-{}", std::process::id()));
+        let request = control_request("processing-control", "processing route");
+        let mut bytes = Vec::new();
+        serde_json::to_writer(&mut bytes, &request).unwrap();
+        bytes.push(b'\n');
+        fs::write(&processing, bytes).unwrap();
+
+        let records = list_pending_amendments(&workspace).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].queue, "live");
+        assert_eq!(records[1].queue, "processing");
+        assert!(records.iter().all(|record| {
+            record.content_hash.starts_with("sha256:") && record.content_hash.len() == 71
+        }));
+        assert!(records
+            .iter()
+            .any(|record| record.amendment.command_id == "processing-control"));
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn control_rejection_removes_exactly_one_and_preserves_unmatched_entries() {
+        let workspace = temp_workspace("control-reject");
+        for (id, instruction) in [
+            ("keep-before", "before"),
+            ("reject-me", "remove"),
+            ("keep-after", "after"),
+        ] {
+            queue_edit(
+                &workspace,
+                id,
+                "reroute_node",
+                "build",
+                None,
+                instruction,
+                "control-test",
+            )
+            .unwrap();
+        }
+        let rejection = reject_pending_amendment(&workspace, "reject-me", "stale request")
+            .expect("one amendment is rejected");
+        assert_eq!(rejection.schema, REJECTION_SCHEMA);
+        assert_eq!(rejection.actor, "owner");
+        assert_eq!(rejection.command_id, "reject-me");
+        assert_eq!(rejection.reason, "stale request");
+        assert_eq!(rejection.queue, "live");
+        assert!(rejection.content_hash.starts_with("sha256:"));
+
+        let remaining = list_pending_amendments(&workspace).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().all(|record| {
+            record.amendment.command_id == "keep-before"
+                || record.amendment.command_id == "keep-after"
+        }));
+        let audit = rejection_path(&workspace);
+        assert_owner_only_file(&audit).unwrap();
+        let encoded: AmendmentRejectionRecord =
+            serde_json::from_str(fs::read_to_string(audit).unwrap().trim()).unwrap();
+        assert_eq!(encoded, rejection);
+        assert!(reject_pending_amendment(&workspace, "reject-me", "again").is_err());
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn control_rejection_cleans_up_an_identical_requeued_request_idempotently() {
+        let workspace = temp_workspace("control-reject-requeue");
+        queue_edit(
+            &workspace,
+            "requeue-me",
+            "reroute_node",
+            "build",
+            None,
+            "same route",
+            "control-test",
+        )
+        .unwrap();
+        let first = reject_pending_amendment(&workspace, "requeue-me", "stale request")
+            .expect("initial rejection succeeds");
+
+        // Requeue the byte-identical request after its durable audit exists.
+        // The second rejection must remove this target without publishing a
+        // second audit record.
+        queue_edit(
+            &workspace,
+            "requeue-me",
+            "reroute_node",
+            "build",
+            None,
+            "same route",
+            "control-test",
+        )
+        .unwrap();
+        let second = reject_pending_amendment(&workspace, "requeue-me", "retry request")
+            .expect("identical requeued request is cleaned up");
+        assert_eq!(second, first);
+        assert!(list_pending_amendments(&workspace).unwrap().is_empty());
+
+        let audit_lines = fs::read_to_string(rejection_path(&workspace))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(audit_lines, 1);
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn control_rejection_supports_stale_processing_queue() {
+        let workspace = temp_workspace("control-reject-processing");
+        let processing =
+            queue_path(&workspace).with_extension(format!("processing-{}", std::process::id()));
+        fs::create_dir_all(processing.parent().unwrap()).unwrap();
+        let request = control_request("processing-reject", "stale processing route");
+        let mut bytes = Vec::new();
+        serde_json::to_writer(&mut bytes, &request).unwrap();
+        bytes.push(b'\n');
+        fs::write(&processing, bytes).unwrap();
+        let rejection = reject_pending(&workspace, "processing-reject", "stale claim")
+            .expect("stale processing amendment is rejected");
+        assert_eq!(rejection.queue, "processing");
+        assert!(list_pending(&workspace).unwrap().is_empty());
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn control_reject_fails_closed_for_duplicates_invalid_input_and_busy_queue() {
+        let workspace = temp_workspace("control-reject-guards");
+        let request = control_request("duplicate-control", "duplicate");
+        let queue = queue_path(&workspace);
+        fs::create_dir_all(queue.parent().unwrap()).unwrap();
+        let mut bytes = Vec::new();
+        serde_json::to_writer(&mut bytes, &request).unwrap();
+        bytes.push(b'\n');
+        fs::write(&queue, &bytes).unwrap();
+        let processing = queue.with_extension(format!("processing-{}", std::process::id()));
+        fs::write(&processing, bytes).unwrap();
+        assert!(list_pending(&workspace).is_err());
+        assert!(reject_pending(&workspace, "duplicate-control", "ambiguous").is_err());
+        assert!(reject_pending(&workspace, "../unsafe", "reason").is_err());
+        assert!(reject_pending(&workspace, "duplicate-control", "\n").is_err());
+
+        fs::remove_file(processing).unwrap();
+        let marker = claim_marker_path(&workspace);
+        fs::write(&marker, b"active\n").unwrap();
+        assert!(reject_pending(&workspace, "duplicate-control", "active claim").is_err());
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn claim_fails_closed_on_malformed_processing_without_deleting_it() {
+        let workspace = temp_workspace("claim-malformed");
+        let graph = editable_graph();
+        crate::graph_store::commit_graph(&graph).unwrap();
+        crate::project_file::persist(&workspace, &graph, "Malformed claim").unwrap();
+        let processing =
+            queue_path(&workspace).with_extension(format!("processing-{}", std::process::id()));
+        fs::create_dir_all(processing.parent().unwrap()).unwrap();
+        fs::write(&processing, b"{not-json}\n").unwrap();
+        let before = graph["graph_hash"].as_str().unwrap().to_owned();
+        let (unchanged, hash) = apply_pending(graph, before.clone(), &workspace, "lead");
+        assert_eq!(hash, before);
+        assert_eq!(unchanged["graph_hash"], before);
+        assert!(processing.exists());
+        assert!(list_pending_amendments(&workspace).is_err());
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn prepared_rejection_transaction_recovers_queue_then_audit() {
+        let workspace = temp_workspace("rejection-recovery");
+        let request = control_request("recover-me", "recoverable route");
+        let mut original = Vec::new();
+        serde_json::to_writer(&mut original, &request).unwrap();
+        original.push(b'\n');
+        let queue = queue_path(&workspace);
+        fs::create_dir_all(queue.parent().unwrap()).unwrap();
+        fs::write(&queue, &original).unwrap();
+        let record = AmendmentRejectionRecord {
+            schema: REJECTION_SCHEMA.to_owned(),
+            actor: "owner".to_owned(),
+            command_id: request.command_id.clone(),
+            reason: "recover after crash".to_owned(),
+            rejected_at: crate::project_file::project_timestamp(),
+            content_hash: amendment_content_hash(&request).unwrap(),
+            queue: "live".to_owned(),
+            queue_file: "pending-amendments.jsonl".to_owned(),
+            request,
+        };
+        let original_content = String::from_utf8(original).unwrap();
+        let transaction = RejectionTransaction {
+            schema: REJECTION_SCHEMA.to_owned(),
+            phase: "prepared".to_owned(),
+            queue_file: "pending-amendments.jsonl".to_owned(),
+            original_content_hash: raw_queue_content_hash(&original_content).unwrap(),
+            original_content,
+            replacement_content: String::new(),
+            replacement_content_hash: raw_queue_content_hash("").unwrap(),
+            record,
+        };
+        write_rejection_transaction(&workspace, &transaction).unwrap();
+        assert!(list_pending_amendments(&workspace).unwrap().is_empty());
+        assert!(!rejection_transaction_path(&workspace).exists());
+        let audit = audit_record_for_command(&workspace, "recover-me")
+            .unwrap()
+            .expect("recovery publishes audit");
+        assert_eq!(audit.reason, "recover after crash");
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn listing_fails_closed_on_tampered_rejection_transaction_marker() {
+        let workspace = temp_workspace("rejection-tamper");
+        let request = control_request("tampered-marker", "must remain queued");
+        let mut original = Vec::new();
+        serde_json::to_writer(&mut original, &request).unwrap();
+        original.push(b'\n');
+        let original_content = String::from_utf8(original).unwrap();
+        let queue = queue_path(&workspace);
+        fs::create_dir_all(queue.parent().unwrap()).unwrap();
+        fs::write(&queue, &original_content).unwrap();
+        let record = AmendmentRejectionRecord {
+            schema: REJECTION_SCHEMA.to_owned(),
+            actor: "owner".to_owned(),
+            command_id: request.command_id.clone(),
+            reason: "tamper test".to_owned(),
+            rejected_at: crate::project_file::project_timestamp(),
+            content_hash: amendment_content_hash(&request).unwrap(),
+            queue: "live".to_owned(),
+            queue_file: "pending-amendments.jsonl".to_owned(),
+            request,
+        };
+        let transaction = RejectionTransaction {
+            schema: REJECTION_SCHEMA.to_owned(),
+            phase: "prepared".to_owned(),
+            queue_file: "pending-amendments.jsonl".to_owned(),
+            original_content_hash: "sha256:tampered".to_owned(),
+            original_content,
+            replacement_content: String::new(),
+            replacement_content_hash: raw_queue_content_hash("").unwrap(),
+            record,
+        };
+        write_rejection_transaction(&workspace, &transaction).unwrap();
+        assert!(list_pending_amendments(&workspace).is_err());
+        assert!(rejection_transaction_path(&workspace).exists());
+        assert!(queue.exists());
+        assert!(audit_record_for_command(&workspace, "tampered-marker")
+            .unwrap()
+            .is_none());
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_listing_rejects_symlinked_queue_file() {
+        use std::os::unix::fs::symlink;
+        let workspace = temp_workspace("control-symlink");
+        let queue = queue_path(&workspace);
+        fs::create_dir_all(queue.parent().unwrap()).unwrap();
+        let target = workspace.join("outside-queue.jsonl");
+        fs::write(&target, b"{}\n").unwrap();
+        symlink(&target, &queue).unwrap();
+        assert!(list_pending(&workspace).is_err());
+        assert!(reject_pending(&workspace, "safe-id", "reason").is_err());
+        assert!(queue_edit(
+            &workspace,
+            "safe-id",
+            "reroute_node",
+            "build",
+            None,
+            "route",
+            "control-test",
+        )
+        .is_err());
+        fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]
