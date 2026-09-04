@@ -11,9 +11,14 @@ This directory contains the static frontend served by the Rust CLI:
 fractal graph board GRAPH_HASH
 ```
 
-That command is manual mode: it serves the graph for inspection and task
-selection without starting a coordinator, launching agents, or checking out a
-node. Execution begins only through an explicit Rust CLI transition.
+That command is read-only compiled-graph inspection. It is not FractalMaster's
+Manual mode and does not launch agents or own manual task lifecycle.
+
+The current manual assignment board—the UI with Codex Fast, Claude, Cursor,
+GLM/ZCode, prompt copying, retry-safe checkout, release, and completion—is in
+`/Users/jamesstar/fractalmaster/intelligence_graph`. Launch it with
+`python3 -m intelligence_graph.web_server --manual-prd ...` from the target
+project. Do not present this snapshot viewer as that manual UI.
 
 The visible individual-project frontend is the generated browser bundle from
 Fractal Society's `@fractalsociety/graph-ui` package. Its pinned source commit,

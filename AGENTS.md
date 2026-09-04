@@ -16,19 +16,24 @@ The portable project state is:
 .fractal/project.fractal
 ```
 
-## Canonical graph version
+## Graph surfaces: do not confuse them
 
-The only current local graph is the Rust-backed graph snapshot rendered by
-`fractal-graph-ui.v1`. Its authoritative read API is `/api/snapshot` with
-schema `fractal.graph_snapshot.v1`, and its checked-in browser assets are
-pinned by `execution-graph/fractal-graph-ui.manifest.json`.
+The Rust-backed snapshot rendered by `fractal-graph-ui.v1` is the canonical
+viewer for CLI-managed execution state. Its authoritative read API is
+`/api/snapshot` with schema `fractal.graph_snapshot.v1`, and its checked-in
+browser assets are pinned by `execution-graph/fractal-graph-ui.manifest.json`.
 
-For manual mode, launch the read-only board without starting a coordinator or
-checking out work:
+For read-only inspection of a compiled CLI graph:
 
 ```sh
 fractal graph board GRAPH_HASH
 ```
+
+This is not FractalMaster Manual mode. When a user asks for the manual board
+with Codex Fast, Claude, Cursor, GLM/ZCode, prompt copying, retry-safe checkout,
+release, and completion controls, use `/Users/jamesstar/fractalmaster` and run
+`python3 -m intelligence_graph.web_server --manual-prd ...`. Do not serve this
+snapshot viewer in its place.
 
 Do not restore or use the retired standalone Three.js graph
 (`three-graph.js`), its `graph-state*.json` state, or the Python task-control
