@@ -35,6 +35,9 @@ mod lessons;
 mod master_graph;
 mod mobile;
 mod node;
+mod node_intelligence;
+#[cfg(test)]
+mod node_intelligence_coding_tests;
 mod orchestrate;
 mod pipeline;
 mod prd_graph;

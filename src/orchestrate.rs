@@ -253,6 +253,9 @@ pub(crate) fn run_end_to_end_with_efficiency(
         for run in &outcome.log {
             ledger.lease(&run.node, &run.agent);
             ledger.execution(&run.node, hex_to_hash(&run.evidence_hex));
+            if let Some(receipt) = &run.receipt {
+                ledger.route_receipt(receipt);
+            }
             if run.is_verify {
                 ledger.verdict(&run.node, run.ok);
             }

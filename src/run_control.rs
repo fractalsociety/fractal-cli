@@ -141,6 +141,23 @@ pub(crate) struct WorkerGuard {
 }
 
 impl WorkerGuard {
+    /// Strict registration for native bridge/worker children. Legacy callers
+    /// without an active run keep the optional registration behavior.
+    pub(crate) fn register_current(pid: u32) -> Result<Self> {
+        if std::env::var_os(RUN_ID_ENV).is_none() {
+            return Ok(Self::register(pid));
+        }
+        mutate_current_required(|run| {
+            if !run.worker_groups.contains(&pid) {
+                run.worker_groups.push(pid);
+            }
+        })?;
+        Ok(Self {
+            pid,
+            registered: true,
+        })
+    }
+
     pub(crate) fn register(pid: u32) -> Self {
         let registered = mutate_current(|run| {
             if !run.worker_groups.contains(&pid) {
@@ -167,6 +184,14 @@ pub(crate) fn set_graph(graph_hash: &str, board_url: &str) {
         run.board_url = Some(board_url.to_owned());
     })
     .ok();
+}
+
+/// Ensure an active native run has not been stopped before spawning a child.
+pub(crate) fn check_current_run_before_spawn() -> Result<()> {
+    if std::env::var_os(RUN_ID_ENV).is_some() {
+        mutate_current_required(|_| {})?;
+    }
+    Ok(())
 }
 
 pub(crate) fn node_transition(board: Option<&str>, node: &str, action: &str, agent: &str) {
@@ -845,6 +870,22 @@ fn mutate_current(mutator: impl FnOnce(&mut ActiveRun)) -> Result<()> {
     write_run(&run)?;
     write_project_state(&run).ok();
     Ok(())
+}
+
+fn mutate_current_required(mutator: impl FnOnce(&mut ActiveRun)) -> Result<()> {
+    let _guard = REGISTRY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("run registry lock");
+    let id = std::env::var(RUN_ID_ENV).context("native execution requires a run guard")?;
+    let mut run = read_run(&id)?.context("native run registration is missing")?;
+    if run.status != "running" || !process_alive(run.pid) {
+        bail!("native run registration is no longer live");
+    }
+    mutator(&mut run);
+    run.updated_at_ms = now_ms();
+    write_run(&run)?;
+    write_project_state(&run)
 }
 
 fn read_run(run_id: &str) -> Result<Option<ActiveRun>> {

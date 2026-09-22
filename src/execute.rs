@@ -16,6 +16,10 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
+use crate::chain::jev_receipt::{
+    validate_host_anchored_receipt, HostObservedContext, HostObservedDecision, HostObservedUsage,
+    RouteInvocation, RouteProvenance, RouteReceiptV1,
+};
 use crate::efficiency::{RepairAction, WasteType};
 use crate::efficiency_accounting::{self, EpisodeDraft, UpsertOutcome};
 use crate::efficiency_config::EfficiencyConfig;
@@ -23,7 +27,6 @@ use crate::efficiency_detector::{self, NodeSnapshot, SnapshotState};
 use crate::efficiency_policy::{
     self, ApprovalState, ImpactAssessment, PolicyDecision, PolicyRequest,
 };
-
 /// One node's execution record, for signed receipts + evidence roots.
 #[derive(Clone)]
 pub(crate) struct NodeRun {
@@ -40,6 +43,10 @@ pub(crate) struct NodeRun {
     /// signal the mid-run morphogenesis supervisor reads (a slow node triggers a
     /// proactive verification graft). Zero when unmeasured.
     pub latency_ms: u64,
+    /// Host-observed JEV outcome receipt. It is anchored by orchestrate after
+    /// this node run is finalized; `None` is reserved for legacy callers that
+    /// construct no node outcome at all.
+    pub receipt: Option<RouteReceiptV1>,
 }
 
 /// Outcome of driving one graph.
@@ -53,6 +60,14 @@ pub(crate) struct RunOutcome {
     pub retryable: bool,
     /// Per-node execution log for chain receipts + the sanitized export.
     pub log: Vec<NodeRun>,
+}
+
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 /// The headless worker to use, from `$FRACTAL_WORKER` (default `claude`).
 fn worker_kind() -> String {
@@ -262,10 +277,34 @@ pub(crate) fn worker_command(
 pub(crate) struct AgentRun {
     pub ok: bool,
     pub timed_out: bool,
+    pub invocation: Option<InvocationObservation>,
     /// IDs of prior verified lessons injected into this worker's prompt.  The
     /// IDs are carried to the final lifecycle transition so reuse is recorded
     /// as an additive typed edge, never as a mutable weight.
     pub lesson_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InvocationObservation {
+    pub invocation: RouteInvocation,
+    pub process_status: String,
+    pub process_started_at_ms: Option<u64>,
+    pub process_ended_at_ms: Option<u64>,
+    pub exit_status: Option<i32>,
+    pub node_intelligence: Option<crate::node_intelligence::BridgeEvidence>,
+}
+
+impl InvocationObservation {
+    fn not_executed(agent: &str) -> Self {
+        Self {
+            invocation: RouteInvocation::unknown(agent),
+            process_status: "not_executed".to_owned(),
+            process_started_at_ms: None,
+            process_ended_at_ms: None,
+            exit_status: None,
+            node_intelligence: None,
+        }
+    }
 }
 
 const OPENCODE_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -275,6 +314,9 @@ const OPENCODE_JSON_MAX_BYTES: usize = 1_048_576;
 struct CapturedCommand {
     success: bool,
     timed_out: bool,
+    process_started_at_ms: u64,
+    process_ended_at_ms: u64,
+    exit_status: Option<i32>,
     stdout: Vec<u8>,
     stdout_overflowed: bool,
 }
@@ -308,12 +350,14 @@ fn run_captured_command(
     timeout: Duration,
     label: &str,
 ) -> Result<CapturedCommand> {
+    crate::run_control::check_current_run_before_spawn()?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
     command.process_group(0);
+    let process_started_at_ms = now_ms();
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to launch {label} (is opencode on PATH?)"))?;
@@ -323,15 +367,15 @@ fn run_captured_command(
     // Always drain stderr to prevent a pipe deadlock, but never retain or log
     // it: provider diagnostics can contain credential-shaped configuration.
     let stderr_reader = capture_bounded(stderr, 0, false);
-    let worker = crate::run_control::WorkerGuard::register(child.id());
+    let worker = register_spawned_worker(&mut child)?;
     let deadline = Instant::now() + timeout;
-    let (success, timed_out) = loop {
+    let (success, timed_out, exit_status) = loop {
         match child.try_wait()? {
-            Some(status) => break (status.success(), false),
+            Some(status) => break (status.success(), false, status.code()),
             None if Instant::now() >= deadline => {
                 crate::run_control::terminate_worker(child.id());
                 let _ = child.wait();
-                break (false, true);
+                break (false, true, None);
             }
             None => std::thread::sleep(Duration::from_millis(25)),
         }
@@ -347,6 +391,9 @@ fn run_captured_command(
     Ok(CapturedCommand {
         success,
         timed_out,
+        process_started_at_ms,
+        process_ended_at_ms: now_ms(),
+        exit_status,
         stdout,
         stdout_overflowed,
     })
@@ -422,7 +469,7 @@ fn run_worker_as(
     workspace: &Path,
     timeout_ms: u64,
 ) -> Result<AgentRun> {
-    run_worker_as_for_node(kind, instruction, workspace, timeout_ms, None)
+    run_worker_as_for_node(kind, instruction, workspace, timeout_ms, None, None, None)
 }
 
 fn run_worker_as_for_node(
@@ -431,6 +478,8 @@ fn run_worker_as_for_node(
     workspace: &Path,
     timeout_ms: u64,
     node: Option<&Value>,
+    expected_review: Option<&crate::node_intelligence::ReviewBinding>,
+    runtime_deadline: Option<Instant>,
 ) -> Result<AgentRun> {
     let (lesson_section, lesson_ids) = node
         .map(|node| {
@@ -449,13 +498,24 @@ fn run_worker_as_for_node(
     } else {
         format!("\n\n{lesson_section}")
     };
+    let node_id = node.and_then(|node| node.get("id")).and_then(Value::as_str);
     let prompt = format!(
         "You are one agent on a coordinated team; a lead has planned the project (read INTERFACE.md \
          if it exists). Do exactly this assigned task and nothing else:\n\n{instruction}\n\nWork \
          entirely in the current directory. Create or edit only the files this task needs and make \
          any tests pass. Do not ask questions; make reasonable choices.{lesson_section}"
     );
-    let mut run = run_agent_prompt(kind, &prompt, workspace, timeout_ms)?;
+    let mut run = run_agent_prompt_with_role(
+        kind,
+        &prompt,
+        workspace,
+        timeout_ms,
+        AgentRole::Worker,
+        "worker",
+        node_id,
+        expected_review,
+        runtime_deadline,
+    )?;
     run.lesson_ids = lesson_ids;
     Ok(run)
 }
@@ -492,6 +552,9 @@ pub(crate) fn run_agent_prompt(
         timeout_ms,
         AgentRole::Worker,
         "worker",
+        None,
+        None,
+        None,
     )
 }
 
@@ -510,9 +573,13 @@ pub(crate) fn run_lead_agent_prompt(
         timeout_ms,
         AgentRole::LeadPlanner,
         "lead planner",
+        None,
+        None,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_agent_prompt_with_role(
     kind: &str,
     prompt: &str,
@@ -520,38 +587,224 @@ fn run_agent_prompt_with_role(
     timeout_ms: u64,
     role: AgentRole,
     label: &str,
+    node_id: Option<&str>,
+    expected_review: Option<&crate::node_intelligence::ReviewBinding>,
+    runtime_deadline: Option<Instant>,
 ) -> Result<AgentRun> {
+    crate::run_control::check_current_run_before_spawn()?;
+    let runtime_deadline = match runtime_deadline {
+        Some(deadline) => Some(deadline),
+        None => node_id
+            .map(|node_id| crate::node_intelligence::attempt_deadline(workspace, node_id))
+            .transpose()?
+            .flatten(),
+    };
+    let mut preview = worker_command(kind, prompt, role, workspace)?;
+    configure_node_id(&mut preview, node_id);
+    let route_preview = route_invocation(&preview, kind);
+    let bridge = match (node_id, runtime_deadline) {
+        (Some(node_id), Some(deadline)) => {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            crate::node_intelligence::prepare_with_timeout(
+                workspace,
+                node_id,
+                kind,
+                &route_preview,
+                timeout,
+            )?
+        }
+        (Some(node_id), None) => {
+            crate::node_intelligence::prepare(workspace, node_id, kind, &route_preview)?
+        }
+        (None, _) => None,
+    };
+    let bridge_budget_started = Instant::now();
+    if (expected_review.is_some() || runtime_deadline.is_some()) && bridge.is_none() {
+        bail!("configured node-intelligence task was disabled before worker launch");
+    }
+    if let (Some(evidence), Some(expected)) = (bridge.as_ref(), expected_review) {
+        if let Err(error) = crate::node_intelligence::require_review_binding(evidence, expected) {
+            return Ok(failed_before_worker(kind, route_preview, evidence, &error));
+        }
+    }
+    let effective_timeout_ms = if let Some(evidence) = bridge.as_ref() {
+        if evidence.remaining_calls == 0 || evidence.remaining_elapsed_ms == 0 {
+            let error = anyhow::anyhow!(
+                "node-intelligence exhausted the pinned worker call or time budget"
+            );
+            return Ok(failed_before_worker(kind, route_preview, evidence, &error));
+        }
+        timeout_ms
+            .min(evidence.remaining_elapsed_ms)
+            .min(runtime_deadline.map_or(u64::MAX, |deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64
+            }))
+    } else {
+        timeout_ms
+    };
+    let effective_prompt = bridge
+        .as_ref()
+        .map(|evidence| append_node_context_pointer(prompt, evidence))
+        .unwrap_or_else(|| prompt.to_owned());
+
     if command_kind_for_agent(kind) == "opencode" {
-        preflight_opencode(workspace)?;
-        let mut command = worker_command(kind, prompt, role, workspace)?;
+        if let Err(error) = preflight_opencode(workspace) {
+            if let Some(bridge) = bridge.as_ref() {
+                return Ok(failed_before_worker(kind, route_preview, bridge, &error));
+            }
+            return Err(error);
+        }
+    }
+    let command_result = (|| -> Result<(Command, RouteInvocation, u64)> {
+        let mut command = worker_command(kind, &effective_prompt, role, workspace)?;
+        configure_node_id(&mut command, node_id);
+        if let Some(bridge) = bridge.as_ref() {
+            attach_node_context(&mut command, bridge);
+        }
+        let invocation = route_invocation(&command, kind);
+        let mut launch_timeout_ms = effective_timeout_ms;
+        if let Some(bridge) = bridge.as_ref() {
+            if baseline_route_id(&invocation) != bridge.decision["baseline"].as_str().unwrap_or("")
+            {
+                bail!("worker route changed after node-intelligence decision");
+            }
+            let remaining = bridge
+                .remaining_elapsed_ms
+                .saturating_sub(bridge_budget_started.elapsed().as_millis() as u64)
+                .min(runtime_deadline.map_or(u64::MAX, |deadline| {
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis() as u64
+                }));
+            crate::node_intelligence::recheck_before_effect_with_budget(
+                workspace, bridge, kind, remaining,
+            )?;
+            let remaining = bridge
+                .remaining_elapsed_ms
+                .saturating_sub(bridge_budget_started.elapsed().as_millis() as u64)
+                .min(runtime_deadline.map_or(u64::MAX, |deadline| {
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis() as u64
+                }));
+            if remaining == 0 {
+                bail!("node-intelligence elapsed budget is exhausted before worker launch");
+            }
+            launch_timeout_ms = launch_timeout_ms.min(remaining);
+        }
+        Ok((command, invocation, launch_timeout_ms))
+    })();
+    let (mut command, invocation, mut effective_timeout_ms) = match command_result {
+        Ok(command) => command,
+        Err(error) => {
+            if let Some(bridge) = bridge.as_ref() {
+                if crate::node_intelligence::is_review_blocked_before_effect(&error) {
+                    return Err(error);
+                }
+                return Ok(failed_before_worker(kind, route_preview, bridge, &error));
+            }
+            return Err(error);
+        }
+    };
+    if let Some(evidence) = bridge.as_ref() {
+        let remaining = evidence
+            .remaining_elapsed_ms
+            .saturating_sub(bridge_budget_started.elapsed().as_millis() as u64)
+            .min(runtime_deadline.map_or(u64::MAX, |deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64
+            }));
+        if remaining == 0 {
+            let error = anyhow::anyhow!(
+                "node-intelligence elapsed budget is exhausted before worker launch"
+            );
+            return Ok(failed_before_worker(kind, invocation, evidence, &error));
+        }
+        effective_timeout_ms = effective_timeout_ms.min(remaining);
+    }
+    if command_kind_for_agent(kind) == "opencode" {
         command.current_dir(workspace);
-        let result = run_captured_command(
+        let result = match run_captured_command(
             command,
-            Duration::from_millis(timeout_ms),
+            Duration::from_millis(effective_timeout_ms),
             "OpenCode worker",
-        )?;
+        ) {
+            Ok(result) => result,
+            Err(error) if bridge.is_some() => {
+                return Ok(failed_before_worker(
+                    kind,
+                    invocation.clone(),
+                    bridge.as_ref().expect("checked bridge"),
+                    &error,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         return Ok(AgentRun {
             ok: result.success
                 && !result.timed_out
                 && !result.stdout_overflowed
                 && opencode_json_succeeded(&result.stdout),
             timed_out: result.timed_out,
+            invocation: Some(InvocationObservation {
+                invocation,
+                process_status: if result.timed_out {
+                    "timeout".to_owned()
+                } else if result.success {
+                    "exited_success".to_owned()
+                } else {
+                    "exited_failure".to_owned()
+                },
+                process_started_at_ms: Some(result.process_started_at_ms),
+                process_ended_at_ms: Some(result.process_ended_at_ms),
+                exit_status: result.exit_status,
+                node_intelligence: bridge,
+            }),
             lesson_ids: Vec::new(),
         });
     }
     // Detach the worker's stdin: headless agents (e.g. `claude -p`) otherwise
     // inherit the CLI's piped stdin and block reading it instead of exiting.
-    let mut command = worker_command(kind, prompt, role, workspace)?;
     command
         .current_dir(workspace)
         .stdin(std::process::Stdio::null());
     #[cfg(unix)]
     command.process_group(0);
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to launch {label} `{kind}` (is it on PATH?)"))?;
-    let worker = crate::run_control::WorkerGuard::register(child.id());
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) if bridge.is_some() => {
+            let error = anyhow::Error::from(error).context(format!(
+                "failed to launch {label} `{kind}` (is it on PATH?)"
+            ));
+            return Ok(failed_before_worker(
+                kind,
+                invocation,
+                bridge.as_ref().expect("checked bridge"),
+                &error,
+            ));
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to launch {label} `{kind}` (is it on PATH?)"))
+        }
+    };
+    let worker = match register_spawned_worker(&mut child) {
+        Ok(worker) => worker,
+        Err(error) if bridge.is_some() => {
+            return Ok(failed_before_worker(
+                kind,
+                invocation,
+                bridge.as_ref().expect("checked bridge"),
+                &error,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let process_started_at_ms = now_ms();
+    let deadline = Instant::now() + Duration::from_millis(effective_timeout_ms);
     loop {
         match child.try_wait()? {
             Some(status) => {
@@ -564,6 +817,18 @@ fn run_agent_prompt_with_role(
                 return Ok(AgentRun {
                     ok: status.success(),
                     timed_out: false,
+                    invocation: Some(InvocationObservation {
+                        invocation: invocation.clone(),
+                        process_status: if status.success() {
+                            "exited_success".to_owned()
+                        } else {
+                            "exited_failure".to_owned()
+                        },
+                        process_started_at_ms: Some(process_started_at_ms),
+                        process_ended_at_ms: Some(now_ms()),
+                        exit_status: status.code(),
+                        node_intelligence: bridge.clone(),
+                    }),
                     lesson_ids: Vec::new(),
                 });
             }
@@ -575,12 +840,108 @@ fn run_agent_prompt_with_role(
                     return Ok(AgentRun {
                         ok: false,
                         timed_out: true,
+                        invocation: Some(InvocationObservation {
+                            invocation: invocation.clone(),
+                            process_status: "timeout".to_owned(),
+                            process_started_at_ms: Some(process_started_at_ms),
+                            process_ended_at_ms: Some(now_ms()),
+                            exit_status: None,
+                            node_intelligence: bridge.clone(),
+                        }),
                         lesson_ids: Vec::new(),
                     });
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
+    }
+}
+
+fn append_node_context_pointer(
+    prompt: &str,
+    evidence: &crate::node_intelligence::BridgeEvidence,
+) -> String {
+    format!(
+        "{prompt}\n\nFractal pinned the authorized inputs and typed task context for this attempt in `{}` ({}). Read that local manifest before acting and keep work within its authorized scope.",
+        evidence.context_manifest_path, evidence.context_manifest_ref
+    )
+}
+
+fn attach_node_context(command: &mut Command, evidence: &crate::node_intelligence::BridgeEvidence) {
+    command
+        .env("FRACTAL_NODE_ATTEMPT_REF", &evidence.attempt_ref)
+        .env("FRACTAL_NODE_CONTEXT_REF", &evidence.context_manifest_ref)
+        .env("FRACTAL_NODE_CONTEXT_PATH", &evidence.context_manifest_path);
+}
+
+fn failed_before_worker(
+    _worker: &str,
+    invocation: RouteInvocation,
+    evidence: &crate::node_intelligence::BridgeEvidence,
+    _error: &anyhow::Error,
+) -> AgentRun {
+    AgentRun {
+        ok: false,
+        timed_out: false,
+        invocation: Some(InvocationObservation {
+            invocation,
+            process_status: "not_executed".to_owned(),
+            process_started_at_ms: None,
+            process_ended_at_ms: None,
+            exit_status: None,
+            node_intelligence: Some(evidence.clone()),
+        }),
+        lesson_ids: Vec::new(),
+    }
+}
+
+fn baseline_route_id(invocation: &RouteInvocation) -> String {
+    format!(
+        "legacy:{}:backend-unknown:model-unknown:{}",
+        invocation.cli_family,
+        invocation.selected_effort.as_deref().unwrap_or("unknown")
+    )
+}
+
+/// A spawned process must not survive failure to durably register its ownership.
+fn register_spawned_worker(
+    child: &mut std::process::Child,
+) -> Result<crate::run_control::WorkerGuard> {
+    crate::run_control::WorkerGuard::register_current(child.id()).map_err(|error| {
+        crate::run_control::terminate_worker(child.id());
+        let _ = child.wait();
+        error.context("worker registration failed")
+    })
+}
+
+fn configure_node_id(command: &mut Command, node_id: Option<&str>) {
+    if let Some(node_id) = node_id {
+        command.env("FRACTAL_NODE_ID", node_id);
+    } else {
+        command.env_remove("FRACTAL_NODE_ID");
+    }
+}
+
+/// Extract only public command configuration for the receipt. This observes
+/// the command built by the existing worker authority; it deliberately does
+/// not infer provider/backend provenance from the logical agent or alias.
+fn route_invocation(command: &Command, agent: &str) -> RouteInvocation {
+    let args: Vec<_> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let selected_model = args
+        .windows(2)
+        .find_map(|pair| matches!(pair[0].as_str(), "--model" | "-m").then(|| pair[1].clone()));
+    let selected_effort = args.iter().find_map(|arg| {
+        arg.strip_prefix("model_reasoning_effort=")
+            .map(|value| value.trim_matches('"').to_owned())
+    });
+    RouteInvocation {
+        cli_family: command_kind_for_agent(agent).to_owned(),
+        selected_model,
+        selected_effort,
+        configuration_source: "host-observed-command-config".to_owned(),
     }
 }
 
@@ -907,7 +1268,15 @@ impl HybridSession {
             .unwrap_or("");
         let worktree = self.create_worktree(id, agent)?;
         copy_hybrid_context(&self.workspace, &worktree)?;
-        let run = run_worker_as_for_node(agent, instruction, &worktree, timeout_ms, Some(node))?;
+        let run = run_worker_as_for_node(
+            agent,
+            instruction,
+            &worktree,
+            timeout_ms,
+            Some(node),
+            None,
+            None,
+        )?;
         if !run.ok {
             eprintln!(
                 "  [{agent}] hybrid worktree preserved after worker failure: {}",
@@ -1482,6 +1851,12 @@ fn pool_requeue_failure(
     *retries = retries.saturating_add(1);
     let retries = *retries;
     if retries <= POOL_NODE_RETRY_LIMIT {
+        // A retry increments the canonical attempt identity. Never carry a
+        // human approval, pending timer, or blocked outcome onto that new pin.
+        state.review_admitted.remove(id);
+        state.review_attempts.remove(id);
+        state.review_pending_until.remove(id);
+        state.review_blocked.remove(id);
         let _ = reopen_for_retry(workspace, id);
         false
     } else {
@@ -1620,6 +1995,7 @@ struct NodeOutcome {
     failure_code: Option<crate::learning_data::FailureCode>,
     integration_failure: Option<crate::learning_data::IntegrationFailureDetail>,
     retryable: bool,
+    invocation: Option<InvocationObservation>,
 }
 
 impl NodeOutcome {
@@ -1633,6 +2009,7 @@ impl NodeOutcome {
             failure_code: None,
             integration_failure: None,
             retryable: false,
+            invocation: None,
         }
     }
 
@@ -1646,6 +2023,7 @@ impl NodeOutcome {
             failure_code: None,
             integration_failure: None,
             retryable: true,
+            invocation: None,
         }
     }
 
@@ -1659,11 +2037,17 @@ impl NodeOutcome {
             failure_code: Some(failure.failure_code),
             integration_failure: Some(failure.detail.clone()),
             retryable: false,
+            invocation: None,
         }
     }
 
     fn with_lessons(mut self, lessons: Vec<String>) -> Self {
         self.lessons = lessons;
+        self
+    }
+
+    fn with_invocation(mut self, invocation: Option<InvocationObservation>) -> Self {
+        self.invocation = invocation;
         self
     }
 }
@@ -1691,6 +2075,8 @@ fn run_worker_node(
     agent: &str,
     workspace: &Path,
     hybrid: Option<&HybridSession>,
+    expected_review: Option<&crate::node_intelligence::ReviewBinding>,
+    runtime_deadline: Option<Instant>,
 ) -> Result<NodeOutcome> {
     let instruction = node
         .get("instruction")
@@ -1698,6 +2084,9 @@ fn run_worker_node(
         .unwrap_or("");
     let timeout_ms = agent_timeout_ms(node);
     let run = match hybrid {
+        Some(_session) if expected_review.is_some() || runtime_deadline.is_some() => {
+            bail!("configured node-intelligence task cannot bypass the managed worker boundary")
+        }
         Some(session) => match session.run_worker(node, agent, timeout_ms) {
             Ok(run) => run,
             Err(error) => {
@@ -1707,7 +2096,15 @@ fn run_worker_node(
                 return Err(error);
             }
         },
-        None => run_worker_as_for_node(agent, instruction, workspace, timeout_ms, Some(node))?,
+        None => run_worker_as_for_node(
+            agent,
+            instruction,
+            workspace,
+            timeout_ms,
+            Some(node),
+            expected_review,
+            runtime_deadline,
+        )?,
     };
     let timeout_note = run.timed_out.then(|| {
         format!(
@@ -1716,9 +2113,9 @@ fn run_worker_node(
         )
     });
     if !run.ok {
-        return Ok(
-            NodeOutcome::failure(None, run.timed_out, timeout_note).with_lessons(run.lesson_ids)
-        );
+        return Ok(NodeOutcome::failure(None, run.timed_out, timeout_note)
+            .with_lessons(run.lesson_ids)
+            .with_invocation(run.invocation));
     }
     if let Some(path) =
         node_required_agent(node).and_then(|_| declared_artifact_path(node, workspace))
@@ -1732,10 +2129,13 @@ fn run_worker_node(
                     path.display()
                 )),
             )
-            .with_lessons(run.lesson_ids));
+            .with_lessons(run.lesson_ids)
+            .with_invocation(run.invocation));
         }
     }
-    Ok(NodeOutcome::success(None, timeout_note).with_lessons(run.lesson_ids))
+    Ok(NodeOutcome::success(None, timeout_note)
+        .with_lessons(run.lesson_ids)
+        .with_invocation(run.invocation))
 }
 
 /// Execute one node with a given agent. Build nodes run the worker. An explicitly
@@ -1743,7 +2143,7 @@ fn run_worker_node(
 /// Cursor CLI), then the trusted host independently evaluates the workspace.
 /// Unpinned verification nodes remain host-only acceptance gates.
 fn run_node(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> {
-    run_node_with_hybrid(node, agent, workspace, None)
+    run_node_with_hybrid(node, agent, workspace, None, None, None)
 }
 
 fn run_node_with_hybrid(
@@ -1751,9 +2151,20 @@ fn run_node_with_hybrid(
     agent: &str,
     workspace: &Path,
     hybrid: Option<&HybridSession>,
+    expected_review: Option<&crate::node_intelligence::ReviewBinding>,
+    runtime_deadline: Option<Instant>,
 ) -> Result<NodeOutcome> {
     let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
     let id = node.get("id").and_then(Value::as_str).unwrap_or("node");
+    if capability == crate::node_intelligence::ANALYSIS_CAPABILITY {
+        return run_node_intelligence_analysis(
+            node,
+            agent,
+            workspace,
+            expected_review,
+            runtime_deadline,
+        );
+    }
     // Defense in depth: callers must atomically checkout first, but this
     // worker seam is also private authority against direct execution paths.
     // A malformed declaration, missing ledger, stale evidence, or reviewer
@@ -1769,21 +2180,38 @@ fn run_node_with_hybrid(
     if capability == "control.closeout" {
         run_lead_closeout(node, agent, workspace)
     } else if is_build(capability) {
-        run_worker_node(node, agent, workspace, hybrid)
+        run_worker_node(
+            node,
+            agent,
+            workspace,
+            hybrid,
+            expected_review,
+            runtime_deadline,
+        )
     } else if is_verify(capability) && node_required_agent(node).is_some() {
-        let worker = run_worker_node(node, agent, workspace, hybrid)?;
+        let worker = run_worker_node(
+            node,
+            agent,
+            workspace,
+            hybrid,
+            expected_review,
+            runtime_deadline,
+        )?;
         if !worker.ok {
             return Ok(worker);
         }
+        let invocation = worker.invocation.clone();
         match crate::verify::evaluate_workspace(workspace, id, agent)? {
             Some(verdict) if verdict.complete => Ok(NodeOutcome::success(
                 Some(true),
                 Some(format!("worker task complete; {}", verdict.detail)),
             )
-            .with_lessons(worker.lessons)),
+            .with_lessons(worker.lessons)
+            .with_invocation(invocation.clone())),
             Some(verdict) => Ok(
                 NodeOutcome::failure(Some(false), false, Some(verdict.detail))
-                    .with_lessons(worker.lessons),
+                    .with_lessons(worker.lessons)
+                    .with_invocation(invocation.clone()),
             ),
             None => Ok(NodeOutcome::failure(
                 None,
@@ -1792,7 +2220,8 @@ fn run_node_with_hybrid(
                     "worker task completed, but no native verification suite was found".to_owned(),
                 ),
             )
-            .with_lessons(worker.lessons)),
+            .with_lessons(worker.lessons)
+            .with_invocation(invocation)),
         }
     } else if is_verify(capability) {
         // Genuine governance: judge the suite with the real deny-by-default floor.
@@ -1816,6 +2245,80 @@ fn run_node_with_hybrid(
     }
 }
 
+/// Run the opt-in deterministic measurement adapter for its canonical graph capability.
+fn run_node_intelligence_analysis(
+    node: &Value,
+    agent: &str,
+    workspace: &Path,
+    expected_review: Option<&crate::node_intelligence::ReviewBinding>,
+    runtime_deadline: Option<Instant>,
+) -> Result<NodeOutcome> {
+    let node_id = node
+        .get("id")
+        .and_then(Value::as_str)
+        .context("analysis node is missing canonical id")?;
+    let route = RouteInvocation {
+        cli_family: "node-intelligence-analysis".to_owned(),
+        selected_model: None,
+        selected_effort: None,
+        configuration_source: "host-deterministic-analysis-adapter".to_owned(),
+    };
+    let started_at = now_ms();
+    let bridge = crate::node_intelligence::prepare_analysis(
+        workspace,
+        node_id,
+        agent,
+        &route,
+        expected_review,
+        runtime_deadline,
+    )?;
+    let post_action_binding_error =
+        crate::node_intelligence::recheck_before_effect(workspace, &bridge, agent).err();
+    let ended_at = now_ms();
+    let analysis = bridge
+        .analysis
+        .as_ref()
+        .context("analysis adapter response lacks typed result")?;
+    let action = analysis
+        .get("action")
+        .context("analysis adapter response lacks action receipt")?;
+    let collection = analysis
+        .get("collection")
+        .context("analysis adapter response lacks collection receipt")?;
+    let action_complete = action.get("state").and_then(Value::as_str) == Some("complete");
+    let collection_available = collection.get("available").and_then(Value::as_bool) == Some(true);
+    let artifact_count = collection
+        .get("artifact_refs")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let note = if post_action_binding_error.is_some() {
+        "analysis action ran, but host authorization or pinned configuration changed afterward; its deterministic effect may have persisted".to_owned()
+    } else if action_complete && collection_available {
+        format!("deterministic analysis completed and collected {artifact_count} artifact(s)")
+    } else {
+        let reason = action
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|reason| reason.len() <= 120)
+            .unwrap_or("analysis action or collection did not complete");
+        format!("deterministic analysis did not complete: {reason}")
+    };
+    let invocation = InvocationObservation {
+        invocation: route,
+        process_status: "exited_success".to_owned(),
+        process_started_at_ms: Some(started_at),
+        process_ended_at_ms: Some(ended_at),
+        exit_status: Some(0),
+        node_intelligence: Some(bridge),
+    };
+    if action_complete && collection_available && post_action_binding_error.is_none() {
+        Ok(NodeOutcome::success(None, Some(note)).with_invocation(Some(invocation)))
+    } else {
+        Ok(NodeOutcome::failure(None, false, Some(note)).with_invocation(Some(invocation)))
+    }
+}
+
 fn run_lead_closeout(node: &Value, agent: &str, workspace: &Path) -> Result<NodeOutcome> {
     let closeout_path = workspace.join(".fractal").join("closeout.json");
     std::fs::remove_file(&closeout_path).ok();
@@ -1825,6 +2328,7 @@ fn run_lead_closeout(node: &Value, agent: &str, workspace: &Path) -> Result<Node
         .unwrap_or("Review and close out the project.");
     let timeout_ms = agent_timeout_ms(node);
     let run = run_lead_agent_as(agent, instruction, workspace, timeout_ms)?;
+    let invocation = run.invocation.clone();
     if !run.ok {
         return Ok(NodeOutcome::failure(
             Some(false),
@@ -1834,7 +2338,8 @@ fn run_lead_closeout(node: &Value, agent: &str, workspace: &Path) -> Result<Node
             } else {
                 "lead closeout agent failed".to_owned()
             }),
-        ));
+        )
+        .with_invocation(invocation.clone()));
     }
 
     let prd: Value = serde_json::from_slice(
@@ -1850,7 +2355,8 @@ fn run_lead_closeout(node: &Value, agent: &str, workspace: &Path) -> Result<Node
     Ok(NodeOutcome::success(
         Some(true),
         Some(format!("lead approved {approved} acceptance criteria")),
-    ))
+    )
+    .with_invocation(invocation))
 }
 
 fn validate_closeout(prd: &Value, closeout: &Value) -> Result<usize> {
@@ -2722,6 +3228,279 @@ fn workspace_digest(workspace: &Path) -> String {
     hex
 }
 
+/// Finalize one node outcome with the host-observed process/configuration
+/// fields. Provider usage and backend identity remain unknown until a provider
+/// supplies an authoritative receipt; command selection alone never fills them.
+#[allow(clippy::too_many_arguments)]
+fn node_run_with_receipt(
+    node: &Value,
+    agent: &str,
+    workspace: &Path,
+    graph_id: &str,
+    graph_hash: &str,
+    is_verify: bool,
+    ok: bool,
+    verified: Option<bool>,
+    evidence_hex: String,
+    latency_ms: u64,
+    invocation: Option<InvocationObservation>,
+    retries: u32,
+) -> NodeRun {
+    let id = node
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let project_id = crate::project_file::load(workspace)
+        .map(|document| document.project.slug)
+        .unwrap_or_else(|_| "unknown".to_owned());
+    let attempt = crate::project_file::load(workspace)
+        .ok()
+        .and_then(|document| {
+            document
+                .learning
+                .nodes
+                .get(&id)
+                .map(|record| record.attempt_count)
+        })
+        .unwrap_or(0);
+    let retries = retries.max(attempt.saturating_sub(1));
+    let objective = node.get("instruction").cloned().unwrap_or(Value::Null);
+    let objective_hash =
+        fractal_contracts::canonical_sha256(&objective).unwrap_or_else(|_| "unknown".to_owned());
+    let observation = invocation.unwrap_or_else(|| InvocationObservation::not_executed(agent));
+    let effort = observation
+        .invocation
+        .selected_effort
+        .as_deref()
+        .unwrap_or("unknown");
+    let actual_route_id = format!(
+        "legacy:{}:backend-unknown:model-unknown:{effort}",
+        observation.invocation.cli_family
+    );
+    let cli_family = observation.invocation.cli_family.clone();
+    let verification_status = if !is_verify {
+        "not_applicable"
+    } else {
+        match verified {
+            Some(true) => "passed",
+            Some(false) => "failed",
+            None => "unknown",
+        }
+    };
+    let verifier_identity = is_verify
+        .then(|| agent.to_owned())
+        .filter(|_| verified.is_some());
+    let verification_evidence_ref = verifier_identity
+        .as_ref()
+        .map(|_| compact_evidence_ref(&id, &evidence_hex));
+    let host_invocation = observation.invocation.clone();
+    let host_decision = observation
+        .node_intelligence
+        .as_ref()
+        .map(node_intelligence_host_decision)
+        .unwrap_or_else(HostObservedDecision::unknown);
+    let host_route_provenance = RouteProvenance::unknown(cli_family);
+    let host_process_status = observation.process_status.clone();
+    let host_process_started_at_ms = observation.process_started_at_ms;
+    let host_process_ended_at_ms = observation.process_ended_at_ms;
+    let host_exit_status = observation.exit_status;
+    let host_verifier_identity = verifier_identity.clone();
+    let host_verification_status = verification_status.to_owned();
+    // Process success answers only whether the invoked command completed under
+    // its process contract. It must not be conflated with task `ok`, which may
+    // be false because the artifact or verification failed.
+    let process_success = observation.process_status == "exited_success";
+    let verification_evidence_ref_for_host = verification_evidence_ref.clone();
+    let receipt = RouteReceiptV1::from_host_observation(
+        project_id,
+        graph_id.to_owned(),
+        graph_hash.to_owned(),
+        id.clone(),
+        attempt,
+        objective_hash,
+        observation.invocation,
+        actual_route_id,
+        host_route_provenance.clone(),
+        host_process_status.clone(),
+        host_process_started_at_ms,
+        host_process_ended_at_ms,
+        host_exit_status,
+        process_success,
+        verifier_identity,
+        verification_status.to_owned(),
+        None,
+        verification_evidence_ref,
+        evidence_hex.as_str().to_owned(),
+        retries,
+    );
+    let mut receipt = receipt;
+    bind_host_decision_to_receipt(&mut receipt, &host_decision);
+    let validation = validate_host_anchored_receipt(
+        &receipt,
+        &HostObservedContext {
+            project_id: receipt.project_id.clone(),
+            graph_id: receipt.graph_id.clone(),
+            graph_hash: receipt.graph_hash.clone(),
+            node_id: receipt.node_id.clone(),
+            attempt: receipt.attempt,
+            worker_identity: agent.to_owned(),
+            ledger_subject: receipt.ledger_subject.clone(),
+            actual_route_id: receipt.actual_route_id.clone(),
+            actual_route_provenance: host_route_provenance,
+            invocation: host_invocation,
+            process_status: host_process_status,
+            process_started_at_ms: host_process_started_at_ms,
+            process_ended_at_ms: host_process_ended_at_ms,
+            exit_status: host_exit_status,
+            process_success,
+            usage: HostObservedUsage::unknown(),
+            decision: host_decision,
+            verifier_identity: host_verifier_identity,
+            verification_evidence_ref: verification_evidence_ref_for_host,
+            independent_verifier: None,
+            task_correctness: "unknown".to_owned(),
+            verification_status: host_verification_status,
+            evidence_root_hash: receipt.evidence_root_hash.clone(),
+        },
+    );
+    debug_assert!(validation.is_valid());
+    let _training_ready = validation.is_training_ready();
+    NodeRun {
+        node: id,
+        agent: agent.to_owned(),
+        is_verify,
+        ok,
+        verified,
+        evidence_hex,
+        latency_ms,
+        receipt: Some(receipt),
+    }
+}
+
+/// Copy a decision observed and validated by the managed host bridge into the
+/// durable public receipt. `from_host_observation` deliberately defaults these
+/// fields to unknown for legacy callers; a managed bridge has its own pinned,
+/// independently checked decision envelope that must remain inspectable.
+fn bind_host_decision_to_receipt(receipt: &mut RouteReceiptV1, decision: &HostObservedDecision) {
+    receipt.request_hash = decision.request_hash.clone();
+    receipt.response_hash = decision.response_hash.clone();
+    receipt.policy_hash = decision.policy_hash.clone();
+    receipt.roster_hash = decision.roster_hash.clone();
+    receipt.eligibility_hash = decision.eligibility_hash.clone();
+    receipt.model_hash = decision.model_hash.clone();
+    receipt.decision_envelope_hash = decision.decision_envelope_hash.clone();
+    receipt.eligibility_mask = decision.eligibility_mask.clone();
+    receipt.authorization_evidence_refs = decision.authorization_evidence_refs.clone();
+    receipt.proposed_route_id = decision.proposed_route_id.clone();
+    receipt.observed_baseline_route_id = decision.observed_baseline_route_id.clone();
+    receipt.decision_kind = decision.decision_kind.clone();
+    receipt.fallback_used = decision.fallback_used;
+    receipt.shadow = decision.shadow;
+    receipt.canary = decision.canary;
+    receipt.reason_codes = decision.reason_codes.clone();
+    let mut value = serde_json::to_value(&*receipt).expect("serialize host-bound route receipt");
+    value
+        .as_object_mut()
+        .expect("route receipt serializes as an object")
+        .remove("receipt_hash");
+    receipt.receipt_hash = crate::chain::jev_receipt::canonical_route_hash(&value)
+        .expect("canonicalize host-bound route receipt");
+}
+
+fn node_intelligence_host_decision(
+    evidence: &crate::node_intelligence::BridgeEvidence,
+) -> HostObservedDecision {
+    let mut authorization_evidence_refs = vec![
+        format!("node-intelligence:attempt:{}", evidence.attempt_ref),
+        format!("node-intelligence:request:{}", evidence.request_hash),
+        format!("node-intelligence:response:{}", evidence.response_hash),
+        format!("node-intelligence:receipt:{}", evidence.receipt_ref),
+        format!(
+            "node-intelligence:context:{}",
+            evidence.context_manifest_ref
+        ),
+        format!("node-intelligence:network:{}", evidence.network_ref),
+        format!(
+            "node-intelligence:host-policy:{}",
+            evidence.host_policy_digest
+        ),
+        format!("node-intelligence:model:{}", evidence.model_ref),
+        format!("node-intelligence:policy:{}", evidence.policy_ref),
+    ];
+    for (kind, references) in [
+        ("input", evidence.input_refs.clone()),
+        ("handoff", evidence.handoff_refs.clone()),
+        ("review", evidence.review_packet_refs.clone()),
+    ] {
+        authorization_evidence_refs.extend(
+            references
+                .into_iter()
+                .map(|reference| format!("node-intelligence:{kind}:{reference}")),
+        );
+    }
+    authorization_evidence_refs.extend(
+        evidence
+            .approved_gate_refs
+            .iter()
+            .map(|reference| format!("node-intelligence:gate:{reference}")),
+    );
+    if let Some(action) = evidence
+        .analysis
+        .as_ref()
+        .and_then(|value| value.get("action"))
+    {
+        for field in ["receipt_ref", "input_ref"] {
+            if let Some(reference) = action.get(field).and_then(Value::as_str) {
+                if reference.starts_with("sha256:") {
+                    authorization_evidence_refs
+                        .push(format!("node-intelligence:analysis-{field}:{reference}"));
+                }
+            }
+        }
+        if let Some(references) = action.get("artifact_refs").and_then(Value::as_array) {
+            authorization_evidence_refs.extend(
+                references
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|reference| format!("node-intelligence:analysis-artifact:{reference}")),
+            );
+        }
+    }
+    authorization_evidence_refs.sort();
+    authorization_evidence_refs.dedup();
+    let baseline = evidence
+        .decision
+        .get("baseline")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    HostObservedDecision {
+        request_hash: evidence.request_hash.clone(),
+        response_hash: evidence.response_hash.clone(),
+        policy_hash: evidence.policy_ref.clone(),
+        // The task's pinned model is retained as evidence above, but it is not
+        // an authoritative identity for a route-scoring model.
+        roster_hash: "unknown".to_owned(),
+        eligibility_hash: "unknown".to_owned(),
+        model_hash: "unknown".to_owned(),
+        decision_envelope_hash: fractal_contracts::canonical_sha256(&evidence.decision)
+            .unwrap_or_else(|_| "unknown".to_owned()),
+        eligibility_mask: Vec::new(),
+        authorization_evidence_refs: authorization_evidence_refs
+            .into_iter()
+            .map(crate::chain::jev_receipt::AuthorizationEvidenceRef::new)
+            .collect(),
+        proposed_route_id: "ABSTAIN".to_owned(),
+        observed_baseline_route_id: baseline,
+        decision_kind: "node_intelligence_shadow".to_owned(),
+        fallback_used: true,
+        shadow: true,
+        canary: false,
+        reason_codes: vec!["NODE_INTELLIGENCE_SHADOW_ABSTAIN".to_owned()],
+    }
+}
+
 /// Shared scheduler state for the multi-agent pull-queue.
 #[derive(Default)]
 struct Schedule {
@@ -2730,12 +3509,24 @@ struct Schedule {
     /// Pool slot identity → node currently leased to that slot.
     slot_leases: BTreeMap<String, String>,
     retry_counts: BTreeMap<String, u32>,
+    review_in_progress: BTreeSet<String>,
+    review_pending_until: BTreeMap<String, Instant>,
+    review_blocked: BTreeMap<String, String>,
+    review_attempts: BTreeMap<String, crate::node_intelligence::ReviewBinding>,
+    review_admitted: BTreeMap<String, crate::node_intelligence::ReviewBinding>,
     failed: Option<String>,
     failed_retryable: bool,
     built: bool,
     verified: Option<bool>,
     log: Vec<NodeRun>,
 }
+
+enum ScheduledTask {
+    Review(String),
+    Execute(String, Option<crate::node_intelligence::ReviewBinding>),
+}
+
+const REVIEW_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Drive the whole graph with several agents: each agent repeatedly checks out a
 /// dependency-ready node no one else holds, runs it, and marks it complete —
@@ -2819,6 +3610,19 @@ fn run_multi_agent_inner(
                 .map(|id| (id.to_owned(), node.clone()))
         })
         .collect();
+    // Inspect project task configuration before worker threads or checkouts are
+    // started. A packet-pinned task must pass the read-only review admission
+    // request before it can acquire an execution slot or consume an attempt.
+    let review_nodes: BTreeSet<String> = ids
+        .iter()
+        .filter_map(
+            |id| match crate::node_intelligence::requires_review_admission(workspace, id) {
+                Ok(true) => Some(Ok(id.clone())),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
+        .collect::<Result<_>>()?;
     let hybrid_ownership: BTreeMap<String, Vec<String>> = if hybrid.is_some() {
         node_by_id
             .iter()
@@ -2852,6 +3656,11 @@ fn run_multi_agent_inner(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    let graph_id = graph
+        .get("graph_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
     // Resume: pre-mark already-completed tasks so they are skipped (the ready
     // check treats them as done) but still counted toward `total`.
     let schedule = Mutex::new(Schedule {
@@ -2878,14 +3687,26 @@ fn run_multi_agent_inner(
             let agent = agent.clone();
             let is_lead = agent.as_str() == lead;
             let provider_caps = provider_caps.clone();
-            let (schedule, ids, node_by_id, predecessors, graph, graph_hash, hybrid_ownership) = (
+            let (
+                schedule,
+                ids,
+                node_by_id,
+                predecessors,
+                graph,
+                graph_id,
+                graph_hash,
+                hybrid_ownership,
+                review_nodes,
+            ) = (
                 &schedule,
                 &ids,
                 &node_by_id,
                 &predecessors,
                 graph,
+                &graph_id,
                 &graph_hash,
                 &hybrid_ownership,
+                &review_nodes,
             );
             scope.spawn(move || {
               let mut mine: u64 = 0;
@@ -2900,10 +3721,11 @@ fn run_multi_agent_inner(
                 if mine > 0 {
                     std::thread::sleep(Duration::from_millis(mine.min(3) * 120));
                 }
+                let clr = crate::ui::CLEAR_LINE;
                 // Atomically check out a ready, unclaimed node.
                 // The scheduler barrier serializes claims against efficiency
                 // boundary inspection so repairs never race checkout.
-                let claimed = {
+                let scheduled = {
                     let _barrier = lock_scheduler();
                     let mut state = schedule.lock().expect("schedule lock");
                     if state.failed.is_some() || state.completed.len() == total {
@@ -2937,8 +3759,9 @@ fn run_multi_agent_inner(
                             document.external_gate_ledger.as_ref(),
                         )
                     };
-                    let is_ready = |id: &String, state: &Schedule| {
+                    let prerequisite_ready = |id: &String, state: &Schedule| {
                         !state.completed.contains(id)
+                            && !state.review_blocked.contains_key(id)
                             && !state.in_progress.contains(id)
                             && predecessors[id]
                                 .iter()
@@ -2949,6 +3772,11 @@ fn run_multi_agent_inner(
                                 &state.in_progress,
                                 hybrid_ownership,
                             )
+                    };
+                    let is_ready = |id: &String, state: &Schedule| {
+                        prerequisite_ready(id, state)
+                            && (!review_nodes.contains(id)
+                                || state.review_admitted.contains_key(id))
                     };
                     let is_root = |id: &String| predecessors[id].is_empty();
                     let is_control = |id: &String| capability_of(id).starts_with("control.");
@@ -2966,13 +3794,47 @@ fn run_multi_agent_inner(
                             !is_root(id) && !is_control(id)
                         }
                     };
-                    let next = if slot_may_claim(&state, &agent, pool_mode, &provider_caps) {
+                    // Review admission is a separate, bounded control-plane
+                    // operation. Reserve only its node identity so it never
+                    // consumes a worker/provider slot or task attempt.
+                    let review_next = ids.iter().find(|id| {
+                        review_nodes.contains(*id)
+                            && !state.review_admitted.contains_key(*id)
+                            && !state.review_in_progress.contains(*id)
+                            && state
+                                .review_pending_until
+                                .get(*id)
+                                .is_none_or(|retry_at| *retry_at <= Instant::now())
+                            && prerequisite_ready(id, &state)
+                            && for_this_agent(id)
+                    });
+                    let next = if review_next.is_none()
+                        && slot_may_claim(&state, &agent, pool_mode, &provider_caps)
+                    {
                         ids.iter()
                             .find(|id| is_ready(id, &state) && for_this_agent(id))
                     } else {
                         None
                     };
-                    if next.is_none() && state.in_progress.is_empty() {
+                    let scheduled = if let Some(id) = review_next {
+                        let id = id.clone();
+                        state.review_in_progress.insert(id.clone());
+                        state.review_pending_until.remove(&id);
+                        Some(ScheduledTask::Review(id))
+                    } else if let Some(id) = next {
+                        let id = id.clone();
+                        let reviewed = state.review_admitted.get(&id).cloned();
+                        state.in_progress.insert(id.clone());
+                        state.slot_leases.insert(agent.clone(), id.clone());
+                        Some(ScheduledTask::Execute(id, reviewed))
+                    } else {
+                        None
+                    };
+                    if next.is_none()
+                        && review_next.is_none()
+                        && state.in_progress.is_empty()
+                        && state.review_in_progress.is_empty()
+                    {
                         // No worker can make progress. If a dependency-ready
                         // node is denied by the external-gate predicate,
                         // terminate the run instead of polling forever.
@@ -2988,19 +3850,95 @@ fn run_multi_agent_inner(
                             state.failed_retryable = false;
                             break;
                         }
-                    }
-                    match next {
-                        Some(id) => {
-                            state.in_progress.insert(id.clone());
-                            state.slot_leases.insert(agent.clone(), id.clone());
-                            Some(id.clone())
+                        let pending_review_wait = ids.iter().any(|id| {
+                            !state.completed.contains(id)
+                                && !state.review_blocked.contains_key(id)
+                                && predecessors[id]
+                                    .iter()
+                                    .all(|pred| state.completed.contains(pred))
+                                && state
+                                    .review_pending_until
+                                    .get(id)
+                                    .is_some_and(|retry_at| *retry_at > Instant::now())
+                        });
+                        if !pending_review_wait {
+                          if let Some(blocked) = ids.iter().find(|id| {
+                            state.review_blocked.contains_key(*id)
+                                && !state.completed.contains(*id)
+                                && !state.in_progress.contains(*id)
+                                && predecessors[*id]
+                                    .iter()
+                                    .all(|pred| state.completed.contains(pred))
+                        }) {
+                            state.failed = Some(blocked.clone());
+                            state.failed_retryable = false;
+                            break;
+                          }
                         }
-                        None => None,
                     }
+                    scheduled
                 };
-                let Some(id) = claimed else {
+                let Some(scheduled) = scheduled else {
                     std::thread::sleep(Duration::from_millis(30));
                     continue;
+                };
+
+                let (id, reviewed_attempt) = match scheduled {
+                    ScheduledTask::Review(id) => {
+                        let admission = crate::node_intelligence::review_admission(
+                            workspace,
+                            &id,
+                            &agent,
+                        );
+                        let mut state = schedule.lock().expect("schedule lock");
+                        state.review_in_progress.remove(&id);
+                        match admission {
+                            Ok(crate::node_intelligence::ReviewAdmission::Pending(binding)) => {
+                                let changed = state
+                                    .review_attempts
+                                    .get(&id)
+                                    .is_some_and(|prior| prior != &binding);
+                                if changed {
+                                    state.review_blocked.insert(
+                                        id.clone(),
+                                        "pinned attempt changed while review was pending".to_owned(),
+                                    );
+                                    eprintln!("  [{agent}] ✗ {id}: pinned attempt changed while review was pending; unrelated nodes remain eligible");
+                                } else {
+                                    state.review_attempts.insert(id.clone(), binding);
+                                    state.review_pending_until.insert(
+                                        id.clone(),
+                                        Instant::now() + REVIEW_RETRY_INTERVAL,
+                                    );
+                                    println!("{clr}  [{agent}] waiting for review ▸ {id}");
+                                }
+                            }
+                            Ok(crate::node_intelligence::ReviewAdmission::Ready(binding)) => {
+                                let changed = state
+                                    .review_attempts
+                                    .get(&id)
+                                    .is_some_and(|prior| prior != &binding);
+                                if changed {
+                                    state.review_blocked.insert(
+                                        id.clone(),
+                                        "pinned attempt changed during review admission".to_owned(),
+                                    );
+                                    eprintln!("  [{agent}] ✗ {id}: pinned attempt changed during review admission; unrelated nodes remain eligible");
+                                } else {
+                                    state.review_attempts.insert(id.clone(), binding.clone());
+                                    state.review_pending_until.remove(&id);
+                                    state.review_admitted.insert(id.clone(), binding);
+                                }
+                            }
+                            Err(error) => {
+                                let detail = format!("review admission blocked: {error:#}");
+                                state.review_blocked.insert(id.clone(), detail.clone());
+                                eprintln!("  [{agent}] ✗ {id}: {detail}; unrelated nodes remain eligible");
+                            }
+                        }
+                        continue;
+                    }
+                    ScheduledTask::Execute(id, reviewed) => (id, reviewed),
                 };
 
                 let node = node_by_id.get(&id).expect("claimed node exists");
@@ -3022,37 +3960,148 @@ fn run_multi_agent_inner(
                     state.slot_leases.remove(&agent);
                     state.failed = Some(id.clone());
                     state.failed_retryable = false;
-                    state.log.push(NodeRun {
-                        node: id.clone(),
-                        agent: agent.clone(),
-                        is_verify: is_verify(capability),
-                        ok: false,
-                        verified: None,
+                    let retries = state.retry_counts.get(&id).copied().unwrap_or(0);
+                    state.log.push(node_run_with_receipt(
+                        node,
+                        &agent,
+                        workspace,
+                        graph_id,
+                        graph_hash,
+                        is_verify(capability),
+                        false,
+                        None,
                         evidence_hex,
-                        latency_ms: 0,
-                    });
+                        0,
+                        None,
+                        retries,
+                    ));
                     eprintln!("  [{agent}] ✗ {id}: checkout denied: {error:#}");
                     break;
                 }
                 let started = std::time::Instant::now();
-                let result = run_node_with_hybrid(node, &agent, workspace, hybrid);
+                let runtime_deadline = match crate::node_intelligence::attempt_deadline(workspace, &id) {
+                    Ok(deadline) => deadline,
+                    Err(error) if reviewed_attempt.is_some() => {
+                        let _ = report_node(board, &id, "cancelled", &agent, workspace);
+                        let mut state = schedule.lock().expect("schedule lock");
+                        state.in_progress.remove(&id);
+                        state.slot_leases.remove(&agent);
+                        state.review_admitted.remove(&id);
+                        state.review_attempts.remove(&id);
+                        state.review_blocked.insert(
+                            id.clone(),
+                            format!("runtime config changed after review admission: {error:#}"),
+                        );
+                        eprintln!("  [{agent}] ✗ {id}: runtime config changed after review admission: {error:#}; unrelated nodes remain eligible");
+                        continue;
+                    }
+                    Err(_) => None,
+                };
+                if let Some(binding) = reviewed_attempt.as_ref() {
+                    if let Err(error) = crate::node_intelligence::verify_reviewed_checkout(
+                        workspace,
+                        &id,
+                        &agent,
+                        binding,
+                        runtime_deadline.expect("reviewed tasks receive an attempt deadline"),
+                    ) {
+                        let _ = report_node(board, &id, "cancelled", &agent, workspace);
+                        let mut state = schedule.lock().expect("schedule lock");
+                        state.in_progress.remove(&id);
+                        state.slot_leases.remove(&agent);
+                        state.review_admitted.remove(&id);
+                        state.review_attempts.remove(&id);
+                        state.review_blocked.insert(
+                            id.clone(),
+                            format!("review pin changed after checkout: {error:#}"),
+                        );
+                        eprintln!("  [{agent}] ✗ {id}: review pin changed after checkout: {error:#}; unrelated nodes remain eligible");
+                        continue;
+                    }
+                }
+                let result = run_node_with_hybrid(
+                    node,
+                    &agent,
+                    workspace,
+                    hybrid,
+                    reviewed_attempt.as_ref(),
+                    runtime_deadline,
+                );
                 let latency_ms = started.elapsed().as_millis() as u64;
+
+                // A workflow rejection returned by the configured bridge is
+                // known to precede both worker launch and the local analysis
+                // action. Release this checkout and block only its pinned
+                // attempt; generic errors still use the normal retry/failure
+                // path because an effect may already have happened.
+                if reviewed_attempt.is_some()
+                    && result.as_ref().err().is_some_and(
+                        crate::node_intelligence::is_review_blocked_before_effect,
+                    )
+                {
+                    let detail = result
+                        .as_ref()
+                        .err()
+                        .expect("review error was checked")
+                        .to_string();
+                    let _ = report_node(board, &id, "cancelled", &agent, workspace);
+                    let evidence_hex = workspace_digest(workspace);
+                    let mut state = schedule.lock().expect("schedule lock");
+                    state.in_progress.remove(&id);
+                    state.slot_leases.remove(&agent);
+                    state.review_admitted.remove(&id);
+                    state.review_attempts.remove(&id);
+                    state.review_pending_until.remove(&id);
+                    state.review_blocked.insert(id.clone(), detail.clone());
+                    let retries = state.retry_counts.get(&id).copied().unwrap_or(0);
+                    state.log.push(node_run_with_receipt(
+                        node,
+                        &agent,
+                        workspace,
+                        graph_id,
+                        graph_hash,
+                        is_verify(capability),
+                        false,
+                        None,
+                        evidence_hex,
+                        latency_ms,
+                        None,
+                        retries,
+                    ));
+                    eprintln!("  [{agent}] ✗ {id}: {detail}; attempt blocked before effect, unrelated nodes remain eligible");
+                    continue;
+                }
 
                 let evidence_hex = workspace_digest(workspace);
                 let node_is_verify = is_verify(capability);
                 let mut node_verified: Option<bool> = None;
+                let mut node_invocation: Option<InvocationObservation> = None;
                 let preds = predecessors.get(&id).cloned().unwrap_or_default();
+                let result = result.map(|outcome| {
+                    report_node_outcome_with_lessons(
+                        board,
+                        &id,
+                        &agent,
+                        workspace,
+                        &outcome,
+                        &evidence_hex,
+                        latency_ms,
+                        &preds,
+                        &outcome.lessons,
+                    );
+                    outcome
+                });
                 let mut state = schedule.lock().expect("schedule lock");
                 state.in_progress.remove(&id);
                 state.slot_leases.remove(&agent);
                 let node_ok = match result {
                     Ok(outcome) => {
+                        node_invocation = outcome.invocation.clone();
                         let NodeOutcome {
                             ok,
                             verified,
                             timed_out: _,
                             note,
-                            lessons,
                             retryable,
                             ..
                         } = &outcome;
@@ -3071,36 +4120,10 @@ fn run_multi_agent_inner(
                             let first_completion = state.completed.insert(id.clone());
                             if first_completion {
                                 mine += 1;
-                                report_node_outcome_with_lessons(
-                                    board,
-                                    &id,
-                                    &agent,
-                                    workspace,
-                                    &outcome,
-                                    &evidence_hex,
-                                    latency_ms,
-                                    &preds,
-                                    lessons,
-                                );
                                 let _ = mark_ready_frontier(workspace, graph, &state.completed);
-                                if is_planning {
-                                    println!("{clr}  [{agent}] ✓ plan ready — dispatching tasks to the workers.");
-                                } else {
-                                    println!("{clr}  [{agent}] ✓ {id}{suffix}");
-                                }
+                                println!("{clr}  [{agent}] ✓ {id}{suffix}");
                             }
                         } else {
-                            report_node_outcome_with_lessons(
-                                board,
-                                &id,
-                                &agent,
-                                workspace,
-                                &outcome,
-                                &evidence_hex,
-                                latency_ms,
-                                &preds,
-                                lessons,
-                            );
                             if pool_requeue_failure(
                                 &mut state,
                                 workspace,
@@ -3147,15 +4170,21 @@ fn run_multi_agent_inner(
                         false
                     }
                 };
-                state.log.push(NodeRun {
-                    node: id.clone(),
-                    agent: agent.clone(),
-                    is_verify: node_is_verify,
-                    ok: node_ok,
-                    verified: node_verified,
+                let retries = state.retry_counts.get(&id).copied().unwrap_or(0);
+                state.log.push(node_run_with_receipt(
+                    node,
+                    &agent,
+                    workspace,
+                    graph_id,
+                    graph_hash,
+                    node_is_verify,
+                    node_ok,
+                    node_verified,
                     evidence_hex,
                     latency_ms,
-                });
+                    node_invocation,
+                    retries,
+                ));
               }
             });
         }
@@ -3810,6 +4839,43 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
         .unwrap_or("")
         .to_owned();
     let capability = node.get("capability").and_then(Value::as_str).unwrap_or("");
+    let (graph_id, graph_hash) = crate::project_file::load(workspace)
+        .map(|document| {
+            (
+                document
+                    .graph
+                    .get("graph_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                document.graph_hash,
+            )
+        })
+        .unwrap_or_else(|_| ("unknown".to_owned(), "unknown".to_owned()));
+    let managed_boundary = match crate::node_intelligence::has_enabled_task(workspace, &id) {
+        Ok(false) => None,
+        Ok(true) => Some(
+            "enabled node-intelligence tasks require the managed pull-queue executor; set FRACTAL_MIDRUN=0 to use it".to_owned(),
+        ),
+        Err(error) => Some(format!("node-intelligence task configuration is invalid: {error:#}")),
+    };
+    if let Some(reason) = managed_boundary {
+        eprintln!("  [{agent}] ✗ {id}: {reason}; wave execution was blocked before checkout");
+        return node_run_with_receipt(
+            node,
+            agent,
+            workspace,
+            &graph_id,
+            &graph_hash,
+            is_verify(capability),
+            false,
+            None,
+            workspace_digest(workspace),
+            0,
+            None,
+            0,
+        );
+    }
     let clr = crate::ui::CLEAR_LINE;
     println!("{clr}  [{agent}] ▸ {id} ({capability})");
     // Serialize checkout with the efficiency boundary: never claim a node while
@@ -3818,15 +4884,20 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
         let _barrier = lock_scheduler();
         if let Err(error) = report_node(board, &id, "checkout", agent, workspace) {
             eprintln!("  [{agent}] ✗ {id}: checkout denied: {error:#}");
-            return NodeRun {
-                node: id,
-                agent: agent.to_owned(),
-                is_verify: is_verify(capability),
-                ok: false,
-                verified: None,
-                evidence_hex: workspace_digest(workspace),
-                latency_ms: 0,
-            };
+            return node_run_with_receipt(
+                node,
+                agent,
+                workspace,
+                &graph_id,
+                &graph_hash,
+                is_verify(capability),
+                false,
+                None,
+                workspace_digest(workspace),
+                0,
+                None,
+                0,
+            );
         }
     }
     let started = std::time::Instant::now();
@@ -3845,9 +4916,11 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
             .collect::<Vec<_>>()
     };
     let mut verified = None;
+    let mut invocation = None;
     let ok = match result {
         Ok(outcome) => {
             verified = outcome.verified;
+            invocation = outcome.invocation.clone();
             let suffix = outcome
                 .note
                 .as_deref()
@@ -3886,15 +4959,20 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
             false
         }
     };
-    NodeRun {
-        node: id,
-        agent: agent.to_owned(),
-        is_verify: is_verify_node,
+    node_run_with_receipt(
+        node,
+        agent,
+        workspace,
+        &graph_id,
+        &graph_hash,
+        is_verify_node,
         ok,
         verified,
         evidence_hex,
         latency_ms,
-    }
+        invocation,
+        0,
+    )
 }
 
 /// Run one wave — a set of already-ready, mutually independent nodes — in parallel
@@ -3970,6 +5048,7 @@ pub(crate) fn run_wave_with_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::efficiency::EfficiencyMode;
     use crate::efficiency_accounting::UpsertOutcome;
     use crate::efficiency_policy::PolicyDecision;
@@ -4693,6 +5772,7 @@ esac
         assert!(args
             .windows(2)
             .any(|pair| { pair == ["--model".to_owned(), "gpt-5.6-luna".to_owned()] }));
+        assert!(!args.iter().any(|arg| arg == "gpt-5.6-sol"));
         assert!(!args
             .iter()
             .any(|arg| arg == "gpt-5.6-sol" || arg == "model_reasoning_effort=\"high\""));
@@ -4884,6 +5964,539 @@ esac
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn admitted_analysis_node_runs_the_real_local_runtime_bridge() {
+        use std::io::Write;
+
+        let _env_lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let workspace = temp_workspace();
+        fs::create_dir_all(&workspace).unwrap();
+        let workspace = fs::canonicalize(workspace).unwrap();
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_node_intelligence_measurement",
+            "nodes": [{
+                "id": "analysis",
+                "capability": crate::node_intelligence::ANALYSIS_CAPABILITY,
+                "title": "Analyze synthetic measurements",
+                "instruction": "Summarize the pinned synthetic measurements.",
+                "hard_limits": {"max_calls": 1, "max_elapsed_ms": 5000, "max_retries": 0}
+            }],
+            "edges": []
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::project_file::persist(&workspace, &graph, "Node Intelligence Integration").unwrap();
+        crate::project_file::checkout_start_node(
+            &workspace,
+            "analysis",
+            "fixture-agent",
+            "Fixture Agent",
+        )
+        .unwrap();
+        let document = crate::project_file::load(&workspace).unwrap();
+        let fractalmaster = PathBuf::from("/Users/jamesstar/fractalmaster");
+        let fixture = fractalmaster.join("runs/jev-network/runtime_fixture.py");
+        let mut child = Command::new("python3")
+            .arg(&fixture)
+            .args([
+                "--workspace",
+                workspace.to_str().unwrap(),
+                "--project-id",
+                &document.project.slug,
+                "--task-id",
+                "analysis",
+            ])
+            .env("PYTHONPATH", &fractalmaster)
+            .current_dir(&workspace)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start deterministic runtime fixture");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&fractal_contracts::canonical_json(&document.graph).unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let configuration_path = workspace.join(".fractal/node-intelligence.json");
+        let configuration_bytes = fs::read(&configuration_path).unwrap();
+        let configuration: Value = serde_json::from_slice(&configuration_bytes).unwrap();
+        let task = &configuration["tasks"]["analysis"];
+        let host_policy_path = workspace
+            .parent()
+            .unwrap()
+            .join("node-intelligence-host-policy.json");
+        let host_policy = json!({
+            "schema": "fractal.node_intelligence.host_policy.v1",
+            "project_id": format!("fractal:project:{}", document.project.slug),
+            "graph_hash": document.graph_hash,
+            "tasks": {
+                "analysis": {
+                    "authorization": task["runtime"]["authorization"],
+                    "authorized_approvers": task["authorized_approvers"],
+                    "qualified_reviewers": task["qualified_reviewers"]
+                }
+            }
+        });
+        fs::write(
+            &host_policy_path,
+            fractal_contracts::canonical_json(&host_policy).unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&host_policy_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let _python_path = EnvGuard::set("PYTHONPATH", &fractalmaster);
+        let _host_policy = EnvGuard::set("FRACTAL_NODE_INTELLIGENCE_POLICY", &host_policy_path);
+        let node = document.graph["nodes"][0].clone();
+
+        let route = RouteInvocation {
+            cli_family: "node-intelligence-analysis".to_owned(),
+            selected_model: None,
+            selected_effort: None,
+            configuration_source: "host-deterministic-analysis-adapter".to_owned(),
+        };
+        let preflight =
+            crate::node_intelligence::prepare(&workspace, "analysis", "fixture-agent", &route)
+                .unwrap()
+                .expect("configured preflight");
+        let host_policy_bytes = fs::read(&host_policy_path).unwrap();
+        let mut changed_policy = host_policy_bytes.clone();
+        changed_policy.push(b' ');
+        fs::write(&host_policy_path, changed_policy).unwrap();
+        assert!(crate::node_intelligence::recheck_before_effect(
+            &workspace,
+            &preflight,
+            "fixture-agent",
+        )
+        .is_err());
+        fs::write(&host_policy_path, &host_policy_bytes).unwrap();
+        let alternate_policy_path = workspace
+            .parent()
+            .unwrap()
+            .join("node-intelligence-host-policy-copy.json");
+        fs::write(&alternate_policy_path, &host_policy_bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&alternate_policy_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        {
+            let _alternate_policy =
+                EnvGuard::set("FRACTAL_NODE_INTELLIGENCE_POLICY", &alternate_policy_path);
+            assert!(crate::node_intelligence::recheck_before_effect(
+                &workspace,
+                &preflight,
+                "fixture-agent",
+            )
+            .is_err());
+        }
+        fs::remove_file(alternate_policy_path).unwrap();
+        let mut changed_config: Value = serde_json::from_slice(&configuration_bytes).unwrap();
+        changed_config["timeout_ms"] = json!(4_999);
+        fs::write(
+            &configuration_path,
+            fractal_contracts::canonical_json(&changed_config).unwrap(),
+        )
+        .unwrap();
+        assert!(crate::node_intelligence::recheck_before_effect(
+            &workspace,
+            &preflight,
+            "fixture-agent",
+        )
+        .is_err());
+        fs::write(&configuration_path, &configuration_bytes).unwrap();
+        let mut self_granted_memory: Value = serde_json::from_slice(&configuration_bytes).unwrap();
+        self_granted_memory["tasks"]["analysis"]["runtime"]["memory"] = json!({});
+        fs::write(
+            &configuration_path,
+            fractal_contracts::canonical_json(&self_granted_memory).unwrap(),
+        )
+        .unwrap();
+        let memory_error =
+            crate::node_intelligence::prepare(&workspace, "analysis", "fixture-agent", &route)
+                .unwrap_err();
+        assert!(
+            format!("{memory_error:#}").contains("grants do not match the independent host policy"),
+            "unexpected self-granted memory error: {memory_error:#}"
+        );
+        fs::write(&configuration_path, &configuration_bytes).unwrap();
+        assert!(!workspace
+            .join(".fractal/node-actions/actions.sqlite3")
+            .exists());
+
+        let outcome = run_node(&node, "fixture-agent", &workspace).unwrap();
+        assert!(outcome.ok, "analysis outcome: {:?}", outcome.note);
+        assert_eq!(outcome.verified, None);
+        let evidence = outcome
+            .invocation
+            .as_ref()
+            .and_then(|invocation| invocation.node_intelligence.as_ref())
+            .expect("analysis retains its host-validated bridge evidence");
+        assert_eq!(evidence.remaining_calls, 0);
+        let analysis = evidence.analysis.as_ref().unwrap();
+        assert_eq!(analysis["action"]["state"], "complete");
+        assert_eq!(analysis["collection"]["available"], true);
+        assert!(evidence.host_policy_digest.starts_with("sha256:"));
+        assert!(workspace
+            .join(".fractal/node-actions/actions.sqlite3")
+            .exists());
+        fs::remove_file(host_policy_path).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_review_waits_without_checkout_while_unrelated_work_runs() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env_lock = crate::graph_store::ENV_LOCK.lock().unwrap();
+        let uncanonical_root = temp_workspace();
+        fs::create_dir_all(&uncanonical_root).unwrap();
+        let root = fs::canonicalize(uncanonical_root).unwrap();
+        let workspace = root.join("workspace");
+        let bin = root.join("bin");
+        let capture = root.join("worker-capture.json");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let _home = EnvGuard::set("FRACTAL_HOME", root.join("isolated-home"));
+        let _offline = EnvGuard::set("FRACTAL_OFFLINE", "1");
+        let _active_run = EnvGuard::set("FRACTAL_ACTIVE_RUN_ID", "");
+        std::env::remove_var("FRACTAL_ACTIVE_RUN_ID");
+        let _timeout = EnvGuard::set("FRACTAL_AGENT_TIMEOUT_MS", "15000");
+        let _capture = EnvGuard::set("FRACTAL_NODE_TEST_CAPTURE", &capture);
+        let _python_path = EnvGuard::set("PYTHONPATH", "/Users/jamesstar/fractalmaster");
+        let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        let _path = EnvGuard::set("PATH", path);
+
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_node_intelligence_review_scheduler",
+            "nodes": [
+                {
+                    "id": "analysis",
+                    "capability": crate::node_intelligence::ANALYSIS_CAPABILITY,
+                    "title": "Reviewed synthetic analysis",
+                    "instruction": "Summarize the pinned synthetic measurements.",
+                    "hard_limits": {"max_calls": 1, "max_elapsed_ms": 15000, "max_retries": 0}
+                },
+                {
+                    "id": "ordinary",
+                    "capability": "code.generate",
+                    "title": "Independent ordinary work",
+                    "instruction": "Run the fake local coding command.",
+                    "hard_limits": {"max_elapsed_ms": 15000}
+                }
+            ],
+            "edges": []
+        });
+        graph["graph_hash"] = Value::String(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::project_file::persist(&workspace, &graph, "Node Intelligence Review Scheduler")
+            .unwrap();
+        let document = crate::project_file::load(&workspace).unwrap();
+        let fixture =
+            PathBuf::from("/Users/jamesstar/fractalmaster/runs/jev-network/runtime_fixture.py");
+        let mut fixture_child = Command::new("python3")
+            .arg(&fixture)
+            .args([
+                "--workspace",
+                workspace.to_str().unwrap(),
+                "--project-id",
+                &document.project.slug,
+                "--task-id",
+                "analysis",
+                "--pending-review",
+            ])
+            .env("PYTHONPATH", "/Users/jamesstar/fractalmaster")
+            .current_dir(&workspace)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start pending-review fixture");
+        fixture_child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&fractal_contracts::canonical_json(&document.graph).unwrap())
+            .unwrap();
+        let fixture_output = fixture_child.wait_with_output().unwrap();
+        assert!(
+            fixture_output.status.success(),
+            "pending fixture failed: {}",
+            String::from_utf8_lossy(&fixture_output.stderr)
+        );
+        let fixture_result: Value = serde_json::from_slice(&fixture_output.stdout).unwrap();
+        let expected_attempt_ref = fixture_result["attempt_ref"].as_str().unwrap().to_owned();
+        let configuration: Value = serde_json::from_slice(
+            &fs::read(workspace.join(".fractal/node-intelligence.json")).unwrap(),
+        )
+        .unwrap();
+        let task = &configuration["tasks"]["analysis"];
+        let host_policy_path = root.join("host-policy.json");
+        let host_policy = json!({
+            "schema": "fractal.node_intelligence.host_policy.v1",
+            "project_id": format!("fractal:project:{}", document.project.slug),
+            "graph_hash": document.graph_hash,
+            "tasks": {
+                "analysis": {
+                    "authorization": task["runtime"]["authorization"],
+                    "authorized_approvers": task["authorized_approvers"],
+                    "qualified_reviewers": task["qualified_reviewers"]
+                }
+            }
+        });
+        fs::write(
+            &host_policy_path,
+            fractal_contracts::canonical_json(&host_policy).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&host_policy_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let _host_policy = EnvGuard::set("FRACTAL_NODE_INTELLIGENCE_POLICY", &host_policy_path);
+
+        let fake_coder = bin.join("codex");
+        fs::write(
+            &fake_coder,
+            r#"#!/usr/bin/python3
+import json, os, pathlib, sys
+workspace = pathlib.Path('.fractal/project.fractal')
+document = json.loads(workspace.read_text())
+assignment = document.get('execution', {}).get('assignments', {}).get('analysis')
+assert assignment is None or assignment.get('state') != 'checked_out', 'pending review consumed an attempt before unrelated work'
+pathlib.Path(os.environ['FRACTAL_NODE_TEST_CAPTURE']).write_text(json.dumps({
+    'args': sys.argv[1:],
+    'analysis_assignment': assignment,
+    'analysis_attempt_count': document['learning']['nodes']['analysis']['attempt_count'],
+    'node': os.environ.get('FRACTAL_NODE_ID'),
+}))
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fake_coder, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let direct_wave = run_wave(
+            &[document.graph["nodes"][0].clone()],
+            &document.graph,
+            &["codex".to_owned()],
+            &workspace,
+            None,
+        );
+        assert_eq!(direct_wave.len(), 1);
+        assert!(!direct_wave[0].ok);
+        assert!(!capture.exists(), "direct wave launched an unadmitted task");
+        assert_eq!(
+            crate::project_file::load(&workspace)
+                .unwrap()
+                .learning
+                .nodes["analysis"]
+                .attempt_count,
+            0
+        );
+        assert!(crate::project_file::assignment(&workspace, "analysis")
+            .unwrap()
+            .is_none());
+
+        let graph_for_run = document.graph.clone();
+        let workspace_for_run = workspace.clone();
+        let scheduler = std::thread::spawn(move || {
+            run_multi_agent(
+                &graph_for_run,
+                &workspace_for_run,
+                &["codex".to_owned()],
+                None,
+                &BTreeSet::new(),
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while !capture.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            capture.exists(),
+            "unrelated fake coding task did not run while review was pending"
+        );
+        let before_approval = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(before_approval.learning.nodes["analysis"].attempt_count, 0);
+        assert!(crate::project_file::assignment(&workspace, "analysis")
+            .unwrap()
+            .is_none());
+        let worker_capture: Value = serde_json::from_slice(&fs::read(&capture).unwrap()).unwrap();
+        assert_eq!(worker_capture["node"], "ordinary");
+        assert_eq!(worker_capture["analysis_attempt_count"], 0);
+        assert!(worker_capture["analysis_assignment"].is_null());
+
+        // Approval uses the production owner-review API and leaves the same
+        // predicted attempt intact for the scheduler's next admission check.
+        let approval = Command::new("python3")
+            .arg(&fixture)
+            .args([
+                "--workspace",
+                workspace.to_str().unwrap(),
+                "--project-id",
+                &document.project.slug,
+                "--task-id",
+                "analysis",
+                "--approve-review",
+            ])
+            .env("PYTHONPATH", "/Users/jamesstar/fractalmaster")
+            .current_dir(&workspace)
+            .output()
+            .expect("run explicit fixture owner approval");
+        assert!(
+            approval.status.success(),
+            "fixture approval failed: {}",
+            String::from_utf8_lossy(&approval.stderr)
+        );
+        let outcome = scheduler.join().unwrap().unwrap();
+        assert_eq!(
+            outcome.failed_node, None,
+            "scheduler outcome: {}",
+            outcome.detail
+        );
+        assert!(outcome
+            .log
+            .iter()
+            .any(|run| run.node == "ordinary" && run.ok));
+        assert!(outcome
+            .log
+            .iter()
+            .any(|run| run.node == "analysis" && run.ok));
+        let analysis_receipt = outcome
+            .log
+            .iter()
+            .find(|run| run.node == "analysis")
+            .and_then(|run| run.receipt.as_ref())
+            .expect("analysis outcome has a host route receipt");
+        assert!(analysis_receipt
+            .authorization_evidence_refs
+            .iter()
+            .any(|reference| {
+                reference.reference == format!("node-intelligence:attempt:{expected_attempt_ref}")
+            }));
+        let after = crate::project_file::load(&workspace).unwrap();
+        assert_eq!(after.learning.nodes["analysis"].attempt_count, 1);
+        assert_eq!(
+            crate::project_file::assignment(&workspace, "analysis")
+                .unwrap()
+                .unwrap()
+                .state,
+            "completed"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn route_receipts_separate_process_success_failure_retry_and_denied_checkout() {
+        let workspace = temp_workspace();
+        let node = json!({
+            "id": "receipt-node",
+            "capability": "code.generate",
+            "instruction": "bounded fixture"
+        });
+        let invocation = |status: &str, exit_status: Option<i32>| {
+            Some(InvocationObservation {
+                invocation: RouteInvocation {
+                    cli_family: "codex".to_owned(),
+                    selected_model: Some("gpt-5.6-luna".to_owned()),
+                    selected_effort: Some("high".to_owned()),
+                    configuration_source: "host-observed-command-config".to_owned(),
+                },
+                process_status: status.to_owned(),
+                process_started_at_ms: Some(10),
+                process_ended_at_ms: Some(20),
+                exit_status,
+                node_intelligence: None,
+            })
+        };
+        let success = node_run_with_receipt(
+            &node,
+            "codex-luna",
+            &workspace,
+            "graph",
+            "sha256:graph",
+            false,
+            true,
+            None,
+            "sha256:success".to_owned(),
+            10,
+            invocation("exited_success", Some(0)),
+            0,
+        );
+        assert_eq!(
+            success.receipt.as_ref().unwrap().process_status,
+            "exited_success"
+        );
+        assert!(success.receipt.as_ref().unwrap().process_success);
+        assert_eq!(
+            success
+                .receipt
+                .as_ref()
+                .unwrap()
+                .invocation
+                .selected_model
+                .as_deref(),
+            Some("gpt-5.6-luna")
+        );
+
+        let failed = node_run_with_receipt(
+            &node,
+            "codex-luna",
+            &workspace,
+            "graph",
+            "sha256:graph",
+            true,
+            false,
+            Some(false),
+            "sha256:failure".to_owned(),
+            10,
+            invocation("exited_failure", Some(23)),
+            2,
+        );
+        let failed_receipt = failed.receipt.as_ref().unwrap();
+        assert!(!failed_receipt.process_success);
+        assert_eq!(failed_receipt.verification.verification_status, "failed");
+        assert_eq!(failed_receipt.retries, 2);
+        assert_eq!(failed_receipt.exit_status, Some(23));
+
+        let denied = node_run_with_receipt(
+            &node,
+            "codex-luna",
+            &workspace,
+            "graph",
+            "sha256:graph",
+            false,
+            false,
+            None,
+            "sha256:denied".to_owned(),
+            0,
+            None,
+            0,
+        );
+        let denied_receipt = denied.receipt.as_ref().unwrap();
+        assert_eq!(denied_receipt.process_status, "not_executed");
+        assert!(!denied_receipt.process_success);
+        assert!(denied_receipt.process_started_at_ms.is_none());
+        assert!(denied_receipt.process_ended_at_ms.is_none());
+        let _ = fs::remove_dir_all(workspace);
     }
 
     fn efficiency_node(
