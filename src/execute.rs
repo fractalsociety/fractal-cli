@@ -2052,6 +2052,42 @@ impl NodeOutcome {
     }
 }
 
+/// Child-process failpoint for proving that a durable local adapter action is
+/// reconciled after its coordinator dies but before the graph outcome commits.
+/// It is absent from production builds and exits only after an adapter receipt
+/// and collected output have both been persisted.
+#[cfg(test)]
+fn maybe_crash_after_node_intelligence_effect(_node_id: &str, result: &Result<NodeOutcome>) {
+    let Ok(expected_operation) = std::env::var("FRACTAL_NODE_INTELLIGENCE_TEST_CRASH_AFTER_EFFECT")
+    else {
+        return;
+    };
+    let Some(outcome) = result.as_ref().ok().filter(|outcome| outcome.ok) else {
+        return;
+    };
+    let Some(evidence) = outcome
+        .invocation
+        .as_ref()
+        .and_then(|invocation| invocation.node_intelligence.as_ref())
+    else {
+        return;
+    };
+    if evidence.operation != expected_operation || evidence.intent_ref.is_none() {
+        return;
+    }
+    let Some(effect) = evidence.effect.as_ref() else {
+        return;
+    };
+    if effect.pointer("/action/state").and_then(Value::as_str) == Some("complete")
+        && effect
+            .pointer("/collection/available")
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        std::process::exit(86);
+    }
+}
+
 fn declared_artifact_path(node: &Value, workspace: &Path) -> Option<PathBuf> {
     let raw = node
         .pointer("/efficiency/expected_artifact")
@@ -2165,6 +2201,26 @@ fn run_node_with_hybrid(
             runtime_deadline,
         );
     }
+    if capability == crate::node_intelligence::INTAKE_CAPABILITY {
+        return run_node_intelligence_measurement(
+            node,
+            agent,
+            workspace,
+            expected_review,
+            runtime_deadline,
+            "intake",
+        );
+    }
+    if capability == crate::node_intelligence::CHECK_CAPABILITY {
+        return run_node_intelligence_measurement(
+            node,
+            agent,
+            workspace,
+            expected_review,
+            runtime_deadline,
+            "check",
+        );
+    }
     // Defense in depth: callers must atomically checkout first, but this
     // worker seam is also private authority against direct execution paths.
     // A malformed declaration, missing ledger, stale evidence, or reviewer
@@ -2253,56 +2309,90 @@ fn run_node_intelligence_analysis(
     expected_review: Option<&crate::node_intelligence::ReviewBinding>,
     runtime_deadline: Option<Instant>,
 ) -> Result<NodeOutcome> {
+    run_node_intelligence_measurement(
+        node,
+        agent,
+        workspace,
+        expected_review,
+        runtime_deadline,
+        "analysis",
+    )
+}
+
+fn run_node_intelligence_measurement(
+    node: &Value,
+    agent: &str,
+    workspace: &Path,
+    expected_review: Option<&crate::node_intelligence::ReviewBinding>,
+    runtime_deadline: Option<Instant>,
+    operation: &str,
+) -> Result<NodeOutcome> {
     let node_id = node
         .get("id")
         .and_then(Value::as_str)
-        .context("analysis node is missing canonical id")?;
+        .context("measurement node is missing canonical id")?;
+    if node.get("harness_runtime").is_some() {
+        bail!("deterministic measurement nodes cannot use project-harness lifecycle adapters");
+    }
     let route = RouteInvocation {
-        cli_family: "node-intelligence-analysis".to_owned(),
+        cli_family: format!("node-intelligence-{operation}"),
         selected_model: None,
         selected_effort: None,
-        configuration_source: "host-deterministic-analysis-adapter".to_owned(),
+        configuration_source: format!("host-deterministic-{operation}-adapter"),
     };
     let started_at = now_ms();
-    let bridge = crate::node_intelligence::prepare_analysis(
-        workspace,
-        node_id,
-        agent,
-        &route,
-        expected_review,
-        runtime_deadline,
-    )?;
+    let bridge = if operation == "analysis" {
+        crate::node_intelligence::prepare_analysis(
+            workspace,
+            node_id,
+            agent,
+            &route,
+            expected_review,
+            runtime_deadline,
+        )?
+    } else {
+        crate::node_intelligence::prepare_effect(
+            workspace,
+            node_id,
+            agent,
+            &route,
+            operation,
+            expected_review,
+            runtime_deadline,
+        )?
+    };
     let post_action_binding_error =
         crate::node_intelligence::recheck_before_effect(workspace, &bridge, agent).err();
     let ended_at = now_ms();
-    let analysis = bridge
-        .analysis
+    let effect = bridge
+        .effect
         .as_ref()
-        .context("analysis adapter response lacks typed result")?;
-    let action = analysis
+        .context("measurement adapter response lacks typed result")?;
+    let action = effect
         .get("action")
-        .context("analysis adapter response lacks action receipt")?;
-    let collection = analysis
+        .context("measurement adapter response lacks action receipt")?;
+    let collection = effect
         .get("collection")
-        .context("analysis adapter response lacks collection receipt")?;
+        .context("measurement adapter response lacks collection receipt")?;
     let action_complete = action.get("state").and_then(Value::as_str) == Some("complete");
     let collection_available = collection.get("available").and_then(Value::as_bool) == Some(true);
+    let verified_outcome = effect.get("verified_outcome").and_then(Value::as_bool);
     let artifact_count = collection
         .get("artifact_refs")
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or_default();
     let note = if post_action_binding_error.is_some() {
-        "analysis action ran, but host authorization or pinned configuration changed afterward; its deterministic effect may have persisted".to_owned()
+        format!("{operation} action ran, but host authorization or pinned configuration changed afterward; its deterministic effect may have persisted")
     } else if action_complete && collection_available {
-        format!("deterministic analysis completed and collected {artifact_count} artifact(s)")
+        format!("deterministic {operation} completed and collected {artifact_count} artifact(s)")
     } else {
         let reason = action
             .get("reason")
             .and_then(Value::as_str)
             .filter(|reason| reason.len() <= 120)
-            .unwrap_or("analysis action or collection did not complete");
-        format!("deterministic analysis did not complete: {reason}")
+            .unwrap_or("measurement action or collection did not complete");
+        format!("deterministic {operation} did not complete: {reason}")
     };
     let invocation = InvocationObservation {
         invocation: route,
@@ -2313,7 +2403,16 @@ fn run_node_intelligence_analysis(
         node_intelligence: Some(bridge),
     };
     if action_complete && collection_available && post_action_binding_error.is_none() {
-        Ok(NodeOutcome::success(None, Some(note)).with_invocation(Some(invocation)))
+        if operation == "check" {
+            if verified_outcome == Some(true) {
+                Ok(NodeOutcome::success(Some(true), Some(note)).with_invocation(Some(invocation)))
+            } else {
+                Ok(NodeOutcome::failure(Some(false), false, Some(note))
+                    .with_invocation(Some(invocation)))
+            }
+        } else {
+            Ok(NodeOutcome::success(None, Some(note)).with_invocation(Some(invocation)))
+        }
     } else {
         Ok(NodeOutcome::failure(None, false, Some(note)).with_invocation(Some(invocation)))
     }
@@ -2489,7 +2588,7 @@ fn report_node_outcome(
     latency_ms: u64,
     predecessors: &[String],
 ) {
-    report_node_outcome_with_lessons(
+    if let Err(error) = report_node_outcome_with_lessons(
         board,
         node,
         agent,
@@ -2499,7 +2598,9 @@ fn report_node_outcome(
         latency_ms,
         predecessors,
         &[],
-    )
+    ) {
+        eprintln!("  live graph state note: {error:#}");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2513,26 +2614,22 @@ fn report_node_outcome_with_lessons(
     latency_ms: u64,
     predecessors: &[String],
     provided_lessons: &[String],
-) {
+) -> Result<()> {
     if outcome.ok {
         let human = agent.eq_ignore_ascii_case("human");
         let board_action = "complete";
-        crate::run_control::node_transition(board, node, board_action, agent);
-        let result = finish_learning_success(
+        finish_learning_success(
             workspace,
             node,
             agent,
             outcome.verified,
             Some((evidence_hex, latency_ms, predecessors)),
             human,
-        );
-        if let Err(error) = result {
-            eprintln!("  live graph state note: {error:#}");
-        } else {
-            crate::project_sync::maybe_sync_runtime(workspace);
-        }
+        )?;
+        crate::run_control::node_transition(board, node, board_action, agent);
+        crate::project_sync::maybe_sync_runtime(workspace);
         record_lesson_reuse(workspace, node, provided_lessons, outcome, evidence_hex);
-        return;
+        return Ok(());
     }
 
     let (learning_outcome, default_failure_code) = if outcome.verified == Some(false) {
@@ -2552,7 +2649,6 @@ fn report_node_outcome_with_lessons(
         )
     };
     let failure_code = outcome.failure_code.unwrap_or(default_failure_code);
-    crate::run_control::node_transition(board, node, "release", agent);
     let evidence = compact_evidence_ref(node, evidence_hex);
     let mut result = release_learning_failure(
         workspace,
@@ -2568,12 +2664,11 @@ fn report_node_outcome_with_lessons(
                 crate::project_file::record_integration_failure(workspace, node, detail.clone());
         }
     }
-    if let Err(error) = result {
-        eprintln!("  live graph state note: {error:#}");
-    } else {
-        crate::project_sync::maybe_sync_runtime(workspace);
-    }
+    result?;
+    crate::run_control::node_transition(board, node, "release", agent);
+    crate::project_sync::maybe_sync_runtime(workspace);
     record_lesson_reuse(workspace, node, provided_lessons, outcome, evidence_hex);
+    Ok(())
 }
 
 fn compact_evidence_ref(node: &str, evidence_hex: &str) -> String {
@@ -4027,6 +4122,8 @@ fn run_multi_agent_inner(
                     reviewed_attempt.as_ref(),
                     runtime_deadline,
                 );
+                #[cfg(test)]
+                maybe_crash_after_node_intelligence_effect(&id, &result);
                 let latency_ms = started.elapsed().as_millis() as u64;
 
                 // A workflow rejection returned by the configured bridge is
@@ -4077,19 +4174,28 @@ fn run_multi_agent_inner(
                 let mut node_verified: Option<bool> = None;
                 let mut node_invocation: Option<InvocationObservation> = None;
                 let preds = predecessors.get(&id).cloned().unwrap_or_default();
-                let result = result.map(|outcome| {
-                    report_node_outcome_with_lessons(
-                        board,
-                        &id,
-                        &agent,
-                        workspace,
-                        &outcome,
-                        &evidence_hex,
-                        latency_ms,
-                        &preds,
-                        &outcome.lessons,
-                    );
-                    outcome
+                let mut persistence_failed = false;
+                let result = result.and_then(|outcome| {
+                    if let Err(error) = report_node_outcome_with_lessons(
+                        board, &id, &agent, workspace, &outcome, &evidence_hex,
+                        latency_ms, &preds, &outcome.lessons,
+                    ) {
+                        persistence_failed = true;
+                        return Err(error.context("canonical outcome was not committed"));
+                    }
+                    if let Some(evidence) = outcome
+                        .invocation
+                        .as_ref()
+                        .and_then(|invocation| invocation.node_intelligence.as_ref())
+                    {
+                        if let Err(error) = crate::node_intelligence::mark_effect_completed(
+                            workspace,
+                            evidence,
+                        ) {
+                            eprintln!("  [{agent}] warning: committed node effect could not be marked resolved: {error:#}");
+                        }
+                    }
+                    Ok(outcome)
                 });
                 let mut state = schedule.lock().expect("schedule lock");
                 state.in_progress.remove(&id);
@@ -4142,7 +4248,7 @@ fn run_multi_agent_inner(
                         *ok
                     }
                     Err(error) => {
-                        report_node_outcome(
+                        if !persistence_failed { report_node_outcome(
                             board,
                             &id,
                             &agent,
@@ -4151,14 +4257,14 @@ fn run_multi_agent_inner(
                             &evidence_hex,
                             latency_ms,
                             &preds,
-                        );
+                        ); }
                         if pool_requeue_failure(
                             &mut state,
                             workspace,
                             &id,
                             pool_mode,
                             is_lead,
-                            true,
+                            !persistence_failed,
                         ) {
                             eprintln!("  [{agent}] ✗ {id}: {error:#}");
                         } else {
@@ -4926,7 +5032,7 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
                 .as_deref()
                 .map(|note| format!(" — {note}"))
                 .unwrap_or_default();
-            report_node_outcome_with_lessons(
+            let committed = report_node_outcome_with_lessons(
                 board,
                 &id,
                 agent,
@@ -4937,6 +5043,23 @@ fn run_and_record(node: &Value, agent: &str, workspace: &Path, board: Option<&st
                 &predecessors,
                 &outcome.lessons,
             );
+            if let Err(error) = committed {
+                eprintln!("  [{agent}] ✗ {id}: canonical outcome was not committed: {error:#}");
+                return node_run_with_receipt(
+                    node,
+                    agent,
+                    workspace,
+                    &graph_id,
+                    &graph_hash,
+                    is_verify_node,
+                    false,
+                    None,
+                    evidence_hex,
+                    latency_ms,
+                    invocation,
+                    0,
+                );
+            }
             if outcome.ok {
                 println!("{clr}  [{agent}] ✓ {id}{suffix}");
             } else {

@@ -17,7 +17,7 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Map, Value};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -31,12 +31,28 @@ const APPROVAL_MANIFEST_SCHEMA: &str = "fractal.node_intelligence.approval_manif
 const HOST_POLICY_SCHEMA: &str = "fractal.node_intelligence.host_policy.v1";
 const HOST_POLICY_ENV: &str = "FRACTAL_NODE_INTELLIGENCE_POLICY";
 pub(crate) const ANALYSIS_CAPABILITY: &str = "intelligence.measurement.analyze";
+pub(crate) const INTAKE_CAPABILITY: &str = "intelligence.measurement.intake";
+pub(crate) const CHECK_CAPABILITY: &str = "intelligence.measurement.check";
+const EFFECT_INTENT_SCHEMA: &str = "fractal.node_intelligence.effect_intent.v1";
+const EFFECT_SNAPSHOT_SCHEMA: &str = "fractal.node_intelligence.effect_snapshot.v1";
+const MATERIALIZATION_RECEIPT_SCHEMA: &str = "fractal.node_intelligence.materialization.v1";
+const NETWORK_RESOLUTION_SCHEMA: &str = "fractal.node_intelligence.network_resolution.v1";
+const EFFECT_INTENT_DIR: &str = ".fractal/node-intelligence-intents";
+const EFFECT_SNAPSHOT_DIR: &str = ".fractal/node-intelligence-effects";
+const EFFECT_RESOLUTION_DIR: &str = ".fractal/node-intelligence-resolutions";
+const MATERIALIZED_TASK_DIR: &str = ".fractal/node-intelligence-materialized";
+const RESOLVED_TASK_DIR: &str = ".fractal/node-intelligence-resolved";
+const NETWORK_RESOLVER_ENV: &str = "FRACTAL_NODE_NETWORK_RESOLVER";
+const FEEDBACK_POLICY_ENV: &str = "FRACTAL_NODE_FEEDBACK_POLICY";
+const RESOLVED_TASK_SCHEMA: &str = "fractal.node_intelligence.resolved_task.v1";
 const MAX_CONFIG_BYTES: u64 = 1_048_576;
 const MAX_REQUEST_BYTES: usize = 1_048_576;
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_PRIVATE_RECEIPT_BYTES: usize = 256 * 1024;
 const MAX_APPROVAL_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_HOST_POLICY_BYTES: u64 = 1_048_576;
+const MAX_EFFECT_RECORD_BYTES: usize = 64 * 1024;
+const MAX_EFFECT_RECORDS: usize = 4096;
 const ECHO_FIELDS: [&str; 16] = [
     "request_id",
     "request_hash",
@@ -119,7 +135,15 @@ pub(crate) struct BridgeEvidence {
     pub(crate) handoff_refs: Vec<String>,
     pub(crate) review_packet_refs: Vec<String>,
     pub(crate) decision: Value,
+    pub(crate) operation: String,
+    pub(crate) effect: Option<Value>,
+    /// Kept as an alias while existing analysis callers migrate to `effect`.
     pub(crate) analysis: Option<Value>,
+    pub(crate) recovered: bool,
+    pub(crate) intent_ref: Option<String>,
+    pub(crate) current_attempt_number: Option<u32>,
+    pub(crate) materialization_ref: Option<String>,
+    pub(crate) network_resolution_ref: Option<String>,
     pub(crate) remaining_elapsed_ms: u64,
     pub(crate) remaining_calls: u64,
     pub(crate) approved_gate_refs: Vec<String>,
@@ -132,6 +156,45 @@ pub(crate) struct BridgeEvidence {
     attempt_number: u32,
     graph_hash: String,
     pre_admission: bool,
+}
+
+/// The managed effect may outlive the Rust coordinator that launched it. This
+/// immutable record is written before the child can execute so a later Rust
+/// checkout can query the original attempt's durable action journal without
+/// launching a second effect.
+#[derive(Clone, Debug)]
+struct EffectIntent {
+    intent_ref: String,
+    body: Value,
+}
+
+/// A validated predecessor output receipt passed to the deterministic workflow
+/// materializer. It contains references only; artifact bodies remain in the
+/// private contract store and are revalidated by the Python host bridge.
+#[derive(Clone, Debug)]
+pub(crate) struct EffectSnapshot {
+    pub(crate) node_id: String,
+    pub(crate) attempt_number: u32,
+    pub(crate) scheduler_attempt_number: u32,
+    pub(crate) attempt_ref: String,
+    pub(crate) operation: String,
+    pub(crate) receipt_ref: String,
+    pub(crate) artifact_refs: Vec<String>,
+    pub(crate) verified_outcome: Option<bool>,
+    pub(crate) network_resolution_ref: Option<String>,
+    pub(crate) snapshot_ref: String,
+}
+
+/// Materialized task configuration is an in-memory, host-validated overlay.
+/// It is never written back into project configuration.
+#[derive(Clone, Debug)]
+pub(crate) struct MaterializedTask {
+    pub(crate) node_id: String,
+    pub(crate) attempt_number: u32,
+    pub(crate) original_task_ref: String,
+    pub(crate) task: Value,
+    pub(crate) materialization_ref: String,
+    pub(crate) producer_receipt_refs: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,6 +232,27 @@ struct GateContext {
 struct TaskConfiguration {
     values: Map<String, Value>,
     timeout: Duration,
+    original_task: Option<Value>,
+    materialization_ref: Option<String>,
+    network_resolution_ref: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedNetworkTask {
+    node_id: String,
+    graph_hash: String,
+    attempt_number: u32,
+    original_task_ref: String,
+    task: Value,
+    resolution_ref: String,
+    resolver_config_ref: String,
+    request_hash: String,
+}
+
+#[derive(Clone, Debug)]
+struct NetworkResolverConfig {
+    path: PathBuf,
+    digest: String,
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +266,7 @@ struct HostPolicy {
 struct BridgeRequest {
     value: Value,
     gate_context: GateContext,
+    recheck_gate_context: GateContext,
     attempt_number: u32,
     graph_hash: String,
     node_id: String,
@@ -194,6 +279,7 @@ struct BridgeRequest {
     pre_admission: bool,
     review_operation: bool,
     previous_attempt_count: u32,
+    intent_ref: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -265,72 +351,318 @@ pub(crate) fn prepare_analysis(
     expected_review: Option<&ReviewBinding>,
     deadline: Option<Instant>,
 ) -> Result<BridgeEvidence> {
+    prepare_effect(
+        workspace,
+        node_id,
+        worker_id,
+        invocation,
+        "analysis",
+        expected_review,
+        deadline,
+    )
+}
+
+pub(crate) fn prepare_effect(
+    workspace: &Path,
+    node_id: &str,
+    worker_id: &str,
+    invocation: &crate::chain::jev_receipt::RouteInvocation,
+    operation: &str,
+    expected_review: Option<&ReviewBinding>,
+    deadline: Option<Instant>,
+) -> Result<BridgeEvidence> {
     let deadline = match deadline {
         Some(deadline) => Some(deadline),
         None => attempt_deadline(workspace, node_id)?,
     };
     let document = crate::project_file::load(workspace)?;
-    let capability = document
-        .graph
-        .get("nodes")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|node| node.get("id").and_then(Value::as_str) == Some(node_id))
-        .and_then(|node| node.get("capability"))
-        .and_then(Value::as_str);
-    if capability != Some(ANALYSIS_CAPABILITY) {
-        bail!("analysis adapter requires canonical intelligence.measurement.analyze capability");
+    let node = graph_node(&document.graph, node_id)?;
+    validate_measurement_configuration(
+        node,
+        &task_configuration(workspace, node_id)?
+            .context("measurement operation requires an enabled task")?
+            .values,
+        operation,
+    )?;
+    if let Some(intent) = pending_effect_intent(workspace, node_id, &document.graph_hash, false)? {
+        let evidence = recover_effect(
+            workspace, node_id, worker_id, invocation, operation, intent, deadline,
+        )?;
+        if let Some(expected) = expected_review {
+            require_review_binding(&evidence, expected)?;
+        }
+        return Ok(evidence);
     }
-    let preflight_timeout = remaining_deadline(deadline)?;
     let preflight = prepare_for_operation_with_timeout(
         workspace,
         node_id,
         worker_id,
         invocation,
         "prepare",
-        preflight_timeout,
+        remaining_deadline(deadline)?,
     )?
-    .context("analysis adapter requires an explicitly enabled node-intelligence task")?;
+    .context("measurement adapter requires an explicitly enabled task")?;
     if let Some(expected) = expected_review {
         require_review_binding(&preflight, expected)?;
     }
-    let preflight_budget_started = Instant::now();
-    let remaining_before_recheck = preflight
+    let budget_started = Instant::now();
+    let preflight_remaining = preflight
         .remaining_elapsed_ms
-        .saturating_sub(preflight_budget_started.elapsed().as_millis() as u64)
-        .min(
-            remaining_deadline(deadline)?.map_or(u64::MAX, |duration| duration.as_millis() as u64),
-        );
-    recheck_before_effect_with_budget(workspace, &preflight, worker_id, remaining_before_recheck)
-        .context("host gate or workflow approval changed after analysis preflight")?;
-    let analysis_remaining = preflight
+        .saturating_sub(budget_started.elapsed().as_millis() as u64)
+        .min(remaining_deadline(deadline)?.map_or(u64::MAX, |value| value.as_millis() as u64));
+    recheck_before_effect_with_budget(workspace, &preflight, worker_id, preflight_remaining)
+        .with_context(|| format!("host gates changed after {operation} preflight"))?;
+    let remaining = preflight
         .remaining_elapsed_ms
-        .saturating_sub(preflight_budget_started.elapsed().as_millis() as u64)
-        .min(
-            remaining_deadline(deadline)?.map_or(u64::MAX, |duration| duration.as_millis() as u64),
-        );
-    if analysis_remaining == 0 {
-        bail!("node-intelligence elapsed budget is exhausted before analysis effect");
+        .saturating_sub(budget_started.elapsed().as_millis() as u64)
+        .min(remaining_deadline(deadline)?.map_or(u64::MAX, |value| value.as_millis() as u64));
+    if remaining == 0 {
+        bail!("node-intelligence elapsed budget is exhausted before local effect");
     }
-    prepare_for_operation_with_timeout(
+    let effect = prepare_for_operation_with_intent(
         workspace,
         node_id,
         worker_id,
         invocation,
-        "analysis",
-        Some(Duration::from_millis(analysis_remaining)),
+        operation,
+        Some(Duration::from_millis(remaining)),
+        Some(operation),
     )?
-    .context("analysis adapter requires an explicitly enabled node-intelligence task")
+    .context("measurement task became disabled before its effect")?;
+    save_effect_snapshot(
+        workspace,
+        &effect,
+        effect
+            .current_attempt_number
+            .unwrap_or(effect.attempt_number),
+    )?;
+    Ok(effect)
+}
+
+fn recover_effect(
+    workspace: &Path,
+    node_id: &str,
+    worker_id: &str,
+    invocation: &crate::chain::jev_receipt::RouteInvocation,
+    requested_operation: &str,
+    intent: EffectIntent,
+    deadline: Option<Instant>,
+) -> Result<BridgeEvidence> {
+    let document = crate::project_file::load(workspace)?;
+    let old_operation = intent
+        .body
+        .get("operation")
+        .and_then(Value::as_str)
+        .context("effect intent lacks operation")?;
+    if old_operation != requested_operation {
+        bail!("unresolved effect intent operation differs from the canonical node capability");
+    }
+    let old_number = intent
+        .body
+        .get("attempt_number")
+        .and_then(Value::as_u64)
+        .context("effect intent lacks attempt number")? as u32;
+    let current_number = document
+        .learning
+        .nodes
+        .get(node_id)
+        .map(|record| record.attempt_count)
+        .unwrap_or_default();
+    if current_number <= old_number {
+        bail!("effect recovery requires a later canonical checkout attempt");
+    }
+    let config =
+        task_configuration(workspace, node_id)?.context("effect recovery task was disabled")?;
+    let mut request = build_request(workspace, node_id, worker_id, invocation, config, "prepare")?;
+    if request.attempt_number != current_number {
+        bail!("effect recovery checkout attempt changed during request construction");
+    }
+    if request.config_digest != intent.body["config_digest"].as_str().unwrap_or_default()
+        || request.host_policy_path.to_string_lossy()
+            != intent.body["host_policy_path"].as_str().unwrap_or_default()
+        || request.host_policy_digest
+            != intent.body["host_policy_digest"]
+                .as_str()
+                .unwrap_or_default()
+        || request.value["network_ref"] != intent.body["network_ref"]
+        || request.value["capability_id"] != intent.body["capability_id"]
+        || request.value["node_ref"] != intent.body["node_ref"]
+        || request.value["model_ref"] != intent.body["model_ref"]
+        || request.value["policy_ref"] != intent.body["policy_ref"]
+        || request
+            .value
+            .pointer("/runtime/network_resolution_ref")
+            .and_then(Value::as_str)
+            != intent
+                .body
+                .get("network_resolution_ref")
+                .and_then(Value::as_str)
+        || request.gate_context.input_refs
+            != intent.body["input_refs"]
+                .as_array()
+                .context("intent input refs are invalid")?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        || request.gate_context.handoff_refs
+            != intent.body["handoff_refs"]
+                .as_array()
+                .context("intent handoff refs are invalid")?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        || request.gate_context.review_packet_refs
+            != intent.body["review_packet_refs"]
+                .as_array()
+                .context("intent review refs are invalid")?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+    {
+        bail!("current task, route pins, owner policy, or producer handoffs differ from the committed effect intent");
+    }
+    let project_id = request.value["project_id"]
+        .as_str()
+        .context("request project id is invalid")?
+        .to_owned();
+    let graph_hash = request.graph_hash.clone();
+    let old_id = attempt_id(&project_id, &graph_hash, node_id, old_number);
+    let old_attempt_ref = attempt_ref_for_request(&request.value, &old_id, old_number)?;
+    if intent.body.get("attempt_ref").and_then(Value::as_str) != Some(old_attempt_ref.as_str())
+        || intent.body.get("action_id").and_then(Value::as_str)
+            != Some(measurement_action_id(&old_attempt_ref, old_operation)?.as_str())
+    {
+        bail!("effect intent attempt or action identity is invalid");
+    }
+    request.value["attempt"] = json!({"id": old_id, "node_id": node_id, "number": old_number});
+    request.value["request_id"] = Value::String(format!(
+        "node-intelligence-{}",
+        digest_hex(format!("{}|{}|{}|{}", project_id, graph_hash, node_id, old_number).as_bytes())
+    ));
+    request.value["operation"] = Value::String("recover".to_owned());
+    request.value["recovery"] = json!({
+        "operation": old_operation,
+        "intent_ref": intent.intent_ref,
+        "current_attempt": {
+            "id": attempt_id(&project_id, &graph_hash, node_id, current_number),
+            "number": current_number,
+        },
+    });
+    request.gate_context.attempt_ref = old_attempt_ref;
+    request.intent_ref = Some(intent.intent_ref.clone());
+    let expected_binding = intent
+        .body
+        .get("request_binding_hash")
+        .and_then(Value::as_str)
+        .context("effect intent lacks request binding")?;
+    if request_binding_hash(&request.value)? != expected_binding {
+        bail!("effect recovery request does not reproduce the original immutable action binding");
+    }
+    request
+        .value
+        .as_object_mut()
+        .context("effect recovery request must be an object")?
+        .remove("request_hash");
+    let request_hash = fractal_contracts::canonical_sha256(&request.value)
+        .map_err(|error| anyhow::anyhow!("hash effect recovery request: {error}"))?;
+    request.value["request_hash"] = Value::String(request_hash);
+    request.timeout = remaining_deadline(deadline)?
+        .unwrap_or(request.timeout)
+        .min(request.timeout);
+    recheck_request_binding(workspace, &request)?;
+    let encoded = serde_json::to_vec(&request.value).context("encode effect recovery request")?;
+    if encoded.len() > MAX_REQUEST_BYTES {
+        bail!("effect recovery request exceeds size limit");
+    }
+    let response = run_bridge_child(
+        workspace,
+        &encoded,
+        request.timeout,
+        &Launcher {
+            program: PathBuf::from("python3"),
+            args: vec!["-m".into(), "intelligence_graph.node_runtime".into()],
+        },
+    )?;
+    let evidence = validate_response(workspace, &request, &response)?;
+    if !evidence.recovered
+        || evidence.operation != old_operation
+        || evidence.intent_ref.as_deref() != Some(intent.intent_ref.as_str())
+        || evidence
+            .effect
+            .as_ref()
+            .and_then(|effect| effect.pointer("/action/state"))
+            .and_then(Value::as_str)
+            != Some("complete")
+        || evidence
+            .effect
+            .as_ref()
+            .and_then(|effect| effect.pointer("/collection/available"))
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        bail!("durable measurement action is not complete and recoverable");
+    }
+    recheck_before_effect(workspace, &evidence, worker_id)
+        .context("host authority changed while reconciling the committed effect")?;
+    save_effect_snapshot(workspace, &evidence, current_number)?;
+    Ok(evidence)
+}
+
+fn attempt_ref_for_request(request: &Value, id: &str, attempt_number: u32) -> Result<String> {
+    let pin = json!({
+        "schema": "fractal.node.attempt.v1",
+        "id": id,
+        "project_id": request["project_id"],
+        "graph_ref": request["graph_hash"],
+        "task_id": request.pointer("/attempt/node_id"),
+        "network_ref": request["network_ref"],
+        "capability_id": request["capability_id"],
+        "node_ref": request["node_ref"],
+        "model_ref": request["model_ref"],
+        "policy_ref": request["policy_ref"],
+        "input_refs": request["input_refs"],
+        "memory_refs": request["memory_refs"],
+        "evidence_refs": request["evidence_refs"],
+    });
+    let _ = attempt_number;
+    fractal_contracts::canonical_sha256(&pin)
+        .map_err(|error| anyhow::anyhow!("hash recovered attempt pin: {error}"))
 }
 
 /// True when an enabled task pins at least one packet whose human review must
 /// be admitted before Rust checks out the node. Malformed config is an error,
 /// so it cannot silently bypass this pre-admission boundary.
 pub(crate) fn requires_review_admission(workspace: &Path, node_id: &str) -> Result<bool> {
+    let document = crate::project_file::load(workspace)?;
+    if pending_effect_intent(workspace, node_id, &document.graph_hash, false)?.is_some() {
+        // The original attempt's approved packet is rechecked during
+        // read-only effect recovery; asking for admission on the next attempt
+        // would incorrectly bind that existing action to a fresh packet.
+        return Ok(false);
+    }
     let Some(configuration) = task_configuration(workspace, node_id)? else {
         return Ok(false);
     };
+    if configuration
+        .values
+        .get("runtime")
+        .and_then(|runtime| runtime.get("materialize_from"))
+        .and_then(Value::as_array)
+        .is_some_and(|refs| !refs.is_empty())
+    {
+        return Ok(true);
+    }
+    if configuration
+        .values
+        .get("runtime")
+        .and_then(|runtime| runtime.get("network_resolver_config"))
+        .is_some()
+    {
+        return Ok(true);
+    }
     match configuration.values.get("review_packet_refs") {
         None => Ok(false),
         Some(Value::Array(refs)) => {
@@ -362,6 +694,37 @@ pub(crate) fn review_admission(
     node_id: &str,
     worker_id: &str,
 ) -> Result<ReviewAdmission> {
+    if let Some(raw) = task_configuration_raw(workspace, node_id)? {
+        let current = crate::project_file::load(workspace)?;
+        let pending_recovery =
+            pending_effect_intent(workspace, node_id, &current.graph_hash, false)?;
+        let producers = raw
+            .values
+            .get("runtime")
+            .and_then(|runtime| runtime.get("materialize_from"))
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty());
+        if producers && pending_recovery.is_none() {
+            let ready = task_configuration(workspace, node_id)?
+                .is_some_and(|configuration| configuration.materialization_ref.is_some());
+            if !ready {
+                materialize_task(workspace, node_id, worker_id, &raw)?;
+            }
+        }
+        if pending_recovery.is_none() {
+            let resolved = task_configuration(workspace, node_id)?
+                .is_some_and(|configuration| configuration.network_resolution_ref.is_some());
+            if !resolved
+                && raw
+                    .values
+                    .get("runtime")
+                    .and_then(|runtime| runtime.get("network_resolver_config"))
+                    .is_some()
+            {
+                resolve_network_task(workspace, node_id, &raw)?;
+            }
+        }
+    }
     let invocation = crate::chain::jev_receipt::RouteInvocation::unknown(worker_id);
     let evidence = prepare_for_operation(workspace, node_id, worker_id, &invocation, "review")?
         .context("review admission requires an explicitly enabled node-intelligence task")?;
@@ -374,6 +737,367 @@ pub(crate) fn review_admission(
     } else {
         Ok(ReviewAdmission::Ready(binding))
     }
+}
+
+fn materialize_task(
+    workspace: &Path,
+    node_id: &str,
+    _worker_id: &str,
+    configuration: &TaskConfiguration,
+) -> Result<MaterializedTask> {
+    let original_task = configuration
+        .original_task
+        .as_ref()
+        .context("materialization requires the original task config")?;
+    let document = crate::project_file::load(workspace)?;
+    let runtime = original_task
+        .get("runtime")
+        .and_then(Value::as_object)
+        .context("materialized task runtime is missing")?;
+    let declared = sorted_node_ids(runtime.get("materialize_from"), "materialize_from")?;
+    if declared.is_empty() || declared.len() > 128 || declared.contains(&node_id.to_owned()) {
+        bail!("materialize_from must name a bounded set of distinct predecessor nodes");
+    }
+    let project_id = format!("fractal:project:{}", document.project.slug);
+    let policy = load_host_policy(workspace, node_id, &project_id, &document.graph_hash)?;
+    if policy.task.get("materialize_from") != Some(&json!(declared)) {
+        bail!("project materialize_from differs from the owner host policy");
+    }
+    for producer in &declared {
+        if !graph_has_edge(&document.graph, producer, node_id) {
+            bail!("materialize_from is not a canonical graph dependency");
+        }
+    }
+    let previous_attempt = document
+        .learning
+        .nodes
+        .get(node_id)
+        .map(|record| record.attempt_count)
+        .unwrap_or_default();
+    if document
+        .execution
+        .as_ref()
+        .and_then(|execution| execution.assignments.get(node_id))
+        .is_some_and(|assignment| assignment.state == "checked_out")
+    {
+        bail!("task materialization must occur before checkout");
+    }
+    let attempt_number = previous_attempt
+        .checked_add(1)
+        .context("node attempt count is exhausted")?;
+    let original_task_ref = fractal_contracts::canonical_sha256(original_task)
+        .map_err(|error| anyhow::anyhow!("hash materialization template: {error}"))?;
+    if let Some(existing) = load_materialized_task(
+        workspace,
+        node_id,
+        &document.graph_hash,
+        attempt_number,
+        &original_task_ref,
+    )? {
+        return Ok(existing);
+    }
+    let mut producer_snapshots = Vec::with_capacity(declared.len());
+    for producer in &declared {
+        producer_snapshots.push(completed_effect_snapshot(workspace, &document, producer)?);
+    }
+    let producer_bindings = producer_snapshots
+        .iter()
+        .map(|snapshot| json!({ "node_id": snapshot.node_id, "receipt_ref": snapshot.receipt_ref }))
+        .collect::<Vec<_>>();
+    let graph_id = document
+        .graph
+        .get("graph_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .context("canonical graph lacks graph_id")?;
+    let attempt = json!({
+        "id": attempt_id(&project_id, &document.graph_hash, node_id, attempt_number),
+        "node_id": node_id,
+        "number": attempt_number,
+    });
+    let mut request = json!({
+        "schema": "fractal.node_intelligence.materialize_request.v1",
+        "operation": "materialize",
+        "workspace": fs::canonicalize(workspace)?.to_string_lossy(),
+        "project_id": project_id,
+        "graph_id": graph_id,
+        "graph_hash": document.graph_hash,
+        "graph": document.graph,
+        "attempt": attempt,
+        "task": original_task,
+        "producers": producer_bindings,
+    });
+    let request_hash = fractal_contracts::canonical_sha256(&request)
+        .map_err(|error| anyhow::anyhow!("hash materialization request: {error}"))?;
+    request["request_hash"] = Value::String(request_hash.clone());
+    let bytes = serde_json::to_vec(&request).context("encode materialization request")?;
+    if bytes.len() > MAX_REQUEST_BYTES {
+        bail!("materialization request exceeds the bridge size bound");
+    }
+    let node = graph_node(&document.graph, node_id)?;
+    let node_budget = node
+        .pointer("/hard_limits/max_elapsed_ms")
+        .and_then(Value::as_u64)
+        .map(Duration::from_millis)
+        .unwrap_or(configuration.timeout);
+    let response = run_bridge_child(
+        workspace,
+        &bytes,
+        configuration.timeout.min(node_budget),
+        &Launcher {
+            program: PathBuf::from("python3"),
+            args: vec!["-m".into(), "intelligence_graph.node_runtime".into()],
+        },
+    )?;
+    let object = response
+        .as_object()
+        .context("materializer response must be an object")?;
+    if object.get("schema").and_then(Value::as_str)
+        != Some("fractal.node_intelligence.materialize_response.v1")
+        || object.get("request_hash").and_then(Value::as_str) != Some(request_hash.as_str())
+        || object.get("attempt") != Some(&attempt)
+        || object.get("original_task_ref").and_then(Value::as_str)
+            != Some(original_task_ref.as_str())
+        || object.get("status").and_then(Value::as_str) != Some("ready")
+        || object.get("provider_calls").and_then(Value::as_u64) != Some(0)
+    {
+        bail!("materializer response is not a ready, correctly bound result");
+    }
+    let materialization_ref = object
+        .get("materialization_ref")
+        .and_then(Value::as_str)
+        .filter(|reference| is_digest(reference))
+        .context("materializer response lacks a valid receipt ref")?
+        .to_owned();
+    let mut task = object
+        .get("task")
+        .cloned()
+        .context("materializer omitted task overlay")?;
+    validate_materialized_task(
+        workspace,
+        original_task,
+        &task,
+        &producer_snapshots,
+        &request,
+        &materialization_ref,
+    )?;
+    let latest = crate::project_file::load(workspace)?;
+    let latest_policy = load_host_policy(workspace, node_id, &project_id, &document.graph_hash)?;
+    if latest.graph_hash != document.graph_hash
+        || latest_policy.path != policy.path
+        || latest_policy.digest != policy.digest
+        || latest
+            .learning
+            .nodes
+            .get(node_id)
+            .map(|record| record.attempt_count)
+            .unwrap_or_default()
+            != previous_attempt
+        || latest
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.assignments.get(node_id))
+            .is_some_and(|assignment| assignment.state == "checked_out")
+    {
+        bail!("graph, attempt, or owner policy changed during task materialization");
+    }
+    for producer in &producer_snapshots {
+        let current = completed_effect_snapshot(workspace, &latest, &producer.node_id)?;
+        if current.receipt_ref != producer.receipt_ref
+            || current.attempt_ref != producer.attempt_ref
+            || current.artifact_refs != producer.artifact_refs
+        {
+            bail!("completed producer output changed during materialization");
+        }
+    }
+    task["runtime"]["materialization_ref"] = Value::String(materialization_ref.clone());
+    let materialized = MaterializedTask {
+        node_id: node_id.to_owned(),
+        attempt_number,
+        original_task_ref,
+        task,
+        materialization_ref,
+        producer_receipt_refs: producer_snapshots
+            .into_iter()
+            .map(|snapshot| snapshot.receipt_ref)
+            .collect(),
+    };
+    save_materialized_task(workspace, &materialized, &document.graph_hash)?;
+    Ok(materialized)
+}
+
+fn sorted_node_ids(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
+    let mut values = value
+        .and_then(Value::as_array)
+        .with_context(|| format!("{field} must be an array"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .with_context(|| format!("{field} has an invalid node id"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    values.sort();
+    if values.is_empty() || values.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!("{field} must contain distinct node ids");
+    }
+    Ok(values)
+}
+
+fn graph_has_edge(graph: &Value, from: &str, to: &str) -> bool {
+    graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|edge| {
+            edge.get("from").and_then(Value::as_str) == Some(from)
+                && edge.get("to").and_then(Value::as_str) == Some(to)
+        })
+}
+
+fn validate_materialized_task(
+    workspace: &Path,
+    original: &Value,
+    task: &Value,
+    producers: &[EffectSnapshot],
+    request: &Value,
+    materialization_ref: &str,
+) -> Result<()> {
+    let original_obj = original
+        .as_object()
+        .context("original materialization task is invalid")?;
+    let task_obj = task.as_object().context("materialized task is invalid")?;
+    let outputs = producers
+        .iter()
+        .flat_map(|producer| producer.artifact_refs.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let inputs = task
+        .get("input_refs")
+        .and_then(Value::as_array)
+        .context("materialized inputs are invalid")?;
+    if inputs
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        != outputs
+    {
+        bail!("materialized inputs do not equal committed producer outputs");
+    }
+    let mut normalized = task.clone();
+    for field in ["input_refs", "handoff_refs", "review_packet_refs"] {
+        normalized[field] = original_obj[field].clone();
+    }
+    let orig_runtime = original
+        .get("runtime")
+        .and_then(Value::as_object)
+        .context("original runtime config is invalid")?;
+    let runtime = normalized
+        .get_mut("runtime")
+        .and_then(Value::as_object_mut)
+        .context("materialized runtime config is invalid")?;
+    for field in ["handoff_refs", "review_packet_refs"] {
+        runtime.insert(field.into(), orig_runtime[field].clone());
+    }
+    let original_auth = orig_runtime
+        .get("authorization")
+        .and_then(Value::as_object)
+        .context("original auth is invalid")?;
+    let auth = runtime
+        .get_mut("authorization")
+        .and_then(Value::as_object_mut)
+        .context("materialized auth is invalid")?;
+    if auth.get("current_sources") != original_auth.get("current_sources")
+        || auth.get("authorized_permissions") != original_auth.get("authorized_permissions")
+    {
+        bail!("materializer changed source authority or permissions");
+    }
+    let expected_artifacts = original_auth["authorized_artifacts"]
+        .as_array()
+        .context("original authorized refs are invalid")?
+        .iter()
+        .chain(inputs.iter())
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .context("artifact ref is not a string")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let actual_artifacts = auth
+        .get("authorized_artifacts")
+        .and_then(Value::as_array)
+        .context("materialized authorized refs are invalid")?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .context("artifact ref is not a string")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    if expected_artifacts != actual_artifacts {
+        bail!("materializer added authorization outside producer outputs");
+    }
+    let current = auth
+        .get("current_artifacts")
+        .and_then(Value::as_object)
+        .context("materialized current artifacts are invalid")?;
+    let original_current = original_auth["current_artifacts"]
+        .as_object()
+        .context("original current artifacts are invalid")?;
+    if original_current
+        .iter()
+        .any(|(key, value)| current.get(key) != Some(value))
+        || current.values().any(|value| {
+            !original_current.values().any(|old| old == value)
+                && value
+                    .as_str()
+                    .is_none_or(|reference| !outputs.contains(reference))
+        })
+        || outputs
+            .iter()
+            .any(|output| !current.values().any(|value| value.as_str() == Some(output)))
+    {
+        bail!("materializer changed or omitted current artifact bindings");
+    }
+    normalized["runtime"]["authorization"] = orig_runtime["authorization"].clone();
+    if &normalized != original
+        || task_obj
+            .get("runtime")
+            .and_then(|runtime| runtime.get("materialization_ref"))
+            .is_some()
+    {
+        bail!("materializer changed fields outside the producer-derived handoff delta");
+    }
+    let receipt_path = orig_runtime
+        .get("receipt_path")
+        .and_then(Value::as_str)
+        .context("receipt path missing")?;
+    let bytes = read_private_content(
+        workspace,
+        &content_path(receipt_path, materialization_ref)?,
+        materialization_ref,
+        MAX_PRIVATE_RECEIPT_BYTES,
+    )?;
+    let receipt = parse_unique_json(&bytes)?;
+    let task_ref = fractal_contracts::canonical_sha256(task)
+        .map_err(|error| anyhow::anyhow!("hash materialized task: {error}"))?;
+    if receipt.get("schema").and_then(Value::as_str) != Some(MATERIALIZATION_RECEIPT_SCHEMA)
+        || receipt.get("task_ref").and_then(Value::as_str) != Some(task_ref.as_str())
+        || receipt.get("request_hash") != request.get("request_hash")
+        || receipt.get("producers") != request.get("producers")
+        || receipt.get("input_refs") != task.get("input_refs")
+        || receipt.get("handoff_refs") != task.get("handoff_refs")
+        || receipt.get("review_packet_refs") != task.get("review_packet_refs")
+        || receipt.get("provider_calls").and_then(Value::as_u64) != Some(0)
+    {
+        bail!("materialization receipt does not bind the exact returned task");
+    }
+    Ok(())
 }
 
 pub(crate) fn require_review_binding(
@@ -463,6 +1187,352 @@ fn request_binding(request: &BridgeRequest) -> ReviewBinding {
     }
 }
 
+fn save_effect_snapshot(
+    workspace: &Path,
+    evidence: &BridgeEvidence,
+    scheduler_attempt_number: u32,
+) -> Result<()> {
+    let Some(effect) = evidence.effect.as_ref() else {
+        return Ok(());
+    };
+    let action = effect
+        .get("action")
+        .context("node-intelligence effect lacks action receipt")?;
+    let collection = effect
+        .get("collection")
+        .context("node-intelligence effect lacks collection receipt")?;
+    if action.get("state").and_then(Value::as_str) != Some("complete")
+        || collection.get("available").and_then(Value::as_bool) != Some(true)
+    {
+        return Ok(());
+    }
+    let artifact_refs = collection
+        .get("artifact_refs")
+        .and_then(Value::as_array)
+        .context("effect collection lacks artifact refs")?
+        .clone();
+    let body = json!({
+        "schema": EFFECT_SNAPSHOT_SCHEMA,
+        "node_id": evidence.node_id,
+        "graph_hash": evidence.graph_hash,
+        "attempt_number": evidence.attempt_number,
+        "scheduler_attempt_number": scheduler_attempt_number,
+        "attempt_ref": evidence.attempt_ref,
+        "operation": evidence.operation,
+        "receipt_ref": evidence.receipt_ref,
+        "artifact_refs": artifact_refs,
+        "verified_outcome": effect.get("verified_outcome").cloned().unwrap_or(Value::Null),
+        "context_manifest_ref": evidence.context_manifest_ref,
+        "materialization_ref": evidence.materialization_ref,
+        "network_resolution_ref": evidence.network_resolution_ref,
+        "intent_ref": evidence.intent_ref,
+        "recovered": evidence.recovered,
+    });
+    write_private_record(workspace, EFFECT_SNAPSHOT_DIR, &body)?;
+    Ok(())
+}
+
+pub(crate) fn mark_effect_completed(workspace: &Path, evidence: &BridgeEvidence) -> Result<()> {
+    if let Some(intent_ref) = evidence.intent_ref.as_deref() {
+        resolve_effect_intent(
+            workspace,
+            intent_ref,
+            evidence
+                .current_attempt_number
+                .unwrap_or(evidence.attempt_number),
+        )?;
+    }
+    Ok(())
+}
+
+fn completed_effect_snapshot(
+    workspace: &Path,
+    document: &crate::project_file::FractalProject,
+    node_id: &str,
+) -> Result<EffectSnapshot> {
+    let directory = safe_project_path(workspace, EFFECT_SNAPSHOT_DIR)?;
+    let metadata = fs::symlink_metadata(&directory)
+        .context("completed predecessor has no durable effect snapshots")?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || !private_metadata(&metadata) {
+        bail!("node-intelligence effect snapshot store is unsafe");
+    }
+    let current_attempt = document
+        .learning
+        .nodes
+        .get(node_id)
+        .map(|record| record.attempt_count)
+        .unwrap_or_default();
+    let assignment = document
+        .execution
+        .as_ref()
+        .and_then(|state| state.assignments.get(node_id))
+        .context("materialization predecessor assignment is missing")?;
+    if assignment.state != "completed" {
+        bail!("materialization predecessor is not canonically complete");
+    }
+    let mut found = None;
+    for entry in fs::read_dir(&directory)? {
+        let name = entry?.file_name();
+        let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+            continue;
+        };
+        let reference = format!("sha256:{stem}");
+        if !is_digest(&reference) {
+            bail!("node-intelligence effect snapshot filename is invalid");
+        }
+        let value = read_private_record(workspace, EFFECT_SNAPSHOT_DIR, &reference)?;
+        if value.get("schema").and_then(Value::as_str) != Some(EFFECT_SNAPSHOT_SCHEMA)
+            || value.get("node_id").and_then(Value::as_str) != Some(node_id)
+            || value.get("graph_hash").and_then(Value::as_str) != Some(document.graph_hash.as_str())
+            || value
+                .get("scheduler_attempt_number")
+                .and_then(Value::as_u64)
+                != Some(u64::from(current_attempt))
+        {
+            continue;
+        }
+        let artifact_refs = value
+            .get("artifact_refs")
+            .and_then(Value::as_array)
+            .context("effect snapshot artifact refs are missing")?
+            .iter()
+            .map(|reference| {
+                reference
+                    .as_str()
+                    .filter(|reference| is_digest(reference))
+                    .map(str::to_owned)
+                    .context("effect snapshot contains an invalid artifact ref")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let snapshot = EffectSnapshot {
+            node_id: node_id.to_owned(),
+            attempt_number: value["attempt_number"].as_u64().unwrap_or_default() as u32,
+            scheduler_attempt_number: current_attempt,
+            attempt_ref: value["attempt_ref"]
+                .as_str()
+                .context("effect snapshot lacks attempt ref")?
+                .to_owned(),
+            operation: value["operation"]
+                .as_str()
+                .context("effect snapshot lacks operation")?
+                .to_owned(),
+            receipt_ref: value["receipt_ref"]
+                .as_str()
+                .filter(|reference| is_digest(reference))
+                .context("effect snapshot lacks runtime receipt ref")?
+                .to_owned(),
+            artifact_refs,
+            verified_outcome: value.get("verified_outcome").and_then(Value::as_bool),
+            network_resolution_ref: value
+                .get("network_resolution_ref")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            snapshot_ref: reference,
+        };
+        validate_effect_snapshot_receipt(workspace, document, &value, &snapshot)?;
+        if found.is_some() {
+            bail!("multiple effect snapshots bind the completed predecessor attempt");
+        }
+        found = Some(snapshot);
+    }
+    found.context("completed predecessor has no validated effect snapshot")
+}
+
+fn validate_effect_snapshot_receipt(
+    workspace: &Path,
+    document: &crate::project_file::FractalProject,
+    snapshot_value: &Value,
+    snapshot: &EffectSnapshot,
+) -> Result<()> {
+    if snapshot.snapshot_ref
+        != fractal_contracts::canonical_sha256(snapshot_value)
+            .map_err(|error| anyhow::anyhow!("hash effect snapshot: {error}"))?
+        || snapshot.scheduler_attempt_number
+            != document
+                .learning
+                .nodes
+                .get(&snapshot.node_id)
+                .map(|record| record.attempt_count)
+                .unwrap_or_default()
+        || snapshot.attempt_number == 0
+        || snapshot.attempt_number > snapshot.scheduler_attempt_number
+        || !matches!(snapshot.operation.as_str(), "analysis" | "intake" | "check")
+        || snapshot_value
+            .get("verified_outcome")
+            .and_then(Value::as_bool)
+            != snapshot.verified_outcome
+        || snapshot_value
+            .get("network_resolution_ref")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            != snapshot.network_resolution_ref
+    {
+        bail!("completed effect snapshot identity is inconsistent");
+    }
+
+    let recovered = snapshot_value
+        .get("recovered")
+        .and_then(Value::as_bool)
+        .context("effect snapshot lacks its recovery status")?;
+    let intent_ref = snapshot_value
+        .get("intent_ref")
+        .and_then(Value::as_str)
+        .filter(|reference| is_digest(reference))
+        .context("effect snapshot lacks a durable intent reference")?;
+    let intent = read_private_record(workspace, EFFECT_INTENT_DIR, intent_ref)?;
+    if intent.get("schema").and_then(Value::as_str) != Some(EFFECT_INTENT_SCHEMA)
+        || intent.get("node_id").and_then(Value::as_str) != Some(snapshot.node_id.as_str())
+        || intent.get("graph_hash").and_then(Value::as_str) != Some(document.graph_hash.as_str())
+        || intent.get("attempt_number").and_then(Value::as_u64)
+            != Some(u64::from(snapshot.attempt_number))
+        || intent.get("attempt_ref").and_then(Value::as_str) != Some(snapshot.attempt_ref.as_str())
+        || intent.get("operation").and_then(Value::as_str) != Some(snapshot.operation.as_str())
+        || intent.get("materialization_ref") != snapshot_value.get("materialization_ref")
+        || intent.get("network_resolution_ref") != snapshot_value.get("network_resolution_ref")
+    {
+        bail!("effect snapshot does not match its immutable intent");
+    }
+
+    let task = task_configuration_raw(workspace, &snapshot.node_id)?
+        .context("completed producer task configuration is missing")?;
+    let receipt_path = task
+        .values
+        .get("runtime")
+        .and_then(|runtime| runtime.get("receipt_path"))
+        .and_then(Value::as_str)
+        .context("completed producer receipt path is missing")?;
+    let receipt_bytes = read_private_content(
+        workspace,
+        &content_path(receipt_path, &snapshot.receipt_ref)?,
+        &snapshot.receipt_ref,
+        MAX_PRIVATE_RECEIPT_BYTES,
+    )?;
+    let receipt =
+        parse_unique_json(&receipt_bytes).context("decode completed producer runtime receipt")?;
+    let attempt = receipt
+        .get("attempt")
+        .and_then(Value::as_object)
+        .context("completed producer receipt lacks attempt identity")?;
+    let observed_attempt_id = attempt
+        .get("id")
+        .and_then(Value::as_str)
+        .context("completed producer receipt lacks attempt id")?;
+    let attempt_number = attempt
+        .get("number")
+        .and_then(Value::as_u64)
+        .context("completed producer receipt lacks attempt number")?;
+    if receipt.get("schema").and_then(Value::as_str) != Some(RECEIPT_SCHEMA)
+        || receipt.get("status").and_then(Value::as_str) != Some("ready")
+        || receipt.get("project_id") != intent.get("project_id")
+        || receipt.get("graph_hash").and_then(Value::as_str) != Some(document.graph_hash.as_str())
+        || receipt.get("attempt_ref").and_then(Value::as_str) != Some(snapshot.attempt_ref.as_str())
+        || attempt.get("node_id").and_then(Value::as_str) != Some(snapshot.node_id.as_str())
+        || attempt_number != u64::from(snapshot.attempt_number)
+        || receipt.get("context_manifest_ref") != snapshot_value.get("context_manifest_ref")
+        || receipt.get("materialization_ref") != snapshot_value.get("materialization_ref")
+        || receipt
+            .get("network_resolution_ref")
+            .unwrap_or(&Value::Null)
+            != snapshot_value
+                .get("network_resolution_ref")
+                .unwrap_or(&Value::Null)
+        || receipt.get("network_ref") != intent.get("network_ref")
+        || receipt.get("capability_id") != intent.get("capability_id")
+        || receipt.get("node_ref") != intent.get("node_ref")
+        || receipt.get("model_ref") != intent.get("model_ref")
+        || receipt.get("policy_ref") != intent.get("policy_ref")
+        || receipt.get("input_refs") != intent.get("input_refs")
+        || receipt.get("memory_refs") != intent.get("memory_refs")
+        || receipt.get("evidence_refs") != intent.get("evidence_refs")
+        || receipt.get("handoff_refs") != intent.get("handoff_refs")
+        || receipt.get("review_packet_refs") != intent.get("review_packet_refs")
+    {
+        bail!("completed producer runtime receipt does not match its pinned intent");
+    }
+    let expected_attempt_id = attempt_id(
+        intent["project_id"]
+            .as_str()
+            .context("effect intent lacks project id")?,
+        &document.graph_hash,
+        &snapshot.node_id,
+        snapshot.attempt_number,
+    );
+    if observed_attempt_id != expected_attempt_id {
+        bail!("completed producer receipt attempt id is not canonical");
+    }
+    let attempt_ref =
+        attempt_ref_for_request(&receipt, observed_attempt_id, snapshot.attempt_number)?;
+    if attempt_ref != snapshot.attempt_ref {
+        bail!("completed producer receipt pin does not reproduce its attempt ref");
+    }
+    let intent_action_id = intent
+        .get("action_id")
+        .and_then(Value::as_str)
+        .context("effect intent lacks action id")?;
+    if intent_action_id != measurement_action_id(&snapshot.attempt_ref, &snapshot.operation)? {
+        bail!("effect intent action id does not match its operation and attempt");
+    }
+    let result = if recovered {
+        receipt.get("recovery").filter(|value| {
+            value.get("operation").and_then(Value::as_str) == Some(snapshot.operation.as_str())
+        })
+    } else {
+        receipt.get(&snapshot.operation)
+    }
+    .context("completed producer receipt lacks its measured result")?;
+    validate_measurement_result(result, &snapshot.attempt_ref, &snapshot.operation)?;
+    if result
+        .get("action")
+        .and_then(|action| action.get("action_id"))
+        .and_then(Value::as_str)
+        != Some(intent_action_id)
+        || result
+            .get("action")
+            .and_then(|action| action.get("state"))
+            .and_then(Value::as_str)
+            != Some("complete")
+        || result
+            .get("collection")
+            .and_then(|collection| collection.get("available"))
+            .and_then(Value::as_bool)
+            != Some(true)
+        || result
+            .get("collection")
+            .and_then(|collection| collection.get("artifact_refs"))
+            != Some(&Value::Array(
+                snapshot
+                    .artifact_refs
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ))
+        || result
+            .get("verified_outcome")
+            .cloned()
+            .unwrap_or(Value::Null)
+            != snapshot_value
+                .get("verified_outcome")
+                .cloned()
+                .unwrap_or(Value::Null)
+    {
+        bail!("completed producer action does not match its durable effect snapshot");
+    }
+    if snapshot.operation == "check" && snapshot.verified_outcome != Some(true) {
+        bail!(
+            "measurement check without a positive verified result cannot produce workflow inputs"
+        );
+    }
+    if !intent_is_resolved(workspace, intent_ref)? {
+        // The graph transition is authoritative proof that the effect's node
+        // outcome committed. Repair the small crash window between that
+        // transition and the additive resolution pointer without re-running
+        // the Python adapter.
+        resolve_effect_intent(workspace, intent_ref, snapshot.scheduler_attempt_number)?;
+    }
+    Ok(())
+}
+
 fn recheck_current_workflow_review(
     workspace: &Path,
     evidence: &BridgeEvidence,
@@ -522,6 +1592,26 @@ fn prepare_for_operation_with_timeout(
     operation: &str,
     timeout_cap: Option<Duration>,
 ) -> Result<Option<BridgeEvidence>> {
+    prepare_for_operation_with_intent(
+        workspace,
+        node_id,
+        worker_id,
+        invocation,
+        operation,
+        timeout_cap,
+        None,
+    )
+}
+
+fn prepare_for_operation_with_intent(
+    workspace: &Path,
+    node_id: &str,
+    worker_id: &str,
+    invocation: &crate::chain::jev_receipt::RouteInvocation,
+    operation: &str,
+    timeout_cap: Option<Duration>,
+    intent_operation: Option<&str>,
+) -> Result<Option<BridgeEvidence>> {
     let Some(configuration) = task_configuration(workspace, node_id)? else {
         return Ok(None);
     };
@@ -545,6 +1635,9 @@ fn prepare_for_operation_with_timeout(
         bail!("node-intelligence request exceeds the bounded JSON contract");
     }
     recheck_request_binding(workspace, &request)?;
+    if let Some(intent_operation) = intent_operation {
+        request.intent_ref = Some(write_effect_intent(workspace, &request, intent_operation)?);
+    }
     let launcher = Launcher {
         program: PathBuf::from("python3"),
         args: vec![
@@ -558,6 +1651,9 @@ fn prepare_for_operation_with_timeout(
         // A second check closes the interval in which another coordinator could
         // claim or alter the predicted attempt while the review process ran.
         recheck_request_binding(workspace, &request)?;
+    }
+    if intent_operation.is_some() {
+        save_effect_snapshot(workspace, &evidence, evidence.attempt_number)?;
     }
     Ok(Some(evidence))
 }
@@ -592,20 +1688,24 @@ pub(crate) fn recheck_before_effect_with_budget(
     // Re-read packet status at the last managed boundary. This helper never
     // makes another recommendation or effect; the host gate/policy check below
     // runs afterward so both authorities are current immediately before spawn.
-    if remaining_elapsed_ms == 0 {
+    if remaining_elapsed_ms == 0 && !evidence.recovered {
         bail!("node-intelligence elapsed budget is exhausted before effect");
     }
-    recheck_current_workflow_review(
-        workspace,
-        evidence,
-        worker_id,
-        Duration::from_millis(remaining_elapsed_ms.min(evidence.remaining_elapsed_ms)),
-    )?;
+    if !evidence.recovered {
+        recheck_current_workflow_review(
+            workspace,
+            evidence,
+            worker_id,
+            Duration::from_millis(remaining_elapsed_ms.min(evidence.remaining_elapsed_ms)),
+        )?;
+    }
     recheck_current_binding(
         workspace,
         &evidence.node_id,
         worker_id,
-        evidence.attempt_number,
+        evidence
+            .current_attempt_number
+            .unwrap_or(evidence.attempt_number),
         &evidence.graph_hash,
         &evidence.gate_context,
         &evidence.approved_gate_refs,
@@ -625,7 +1725,7 @@ fn recheck_request_binding(workspace: &Path, request: &BridgeRequest) -> Result<
         &request.worker_id,
         request.attempt_number,
         &request.graph_hash,
-        &request.gate_context,
+        &request.recheck_gate_context,
         request
             .value
             .pointer("/runtime/approved_gate_refs")
@@ -708,6 +1808,17 @@ fn recheck_current_binding(
     {
         bail!("node-intelligence host policy changed during inference");
     }
+    if current_configuration.network_resolution_ref.is_some() {
+        recheck_network_resolution(workspace, node_id, expected_attempt, &current_configuration)
+            .context("pinned network is no longer authorized by the selected host resolver")?;
+    } else if current_configuration
+        .values
+        .get("runtime")
+        .and_then(|runtime| runtime.get("network_resolver_config"))
+        .is_some()
+    {
+        bail!("selected network resolver has no durable pin for the current attempt");
+    }
     let node = graph_node(&document.graph, node_id)?;
     let current_refs = if pre_admission || review_operation {
         Vec::new()
@@ -720,7 +1831,779 @@ fn recheck_current_binding(
     Ok(())
 }
 
+/// Replay the resolver's immutable request for its existing attempt row. The
+/// Python owner governor checks current policy/registry authority but returns
+/// the saved pins; Rust requires the same request, receipt, and task overlay.
+fn recheck_network_resolution(
+    workspace: &Path,
+    node_id: &str,
+    current_attempt: u32,
+    configuration: &TaskConfiguration,
+) -> Result<()> {
+    let document = crate::project_file::load(workspace)?;
+    let project_id = format!("fractal:project:{}", document.project.slug);
+    let original_task = configuration
+        .original_task
+        .as_ref()
+        .context("resolved task lost its original project config")?;
+    let configured_path = original_task
+        .pointer("/runtime/network_resolver_config")
+        .and_then(Value::as_str)
+        .context("resolved task lacks its selected resolver path")?;
+    let resolver_config = load_network_resolver_config(workspace, configured_path, &project_id)?;
+    let attempt_number = pending_effect_intent(workspace, node_id, &document.graph_hash, false)?
+        .and_then(|intent| intent.body.get("attempt_number").and_then(Value::as_u64))
+        .map(|number| number as u32)
+        .unwrap_or(current_attempt);
+    let original_task_ref = fractal_contracts::canonical_sha256(original_task)
+        .map_err(|error| anyhow::anyhow!("hash original network task: {error}"))?;
+    let saved = load_resolved_network_task(
+        workspace,
+        node_id,
+        &document.graph_hash,
+        attempt_number,
+        &original_task_ref,
+        &resolver_config,
+        original_task,
+    )?
+    .context("saved network-resolution pin is missing")?;
+    if Some(saved.resolution_ref.as_str()) != configuration.network_resolution_ref.as_deref()
+        || saved.task.as_object() != Some(&configuration.values)
+    {
+        bail!("saved network-resolution pins changed before effect");
+    }
+    let attempt = json!({
+        "id": attempt_id(&project_id, &document.graph_hash, node_id, attempt_number),
+        "node_id": node_id,
+        "number": attempt_number,
+    });
+    let mut request = json!({
+        "schema": "fractal.node_intelligence.resolve_request.v1",
+        "operation": "resolve",
+        "workspace": fs::canonicalize(workspace)?.to_string_lossy(),
+        "project_id": project_id,
+        "graph_hash": document.graph_hash,
+        "attempt": attempt,
+        "task": original_task,
+    });
+    let request_hash = fractal_contracts::canonical_sha256(&request)
+        .map_err(|error| anyhow::anyhow!("hash network resolution request: {error}"))?;
+    if request_hash != saved.request_hash {
+        bail!("saved resolver request no longer matches the original attempt");
+    }
+    request["request_hash"] = Value::String(request_hash.clone());
+    let bytes = serde_json::to_vec(&request).context("encode network-resolution recheck")?;
+    let node = graph_node(&document.graph, node_id)?;
+    let timeout = node
+        .pointer("/hard_limits/max_elapsed_ms")
+        .and_then(Value::as_u64)
+        .map(Duration::from_millis)
+        .unwrap_or(configuration.timeout)
+        .min(configuration.timeout);
+    let response = run_bridge_child(
+        workspace,
+        &bytes,
+        timeout,
+        &Launcher {
+            program: PathBuf::from("python3"),
+            args: vec!["-m".into(), "intelligence_graph.node_runtime".into()],
+        },
+    )?;
+    let object = response
+        .as_object()
+        .context("network resolver recheck response must be an object")?;
+    if object.get("schema").and_then(Value::as_str)
+        != Some("fractal.node_intelligence.resolve_response.v1")
+        || object.get("request_hash").and_then(Value::as_str) != Some(request_hash.as_str())
+        || object.get("attempt") != Some(&attempt)
+        || object.get("original_task_ref").and_then(Value::as_str)
+            != Some(original_task_ref.as_str())
+        || object.get("task") != Some(&saved.task)
+        || object.get("resolution_ref").and_then(Value::as_str)
+            != Some(saved.resolution_ref.as_str())
+        || object.get("status").and_then(Value::as_str) != Some("ready")
+        || object.get("provider_calls").and_then(Value::as_u64) != Some(0)
+        || object.get("model_starts").and_then(Value::as_u64) != Some(0)
+    {
+        bail!("resolver no longer authorizes the exact saved network pin");
+    }
+    Ok(())
+}
+
 fn task_configuration(workspace: &Path, node_id: &str) -> Result<Option<TaskConfiguration>> {
+    let Some(mut configuration) = task_configuration_raw(workspace, node_id)? else {
+        return Ok(None);
+    };
+    let materialize_from = configuration
+        .values
+        .get("runtime")
+        .and_then(|runtime| runtime.get("materialize_from"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !materialize_from.is_empty() {
+        let document = crate::project_file::load(workspace)?;
+        let predicted_attempt_number = document
+            .learning
+            .nodes
+            .get(node_id)
+            .map(|record| record.attempt_count)
+            .unwrap_or_default()
+            .saturating_add(u32::from(
+                !document
+                    .execution
+                    .as_ref()
+                    .and_then(|state| state.assignments.get(node_id))
+                    .is_some_and(|assignment| assignment.state == "checked_out"),
+            ));
+        let attempt_number =
+            pending_effect_intent(workspace, node_id, &document.graph_hash, false)?
+                .and_then(|intent| intent.body.get("attempt_number").and_then(Value::as_u64))
+                .map(|number| number as u32)
+                .unwrap_or(predicted_attempt_number);
+        let original_task = Value::Object(configuration.values.clone());
+        let original_task_ref = fractal_contracts::canonical_sha256(&original_task)
+            .map_err(|error| anyhow::anyhow!("hash original materialized task: {error}"))?;
+        if let Some(materialized) = load_materialized_task(
+            workspace,
+            node_id,
+            &document.graph_hash,
+            attempt_number,
+            &original_task_ref,
+        )? {
+            let declared = sorted_node_ids(
+                Some(&Value::Array(materialize_from.clone())),
+                "materialize_from",
+            )?;
+            if materialized.producer_receipt_refs.len() != declared.len() {
+                bail!("materialized producer receipt set no longer matches its declaration");
+            }
+            for (producer, expected_receipt_ref) in
+                declared.iter().zip(&materialized.producer_receipt_refs)
+            {
+                if !graph_has_edge(&document.graph, producer, node_id) {
+                    bail!("materialized input producer is no longer a canonical graph dependency");
+                }
+                let current = completed_effect_snapshot(workspace, &document, producer)?;
+                if current.receipt_ref != *expected_receipt_ref {
+                    bail!("materialized producer receipt changed before receiver reuse");
+                }
+            }
+            configuration.values = materialized
+                .task
+                .as_object()
+                .context("materialized task must be an object")?
+                .clone();
+            configuration.original_task = Some(original_task);
+            configuration.materialization_ref = Some(materialized.materialization_ref);
+        } else {
+            configuration.original_task = Some(original_task);
+        }
+    }
+    let runtime = configuration
+        .values
+        .get("runtime")
+        .and_then(Value::as_object)
+        .context("enabled node-intelligence task runtime is missing")?;
+    if let Some(configured_path) = runtime.get("network_resolver_config") {
+        let configured_path = configured_path
+            .as_str()
+            .filter(|path| !path.trim().is_empty())
+            .context("network_resolver_config must be a non-empty absolute path")?;
+        if configuration.materialization_ref.is_some()
+            || !materialize_from.is_empty()
+            || configuration.values["handoff_refs"]
+                .as_array()
+                .is_some_and(|refs| !refs.is_empty())
+            || configuration.values["review_packet_refs"]
+                .as_array()
+                .is_some_and(|refs| !refs.is_empty())
+        {
+            bail!("network resolver is limited to unbound root attempts without handoffs or review packets");
+        }
+        let document = crate::project_file::load(workspace)?;
+        let project_id = format!("fractal:project:{}", document.project.slug);
+        let owner_config = load_network_resolver_config(workspace, configured_path, &project_id)?;
+        let original_task = configuration
+            .original_task
+            .as_ref()
+            .context("network resolver requires the original project task")?;
+        let original_task_ref = fractal_contracts::canonical_sha256(original_task)
+            .map_err(|error| anyhow::anyhow!("hash original resolver task: {error}"))?;
+        let current_attempt = document
+            .learning
+            .nodes
+            .get(node_id)
+            .map(|record| record.attempt_count)
+            .unwrap_or_default();
+        let pending_intent =
+            pending_effect_intent(workspace, node_id, &document.graph_hash, false)?;
+        let attempt_number = if let Some(intent) = pending_intent.as_ref() {
+            intent
+                .body
+                .get("attempt_number")
+                .and_then(Value::as_u64)
+                .context("resolver recovery intent lacks attempt number")? as u32
+        } else if document
+            .execution
+            .as_ref()
+            .and_then(|state| state.assignments.get(node_id))
+            .is_some_and(|assignment| assignment.state == "checked_out")
+        {
+            current_attempt
+        } else {
+            current_attempt
+                .checked_add(1)
+                .context("node attempt counter is exhausted")?
+        };
+        if let Some(resolved) = load_resolved_network_task(
+            workspace,
+            node_id,
+            &document.graph_hash,
+            attempt_number,
+            &original_task_ref,
+            &owner_config,
+            original_task,
+        )? {
+            configuration.values = resolved
+                .task
+                .as_object()
+                .context("resolved network task must be an object")?
+                .clone();
+            configuration.network_resolution_ref = Some(resolved.resolution_ref);
+        } else if pending_intent.is_some() {
+            bail!("committed effect recovery has no saved network-resolution pin");
+        }
+    }
+    Ok(Some(configuration))
+}
+
+fn load_network_resolver_config(
+    workspace: &Path,
+    configured_path: &str,
+    project_id: &str,
+) -> Result<NetworkResolverConfig> {
+    let selected = std::env::var(NETWORK_RESOLVER_ENV)
+        .with_context(|| format!("network resolver requires {NETWORK_RESOLVER_ENV}"))?;
+    if selected != configured_path {
+        bail!("project resolver path does not match the operator-selected resolver config");
+    }
+    let path = PathBuf::from(&selected);
+    if !path.is_absolute() {
+        bail!("network resolver config path must be absolute");
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).with_context(|| {
+            format!("inspect network resolver config path {}", current.display())
+        })?;
+        if metadata.file_type().is_symlink() {
+            bail!("network resolver config path contains a symlink");
+        }
+    }
+    let canonical_path = fs::canonicalize(&path)
+        .with_context(|| format!("resolve network resolver config {}", path.display()))?;
+    let canonical_workspace = fs::canonicalize(workspace).context("resolve managed workspace")?;
+    if canonical_path.starts_with(&canonical_workspace) {
+        bail!("network resolver config must live outside the project workspace");
+    }
+    let metadata = fs::symlink_metadata(&canonical_path)?;
+    if !metadata.is_file() || metadata.len() > MAX_HOST_POLICY_BYTES || !private_metadata(&metadata)
+    {
+        bail!("network resolver config must be a bounded owner-private regular file");
+    }
+    let file = open_nofollow(&canonical_path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_HOST_POLICY_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_HOST_POLICY_BYTES {
+        bail!("network resolver config exceeds size limit");
+    }
+    let config = parse_unique_json(&bytes).context("decode network resolver config")?;
+    let object = config
+        .as_object()
+        .context("network resolver config must be an object")?;
+    let expected_keys = [
+        "schema",
+        "enabled",
+        "project_id",
+        "registry_path",
+        "rollout_policy_path",
+        "state_path",
+        "baseline_model_refs",
+        "head_artifact_roots",
+        "laya_installation",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if object.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_keys
+        || object.get("schema").and_then(Value::as_str) != Some(NETWORK_RESOLUTION_SCHEMA)
+        || object.get("enabled").and_then(Value::as_bool) != Some(true)
+        || object.get("project_id").and_then(Value::as_str) != Some(project_id)
+    {
+        bail!("network resolver config is not enabled for the current project");
+    }
+    for field in ["registry_path", "rollout_policy_path", "state_path"] {
+        if object
+            .get(field)
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            bail!("network resolver config has an invalid {field}");
+        }
+    }
+    let baselines = object
+        .get("baseline_model_refs")
+        .and_then(Value::as_array)
+        .context("network resolver baseline model refs must be an array")?;
+    if baselines.len() > 128
+        || baselines
+            .iter()
+            .any(|value| value.as_str().is_none_or(|reference| !is_digest(reference)))
+    {
+        bail!("network resolver baseline model refs are invalid");
+    }
+    let artifact_roots = object
+        .get("head_artifact_roots")
+        .and_then(Value::as_array)
+        .context("network resolver artifact roots must be an array")?;
+    if artifact_roots.len() > 128
+        || artifact_roots
+            .iter()
+            .any(|value| value.as_str().is_none_or(|root| root.trim().is_empty()))
+    {
+        bail!("network resolver artifact roots are invalid");
+    }
+    let digest = fractal_contracts::canonical_sha256(&config)
+        .map_err(|error| anyhow::anyhow!("hash network resolver config: {error}"))?;
+    Ok(NetworkResolverConfig {
+        path: canonical_path,
+        digest,
+    })
+}
+
+fn validate_resolved_network_task(original: &Value, resolved: &Value) -> Result<()> {
+    let original = original
+        .as_object()
+        .context("original resolver task must be an object")?;
+    let resolved = resolved
+        .as_object()
+        .context("resolved task must be an object")?;
+    if original.keys().collect::<BTreeSet<_>>() != resolved.keys().collect::<BTreeSet<_>>() {
+        bail!("resolver changed the task schema");
+    }
+    for key in original.keys() {
+        if !matches!(
+            key.as_str(),
+            "network_ref" | "node_ref" | "model_ref" | "policy_ref"
+        ) && original.get(key) != resolved.get(key)
+        {
+            bail!("resolver changed a task field outside the four pinned network refs");
+        }
+    }
+    for key in ["network_ref", "node_ref", "model_ref", "policy_ref"] {
+        if resolved
+            .get(key)
+            .and_then(Value::as_str)
+            .is_none_or(|reference| !is_digest(reference))
+        {
+            bail!("resolver returned an invalid {key}");
+        }
+    }
+    if resolved
+        .get("runtime")
+        .and_then(Value::as_object)
+        .is_some_and(|runtime| runtime.contains_key("network_resolution_ref"))
+    {
+        bail!("resolver cannot set its host-owned resolution receipt ref");
+    }
+    Ok(())
+}
+
+fn load_resolved_network_task(
+    workspace: &Path,
+    node_id: &str,
+    graph_hash: &str,
+    attempt_number: u32,
+    original_task_ref: &str,
+    resolver_config: &NetworkResolverConfig,
+    original_task: &Value,
+) -> Result<Option<ResolvedNetworkTask>> {
+    let directory = safe_project_path(workspace, RESOLVED_TASK_DIR)?;
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || !private_metadata(&metadata) {
+        bail!("resolved network task store is unsafe");
+    }
+    let mut found = None;
+    for entry in fs::read_dir(&directory)? {
+        let name = entry?.file_name();
+        let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+            continue;
+        };
+        let record_ref = format!("sha256:{stem}");
+        if !is_digest(&record_ref) {
+            bail!("resolved network task filename is invalid");
+        }
+        let record = read_private_record(workspace, RESOLVED_TASK_DIR, &record_ref)?;
+        if record.get("schema").and_then(Value::as_str) != Some(RESOLVED_TASK_SCHEMA) {
+            bail!("resolved network task record schema mismatch");
+        }
+        if record.get("node_id").and_then(Value::as_str) != Some(node_id)
+            || record.get("graph_hash").and_then(Value::as_str) != Some(graph_hash)
+            || record.get("attempt_number").and_then(Value::as_u64)
+                != Some(u64::from(attempt_number))
+        {
+            continue;
+        }
+        if record.get("original_task_ref").and_then(Value::as_str) != Some(original_task_ref)
+            || record.get("resolver_config_path").and_then(Value::as_str)
+                != Some(resolver_config.path.to_string_lossy().as_ref())
+            || record.get("resolver_config_ref").and_then(Value::as_str)
+                != Some(resolver_config.digest.as_str())
+        {
+            bail!("resolved network task no longer matches its original task or owner config");
+        }
+        let task = record
+            .get("task")
+            .cloned()
+            .context("resolved network task record lacks task")?;
+        validate_resolved_network_task(original_task, &task)?;
+        let resolution_ref = record
+            .get("resolution_ref")
+            .and_then(Value::as_str)
+            .filter(|reference| is_digest(reference))
+            .context("resolved network task lacks receipt ref")?
+            .to_owned();
+        let request_hash = record
+            .get("request_hash")
+            .and_then(Value::as_str)
+            .filter(|reference| is_digest(reference))
+            .context("resolved network task lacks its original request hash")?
+            .to_owned();
+        let runtime = original_task
+            .pointer("/runtime")
+            .and_then(Value::as_object)
+            .context("resolver task runtime is invalid")?;
+        let receipt_root = runtime
+            .get("receipt_path")
+            .and_then(Value::as_str)
+            .context("resolver task receipt path is missing")?;
+        let receipt_path = content_path(receipt_root, &resolution_ref)?;
+        let receipt_bytes = read_private_content(
+            workspace,
+            &receipt_path,
+            &resolution_ref,
+            MAX_PRIVATE_RECEIPT_BYTES,
+        )?;
+        let receipt =
+            parse_unique_json(&receipt_bytes).context("decode saved network-resolution receipt")?;
+        let document = crate::project_file::load(workspace)?;
+        let project_id = format!("fractal:project:{}", document.project.slug);
+        let expected_attempt = json!({
+            "id": attempt_id(&project_id, graph_hash, node_id, attempt_number),
+            "node_id": node_id,
+            "number": attempt_number,
+        });
+        let expected_task_ref = fractal_contracts::canonical_sha256(&task)
+            .map_err(|error| anyhow::anyhow!("hash resolved task: {error}"))?;
+        if receipt.get("schema").and_then(Value::as_str) != Some(NETWORK_RESOLUTION_SCHEMA)
+            || receipt.get("request_hash").and_then(Value::as_str) != Some(request_hash.as_str())
+            || receipt.get("project_id").and_then(Value::as_str) != Some(project_id.as_str())
+            || receipt.get("graph_hash").and_then(Value::as_str) != Some(graph_hash)
+            || receipt.get("attempt") != Some(&expected_attempt)
+            || receipt.get("config_ref").and_then(Value::as_str)
+                != Some(resolver_config.digest.as_str())
+            || receipt.get("original_task_ref").and_then(Value::as_str) != Some(original_task_ref)
+            || receipt.get("task_ref").and_then(Value::as_str) != Some(expected_task_ref.as_str())
+            || receipt.get("network_ref") != task.get("network_ref")
+            || receipt.get("node_ref") != task.get("node_ref")
+            || receipt.get("model_ref") != task.get("model_ref")
+            || receipt.get("policy_ref") != task.get("policy_ref")
+            || receipt.get("provider_calls").and_then(Value::as_u64) != Some(0)
+            || receipt.get("model_starts").and_then(Value::as_u64) != Some(0)
+        {
+            bail!("network-resolution receipt does not bind its exact attempt and pins");
+        }
+        let resolved = ResolvedNetworkTask {
+            node_id: node_id.to_owned(),
+            graph_hash: graph_hash.to_owned(),
+            attempt_number,
+            original_task_ref: original_task_ref.to_owned(),
+            task,
+            resolution_ref,
+            resolver_config_ref: resolver_config.digest.clone(),
+            request_hash,
+        };
+        if found.replace(resolved).is_some() {
+            bail!("multiple network-resolution overlays bind the same attempt");
+        }
+    }
+    Ok(found)
+}
+
+fn resolve_network_task(
+    workspace: &Path,
+    node_id: &str,
+    configuration: &TaskConfiguration,
+) -> Result<ResolvedNetworkTask> {
+    let original_task = configuration
+        .original_task
+        .as_ref()
+        .context("network resolution requires original task config")?;
+    let runtime = original_task
+        .get("runtime")
+        .and_then(Value::as_object)
+        .context("network resolver runtime is missing")?;
+    let configured_path = runtime
+        .get("network_resolver_config")
+        .and_then(Value::as_str)
+        .context("network resolver config path is missing")?;
+    if runtime
+        .get("materialize_from")
+        .and_then(Value::as_array)
+        .is_some_and(|refs| !refs.is_empty())
+        || configuration.values["handoff_refs"]
+            .as_array()
+            .is_some_and(|refs| !refs.is_empty())
+        || configuration.values["review_packet_refs"]
+            .as_array()
+            .is_some_and(|refs| !refs.is_empty())
+    {
+        bail!("network resolution cannot change pins for a dependency or reviewed task");
+    }
+    let document = crate::project_file::load(workspace)?;
+    let project_id = format!("fractal:project:{}", document.project.slug);
+    let node = graph_node(&document.graph, node_id)?;
+    let capability_id = required_string(&configuration.values, "capability_id")?;
+    if node.get("capability").and_then(Value::as_str) != Some(capability_id.as_str()) {
+        bail!("network resolver task capability differs from the canonical graph node");
+    }
+    if document
+        .execution
+        .as_ref()
+        .and_then(|state| state.assignments.get(node_id))
+        .is_some_and(|assignment| assignment.state == "checked_out")
+    {
+        bail!("network resolution must finish before managed checkout");
+    }
+    let previous_attempt = document
+        .learning
+        .nodes
+        .get(node_id)
+        .map(|record| record.attempt_count)
+        .unwrap_or_default();
+    let attempt_number = previous_attempt
+        .checked_add(1)
+        .context("node attempt counter is exhausted")?;
+    let original_task_ref = fractal_contracts::canonical_sha256(original_task)
+        .map_err(|error| anyhow::anyhow!("hash original network task: {error}"))?;
+    let resolver_config = load_network_resolver_config(workspace, configured_path, &project_id)?;
+    if let Some(existing) = load_resolved_network_task(
+        workspace,
+        node_id,
+        &document.graph_hash,
+        attempt_number,
+        &original_task_ref,
+        &resolver_config,
+        original_task,
+    )? {
+        return Ok(existing);
+    }
+    let policy = load_host_policy(workspace, node_id, &project_id, &document.graph_hash)?;
+    let host_task = policy
+        .task
+        .as_object()
+        .context("host policy task entry must be an object")?;
+    if !host_policy_authorization_matches(host_task, configuration, runtime)
+        || host_task.get("authorized_approvers") != configuration.values.get("authorized_approvers")
+        || host_task.get("qualified_reviewers") != configuration.values.get("qualified_reviewers")
+        || !host_policy_memory_matches(host_task, runtime)
+    {
+        bail!("network resolution task does not match independent host authorization");
+    }
+    let graph_hash = document.graph_hash.clone();
+    let attempt = json!({
+        "id": attempt_id(&project_id, &graph_hash, node_id, attempt_number),
+        "node_id": node_id,
+        "number": attempt_number,
+    });
+    let mut request = json!({
+        "schema": "fractal.node_intelligence.resolve_request.v1",
+        "operation": "resolve",
+        "workspace": fs::canonicalize(workspace)?.to_string_lossy(),
+        "project_id": project_id,
+        "graph_hash": graph_hash,
+        "attempt": attempt,
+        "task": original_task,
+    });
+    let request_hash = fractal_contracts::canonical_sha256(&request)
+        .map_err(|error| anyhow::anyhow!("hash network resolution request: {error}"))?;
+    request["request_hash"] = Value::String(request_hash.clone());
+    let bytes = serde_json::to_vec(&request).context("encode network resolution request")?;
+    if bytes.len() > MAX_REQUEST_BYTES {
+        bail!("network resolution request exceeds the bounded JSON contract");
+    }
+    let node_budget = node
+        .pointer("/hard_limits/max_elapsed_ms")
+        .and_then(Value::as_u64)
+        .map(Duration::from_millis)
+        .unwrap_or(configuration.timeout);
+    let response = run_bridge_child(
+        workspace,
+        &bytes,
+        configuration.timeout.min(node_budget),
+        &Launcher {
+            program: PathBuf::from("python3"),
+            args: vec!["-m".into(), "intelligence_graph.node_runtime".into()],
+        },
+    )?;
+    let object = response
+        .as_object()
+        .context("network resolver response must be an object")?;
+    let response_keys = [
+        "schema",
+        "request_hash",
+        "attempt",
+        "original_task_ref",
+        "task",
+        "resolution_ref",
+        "status",
+        "provider_calls",
+        "model_starts",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if object.keys().map(String::as_str).collect::<BTreeSet<_>>() != response_keys
+        || object.get("schema").and_then(Value::as_str)
+            != Some("fractal.node_intelligence.resolve_response.v1")
+        || object.get("request_hash").and_then(Value::as_str) != Some(request_hash.as_str())
+        || object.get("attempt") != Some(&attempt)
+        || object.get("original_task_ref").and_then(Value::as_str)
+            != Some(original_task_ref.as_str())
+        || object.get("status").and_then(Value::as_str) != Some("ready")
+        || object.get("provider_calls").and_then(Value::as_u64) != Some(0)
+        || object.get("model_starts").and_then(Value::as_u64) != Some(0)
+    {
+        bail!("network resolver response is not ready or correctly bound");
+    }
+    let task = object
+        .get("task")
+        .cloned()
+        .context("network resolver omitted its pinned task")?;
+    validate_resolved_network_task(original_task, &task)?;
+    let resolution_ref = object
+        .get("resolution_ref")
+        .and_then(Value::as_str)
+        .filter(|reference| is_digest(reference))
+        .context("network resolver omitted a valid receipt ref")?
+        .to_owned();
+    let receipt_path = runtime
+        .get("receipt_path")
+        .and_then(Value::as_str)
+        .context("network resolver runtime receipt path is missing")?;
+    let receipt_bytes = read_private_content(
+        workspace,
+        &content_path(receipt_path, &resolution_ref)?,
+        &resolution_ref,
+        MAX_PRIVATE_RECEIPT_BYTES,
+    )?;
+    let receipt = parse_unique_json(&receipt_bytes).context("decode network resolution receipt")?;
+    let task_ref = fractal_contracts::canonical_sha256(&task)
+        .map_err(|error| anyhow::anyhow!("hash resolved network task: {error}"))?;
+    if receipt.get("schema").and_then(Value::as_str) != Some(NETWORK_RESOLUTION_SCHEMA)
+        || receipt.get("request_hash").and_then(Value::as_str) != Some(request_hash.as_str())
+        || receipt.get("project_id").and_then(Value::as_str) != Some(project_id.as_str())
+        || receipt.get("graph_hash").and_then(Value::as_str) != Some(graph_hash.as_str())
+        || receipt.get("attempt") != Some(&attempt)
+        || receipt.get("config_ref").and_then(Value::as_str)
+            != Some(resolver_config.digest.as_str())
+        || receipt.get("original_task_ref").and_then(Value::as_str)
+            != Some(original_task_ref.as_str())
+        || receipt.get("task_ref").and_then(Value::as_str) != Some(task_ref.as_str())
+        || receipt.get("network_ref") != task.get("network_ref")
+        || receipt.get("node_ref") != task.get("node_ref")
+        || receipt.get("model_ref") != task.get("model_ref")
+        || receipt.get("policy_ref") != task.get("policy_ref")
+        || receipt.get("provider_calls").and_then(Value::as_u64) != Some(0)
+        || receipt.get("model_starts").and_then(Value::as_u64) != Some(0)
+    {
+        bail!("network resolution receipt does not bind the selected task pins");
+    }
+    let current_document = crate::project_file::load(workspace)?;
+    let current_raw = task_configuration_raw(workspace, node_id)?
+        .context("resolver task was disabled while resolving network")?;
+    let current_original = current_raw
+        .original_task
+        .as_ref()
+        .context("resolver task lost its original config")?;
+    let current_policy = load_host_policy(workspace, node_id, &project_id, &graph_hash)?;
+    let current_config = load_network_resolver_config(workspace, configured_path, &project_id)?;
+    if current_document.graph_hash != graph_hash
+        || current_document
+            .learning
+            .nodes
+            .get(node_id)
+            .map(|record| record.attempt_count)
+            .unwrap_or_default()
+            != previous_attempt
+        || current_document
+            .execution
+            .as_ref()
+            .and_then(|state| state.assignments.get(node_id))
+            .is_some_and(|assignment| assignment.state == "checked_out")
+        || fractal_contracts::canonical_sha256(current_original)
+            .map_err(|error| anyhow::anyhow!("hash current resolver task: {error}"))?
+            != original_task_ref
+        || current_policy.path != policy.path
+        || current_policy.digest != policy.digest
+        || current_config.path != resolver_config.path
+        || current_config.digest != resolver_config.digest
+    {
+        bail!("graph, attempt, task config, or owner policy changed during network resolution");
+    }
+    let resolved = ResolvedNetworkTask {
+        node_id: node_id.to_owned(),
+        graph_hash,
+        attempt_number,
+        original_task_ref,
+        task,
+        resolution_ref,
+        resolver_config_ref: resolver_config.digest,
+        request_hash,
+    };
+    save_resolved_network_task(workspace, &resolved, &resolver_config.path)?;
+    Ok(resolved)
+}
+
+fn save_resolved_network_task(
+    workspace: &Path,
+    resolved: &ResolvedNetworkTask,
+    resolver_config_path: &Path,
+) -> Result<String> {
+    write_private_record(
+        workspace,
+        RESOLVED_TASK_DIR,
+        &json!({
+            "schema": RESOLVED_TASK_SCHEMA,
+            "node_id": resolved.node_id,
+            "graph_hash": resolved.graph_hash,
+            "attempt_number": resolved.attempt_number,
+            "original_task_ref": resolved.original_task_ref,
+            "task": resolved.task,
+            "resolution_ref": resolved.resolution_ref,
+            "request_hash": resolved.request_hash,
+            "resolver_config_path": resolver_config_path.to_string_lossy(),
+            "resolver_config_ref": resolved.resolver_config_ref,
+        }),
+    )
+}
+
+fn task_configuration_raw(workspace: &Path, node_id: &str) -> Result<Option<TaskConfiguration>> {
     let path = workspace.join(CONFIG_PATH);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -805,9 +2688,23 @@ fn task_configuration(workspace: &Path, node_id: &str) -> Result<Option<TaskConf
     if !(100..=180_000).contains(&timeout_ms) {
         bail!("node-intelligence timeout_ms must be between 100 and 180000");
     }
+    let original_task = Value::Object(merged.clone());
+    if merged
+        .get("runtime")
+        .and_then(Value::as_object)
+        .is_some_and(|runtime| {
+            runtime.contains_key("materialization_ref")
+                || runtime.contains_key("network_resolution_ref")
+        })
+    {
+        bail!("project node-intelligence config cannot set host materialization or network-resolution refs");
+    }
     Ok(Some(TaskConfiguration {
         values: merged,
         timeout: Duration::from_millis(timeout_ms),
+        original_task: Some(original_task),
+        materialization_ref: None,
+        network_resolution_ref: None,
     }))
 }
 
@@ -921,28 +2818,37 @@ fn build_request(
     ) {
         bail!("node-intelligence payload_classification is unsupported");
     }
-    if !matches!(operation, "prepare" | "analysis" | "review") {
+    if !matches!(
+        operation,
+        "prepare" | "analysis" | "intake" | "check" | "review" | "recover"
+    ) {
         bail!("unsupported node-intelligence operation");
     }
-    if review_operation && review_packet_refs.is_empty() {
-        bail!("review admission requires at least one pinned review packet");
-    }
-    if operation == "analysis" {
-        validate_analysis_configuration(node, &configuration.values)?;
+    if matches!(operation, "analysis" | "intake" | "check") {
+        validate_measurement_configuration(node, &configuration.values, operation)?;
     }
     if let Some(configured) = fields.get("operation").and_then(Value::as_str) {
-        let analysis_preflight = operation == "prepare"
-            && configured == "analysis"
-            && node.get("capability").and_then(Value::as_str) == Some(ANALYSIS_CAPABILITY)
+        let effect_preflight = operation == "prepare"
+            && matches!(configured, "analysis" | "intake" | "check")
+            && configured
+                == node
+                    .get("capability")
+                    .and_then(Value::as_str)
+                    .and_then(|capability| match capability {
+                        ANALYSIS_CAPABILITY => Some("analysis"),
+                        INTAKE_CAPABILITY => Some("intake"),
+                        CHECK_CAPABILITY => Some("check"),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
             && runtime
-                .get("analysis")
-                .and_then(|analysis| analysis.get("enabled"))
+                .get(configured)
+                .and_then(|effect| effect.get("enabled"))
                 .and_then(Value::as_bool)
                 == Some(true);
         let review_preflight = operation == "review"
-            && !review_packet_refs.is_empty()
-            && matches!(configured, "prepare" | "analysis");
-        if configured != operation && !analysis_preflight && !review_preflight {
+            && matches!(configured, "prepare" | "analysis" | "intake" | "check");
+        if configured != operation && !effect_preflight && !review_preflight {
             bail!("node-intelligence task operation does not match its managed node capability");
         }
     }
@@ -1040,14 +2946,33 @@ fn build_request(
         .task
         .as_object()
         .context("host policy task entry must be an object")?;
-    if host_task.get("authorization") != runtime.get("authorization")
+    if !host_policy_authorization_matches(host_task, &configuration, runtime)
         || host_task.get("authorized_approvers") != fields.get("authorized_approvers")
         || host_task.get("qualified_reviewers") != fields.get("qualified_reviewers")
+        || host_task.get("materialize_from") != runtime.get("materialize_from")
         || !host_policy_memory_matches(host_task, runtime)
     {
         bail!("project node-intelligence grants do not match the independent host policy");
     }
     let mut runtime_value = runtime.clone();
+    if let Some(network_resolution_ref) = configuration.network_resolution_ref.as_ref() {
+        runtime_value.insert(
+            "network_resolution_ref".to_owned(),
+            Value::String(network_resolution_ref.clone()),
+        );
+    } else if runtime.contains_key("network_resolution_ref") {
+        bail!("project node-intelligence config cannot set network_resolution_ref");
+    } else if runtime.contains_key("network_resolver_config") {
+        bail!("operator-selected network resolver has no saved resolution pin for this attempt");
+    }
+    if let Some(materialization_ref) = configuration.materialization_ref.as_ref() {
+        runtime_value.insert(
+            "materialization_ref".to_owned(),
+            Value::String(materialization_ref.clone()),
+        );
+    } else if runtime.contains_key("materialize_from") {
+        bail!("producer-bound node task has not been materialized for this attempt");
+    }
     runtime_value.insert(
         "approved_gate_refs".to_owned(),
         Value::Array(
@@ -1117,6 +3042,7 @@ fn build_request(
     gate_context.review_packet_refs = review_packet_refs;
     Ok(BridgeRequest {
         value: request,
+        recheck_gate_context: gate_context.clone(),
         gate_context,
         attempt_number,
         graph_hash: document.graph_hash,
@@ -1135,13 +3061,107 @@ fn build_request(
         pre_admission,
         review_operation,
         previous_attempt_count,
+        intent_ref: None,
     })
+}
+
+fn host_policy_authorization_matches(
+    host_task: &Map<String, Value>,
+    configuration: &TaskConfiguration,
+    effective_runtime: &Map<String, Value>,
+) -> bool {
+    let Some(original_runtime) = configuration
+        .original_task
+        .as_ref()
+        .and_then(|task| task.get("runtime"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    if host_task.get("authorization") != original_runtime.get("authorization") {
+        return false;
+    }
+    if configuration.materialization_ref.is_none() {
+        return effective_runtime.get("authorization") == original_runtime.get("authorization");
+    }
+    let Some(original_auth) = original_runtime
+        .get("authorization")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let Some(effective_auth) = effective_runtime
+        .get("authorization")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    if effective_auth.get("current_sources") != original_auth.get("current_sources")
+        || effective_auth.get("authorized_permissions")
+            != original_auth.get("authorized_permissions")
+    {
+        return false;
+    }
+    let Some(original_refs) = original_auth
+        .get("authorized_artifacts")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    let Some(effective_refs) = effective_auth
+        .get("authorized_artifacts")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    let Some(input_refs) = configuration
+        .values
+        .get("input_refs")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    let expected = original_refs
+        .iter()
+        .chain(input_refs)
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    let actual = effective_refs
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    if expected != actual {
+        return false;
+    }
+    effective_auth
+        .get("current_artifacts")
+        .and_then(Value::as_object)
+        .zip(
+            original_auth
+                .get("current_artifacts")
+                .and_then(Value::as_object),
+        )
+        .is_some_and(|(effective, original)| {
+            original
+                .iter()
+                .all(|(key, value)| effective.get(key) == Some(value))
+                && effective.values().all(|value| {
+                    original.values().any(|old| old == value)
+                        || value.as_str().is_some_and(|reference| {
+                            input_refs
+                                .iter()
+                                .any(|input| input.as_str() == Some(reference))
+                        })
+                })
+        })
 }
 
 fn task_config_digest(configuration: &TaskConfiguration) -> Result<String> {
     let value = json!({
         "task": configuration.values,
         "timeout_ms": configuration.timeout.as_millis(),
+        "materialization_ref": configuration.materialization_ref,
+        "network_resolution_ref": configuration.network_resolution_ref,
     });
     fractal_contracts::canonical_sha256(&value)
         .map_err(|error| anyhow::anyhow!("hash merged node-intelligence config: {error}"))
@@ -1241,8 +3261,38 @@ fn load_host_policy(
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
-    if task_keys != legacy_task_keys && task_keys != memory_task_keys {
+    let materialization_task_keys = [
+        "authorization",
+        "authorized_approvers",
+        "qualified_reviewers",
+        "materialize_from",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let memory_materialization_task_keys = [
+        "authorization",
+        "authorized_approvers",
+        "qualified_reviewers",
+        "memory",
+        "materialize_from",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if task_keys != legacy_task_keys
+        && task_keys != memory_task_keys
+        && task_keys != materialization_task_keys
+        && task_keys != memory_materialization_task_keys
+    {
         bail!("node-intelligence host policy task entry has an invalid schema");
+    }
+    if task_object.contains_key("materialize_from") {
+        let ids = sorted_node_ids(
+            task_object.get("materialize_from"),
+            "host_policy.materialize_from",
+        )?;
+        if task_object.get("materialize_from") != Some(&json!(ids)) {
+            bail!("host policy materialize_from must be sorted and unique");
+        }
     }
     if task_object
         .get("memory")
@@ -1368,6 +3418,83 @@ fn validate_analysis_configuration(node: &Value, fields: &Map<String, Value>) ->
         bail!("analysis timeout_ms must be between 100 and 5000");
     }
     Ok(Duration::from_millis(timeout))
+}
+
+fn validate_measurement_configuration(
+    node: &Value,
+    fields: &Map<String, Value>,
+    operation: &str,
+) -> Result<Duration> {
+    let capability = match operation {
+        "analysis" => ANALYSIS_CAPABILITY,
+        "intake" => INTAKE_CAPABILITY,
+        "check" => CHECK_CAPABILITY,
+        _ => bail!("unsupported deterministic measurement operation"),
+    };
+    if node.get("capability").and_then(Value::as_str) != Some(capability) {
+        bail!("{operation} is allowed only for its canonical measurement capability");
+    }
+    if operation == "analysis" {
+        return validate_analysis_configuration(node, fields);
+    }
+    if node
+        .pointer("/hard_limits/max_calls")
+        .and_then(Value::as_u64)
+        .is_none_or(|calls| calls < 1)
+    {
+        bail!("{operation} node has no remaining call budget");
+    }
+    let max_elapsed_ms = node
+        .pointer("/hard_limits/max_elapsed_ms")
+        .and_then(Value::as_u64)
+        .context("measurement node has no elapsed-time budget")?;
+    let runtime = fields
+        .get("runtime")
+        .and_then(Value::as_object)
+        .context("task runtime is missing")?;
+    let effect = runtime
+        .get(operation)
+        .and_then(Value::as_object)
+        .with_context(|| format!("{operation} task requires runtime.{operation}"))?;
+    if effect.get("enabled").and_then(Value::as_bool) != Some(true) {
+        bail!("runtime.{operation}.enabled must be true");
+    }
+    let database_path = effect
+        .get("database_path")
+        .and_then(Value::as_str)
+        .context("measurement task requires a database_path")?;
+    if safe_project_path(Path::new("/workspace"), database_path).is_err() {
+        bail!("measurement database_path must be project-relative");
+    }
+    for field in ["output_permission_ref", "output_retention_ref"] {
+        let value = effect
+            .get(field)
+            .and_then(Value::as_str)
+            .with_context(|| format!("runtime.{operation} requires {field}"))?;
+        if !is_digest(value) {
+            bail!("measurement output rights must be sha256 refs");
+        }
+    }
+    let permission = effect["output_permission_ref"].as_str().unwrap_or_default();
+    let granted = runtime
+        .get("authorization")
+        .and_then(|value| value.get("authorized_permissions"))
+        .and_then(Value::as_array)
+        .context("measurement output rights need host authorization")?;
+    if !granted
+        .iter()
+        .any(|value| value.as_str() == Some(permission))
+    {
+        bail!("measurement output permission is not host-authorized");
+    }
+    let timeout_ms = effect
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(2_000);
+    if !(100..=5_000).contains(&timeout_ms) || timeout_ms > max_elapsed_ms {
+        bail!("measurement timeout must fit the node's bounded elapsed-time limit");
+    }
+    Ok(Duration::from_millis(timeout_ms))
 }
 
 fn validated_gate_bindings(
@@ -1525,6 +3652,8 @@ fn run_bridge_child(
         "LC_ALL",
         "LC_CTYPE",
         "CUDA_VISIBLE_DEVICES",
+        NETWORK_RESOLVER_ENV,
+        FEEDBACK_POLICY_ENV,
     ] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
@@ -1716,21 +3845,49 @@ fn validate_response(
     {
         bail!("review-only response contains a decision from another operation");
     }
-    if review_only && !object.get("analysis").is_some_and(Value::is_null) {
-        bail!("review-only response unexpectedly contains an analysis action");
-    }
-    let analysis = if request_value.get("operation").and_then(Value::as_str) == Some("analysis") {
+    let request_operation = request_value
+        .get("operation")
+        .and_then(Value::as_str)
+        .context("node-intelligence request lacks operation")?;
+    let effect_operation = if request_operation == "recover" {
+        request_value
+            .pointer("/recovery/operation")
+            .and_then(Value::as_str)
+            .context("recovery request lacks original operation")?
+    } else {
+        request_operation
+    };
+    let effect_field = if request_operation == "recover" {
+        "recovery"
+    } else {
+        effect_operation
+    };
+    let effect = if matches!(effect_operation, "analysis" | "intake" | "check") {
         let result = object
-            .get("analysis")
-            .context("analysis response lacks typed analysis status")?;
-        validate_analysis_result(result, &attempt_ref)?;
+            .get(effect_field)
+            .context("node-intelligence response lacks typed effect status")?;
+        validate_measurement_result(result, &attempt_ref, effect_operation)?;
         Some(result.clone())
     } else {
-        if !object.get("analysis").is_some_and(Value::is_null) {
-            bail!("prepare response unexpectedly contains an analysis action");
+        for field in ["analysis", "intake", "check", "recovery"] {
+            if !object.get(field).is_some_and(Value::is_null) {
+                bail!("non-effect node-intelligence response unexpectedly contains {field}");
+            }
         }
         None
     };
+    if request_operation == "recover" {
+        let recovery = object
+            .get("recovery")
+            .and_then(Value::as_object)
+            .context("recovery response lacks recovery binding")?;
+        if recovery.get("operation").and_then(Value::as_str) != Some(effect_operation)
+            || recovery.get("intent_ref") != request_value.pointer("/recovery/intent_ref")
+            || recovery.get("current_attempt") != request_value.pointer("/recovery/current_attempt")
+        {
+            bail!("recovery response does not match the Rust intent and current attempt");
+        }
+    }
     let remaining_elapsed_ms = object
         .get("remaining_elapsed_ms")
         .and_then(Value::as_u64)
@@ -1786,6 +3943,15 @@ fn validate_response(
         || receipt.get("context_manifest_ref").and_then(Value::as_str) != Some(context_ref.as_str())
         || receipt.get("decision") != Some(decision)
         || receipt.get("analysis") != object.get("analysis")
+        || receipt.get("intake") != object.get("intake")
+        || receipt.get("check") != object.get("check")
+        || receipt.get("recovery") != object.get("recovery")
+        || receipt
+            .get("network_resolution_ref")
+            .unwrap_or(&Value::Null)
+            != request_value
+                .pointer("/runtime/network_resolution_ref")
+                .unwrap_or(&Value::Null)
         || receipt.get("remaining_elapsed_ms") != object.get("remaining_elapsed_ms")
         || receipt.get("remaining_calls") != object.get("remaining_calls")
         || receipt.get("provider_calls").and_then(Value::as_u64) != Some(0)
@@ -1829,7 +3995,36 @@ fn validate_response(
         handoff_refs: request.gate_context.handoff_refs.clone(),
         review_packet_refs: request.gate_context.review_packet_refs.clone(),
         decision: decision.clone(),
-        analysis,
+        operation: effect_operation.to_owned(),
+        effect: effect.clone(),
+        analysis: (effect_operation == "analysis")
+            .then(|| effect.clone())
+            .flatten(),
+        recovered: request_operation == "recover",
+        intent_ref: if request_operation == "recover" {
+            request_value
+                .pointer("/recovery/intent_ref")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        } else {
+            request.intent_ref.clone()
+        },
+        current_attempt_number: if request_operation == "recover" {
+            request_value
+                .pointer("/recovery/current_attempt/number")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32)
+        } else {
+            None
+        },
+        materialization_ref: request_value
+            .pointer("/runtime/materialization_ref")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        network_resolution_ref: request_value
+            .pointer("/runtime/network_resolution_ref")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         remaining_elapsed_ms,
         remaining_calls,
         approved_gate_refs: request
@@ -1842,10 +4037,15 @@ fn validate_response(
             .map(str::to_owned)
             .collect(),
         pending_review: status == Some("pending_review"),
-        gate_context: request.gate_context.clone(),
+        gate_context: request.recheck_gate_context.clone(),
         node_id: request.node_id.clone(),
         worker_id: request.worker_id.clone(),
-        attempt_number: request.attempt_number,
+        attempt_number: request
+            .value
+            .pointer("/attempt/number")
+            .and_then(Value::as_u64)
+            .context("node-intelligence response binding lacks attempt number")?
+            as u32,
         graph_hash: request.graph_hash.clone(),
         config_digest: request.config_digest.clone(),
         host_policy_path: request.host_policy_path.clone(),
@@ -1853,33 +4053,40 @@ fn validate_response(
     })
 }
 
-fn validate_analysis_result(value: &Value, expected_attempt_ref: &str) -> Result<()> {
+fn validate_measurement_result(
+    value: &Value,
+    expected_attempt_ref: &str,
+    operation: &str,
+) -> Result<()> {
     let action = value
         .get("action")
-        .context("analysis result lacks action receipt")?;
+        .context("measurement result lacks action receipt")?;
     let collection = value
         .get("collection")
-        .context("analysis result lacks collection status")?;
+        .context("measurement result lacks collection status")?;
     let state = action
         .get("state")
         .and_then(Value::as_str)
-        .context("analysis action state is missing")?;
-    let action_id = format!(
-        "fractal:action:{}",
-        digest_hex(
-            fractal_contracts::canonical_json(&json!({
-                "attempt_ref": expected_attempt_ref,
-                "operation": "measurement-analyze",
-            }))?
-            .as_slice(),
-        )
-    );
+        .context("measurement action state is missing")?;
+    let action_id = measurement_action_id(expected_attempt_ref, operation)?;
     if action.get("action_id").and_then(Value::as_str) != Some(action_id.as_str())
         || action.get("attempt_ref").and_then(Value::as_str) != Some(expected_attempt_ref)
         || collection.get("action_id").and_then(Value::as_str) != Some(action_id.as_str())
     {
-        bail!("analysis action receipt is bound to a different attempt");
+        bail!("measurement action receipt is bound to a different attempt");
     }
+    let checked_outcome = value.get("verified_outcome");
+    let action_outcome = action.get("verified_outcome");
+    let outcome_valid = match operation {
+        "check" => {
+            checked_outcome.is_some_and(Value::is_boolean) && action_outcome == checked_outcome
+        }
+        "analysis" | "intake" => {
+            checked_outcome.is_some_and(Value::is_null)
+                && action_outcome.is_some_and(Value::is_null)
+        }
+        _ => false,
+    };
     if !matches!(
         state,
         "running" | "complete" | "failed" | "timed_out" | "cancelled" | "unknown"
@@ -1887,65 +4094,63 @@ fn validate_analysis_result(value: &Value, expected_attempt_ref: &str) -> Result
         .get("available")
         .and_then(Value::as_bool)
         .is_none()
-        || action
-            .get("verified_outcome")
-            .is_none_or(|outcome| !outcome.is_null())
+        || !outcome_valid
         || action
             .get("receipt_ref")
             .and_then(Value::as_str)
             .is_none_or(|reference| !is_digest(reference))
     {
-        bail!("analysis result violates the typed, unverified action contract");
+        bail!("measurement result violates the typed local action contract");
     }
     let refs = action
         .get("artifact_refs")
         .and_then(Value::as_array)
-        .context("analysis action artifact refs are missing")?;
+        .context("measurement action artifact refs are missing")?;
     if refs.iter().any(|reference| {
         reference
             .as_str()
             .is_none_or(|reference| !is_digest(reference))
     }) {
-        bail!("analysis action contains an invalid artifact ref");
+        bail!("measurement action contains an invalid artifact ref");
     }
     if let Some(input_ref) = action.get("input_ref") {
         if !input_ref.is_null() && input_ref.as_str().is_none_or(|value| !is_digest(value)) {
-            bail!("analysis action contains an invalid input ref");
+            bail!("measurement action contains an invalid input ref");
         }
     }
     let receipt_ref = action["receipt_ref"].as_str().expect("validated above");
     let mut action_without_receipt_ref = action.clone();
     action_without_receipt_ref
         .as_object_mut()
-        .context("analysis action receipt must be an object")?
+        .context("measurement action receipt must be an object")?
         .remove("receipt_ref");
     if fractal_contracts::canonical_sha256(&action_without_receipt_ref)
-        .map_err(|error| anyhow::anyhow!("hash analysis action receipt: {error}"))?
+        .map_err(|error| anyhow::anyhow!("hash measurement action receipt: {error}"))?
         != receipt_ref
     {
-        bail!("analysis action receipt hash mismatch");
+        bail!("measurement action receipt hash mismatch");
     }
     let collection_refs = collection
         .get("artifact_refs")
         .and_then(Value::as_array)
-        .context("analysis collection artifact refs are missing")?;
+        .context("measurement collection artifact refs are missing")?;
     if collection_refs.iter().any(|reference| {
         reference
             .as_str()
             .is_none_or(|reference| !is_digest(reference))
     }) {
-        bail!("analysis collection contains an invalid artifact ref");
+        bail!("measurement collection contains an invalid artifact ref");
     }
     if collection.get("artifact_refs") != action.get("artifact_refs") {
-        bail!("analysis collection does not bind the action's artifact refs");
+        bail!("measurement collection does not bind the action's artifact refs");
     }
     if collection.get("available").and_then(Value::as_bool) == Some(true) && state != "complete" {
-        bail!("analysis collection claims availability for a non-complete action");
+        bail!("measurement collection claims availability for a non-complete action");
     }
     let usage = value
         .get("usage")
         .and_then(Value::as_object)
-        .context("analysis usage receipt is missing")?;
+        .context("measurement usage receipt is missing")?;
     let usage_keys = [
         "action_id",
         "elapsed_ms",
@@ -1963,7 +4168,7 @@ fn validate_analysis_result(value: &Value, expected_attempt_ref: &str) -> Result
         || usage.get("provider_calls").and_then(Value::as_u64) != Some(0)
         || !usage.get("cost_microusd").is_some_and(Value::is_null)
     {
-        bail!("analysis usage receipt is not bound to the local zero-cost adapter");
+        bail!("measurement usage receipt is not bound to the local zero-provider adapter");
     }
     for field in [
         "elapsed_ms",
@@ -1978,7 +4183,7 @@ fn validate_analysis_result(value: &Value, expected_attempt_ref: &str) -> Result
             .get(field)
             .is_none_or(|value| !value.is_null() && value.as_u64().is_none())
         {
-            bail!("analysis usage receipt contains an invalid quantity");
+            bail!("measurement usage receipt contains an invalid quantity");
         }
     }
     Ok(())
@@ -2061,6 +4266,428 @@ fn read_private_content(
         bail!("node-intelligence content-addressed receipt hash mismatch");
     }
     Ok(data)
+}
+
+fn ensure_private_store(workspace: &Path, relative: &str) -> Result<PathBuf> {
+    let path = safe_project_path(workspace, relative)?;
+    let mut current = PathBuf::from(workspace);
+    let components = Path::new(relative)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for (index, part) in components.iter().enumerate() {
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    bail!("node-intelligence private store contains an unsafe path component");
+                }
+                if index + 1 == components.len() && !private_metadata(&metadata) {
+                    bail!("node-intelligence private store is not owner-private");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if index + 1 != components.len() {
+                    bail!("node-intelligence private store parent is missing");
+                }
+                fs::create_dir(&current).with_context(|| {
+                    format!(
+                        "create node-intelligence private store {}",
+                        current.display()
+                    )
+                })?;
+                #[cfg(unix)]
+                fs::set_permissions(&current, fs::Permissions::from_mode(0o700))?;
+                let metadata = fs::symlink_metadata(&current)?;
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_dir()
+                    || !private_metadata(&metadata)
+                {
+                    bail!("created node-intelligence private store is not owner-private");
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(path)
+}
+
+fn write_private_record(workspace: &Path, relative_dir: &str, value: &Value) -> Result<String> {
+    let bytes = fractal_contracts::canonical_json(value)
+        .context("encode canonical node-intelligence private record")?;
+    if bytes.len() > MAX_EFFECT_RECORD_BYTES {
+        bail!("node-intelligence private record exceeds size limit");
+    }
+    let reference = hash_bytes(&bytes);
+    let directory = ensure_private_store(workspace, relative_dir)?;
+    let path = directory.join(format!("{}.json", &reference[7..]));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    match options.open(&path) {
+        Ok(mut file) => {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::File::open(&directory)?.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let rel = Path::new(relative_dir).join(format!("{}.json", &reference[7..]));
+            let existing = read_private_content(
+                workspace,
+                &rel.to_string_lossy(),
+                &reference,
+                MAX_EFFECT_RECORD_BYTES,
+            )?;
+            if existing != bytes {
+                bail!("node-intelligence private record digest collision");
+            }
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("write node-intelligence private record {}", path.display())
+            })
+        }
+    }
+    Ok(reference)
+}
+
+fn read_private_record(workspace: &Path, relative_dir: &str, reference: &str) -> Result<Value> {
+    if !is_digest(reference) {
+        bail!("node-intelligence private record reference is invalid");
+    }
+    let rel = Path::new(relative_dir).join(format!("{}.json", &reference[7..]));
+    let bytes = read_private_content(
+        workspace,
+        &rel.to_string_lossy(),
+        reference,
+        MAX_EFFECT_RECORD_BYTES,
+    )?;
+    parse_unique_json(&bytes).context("decode node-intelligence private record")
+}
+
+fn save_materialized_task(
+    workspace: &Path,
+    materialized: &MaterializedTask,
+    graph_hash: &str,
+) -> Result<String> {
+    let body = json!({
+        "schema": "fractal.node_intelligence.materialized_task.v1",
+        "node_id": materialized.node_id,
+        "graph_hash": graph_hash,
+        "attempt_number": materialized.attempt_number,
+        "original_task_ref": materialized.original_task_ref,
+        "task": materialized.task,
+        "materialization_ref": materialized.materialization_ref,
+        "producer_receipt_refs": materialized.producer_receipt_refs,
+    });
+    write_private_record(workspace, MATERIALIZED_TASK_DIR, &body)
+}
+
+fn load_materialized_task(
+    workspace: &Path,
+    node_id: &str,
+    graph_hash: &str,
+    attempt_number: u32,
+    original_task_ref: &str,
+) -> Result<Option<MaterializedTask>> {
+    let directory = safe_project_path(workspace, MATERIALIZED_TASK_DIR)?;
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || !private_metadata(&metadata) {
+        bail!("node-intelligence materialized-task store is unsafe");
+    }
+    let mut found = None;
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(stem) = name.strip_suffix(".json") else {
+            continue;
+        };
+        let reference = format!("sha256:{stem}");
+        if !is_digest(&reference) {
+            bail!("node-intelligence materialized-task filename is invalid");
+        }
+        let value = read_private_record(workspace, MATERIALIZED_TASK_DIR, &reference)?;
+        if value.get("schema").and_then(Value::as_str)
+            != Some("fractal.node_intelligence.materialized_task.v1")
+        {
+            bail!("node-intelligence materialized-task schema mismatch");
+        }
+        if value.get("node_id").and_then(Value::as_str) != Some(node_id)
+            || value.get("graph_hash").and_then(Value::as_str) != Some(graph_hash)
+            || value.get("attempt_number").and_then(Value::as_u64)
+                != Some(u64::from(attempt_number))
+            || value.get("original_task_ref").and_then(Value::as_str) != Some(original_task_ref)
+        {
+            continue;
+        }
+        let task = value
+            .get("task")
+            .cloned()
+            .context("materialized task record lacks task")?;
+        let materialization_ref = value
+            .get("materialization_ref")
+            .and_then(Value::as_str)
+            .filter(|reference| is_digest(reference))
+            .context("materialized task record lacks a valid receipt ref")?
+            .to_owned();
+        let producer_receipt_refs = value
+            .get("producer_receipt_refs")
+            .and_then(Value::as_array)
+            .context("materialized task record lacks producer receipt refs")?
+            .iter()
+            .map(|reference| {
+                reference
+                    .as_str()
+                    .filter(|reference| is_digest(reference))
+                    .map(str::to_owned)
+                    .context("materialized task producer receipt ref is invalid")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if found.is_some() {
+            bail!("multiple materialized task records match the current attempt");
+        }
+        found = Some(MaterializedTask {
+            node_id: node_id.to_owned(),
+            attempt_number,
+            original_task_ref: original_task_ref.to_owned(),
+            task,
+            materialization_ref,
+            producer_receipt_refs,
+        });
+    }
+    Ok(found)
+}
+
+fn request_binding_hash(value: &Value) -> Result<String> {
+    let mut binding = value.clone();
+    let object = binding
+        .as_object_mut()
+        .context("node-intelligence request must be an object")?;
+    object.remove("request_hash");
+    object.remove("operation");
+    object.remove("recovery");
+    fractal_contracts::canonical_sha256(&binding)
+        .map_err(|error| anyhow::anyhow!("hash node-intelligence effect binding: {error}"))
+}
+
+fn measurement_action_id(attempt_ref: &str, operation: &str) -> Result<String> {
+    let adapter_operation = match operation {
+        "analysis" => "measurement-analyze",
+        "intake" => "measurement-intake",
+        "check" => "measurement-check",
+        _ => bail!("unsupported measurement effect operation"),
+    };
+    let body = json!({ "attempt_ref": attempt_ref, "operation": adapter_operation });
+    let encoded = fractal_contracts::canonical_json(&body)
+        .context("encode deterministic measurement action identity")?;
+    Ok(format!("fractal:action:{}", digest_hex(&encoded)))
+}
+
+fn effect_intent_body(request: &BridgeRequest, operation: &str) -> Result<Value> {
+    let value = &request.value;
+    let attempt_ref = &request.gate_context.attempt_ref;
+    let action_id = measurement_action_id(attempt_ref, operation)?;
+    Ok(json!({
+        "schema": EFFECT_INTENT_SCHEMA,
+        "project_id": value["project_id"],
+        "graph_id": value["graph_id"],
+        "graph_hash": request.graph_hash,
+        "node_id": request.node_id,
+        "operation": operation,
+        "attempt_number": request.attempt_number,
+        "attempt_ref": attempt_ref,
+        "action_id": action_id,
+        "request_binding_hash": request_binding_hash(value)?,
+        "config_digest": request.config_digest,
+        "host_policy_path": request.host_policy_path.to_string_lossy(),
+        "host_policy_digest": request.host_policy_digest,
+        "network_ref": value["network_ref"],
+        "capability_id": value["capability_id"],
+        "node_ref": value["node_ref"],
+        "model_ref": value["model_ref"],
+        "policy_ref": value["policy_ref"],
+        "input_refs": request.gate_context.input_refs,
+        "memory_refs": value["memory_refs"],
+        "evidence_refs": value["evidence_refs"],
+        "handoff_refs": request.gate_context.handoff_refs,
+        "review_packet_refs": request.gate_context.review_packet_refs,
+        "approved_gate_refs": value.pointer("/runtime/approved_gate_refs").cloned().unwrap_or_else(|| json!([])),
+        "materialization_ref": value.pointer("/runtime/materialization_ref").cloned().unwrap_or(Value::Null),
+        "network_resolution_ref": value.pointer("/runtime/network_resolution_ref").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+fn write_effect_intent(
+    workspace: &Path,
+    request: &BridgeRequest,
+    operation: &str,
+) -> Result<String> {
+    let body = effect_intent_body(request, operation)?;
+    write_private_record(workspace, EFFECT_INTENT_DIR, &body)
+}
+
+fn intent_is_resolved(workspace: &Path, intent_ref: &str) -> Result<bool> {
+    let dir = safe_project_path(workspace, EFFECT_RESOLUTION_DIR)?;
+    let path = dir.join(format!("{}.json", &intent_ref[7..]));
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || !private_metadata(&metadata)
+            {
+                bail!("node-intelligence resolution record is unsafe");
+            }
+            let file = open_nofollow(&path)?;
+            let mut bytes = Vec::new();
+            file.take(MAX_EFFECT_RECORD_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > MAX_EFFECT_RECORD_BYTES {
+                bail!("node-intelligence resolution pointer exceeds size limit");
+            }
+            let pointer = parse_unique_json(&bytes)?;
+            if pointer.get("schema").and_then(Value::as_str)
+                != Some("fractal.node_intelligence.effect_resolution_pointer.v1")
+                || pointer.get("intent_ref").and_then(Value::as_str) != Some(intent_ref)
+            {
+                bail!("node-intelligence resolution record binding mismatch");
+            }
+            let resolution_ref = pointer
+                .get("resolution_ref")
+                .and_then(Value::as_str)
+                .filter(|reference| is_digest(reference))
+                .context("resolution pointer ref is invalid")?;
+            let value = read_private_record(workspace, EFFECT_RESOLUTION_DIR, resolution_ref)?;
+            if value.get("schema").and_then(Value::as_str)
+                != Some("fractal.node_intelligence.effect_resolution.v1")
+                || value.get("intent_ref").and_then(Value::as_str) != Some(intent_ref)
+            {
+                bail!("effect resolution does not bind its intent");
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn resolve_effect_intent(
+    workspace: &Path,
+    intent_ref: &str,
+    completion_attempt: u32,
+) -> Result<()> {
+    let intent = read_private_record(workspace, EFFECT_INTENT_DIR, intent_ref)?;
+    let completion = json!({
+        "schema": "fractal.node_intelligence.effect_resolution.v1",
+        "intent_ref": intent_ref,
+        "node_id": intent.get("node_id"),
+        "graph_hash": intent.get("graph_hash"),
+        "effect_attempt_ref": intent.get("attempt_ref"),
+        "completion_attempt": completion_attempt,
+    });
+    let resolution_ref = write_private_record(workspace, EFFECT_RESOLUTION_DIR, &completion)?;
+    let directory = ensure_private_store(workspace, EFFECT_RESOLUTION_DIR)?;
+    let path = directory.join(format!("{}.json", &intent_ref[7..]));
+    let pointer = json!({
+        "schema": "fractal.node_intelligence.effect_resolution_pointer.v1",
+        "intent_ref": intent_ref,
+        "resolution_ref": resolution_ref,
+    });
+    let bytes = fractal_contracts::canonical_json(&pointer)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    match options.open(&path) {
+        Ok(mut file) => {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::File::open(&directory)?.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !intent_is_resolved(workspace, intent_ref)? {
+                return Err(error.into());
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn pending_effect_intent(
+    workspace: &Path,
+    node_id: &str,
+    graph_hash: &str,
+    completed: bool,
+) -> Result<Option<EffectIntent>> {
+    let directory = safe_project_path(workspace, EFFECT_INTENT_DIR)?;
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || !private_metadata(&metadata) {
+        bail!("node-intelligence effect-intent store is unsafe");
+    }
+    let current_document = crate::project_file::load(workspace)?;
+    let current_project_id = format!("fractal:project:{}", current_document.project.slug);
+    let mut found = Vec::new();
+    for entry in fs::read_dir(&directory)? {
+        if found.len() >= MAX_EFFECT_RECORDS {
+            bail!("node-intelligence effect-intent store exceeds record limit");
+        }
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let stem = name.strip_suffix(".json").unwrap_or_default();
+        let intent_ref = format!("sha256:{stem}");
+        if !is_digest(&intent_ref) {
+            bail!("node-intelligence effect-intent filename is invalid");
+        }
+        let body = read_private_record(workspace, EFFECT_INTENT_DIR, &intent_ref)?;
+        if body.get("schema").and_then(Value::as_str) != Some(EFFECT_INTENT_SCHEMA) {
+            bail!("node-intelligence effect-intent schema mismatch");
+        }
+        if body.get("node_id").and_then(Value::as_str) == Some(node_id)
+            && body.get("project_id").and_then(Value::as_str) == Some(current_project_id.as_str())
+            && !intent_is_resolved(workspace, &intent_ref)?
+        {
+            if body.get("graph_hash").and_then(Value::as_str) != Some(graph_hash) {
+                bail!("an unresolved effect intent belongs to a different graph; operator reconciliation is required");
+            }
+            let body_attempt = body
+                .get("attempt_number")
+                .and_then(Value::as_u64)
+                .context("effect intent lacks attempt number")?;
+            if completed {
+                resolve_effect_intent(workspace, &intent_ref, body_attempt as u32)?;
+            } else {
+                found.push(EffectIntent { intent_ref, body });
+            }
+        }
+        let _ = path;
+    }
+    found.sort_by_key(|intent| intent.body["attempt_number"].as_u64().unwrap_or_default());
+    if found.len() > 1 {
+        bail!("multiple unresolved node-intelligence effects require operator reconciliation");
+    }
+    Ok(found.pop())
 }
 
 fn safe_project_path(workspace: &Path, relative: &str) -> Result<PathBuf> {
@@ -2377,6 +5004,48 @@ mod tests {
         hash_bytes(value)
     }
 
+    fn resolver_task() -> Value {
+        json!({
+            "network_ref": digest(b"network-0"),
+            "capability_id": "intelligence.measurement.analyze",
+            "node_ref": digest(b"node-0"),
+            "model_ref": digest(b"model-0"),
+            "policy_ref": digest(b"policy-0"),
+            "input_refs": [digest(b"input-0")],
+            "handoff_refs": [],
+            "review_packet_refs": [],
+            "public_features": {"sample_count": 3},
+            "runtime": {
+                "network_resolver_config": "/tmp/operator/network.json",
+                "authorization": {"authorized_artifacts": [digest(b"input-0")]}
+            }
+        })
+    }
+
+    #[test]
+    fn network_resolution_overlay_only_changes_the_four_pinned_refs() {
+        let original = resolver_task();
+        let mut resolved = original.clone();
+        resolved["network_ref"] = json!(digest(b"network-1"));
+        resolved["node_ref"] = json!(digest(b"node-1"));
+        resolved["model_ref"] = json!(digest(b"model-1"));
+        resolved["policy_ref"] = json!(digest(b"policy-1"));
+        validate_resolved_network_task(&original, &resolved).unwrap();
+
+        let mut changed_input = resolved.clone();
+        changed_input["input_refs"] = json!([digest(b"other-input")]);
+        assert!(validate_resolved_network_task(&original, &changed_input).is_err());
+
+        let mut changed_grant = resolved.clone();
+        changed_grant["runtime"]["authorization"]["authorized_artifacts"] =
+            json!([digest(b"other-input")]);
+        assert!(validate_resolved_network_task(&original, &changed_grant).is_err());
+
+        let mut invalid_pin = resolved;
+        invalid_pin["model_ref"] = json!("sha256:not-a-digest");
+        assert!(validate_resolved_network_task(&original, &invalid_pin).is_err());
+    }
+
     #[test]
     fn owner_policy_binds_private_memory_scope_and_defaults_to_null() {
         let runtime = serde_json::from_value::<Map<String, Value>>(serde_json::json!({})).unwrap();
@@ -2414,9 +5083,41 @@ mod tests {
         assert!(!host_policy_memory_matches(&changed_policy, &runtime));
     }
 
+    #[test]
+    fn unresolved_effect_from_an_old_graph_blocks_relaunch() {
+        let dir = TempDir::new();
+        let mut graph = json!({
+            "schema": "fractal.execution_graph.v1",
+            "graph_id": "fg_effect_intent_recovery",
+            "nodes": [{"id": "analysis", "capability": ANALYSIS_CAPABILITY}],
+            "edges": []
+        });
+        graph["graph_hash"] = json!(fractal_contracts::canonical_sha256(&graph).unwrap());
+        crate::project_file::persist(dir.path(), &graph, "Effect intent recovery fixture").unwrap();
+        let document = crate::project_file::load(dir.path()).unwrap();
+        ensure_private_store(dir.path(), EFFECT_INTENT_DIR).unwrap();
+        write_private_record(
+            dir.path(),
+            EFFECT_INTENT_DIR,
+            &json!({
+                "schema": EFFECT_INTENT_SCHEMA,
+                "project_id": format!("fractal:project:{}", document.project.slug),
+                "graph_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "node_id": "analysis",
+                "attempt_number": 1
+            }),
+        )
+        .unwrap();
+
+        let error =
+            pending_effect_intent(dir.path(), "analysis", &document.graph_hash, false).unwrap_err();
+        assert!(error.to_string().contains("different graph"));
+    }
+
     fn request_fixture(workspace: &Path) -> BridgeRequest {
         let mut request = json!({
             "schema": REQUEST_SCHEMA,
+            "operation": "prepare",
             "request_id": "request-1",
             "request_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "project_id": "fractal:project:fixture",
@@ -2437,26 +5138,25 @@ mod tests {
         });
         let hash = fractal_contracts::canonical_sha256(&request_without_hash(&request)).unwrap();
         request["request_hash"] = Value::String(hash);
+        let gate_context = GateContext {
+            project_id: "fractal:project:fixture".to_owned(),
+            graph_hash: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_owned(),
+            node_id: "build".to_owned(),
+            attempt_ref: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .to_owned(),
+            network_ref: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                .to_owned(),
+            plan_ref: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                .to_owned(),
+            input_refs: Vec::new(),
+            handoff_refs: Vec::new(),
+            review_packet_refs: Vec::new(),
+        };
         BridgeRequest {
             value: request,
-            gate_context: GateContext {
-                project_id: "fractal:project:fixture".to_owned(),
-                graph_hash:
-                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                        .to_owned(),
-                node_id: "build".to_owned(),
-                attempt_ref:
-                    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-                        .to_owned(),
-                network_ref:
-                    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-                        .to_owned(),
-                plan_ref: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
-                    .to_owned(),
-                input_refs: Vec::new(),
-                handoff_refs: Vec::new(),
-                review_packet_refs: Vec::new(),
-            },
+            recheck_gate_context: gate_context.clone(),
+            gate_context,
             attempt_number: 1,
             graph_hash: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 .to_owned(),
@@ -2472,6 +5172,7 @@ mod tests {
             pre_admission: false,
             review_operation: false,
             previous_attempt_count: 0,
+            intent_ref: None,
         }
     }
 
@@ -2525,6 +5226,9 @@ mod tests {
             "context_manifest_ref": context_ref,
             "decision": decision,
             "analysis": null,
+            "intake": null,
+            "check": null,
+            "recovery": null,
             "remaining_elapsed_ms": 1000,
             "remaining_calls": 1,
             "status":status,
@@ -2548,6 +5252,9 @@ mod tests {
             "context_manifest_ref": context_ref,
             "context_manifest_path": content_path(".fractal/node-receipts", &context_ref).unwrap(),
             "analysis": null,
+            "intake": null,
+            "check": null,
+            "recovery": null,
             "remaining_elapsed_ms": 1000,
             "remaining_calls": 1,
             "status":status,"error_code":null

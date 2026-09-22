@@ -38,6 +38,8 @@ mod node;
 mod node_intelligence;
 #[cfg(test)]
 mod node_intelligence_coding_tests;
+#[cfg(test)]
+mod node_intelligence_workflow_tests;
 mod orchestrate;
 mod pipeline;
 mod prd_graph;
