@@ -24,10 +24,33 @@ The same final Rust source in the main worktree also passed
 
 No saved model/head diagnostic, provider call, or graph transition was run. The Rust tests use temporary synthetic projects and bounded fake child processes. The ignored saved-head diagnostic still needs an explicitly configured bounded run if separately authorized.
 
-The ignored managed-learning cohort capture has **not passed acceptance**. Its
-first opt-in preflight stopped before any task action because the paired Python
-fixture still expected 32 graph edges while the frozen two-batch barrier
-correctly supplies 40. The failed v1 artifact is preserved in FractalMaster;
-the fixture owner is correcting the validator before a separately reserved
-v2 capture. This checkpoint contains the planned capture harness, not evidence
-that the complete cohort or subsequent model/controller lifecycle ran.
+## Frozen cohort harness follow-up
+
+The capture helper now invokes its own nested ignored coordinator test by exact
+test name, passes all three per-split policy paths to the fixture, and uses
+unique canonical workspace slugs (`jev-managed-learning-{split}-v1`). Its
+preflight persists all three split projects through the Rust project API and
+calls the real Python fixture without running a task action. It checks the
+namespaced project IDs, graph/config pin round-trip, distinct owner-policy
+paths, private policy modes, and absence of an action database.
+
+The capture audit now reads each action's parsed nonempty output-ref array,
+checks the three expected adapter roles, counts unique output artifacts, and
+reports checker outcomes from `verified_outcome`. The frozen all-positive
+cohort expects 48 completed tasks/actions, 80 distinct output artifacts, 16
+passed checks, zero failed or unknown checks, 16 matching feedback events, and
+zero provider/model calls.
+
+Focused checkpoint verification:
+
+- `cargo test --bin fractal node_intelligence_workflow_tests -- --nocapture`:
+  9 passed, 4 ignored (79.48s). This includes the three ordinary cohort
+  barrier/project-ID/fixture-preflight checks and deterministic scheduler,
+  resume, unit-rejection, and resolver tests. The ignored capture and saved-head
+  test were not run.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+
+The preflight failures from earlier opt-in attempts remain preserved in
+FractalMaster. The root operator started a separately frozen v4 capture after
+these harness changes; this isolated checkpoint does not claim its result or
+the complete data/training/controller acceptance.

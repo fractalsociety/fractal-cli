@@ -14,10 +14,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MASTER: &str = "/Users/jamesstar/fractalmaster";
-const CHILD_TEST: &str = "node_intelligence_workflow_tests::workflow_coordinator_child";
+const CHILD_TEST: &str =
+    "node_intelligence_workflow_tests::node_intelligence_learning_workflow_tests::learning_cohort_coordinator_child";
 const CASES_SCRIPT: &str = r#"
 import json, pathlib, sys
 sys.path.insert(0, str(pathlib.Path(sys.argv[1]) / 'runs/jev-network'))
@@ -37,7 +38,8 @@ result = prepare_cases(
     pathlib.Path(request['workspace']), request['graph'], request['project_id'],
     request['case_document'],
     host_policy_path=pathlib.Path(request['host_policy_path']),
-    feedback_policy_path=pathlib.Path(request['feedback_policy_path']))
+    feedback_policy_path=pathlib.Path(request['feedback_policy_path']),
+    rollout_policy_path=pathlib.Path(request['rollout_policy_path']))
 print(json.dumps(result, sort_keys=True))
 "#;
 const AUDIT_SCRIPT: &str = r#"
@@ -74,8 +76,38 @@ for item in projects:
     connection.close()
     if any(row['state'] != 'complete' for row in actions):
         raise RuntimeError('action_not_complete')
-    if any(not row['output_refs_json'] for row in actions):
-        raise RuntimeError('action_output_missing')
+    outputs_by_action = {}
+    for row in actions:
+        try:
+            refs = json.loads(row['output_refs_json'])
+        except (TypeError, ValueError):
+            raise RuntimeError('action_output_invalid') from None
+        if not isinstance(refs, list) or not refs or any(
+                not isinstance(ref, str) or not ref.startswith('sha256:') for ref in refs):
+            raise RuntimeError('action_output_missing')
+        outputs_by_action[row['action_id']] = refs
+    output_refs = [ref for refs in outputs_by_action.values() for ref in refs]
+    if len(output_refs) != len(set(output_refs)):
+        raise RuntimeError('duplicate_output_artifact')
+    expected_action_count = len(item['case_ids']) * 3
+    expected_output_count = len(item['case_ids']) * 5
+    if len(actions) != expected_action_count or len(output_refs) != expected_output_count:
+        raise RuntimeError('action_output_coverage')
+    adapter_counts = {name: sum(row['adapter_id'] == name for row in actions)
+                      for name in ('deterministic_measurement_intake',
+                                   'deterministic_measurement',
+                                   'deterministic_measurement_checker')}
+    if adapter_counts != {name: len(item['case_ids']) for name in adapter_counts}:
+        raise RuntimeError('action_adapter_coverage')
+    checker_rows = [row for row in actions
+                    if row['adapter_id'] == 'deterministic_measurement_checker']
+    passed_checks = sum(row['verified_outcome'] == 1 for row in checker_rows)
+    failed_checks = sum(row['verified_outcome'] == 0 for row in checker_rows)
+    unknown_checks = sum(row['verified_outcome'] is None for row in checker_rows)
+    if (len(checker_rows) != len(item['case_ids'])
+            or passed_checks != len(item['case_ids'])
+            or failed_checks != 0 or unknown_checks != 0):
+        raise RuntimeError('checker_outcome_coverage')
     policy = json.loads(pathlib.Path(item['feedback_policy_path']).read_text())
     feed = FeedbackStore(workspace / policy['feedback_database_path'],
                          project_id=item['project_id'])
@@ -94,6 +126,9 @@ for item in projects:
         'graph_hash': document['graph']['graph_hash'],
         'canonical_tasks_completed': len(completed),
         'action_rows': len(actions), 'feedback_events': len(events),
+        'output_artifacts': len(output_refs),
+        'checker_passed': passed_checks, 'checker_failed': failed_checks,
+        'checker_unknown': unknown_checks,
         'attempt_refs': sorted(analyses), 'action_ids': sorted(row['action_id'] for row in actions),
         'event_refs': sorted(event['event_ref'] for event in events),
     })
@@ -103,7 +138,11 @@ print(json.dumps({
     'projects': results,
     'canonical_tasks_completed': sum(row['canonical_tasks_completed'] for row in results),
     'action_rows': len(all_actions),
+    'output_artifacts': sum(row['output_artifacts'] for row in results),
     'feedback_events': len(all_events),
+    'checker_passed': sum(row['checker_passed'] for row in results),
+    'checker_failed': sum(row['checker_failed'] for row in results),
+    'checker_unknown': sum(row['checker_unknown'] for row in results),
     'provider_calls': 0,
     'local_model_calls': 0,
 }, sort_keys=True))
@@ -301,6 +340,234 @@ fn training_graph_has_frozen_batch_barrier() {
 }
 
 #[test]
+fn managed_learning_split_projects_have_distinct_canonical_ids() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "fractal-managed-learning-project-ids-{}-{stamp}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).expect("exclusive canonical-project test root");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut project_ids = Vec::new();
+    for split in ["train", "validation", "test"] {
+        let workspace = root.join(format!("jev-managed-learning-{split}-v1"));
+        fs::create_dir(&workspace).expect("exclusive split workspace");
+        let case_count = if split == "train" { 8 } else { 1 };
+        let cases = json!({
+            "schema":"fractal.node.learning_workflow.cases.v1",
+            "cases":(0..case_count).map(|index| json!({
+                "case_id":format!("{split}-case{index:02}"),"split":split
+            })).collect::<Vec<_>>()
+        });
+        let graph = graph_for_split(split, &cases);
+        crate::project_file::persist(&workspace, &graph, "Managed Learning Split")
+            .expect("persist split through canonical project API");
+        let document = crate::project_file::load(&workspace).expect("load canonical project");
+        assert_eq!(document.graph["graph_hash"], graph["graph_hash"]);
+        project_ids.push(document.project.slug);
+    }
+
+    assert_eq!(project_ids.len(), 3);
+    assert_eq!(
+        project_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3,
+        "split workspaces must not collapse to one canonical project ID"
+    );
+    assert_eq!(
+        project_ids,
+        [
+            "jev-managed-learning-train-v1",
+            "jev-managed-learning-validation-v1",
+            "jev-managed-learning-test-v1"
+        ]
+    );
+    fs::remove_dir_all(root).expect("remove canonical-project test root");
+}
+
+#[test]
+fn managed_learning_three_split_fixture_preflight_roundtrips_without_actions() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "fractal-managed-learning-preflight-{}-{stamp}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).expect("exclusive fixture preflight root");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let root = fs::canonicalize(root).expect("canonical fixture preflight root");
+    let policies = root.join("policies");
+    fs::create_dir(&policies).expect("private fixture policy directory");
+    fs::set_permissions(&policies, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let source_snapshot = python_json(CASES_SCRIPT, None);
+    let source_cases = source_snapshot["cases"]["cases"]
+        .as_array()
+        .expect("frozen source cases");
+    let mut project_ids = std::collections::BTreeSet::new();
+    let mut network_refs = std::collections::BTreeSet::new();
+    let mut policy_refs = std::collections::BTreeSet::new();
+    let mut owner_policy_paths = std::collections::BTreeSet::new();
+    let mut feedback_policy_paths = std::collections::BTreeSet::new();
+    let mut rollout_policy_paths = std::collections::BTreeSet::new();
+
+    for split in ["train", "validation", "test"] {
+        let case_document = json!({
+            "schema":source_snapshot["cases"]["schema"],
+            "cases":source_cases.iter().filter(|case| case["split"] == split)
+                .cloned().collect::<Vec<_>>()
+        });
+        let cases = case_document["cases"].as_array().unwrap();
+        let expected_count = source_snapshot["manifest"]["split_counts"][split]
+            .as_u64()
+            .expect("frozen split count") as usize;
+        assert_eq!(cases.len(), expected_count, "{split} source cases");
+        let case_ids = cases
+            .iter()
+            .map(|case| case["case_id"].as_str().expect("case ID"))
+            .collect::<Vec<_>>();
+        let graph = graph_for_split(split, &case_document);
+        let project_root = root.join(split);
+        fs::create_dir(&project_root).expect("exclusive preflight split root");
+        fs::set_permissions(&project_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let workspace = project_root.join(format!("jev-managed-learning-{split}-v1"));
+        fs::create_dir(&workspace).expect("exclusive canonical split workspace");
+        crate::project_file::persist(
+            &workspace,
+            &graph,
+            source_snapshot["manifest"]["project_titles"][split]
+                .as_str()
+                .unwrap(),
+        )
+        .expect("persist via canonical Rust project API");
+        let document = crate::project_file::load(&workspace).expect("canonical project roundtrip");
+        let slug = format!("jev-managed-learning-{split}-v1");
+        assert_eq!(document.project.slug, slug);
+        assert_eq!(document.graph["graph_hash"], graph["graph_hash"]);
+        let project_id = format!("fractal:project:{slug}");
+        project_ids.insert(project_id.clone());
+
+        let host_policy = policies.join(format!("{split}-host-policy.json"));
+        let feedback_policy = policies.join(format!("{split}-feedback-policy.json"));
+        let rollout_policy = policies.join(format!("{split}-rollout-policy.json"));
+        owner_policy_paths.insert(host_policy.clone());
+        feedback_policy_paths.insert(feedback_policy.clone());
+        rollout_policy_paths.insert(rollout_policy.clone());
+        let fixture_request = json!({
+            "workspace":workspace,
+            "graph":document.graph,
+            "project_id":document.project.slug,
+            "case_document":case_document,
+            "host_policy_path":host_policy,
+            "feedback_policy_path":feedback_policy,
+            "rollout_policy_path":rollout_policy
+        });
+        let fixture = python_json(FIXTURE_SCRIPT, Some(&fixture_request));
+        assert_eq!(fixture["project_id"], project_id);
+        assert_eq!(fixture["graph_id"], graph["graph_id"]);
+        assert_eq!(fixture["graph_hash"], graph["graph_hash"]);
+        assert_eq!(fixture["split"], split);
+        assert_eq!(
+            fixture["case_ids"].as_array().unwrap().len(),
+            expected_count
+        );
+        assert_eq!(fixture["source_count"], (expected_count * 3) as u64);
+        assert_eq!(fixture["synthetic"], true);
+        assert_eq!(fixture["training_eligible"], false);
+        assert_eq!(fixture["provider_calls"], 0);
+        assert_eq!(fixture["model_calls"], 0);
+        network_refs.insert(fixture["network_ref"].as_str().unwrap().to_owned());
+        policy_refs.insert(fixture["rollout_policy_ref"].as_str().unwrap().to_owned());
+
+        let task_refs = fixture["task_refs"].as_object().expect("task pins");
+        assert_eq!(task_refs.len(), expected_count * 3);
+        for case_id in &case_ids {
+            for role in ["intake", "analysis", "check"] {
+                let task_id = format!("{case_id}-{role}");
+                let task = task_refs.get(&task_id).expect("fixture task pin");
+                assert_eq!(task["network_ref"], fixture["network_ref"]);
+                assert_eq!(task["policy_ref"], fixture["rollout_policy_ref"]);
+            }
+        }
+        assert_eq!(fixture["host_policy_path"], host_policy.to_str().unwrap());
+        assert_eq!(
+            fixture["feedback_policy_path"],
+            feedback_policy.to_str().unwrap()
+        );
+        assert_eq!(
+            fixture["rollout_policy_path"],
+            rollout_policy.to_str().unwrap()
+        );
+        for path in [&host_policy, &feedback_policy, &rollout_policy] {
+            let metadata = fs::metadata(path).expect("fixture owner policy exists");
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        }
+        let host_policy_body: Value =
+            serde_json::from_slice(&fs::read(&host_policy).unwrap()).expect("host policy JSON");
+        assert_eq!(host_policy_body["project_id"], project_id);
+        assert_eq!(host_policy_body["graph_hash"], graph["graph_hash"]);
+        let config_path = PathBuf::from(fixture["config_path"].as_str().unwrap());
+        assert_eq!(
+            config_path,
+            workspace.join(".fractal/node-intelligence.json")
+        );
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let config: Value =
+            serde_json::from_slice(&fs::read(&config_path).unwrap()).expect("runtime config JSON");
+        assert_eq!(config["schema"], "fractal.node_intelligence.config.v1");
+        assert_eq!(config["enabled"], true);
+        assert_eq!(
+            config["tasks"].as_object().unwrap().len(),
+            expected_count * 3
+        );
+        for case_id in &case_ids {
+            for role in ["intake", "analysis", "check"] {
+                let task_id = format!("{case_id}-{role}");
+                let configured = &config["tasks"][&task_id];
+                let fixture_pins = &task_refs[&task_id];
+                assert_eq!(configured["capability_id"], fixture_pins["capability_id"]);
+                assert_eq!(configured["network_ref"], fixture_pins["network_ref"]);
+                assert_eq!(configured["node_ref"], fixture_pins["node_ref"]);
+                assert_eq!(configured["model_ref"], fixture_pins["model_ref"]);
+                assert_eq!(configured["policy_ref"], fixture_pins["policy_ref"]);
+                assert_eq!(
+                    configured["capability_id"],
+                    format!("fractal:capability:workflow-{role}")
+                );
+                assert_eq!(configured["runtime"][role]["enabled"], true);
+                if role == "intake" {
+                    assert_eq!(configured["input_refs"].as_array().unwrap().len(), 3);
+                } else {
+                    assert!(configured["input_refs"].as_array().unwrap().is_empty());
+                }
+            }
+        }
+        assert!(!workspace
+            .join(".fractal/node-actions/actions.sqlite3")
+            .exists());
+    }
+
+    assert_eq!(project_ids.len(), 3);
+    assert_eq!(network_refs.len(), 3);
+    assert_eq!(policy_refs.len(), 3);
+    assert_eq!(owner_policy_paths.len(), 3);
+    assert_eq!(feedback_policy_paths.len(), 3);
+    assert_eq!(rollout_policy_paths.len(), 3);
+    fs::remove_dir_all(root).expect("remove fixture preflight root");
+}
+
+#[test]
 #[ignore = "one-run frozen source cohort capture; invoke only after root freezes protocol and binary/source fingerprints"]
 fn generate_frozen_managed_learning_cohort() {
     let _lock = crate::graph_store::ENV_LOCK
@@ -385,7 +652,7 @@ fn generate_frozen_managed_learning_cohort() {
         let project_root = run_root.join(split);
         fs::create_dir(&project_root).expect("exclusive split project directory");
         fs::set_permissions(&project_root, fs::Permissions::from_mode(0o700)).unwrap();
-        let workspace = project_root.join("project");
+        let workspace = project_root.join(format!("jev-managed-learning-{split}-v1"));
         fs::create_dir(&workspace).expect("new canonical project workspace");
         crate::project_file::persist(
             &workspace,
@@ -413,7 +680,13 @@ fn generate_frozen_managed_learning_cohort() {
         assert_eq!(fixture["synthetic"], true);
         assert_eq!(fixture["provider_calls"], 0);
         assert_eq!(fixture["model_calls"], 0);
-        assert_eq!(fixture["project_id"], fixture_request["project_id"]);
+        let expected_project_id = format!(
+            "fractal:project:{}",
+            fixture_request["project_id"]
+                .as_str()
+                .expect("canonical project slug")
+        );
+        assert_eq!(fixture["project_id"], expected_project_id);
         assert_eq!(fixture["graph_hash"], graph["graph_hash"]);
         assert_eq!(fixture["rollout_policy_ref"], fixture["policy_ref"]);
         assert_eq!(fixture["provider_calls"], 0);
@@ -477,7 +750,11 @@ fn generate_frozen_managed_learning_cohort() {
     let audit = python_json(AUDIT_SCRIPT, Some(&audit_input));
     assert_eq!(audit["canonical_tasks_completed"], 48, "{audit}");
     assert_eq!(audit["action_rows"], 48, "{audit}");
+    assert_eq!(audit["output_artifacts"], 80, "{audit}");
     assert_eq!(audit["feedback_events"], 16, "{audit}");
+    assert_eq!(audit["checker_passed"], 16, "{audit}");
+    assert_eq!(audit["checker_failed"], 0, "{audit}");
+    assert_eq!(audit["checker_unknown"], 0, "{audit}");
     assert_eq!(audit["provider_calls"], 0);
     assert_eq!(audit["local_model_calls"], 0);
     for project in &projects {
@@ -497,9 +774,19 @@ fn generate_frozen_managed_learning_cohort() {
             (project.case_ids.len() * 3) as u64
         );
         assert_eq!(
+            project_audit["output_artifacts"],
+            (project.case_ids.len() * 5) as u64
+        );
+        assert_eq!(
             project_audit["feedback_events"],
             project.case_ids.len() as u64
         );
+        assert_eq!(
+            project_audit["checker_passed"],
+            project.case_ids.len() as u64
+        );
+        assert_eq!(project_audit["checker_failed"], 0);
+        assert_eq!(project_audit["checker_unknown"], 0);
     }
     let report = json!({
         "schema":"fractal.node.managed_learning.cohort_capture.v1",
