@@ -15,6 +15,9 @@ use fractal_chain::{
     DevelopmentalStep, Hash256, Receipt, ReceiptKind, ScaleLedger,
 };
 
+pub(crate) mod jev_receipt;
+use jev_receipt::RouteReceiptV1;
+
 /// A thread-safe signed ledger for one interactive run.
 pub(crate) struct RunLedger {
     ledger: Mutex<ScaleLedger>,
@@ -189,6 +192,27 @@ impl RunLedger {
         }
     }
 
+    /// Anchor the complete JEV receipt payload under its graph/node/attempt
+    /// subject. The ledger commits only the canonical payload digest; the
+    /// serializable receipt remains available to the audit/export boundary.
+    pub(crate) fn route_receipt(&self, receipt: &RouteReceiptV1) {
+        let payload = serde_json::to_value(receipt).ok();
+        let Some(payload) = payload else { return };
+        let Ok(canonical) = fractal_contracts::canonical_json(&payload) else {
+            return;
+        };
+        if let Ok(mut ledger) = self.ledger.lock() {
+            let _ = commit_anchors(
+                &mut ledger,
+                vec![AnchorEvent::RouteDecision {
+                    subject: receipt.ledger_subject.clone(),
+                    decision_hash: payload_hash_str(&String::from_utf8_lossy(&canonical)),
+                }],
+                now_ms(),
+            );
+        }
+    }
+
     /// `(receipt_blocks, global_root_hex, verified)`.
     pub(crate) fn summary(&self) -> (usize, String, bool) {
         match self.ledger.lock() {
@@ -239,5 +263,41 @@ impl RunLedger {
             machine_root: hex(&machine.head()),
             verified: machine.verify().is_ok(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_receipt_is_anchored_to_graph_node_attempt_subject() {
+        let ledger = RunLedger::new("graph");
+        let receipt = jev_receipt::RouteReceiptV1::from_host_observation(
+            "project".to_owned(),
+            "graph".to_owned(),
+            "sha256:graph".to_owned(),
+            "node".to_owned(),
+            3,
+            "sha256:objective".to_owned(),
+            jev_receipt::RouteInvocation::unknown("codex"),
+            "legacy:codex:backend-unknown:model-unknown:unknown".to_owned(),
+            jev_receipt::RouteProvenance::unknown("codex"),
+            "not_executed".to_owned(),
+            None,
+            None,
+            None,
+            false,
+            None,
+            "not_applicable".to_owned(),
+            None,
+            None,
+            "sha256:evidence".to_owned(),
+            2,
+        );
+        ledger.route_receipt(&receipt);
+        let (blocks, _, verified) = ledger.summary();
+        assert_eq!(blocks, 1);
+        assert!(verified);
     }
 }
