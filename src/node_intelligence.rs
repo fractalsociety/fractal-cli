@@ -37,6 +37,7 @@ const EFFECT_INTENT_SCHEMA: &str = "fractal.node_intelligence.effect_intent.v1";
 const EFFECT_SNAPSHOT_SCHEMA: &str = "fractal.node_intelligence.effect_snapshot.v1";
 const MATERIALIZATION_RECEIPT_SCHEMA: &str = "fractal.node_intelligence.materialization.v1";
 const NETWORK_RESOLUTION_SCHEMA: &str = "fractal.node_intelligence.network_resolution.v1";
+const NETWORK_RESOLVER_CONFIG_SCHEMA: &str = "fractal.node_intelligence.network_resolver.v1";
 const EFFECT_INTENT_DIR: &str = ".fractal/node-intelligence-intents";
 const EFFECT_SNAPSHOT_DIR: &str = ".fractal/node-intelligence-effects";
 const EFFECT_RESOLUTION_DIR: &str = ".fractal/node-intelligence-resolutions";
@@ -970,6 +971,155 @@ fn validate_materialized_task(
         .as_object()
         .context("original materialization task is invalid")?;
     let task_obj = task.as_object().context("materialized task is invalid")?;
+    let orig_runtime = original
+        .get("runtime")
+        .and_then(Value::as_object)
+        .context("original runtime config is invalid")?;
+    let contract_root = orig_runtime
+        .get("store_path")
+        .and_then(Value::as_str)
+        .context("original contract store path is invalid")?;
+    let receipt_root = orig_runtime
+        .get("receipt_path")
+        .and_then(Value::as_str)
+        .context("original receipt store path is invalid")?;
+    if producers.is_empty() {
+        bail!("materialized task requires completed producer evidence");
+    }
+    let mut producer_network: Option<String> = None;
+    let mut producer_policy: Option<String> = None;
+    for producer in producers {
+        let bytes = read_private_content(
+            workspace,
+            &content_path(receipt_root, &producer.receipt_ref)?,
+            &producer.receipt_ref,
+            MAX_PRIVATE_RECEIPT_BYTES,
+        )?;
+        let receipt = parse_unique_json(&bytes).context("decode materialized producer receipt")?;
+        let network_ref = receipt
+            .get("network_ref")
+            .and_then(Value::as_str)
+            .filter(|reference| is_digest(reference))
+            .context("completed producer receipt lacks a network pin")?
+            .to_owned();
+        let policy_ref = receipt
+            .get("policy_ref")
+            .and_then(Value::as_str)
+            .filter(|reference| is_digest(reference))
+            .context("completed producer receipt lacks a policy pin")?
+            .to_owned();
+        if receipt.get("attempt_ref").and_then(Value::as_str) != Some(producer.attempt_ref.as_str())
+            || receipt.get("project_id") != request.get("project_id")
+            || receipt.get("graph_hash") != request.get("graph_hash")
+        {
+            bail!("materialized producer receipt does not bind its completed attempt");
+        }
+        if producer_network
+            .as_ref()
+            .is_some_and(|value| value != &network_ref)
+            || producer_policy
+                .as_ref()
+                .is_some_and(|value| value != &policy_ref)
+        {
+            bail!("materialized producers do not share one network and policy pin");
+        }
+        producer_network = Some(network_ref);
+        producer_policy = Some(policy_ref);
+    }
+    let producer_network = producer_network.expect("nonempty producers checked above");
+    let producer_policy = producer_policy.expect("nonempty producers checked above");
+    if task_obj.get("network_ref").and_then(Value::as_str) != Some(producer_network.as_str())
+        || task_obj.get("policy_ref").and_then(Value::as_str) != Some(producer_policy.as_str())
+        || original_obj.get("policy_ref").and_then(Value::as_str) != Some(producer_policy.as_str())
+        || task_obj.get("capability_id") != original_obj.get("capability_id")
+    {
+        bail!("materialized task pins do not inherit the completed producer network and policy");
+    }
+    let load_contract = |reference: &str| -> Result<Value> {
+        let bytes = read_private_content(
+            workspace,
+            &content_path(contract_root, reference)?,
+            reference,
+            MAX_PRIVATE_RECEIPT_BYTES,
+        )?;
+        parse_unique_json(&bytes).context("decode materialized network contract")
+    };
+    let network_ref = task_obj["network_ref"]
+        .as_str()
+        .context("materialized network ref is invalid")?;
+    let new_node_ref = task_obj["node_ref"]
+        .as_str()
+        .filter(|reference| is_digest(reference))
+        .context("materialized capability ref is invalid")?;
+    let new_model_ref = task_obj["model_ref"]
+        .as_str()
+        .filter(|reference| is_digest(reference))
+        .context("materialized model ref is invalid")?;
+    let new_network = load_contract(network_ref)?;
+    if new_network.get("schema").and_then(Value::as_str) != Some("fractal.node.network.v1")
+        || new_network.get("policy_ref").and_then(Value::as_str) != Some(producer_policy.as_str())
+    {
+        bail!("materialized network contract is not bound to producer policy");
+    }
+    let capability_id = task_obj["capability_id"]
+        .as_str()
+        .context("materialized capability identity is invalid")?;
+    let member_refs = new_network
+        .get("nodes")
+        .and_then(Value::as_array)
+        .context("materialized network membership is invalid")?
+        .iter()
+        .filter(|entry| entry.get("id").and_then(Value::as_str) == Some(capability_id));
+    let member_refs = member_refs.collect::<Vec<_>>();
+    if member_refs.len() != 1
+        || member_refs[0].get("revision").and_then(Value::as_str) != Some(new_node_ref)
+    {
+        bail!("materialized capability pin is not a member of the producer network");
+    }
+    let new_node = load_contract(new_node_ref)?;
+    if new_node.get("schema").and_then(Value::as_str) != Some("fractal.node.capability.v1")
+        || new_node.get("id").and_then(Value::as_str) != Some(capability_id)
+        || new_node.get("model_ref").and_then(Value::as_str) != Some(new_model_ref)
+        || new_node.get("policy_ref").and_then(Value::as_str) != Some(producer_policy.as_str())
+    {
+        bail!("materialized capability contract does not match returned pins");
+    }
+    let old_node_ref = original_obj["node_ref"]
+        .as_str()
+        .filter(|reference| is_digest(reference))
+        .context("original capability ref is invalid")?;
+    let old_node = load_contract(old_node_ref)?;
+    let mut old_interface = old_node
+        .as_object()
+        .cloned()
+        .context("original capability contract is invalid")?;
+    let mut new_interface = new_node
+        .as_object()
+        .cloned()
+        .context("materialized capability contract is invalid")?;
+    for interface in [&mut old_interface, &mut new_interface] {
+        interface.remove("model_ref");
+        interface.remove("performance_refs");
+    }
+    if old_interface != new_interface {
+        bail!("materialized network changed the receiver capability interface or authority");
+    }
+    let old_model_ref = original_obj["model_ref"]
+        .as_str()
+        .filter(|reference| is_digest(reference))
+        .context("original model ref is invalid")?;
+    let old_model = load_contract(old_model_ref)?;
+    let new_model = load_contract(new_model_ref)?;
+    for field in ["owner", "backend", "base_id", "base_revision"] {
+        if old_model.get(field) != new_model.get(field) {
+            bail!("materialized network changed the receiver model backbone");
+        }
+    }
+    if new_model.get("schema").and_then(Value::as_str) != Some("fractal.node.model.v1")
+        || new_model.get("owner").and_then(Value::as_str) != Some(capability_id)
+    {
+        bail!("materialized model owner differs from the receiver capability");
+    }
     let outputs = producers
         .iter()
         .flat_map(|producer| producer.artifact_refs.iter().cloned())
@@ -988,13 +1138,12 @@ fn validate_materialized_task(
         bail!("materialized inputs do not equal committed producer outputs");
     }
     let mut normalized = task.clone();
+    for field in ["network_ref", "node_ref", "model_ref", "policy_ref"] {
+        normalized[field] = original_obj[field].clone();
+    }
     for field in ["input_refs", "handoff_refs", "review_packet_refs"] {
         normalized[field] = original_obj[field].clone();
     }
-    let orig_runtime = original
-        .get("runtime")
-        .and_then(Value::as_object)
-        .context("original runtime config is invalid")?;
     let runtime = normalized
         .get_mut("runtime")
         .and_then(Value::as_object_mut)
@@ -2138,7 +2287,7 @@ fn load_network_resolver_config(
     .into_iter()
     .collect::<BTreeSet<_>>();
     if object.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_keys
-        || object.get("schema").and_then(Value::as_str) != Some(NETWORK_RESOLUTION_SCHEMA)
+        || object.get("schema").and_then(Value::as_str) != Some(NETWORK_RESOLVER_CONFIG_SCHEMA)
         || object.get("enabled").and_then(Value::as_bool) != Some(true)
         || object.get("project_id").and_then(Value::as_str) != Some(project_id)
     {
@@ -2380,7 +2529,27 @@ fn resolve_network_task(
     let project_id = format!("fractal:project:{}", document.project.slug);
     let node = graph_node(&document.graph, node_id)?;
     let capability_id = required_string(&configuration.values, "capability_id")?;
-    if node.get("capability").and_then(Value::as_str) != Some(capability_id.as_str()) {
+    let graph_capability = node.get("capability").and_then(Value::as_str);
+    // Execution-graph capabilities are operation names, while the typed
+    // network uses namespaced capability-record IDs. Accept an exact match
+    // for graphs that use record IDs; for the managed measurement bridge,
+    // bind the known operation name to its explicitly enabled runtime adapter.
+    let managed_operation = match graph_capability {
+        Some(ANALYSIS_CAPABILITY) => Some("analysis"),
+        Some(INTAKE_CAPABILITY) => Some("intake"),
+        Some(CHECK_CAPABILITY) => Some("check"),
+        _ => None,
+    };
+    let managed_operation_is_enabled = managed_operation.is_some_and(|operation| {
+        configuration
+            .values
+            .get("runtime")
+            .and_then(|runtime| runtime.get(operation))
+            .and_then(|adapter| adapter.get("enabled"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    });
+    if graph_capability != Some(capability_id.as_str()) && !managed_operation_is_enabled {
         bail!("network resolver task capability differs from the canonical graph node");
     }
     if document
