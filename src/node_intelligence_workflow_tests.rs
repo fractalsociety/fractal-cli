@@ -14,6 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const MASTER: &str = "/Users/jamesstar/fractalmaster";
 const CHILD_TEST: &str = "node_intelligence_workflow_tests::workflow_coordinator_child";
 
+#[path = "node_intelligence_learning_workflow_tests.rs"]
+mod node_intelligence_learning_workflow_tests;
 #[path = "node_intelligence_network_workflow_tests.rs"]
 mod node_intelligence_network_workflow_tests;
 
